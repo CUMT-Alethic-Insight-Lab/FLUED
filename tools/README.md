@@ -31,3 +31,9 @@ tools/train/v3_4/cbiu.py
 tools/analysis/v3_4/probe_v34_cbiu.py
 tools/analysis/v3_5/build_l2_offline_utility_dataset.py
 ```
+
+跨版本共享：
+
+```text
+tools/eval/p0_inspect.py   # P0 文档级评测集巡检（数据在仓库外 ../eval_data/，见该目录 README）
+```
