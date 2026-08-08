@@ -52,7 +52,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from flued.data import BYTE_OFFSET, MASK_ID, PAD_ID  # noqa: E402
-from flued.v36.model import paged_boundaries  # noqa: E402
+from flued.v36.model import _xcache_select, paged_boundaries  # noqa: E402
 from tools.train.v3_3.train_v33 import (  # noqa: E402
     _append_jsonl,
     _cosine_with_warmup,
@@ -186,7 +186,7 @@ def _prev_ids(tgts: torch.Tensor) -> torch.Tensor:
     return prev.reshape(tgts.shape).clamp(min=0, max=258)
 
 
-def s1_forward(model, source: torch.Tensor, args) -> dict:
+def s1_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None) -> dict:
     byte_states, confidence, valid, _ = model._encode(source)
     hard_cut, utf8_cont, cut_overflow = model._cuts(source, confidence, valid)
     chunks = model.chunk_builder(byte_states, valid, hard_cut, confidence)
@@ -200,10 +200,39 @@ def s1_forward(model, source: torch.Tensor, args) -> dict:
     n_chunks = chunks.chunk_mask.size(1)
     pos = model.chunk_pos.weight.unsqueeze(0)[:, :n_chunks]
     cond_direct = model.decoder_in(content) + pos
+    logits_direct = None
     if getattr(model.config, "backbone_mode", "attn") == "xattn":
         # causal cross-read backbone (s31): queries = per-chunk content,
-        # K/V = pre-state memory, position i sees memory[0..i] only
-        backbone_out = model.backbone(content, memory, chunks.chunk_mask, pos)
+        # K/V = pre-state memory, position i sees memory[0..i] only.
+        # S36 (user-ruled 2026-08-08): optional k=1 gist token + residual-gated
+        # cache (HOLA/HAM): keep only the top-frac memory rows ranked by
+        # per-chunk direct-decode CE.
+        cache_idx, gist = None, None
+        if getattr(model.config, "xcache_gist", False) or getattr(model.config, "xcache_frac", 1.0) < 1.0:
+            last = chunks.chunk_mask.long().sum(dim=1).clamp(min=1) - 1
+            ar = torch.arange(content.size(0), device=content.device)
+            gist = content[ar, last] if getattr(model.config, "xcache_gist", False) else None
+            resid = None
+            if getattr(model.config, "xcache_frac", 1.0) < 1.0:
+                if clean is None or byte_mask is None:
+                    raise ValueError("xcache_frac<1 requires clean+byte_mask (S1 trainer passes them)")
+                logits_direct = model.decoder(cond_direct, chunks.token_mask)
+                targets_r, slot_mask_r, _ = make_targets(
+                    clean, byte_mask, chunks.chunk_ids, chunks.offsets, args.max_chunks, args.max_span
+                )
+                ce = F.cross_entropy(
+                    logits_direct.float().reshape(-1, logits_direct.size(-1)),
+                    targets_r.reshape(-1).clamp(min=0, max=257),
+                    reduction="none",
+                    ignore_index=PAD_ID,
+                ).reshape(targets_r.shape)
+                resid = (ce * slot_mask_r.float()).sum(dim=-1) / slot_mask_r.float().sum(dim=-1).clamp(min=1.0)
+            cache_idx = _xcache_select(
+                resid if resid is not None else chunks.chunk_mask.float(),
+                chunks.chunk_mask,
+                getattr(model.config, "xcache_frac", 1.0),
+            )
+        backbone_out = model.backbone(content, memory, chunks.chunk_mask, pos, cache_idx, gist)
         cond_backbone = backbone_out + pos
     elif getattr(model.config, "backbone_mode", "attn") == "draft":
         # three-state drafting (spec SS23, user-ruled 2026-08-08): input = the
@@ -237,7 +266,8 @@ def s1_forward(model, source: torch.Tensor, args) -> dict:
     else:
         backbone_out = model.backbone(content)
         cond_backbone = backbone_out + pos
-    logits_direct = model.decoder(cond_direct, chunks.token_mask)
+    if logits_direct is None:
+        logits_direct = model.decoder(cond_direct, chunks.token_mask)
     logits_backbone = model.decoder(cond_backbone, chunks.token_mask)
     logits_backbone_mid = None
     if (
@@ -314,7 +344,7 @@ def step_model(model, batch, args, device, train: bool):
         byte_mask = make_byte_mask(valid, args.mask_prob, args.mask_span_min, args.mask_span_max)
     source = clean.masked_fill(byte_mask, MASK_ID)
     with torch.autocast("cuda", dtype=torch.bfloat16, enabled=args.amp and device.type == "cuda"):
-        out = s1_forward(model, source, args)
+        out = s1_forward(model, source, args, clean=clean, byte_mask=byte_mask)
     chunks = out["chunks"]
     targets, slot_mask, masked_slot = make_targets(
         clean, byte_mask, chunks.chunk_ids, chunks.offsets, args.max_chunks, args.max_span

@@ -651,3 +651,52 @@ def test_decoder_markov_bias():
     # default decoder has no markov modules
     plain = FLUEDV36(tiny_config()).decoder
     assert not hasattr(plain, "markov_out")
+
+
+def test_xcache_store_causal_and_gist_visible():
+    """S36 residual-gated cache: a cached row j is invisible to positions
+    i<j (causality); the gist token moves every position; excluded rows
+    move nothing."""
+    from flued.v36.model import CrossReadBackbone
+
+    torch.manual_seed(0)
+    cfg = tiny_config(xcache_gist=True)
+    m = CrossReadBackbone(cfg)
+    content = torch.randn(2, 5, cfg.d_pack)
+    memory = torch.randn(2, 5, cfg.d_mem)
+    mask = torch.ones(2, 5, dtype=torch.bool)
+    pos = torch.randn(1, 5, cfg.d_backbone)
+    gist = torch.randn(2, cfg.d_pack)
+    cache = torch.tensor([[0, 2, 4, -1, -1], [0, 2, 4, -1, -1]])
+    with torch.no_grad():
+        out = m(content, memory, mask, pos, cache, gist)
+        # future cached row must not move earlier positions
+        memory2 = memory.clone()
+        memory2[:, 4] = torch.randn(2, cfg.d_mem)
+        out2 = m(content, memory2, mask, pos, cache, gist)
+        assert torch.allclose(out[:, :2], out2[:, :2], atol=1e-5)
+        assert not torch.allclose(out[:, 3:], out2[:, 3:], atol=1e-3)
+        # excluded row moves nothing
+        memory3 = memory.clone()
+        memory3[:, 1] = torch.randn(2, cfg.d_mem)
+        out3 = m(content, memory3, mask, pos, cache, gist)
+        assert torch.allclose(out, out3, atol=1e-5)
+        # gist moves everything
+        out4 = m(content, memory, mask, pos, cache, torch.randn(2, cfg.d_pack))
+        assert not torch.allclose(out, out4, atol=1e-3)
+    assert torch.isfinite(out).all()
+
+
+def test_xcache_select_respects_rank_and_mask():
+    from flued.v36.model import _xcache_select
+
+    scores = torch.tensor([[0.1, 0.9, 0.3, 0.2], [0.5, 0.4, 0.3, 0.2]])
+    mask = torch.tensor([[True, True, True, False], [True, True, True, True]])
+    idx = _xcache_select(scores, mask, 0.5)
+    # sample 0: 3 real, keep round(1.5)=2 -> top scores among real: rows 1,2
+    assert set(idx[0][idx[0] >= 0].tolist()) == {1, 2}
+    # sample 1: 4 real, keep 2 -> rows 0,1
+    assert set(idx[1][idx[1] >= 0].tolist()) == {0, 1}
+    # frac=1.0 keeps all real rows
+    full = _xcache_select(scores, mask, 1.0)
+    assert (full[0] >= 0).sum().item() == 3 and (full[1] >= 0).sum().item() == 4

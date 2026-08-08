@@ -80,6 +80,8 @@ def build_model(args: Namespace) -> FLUEDV36:
             draft_mem_pos=getattr(args, "draft_mem_pos", False),
             draft_intermediate_weight=getattr(args, "draft_intermediate_weight", 0.0),
             decoder_markov=getattr(args, "decoder_markov", 0),
+            xcache_frac=getattr(args, "xcache_frac", 1.0),
+            xcache_gist=getattr(args, "xcache_gist", False),
             decoder_hidden=args.decoder_hidden,
             decoder_layers=args.decoder_layers,
             max_chunks=args.max_chunks,
@@ -257,6 +259,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="rank of the DSpark-style bigram Markov head on the decoder "
         "(0=off; teacher-forced protocol, arms comparable only among themselves; "
         "wired in train_v36_s1.py only)",
+    )
+    parser.add_argument("--xcache-frac", type=float, default=1.0)
+    parser.add_argument(
+        "--xcache-gist",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="S36: prepend the k=1 final readout as a gist token to the "
+        "cross-read store; with --xcache-frac<1 the memory rows are "
+        "residual-gated (HOLA/HAM)",
     )
     parser.add_argument("--decoder-hidden", type=int, default=1024)
     parser.add_argument("--decoder-layers", type=int, default=3)

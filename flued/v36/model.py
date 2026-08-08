@@ -134,6 +134,14 @@ class V36Config:
     # on, the decoder sees shifted targets -- metrics become a distinct
     # teacher-forced protocol, not comparable to off-arms.
     decoder_markov: int = 0
+    # S36 mainline (user-ruled 2026-08-08): residual-gated exact cache on the
+    # s31 hybrid form (HOLA 2607.02303 / HAM 2603.22325). Store = optional
+    # k=1 final-readout gist token + the top-frac memory rows ranked by
+    # per-chunk direct-decode CE (HAM-style prediction error; computable at
+    # deployment since the window bytes are known). xcache_frac=1.0 keeps all
+    # rows (= s31 with optional gist token -- the sanity arm).
+    xcache_frac: float = 1.0
+    xcache_gist: bool = False
 
 
 @dataclass
@@ -398,6 +406,21 @@ class KDAStateMachine(nn.Module):
         return self.realign(read), state
 
 
+def _xcache_select(scores: torch.Tensor, chunk_mask: torch.Tensor, frac: float) -> torch.Tensor:
+    """S36 residual-gated cache selection (HOLA/HAM): per sample, rank real
+    chunks by score (residual) and keep the top round(frac*n_real); returns
+    (B, C) long with -1 padding past each sample's keep count (masked by the
+    caller). Sync-free: the keep count stays on device and the tensor width
+    is the static chunk grid."""
+    bsz, n = chunk_mask.shape
+    n_real = chunk_mask.long().sum(dim=1)
+    k_keep = (n_real.float() * frac).round().long().clamp(min=1)  # (B,)
+    order = scores.masked_fill(~chunk_mask, float("-inf")).argsort(dim=1, descending=True)
+    rank = torch.arange(n, device=chunk_mask.device).unsqueeze(0)
+    cache_idx = torch.where(rank < k_keep.unsqueeze(1), order, torch.full_like(order, -1))
+    return cache_idx.sort(dim=1).values  # -1 sinks first; masked downstream
+
+
 def paged_boundaries(chunk_mask: torch.Tensor, n: int) -> tuple[torch.Tensor, torch.Tensor]:
     """/n paging geometry (backbone_readout="paged", user-ruled 2026-08-07).
 
@@ -437,6 +460,12 @@ class CrossReadBackbone(nn.Module):
         self.k_proj = nn.Linear(c.d_mem, c.d_backbone, bias=False)
         self.v_proj = nn.Linear(c.d_mem, c.d_backbone, bias=False)
         self.o_proj = nn.Linear(c.d_backbone, c.d_backbone, bias=False)
+        # S36 gist token projections (k=1 final readout as the first store
+        # entry); created only when the gist is enabled so s31 checkpoints
+        # keep loading strict-clean
+        if getattr(c, "xcache_gist", False):
+            self.gist_k = nn.Linear(c.d_pack, c.d_backbone, bias=False)
+            self.gist_v = nn.Linear(c.d_pack, c.d_backbone, bias=False)
         self.blocks = nn.ModuleList(
             [
                 nn.Sequential(
@@ -456,20 +485,48 @@ class CrossReadBackbone(nn.Module):
         memory: torch.Tensor,
         chunk_mask: torch.Tensor,
         pos: torch.Tensor,
+        cache_idx: torch.Tensor | None = None,
+        gist: torch.Tensor | None = None,
     ) -> torch.Tensor:
         bsz, n, _ = content.shape
         h = self.in_proj(content)
         nh = self.nhead
         hd = h.size(-1) // nh
         q = (self.q_proj(h) + pos).view(bsz, n, nh, hd).transpose(1, 2)
-        k = self.k_proj(memory).view(bsz, n, nh, hd).transpose(1, 2)
-        v = self.v_proj(memory).view(bsz, n, nh, hd).transpose(1, 2)
-        future = torch.triu(torch.ones(n, n, dtype=torch.bool, device=content.device), diagonal=1)
-        allowed = (~future).view(1, 1, n, n) & chunk_mask.view(bsz, 1, 1, n)
-        # keep the diagonal even on padded rows: a fully-masked SDPA row yields
-        # NaN, and 0*NaN poisons downstream (documented padding-NaN pitfall)
-        allowed = allowed | torch.eye(n, dtype=torch.bool, device=content.device).view(1, 1, n, n)
-        o = F.scaled_dot_product_attention(q, k, v, attn_mask=allowed)
+        if cache_idx is None and gist is None:
+            # legacy s31 path: causal over all real memory rows
+            k = self.k_proj(memory).view(bsz, n, nh, hd).transpose(1, 2)
+            v = self.v_proj(memory).view(bsz, n, nh, hd).transpose(1, 2)
+            future = torch.triu(torch.ones(n, n, dtype=torch.bool, device=content.device), diagonal=1)
+            allowed = (~future).view(1, 1, n, n) & chunk_mask.view(bsz, 1, 1, n)
+            # keep the diagonal even on padded rows: a fully-masked SDPA row yields
+            # NaN, and 0*NaN poisons downstream (documented padding-NaN pitfall)
+            allowed = allowed | torch.eye(n, dtype=torch.bool, device=content.device).view(1, 1, n, n)
+            o = F.scaled_dot_product_attention(q, k, v, attn_mask=allowed)
+        else:
+            # S36 residual-gated cache (HOLA/HAM): the store is [gist token]
+            # + selected memory rows (original chunk indices in cache_idx).
+            # The gist token is visible to every position (it is the state's
+            # job to carry cross-chunk context); a selected row with original
+            # index j is visible to position i iff j <= i (strict causality);
+            # padded/not-selected rows are excluded. The gist guarantees no
+            # fully-masked row can arise.
+            if gist is None:
+                raise ValueError("residual-gated cache requires the gist token")
+            ks = [self.gist_k(gist).unsqueeze(1)]  # (B, 1, d)
+            vs = [self.gist_v(gist).unsqueeze(1)]
+            allowed_parts = [torch.ones(bsz, n, 1, dtype=torch.bool, device=content.device)]
+            kk = cache_idx.size(1)
+            sel_mem = memory.gather(1, cache_idx.clamp(min=0).unsqueeze(-1).expand(-1, -1, memory.size(-1)))
+            ks.append(self.k_proj(sel_mem))
+            vs.append(self.v_proj(sel_mem))
+            valid_cache = chunk_mask.gather(1, cache_idx.clamp(min=0)) & (cache_idx >= 0)  # (B, K)
+            causal = cache_idx.view(bsz, 1, kk) <= torch.arange(n, device=content.device).view(1, n, 1)
+            allowed_parts.append(causal & valid_cache.view(bsz, 1, kk))
+            k = torch.cat(ks, dim=1).view(bsz, -1, nh, hd).transpose(1, 2)
+            v = torch.cat(vs, dim=1).view(bsz, -1, nh, hd).transpose(1, 2)
+            allowed = torch.cat(allowed_parts, dim=-1).unsqueeze(1)
+            o = F.scaled_dot_product_attention(q, k, v, attn_mask=allowed)
         o = o.transpose(1, 2).reshape(bsz, n, nh * hd)
         h = h + self.o_proj(o)
         for block in self.blocks:
@@ -920,8 +977,19 @@ class FLUEDV36(nn.Module):
             cond_direct = self.decoder_in(content) + pos
             if self.config.backbone_mode == "xattn":
                 # causal cross-read: queries = per-chunk content, K/V = memory,
-                # position i sees memory[0..i] only
-                backbone_out = self.backbone(content, memory, chunks.chunk_mask, pos)
+                # position i sees memory[0..i] only. S36: optional gist token +
+                # residual-gated cache (frac<1 needs targets -> S1 trainer only)
+                cache_idx, gist = None, None
+                if self.config.xcache_gist or self.config.xcache_frac < 1.0:
+                    last = chunks.chunk_mask.long().sum(dim=1).clamp(min=1) - 1
+                    ar = torch.arange(content.size(0), device=content.device)
+                    gist = content[ar, last] if self.config.xcache_gist else None
+                    if self.config.xcache_frac < 1.0:
+                        raise ValueError(
+                            "xcache_frac<1 requires per-chunk residuals; use the S1 trainer path"
+                        )
+                    cache_idx = _xcache_select(chunks.chunk_mask.float(), chunks.chunk_mask, 1.0)
+                backbone_out = self.backbone(content, memory, chunks.chunk_mask, pos, cache_idx, gist)
                 cond_backbone = backbone_out + pos
             elif self.config.backbone_mode == "draft":
                 # three-state drafting (spec SS23): input = the k=1 final
