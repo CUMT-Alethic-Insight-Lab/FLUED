@@ -875,8 +875,11 @@ class OutputStore:
         max_output_gib: float,
         min_free_gib: float,
         run_fingerprint: dict[str, str],
+        shard_prefix: str = "corpus_v5_increment",
     ) -> None:
         self.output_dir = output_dir
+        self.shard_prefix = shard_prefix
+        self.shard_glob = f"{shard_prefix}_*.txt"
         self.shard_dir = output_dir / "shards"
         self.state_dir = output_dir / "state"
         self.manifest_dir = output_dir / "manifests"
@@ -942,7 +945,7 @@ class OutputStore:
             if not dry_run:
                 self._verify_existing_layout()
             self.total_output_bytes = sum(
-                path.stat().st_size for path in self.shard_dir.glob("corpus_v5_increment_*.txt")
+                path.stat().st_size for path in self.shard_dir.glob(self.shard_glob)
             )
         except Exception:
             if self.reference_lookup is not None:
@@ -1013,7 +1016,7 @@ class OutputStore:
                 )
             expected_by_shard[shard_name] = offset + length + 2
         indexed_paths = {Path(name).resolve(): size for name, size in expected_by_shard.items()}
-        actual_paths = {path.resolve(): path.stat().st_size for path in self.shard_dir.glob("corpus_v5_increment_*.txt")}
+        actual_paths = {path.resolve(): path.stat().st_size for path in self.shard_dir.glob(self.shard_glob)}
         if indexed_paths != actual_paths:
             raise RuntimeError(
                 "shard/index layout mismatch before resume: "
@@ -1036,9 +1039,9 @@ class OutputStore:
             )
 
     def _find_last_shard(self) -> tuple[int, Path, int]:
-        paths = sorted(self.shard_dir.glob("corpus_v5_increment_*.txt"))
+        paths = sorted(self.shard_dir.glob(self.shard_glob))
         if not paths:
-            path = self.shard_dir / "corpus_v5_increment_00000.txt"
+            path = self.shard_dir / f"{self.shard_prefix}_00000.txt"
             return 0, path, path.stat().st_size if path.exists() else 0
         path = paths[-1]
         match = re.search(r"(\d+)\.txt$", path.name)
@@ -1046,14 +1049,14 @@ class OutputStore:
         size = path.stat().st_size
         if size >= self.shard_limit:
             index += 1
-            path = self.shard_dir / f"corpus_v5_increment_{index:05d}.txt"
+            path = self.shard_dir / f"{self.shard_prefix}_{index:05d}.txt"
             size = path.stat().st_size if path.exists() else 0
         return index, path, size
 
     def _rotate_if_needed(self, batch_bytes: int) -> None:
         if self.shard_size and self.shard_size + batch_bytes > self.shard_limit:
             self.shard_index += 1
-            self.shard_path = self.shard_dir / f"corpus_v5_increment_{self.shard_index:05d}.txt"
+            self.shard_path = self.shard_dir / f"{self.shard_prefix}_{self.shard_index:05d}.txt"
             self.shard_size = self.shard_path.stat().st_size if self.shard_path.exists() else 0
 
     def _exists(self, digest: bytes) -> bool:
@@ -1237,7 +1240,7 @@ class OutputStore:
 
     def export_manifest(self) -> None:
         rows = []
-        for path in sorted(self.shard_dir.glob("corpus_v5_increment_*.txt")):
+        for path in sorted(self.shard_dir.glob(self.shard_glob)):
             rows.append(
                 {
                     "path": str(path),
@@ -2007,6 +2010,7 @@ def main() -> int:
             max_output_gib=float(config.get("max_output_gib", 300.0)),
             min_free_gib=float(config.get("min_free_gib", 80.0)),
             run_fingerprint=run_fingerprint,
+            shard_prefix=str(config.get("shard_prefix", "corpus_v5_increment")),
         )
         write_run_metadata(output_dir, config_path, config, args)
         started = time.time()

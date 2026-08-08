@@ -17,6 +17,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--reference-db", required=True)
     parser.add_argument("--report", default="")
+    parser.add_argument("--shard-prefix", default="corpus_v5_increment")
     return parser.parse_args()
 
 
@@ -104,7 +105,7 @@ def main() -> int:
             manifest_paths.add(path)
             if not path.exists() or path.stat().st_size != int(row["bytes"]) or sha256(path) != row["sha256"]:
                 manifest_mismatches += 1
-    actual_paths = {path.resolve() for path in (output_dir / "shards").glob("corpus_v5_increment_*.txt")}
+    actual_paths = {path.resolve() for path in (output_dir / "shards").glob(f"{args.shard_prefix}_*.txt")}
     indexed_paths = {Path(path).resolve() for path in by_shard}
     if manifest_paths != actual_paths or indexed_paths != actual_paths:
         manifest_mismatches += 1

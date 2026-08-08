@@ -79,6 +79,7 @@ def build_model(args: Namespace) -> FLUEDV36:
             draft_sandwich=getattr(args, "draft_sandwich", False),
             draft_mem_pos=getattr(args, "draft_mem_pos", False),
             draft_intermediate_weight=getattr(args, "draft_intermediate_weight", 0.0),
+            decoder_markov=getattr(args, "decoder_markov", 0),
             decoder_hidden=args.decoder_hidden,
             decoder_layers=args.decoder_layers,
             max_chunks=args.max_chunks,
@@ -249,6 +250,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--draft-sandwich", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--draft-mem-pos", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--draft-intermediate-weight", type=float, default=0.0)
+    parser.add_argument(
+        "--decoder-markov",
+        type=int,
+        default=0,
+        help="rank of the DSpark-style bigram Markov head on the decoder "
+        "(0=off; teacher-forced protocol, arms comparable only among themselves; "
+        "wired in train_v36_s1.py only)",
+    )
     parser.add_argument("--decoder-hidden", type=int, default=1024)
     parser.add_argument("--decoder-layers", type=int, default=3)
     parser.add_argument("--max-chunks", type=int, default=64)

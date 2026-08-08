@@ -127,6 +127,13 @@ class V36Config:
     draft_sandwich: bool = False
     draft_mem_pos: bool = False
     draft_intermediate_weight: float = 0.0
+    # DSpark-style Markov head (2607.05147): rank-r bigram transition bias
+    # added to decoder logits, conditioned on the previous byte (teacher-
+    # forced). Treats the multi-peak conflict / suffix decay of parallel byte
+    # decoding. 0 = off (default; all historical arms are off). NOTE: when
+    # on, the decoder sees shifted targets -- metrics become a distinct
+    # teacher-forced protocol, not comparable to off-arms.
+    decoder_markov: int = 0
 
 
 @dataclass
@@ -560,12 +567,14 @@ class DraftBackbone(nn.Module):
         pos: torch.Tensor,
         n_steps: int | None = None,
         content: torch.Tensor | None = None,
+        round_hook=None,
     ) -> tuple[torch.Tensor, int]:
         """readout: (B, d_pack) k=1 input state. memory: (B, C, d_mem) pre-state
         rows. chunk_mask: (B, C) bool. pos: (1, C, d). content: (B, C, d_pack)
         per-chunk readouts (only used by draft_init="content_seed"). Returns
         the output matrix (B, C, d_backbone) and the number of thinking
-        rounds used."""
+        rounds used. round_hook(h, t) is applied after each round (probe
+        hook for trajectory stats / perturbation sensitivity)."""
         bsz, n = chunk_mask.shape
         device, dtype = readout.device, readout.dtype
         d = self.c.d_backbone
@@ -640,6 +649,8 @@ class DraftBackbone(nn.Module):
                 h = self._round(h, inj, ck, cv, self_allowed, cross_allowed, t, dtype)
             if steps_used == k_mid:
                 self.last_intermediate = h
+            if round_hook is not None:
+                h = round_hook(h, t)
             if n_steps >= 0 and steps_used >= n_steps:
                 break
             if n_steps < 0 and prev is not None and steps_used >= self.c.think_steps_min:
@@ -774,8 +785,19 @@ class GlobalSpanDecoder(nn.Module):
         # around _frozen_decoder_logits.
         self._ckpt_enabled = True
         self.scale = nn.Parameter(torch.tensor(10.0))
+        # DSpark Markov head (research sweep 2026-08-08): low-rank bigram
+        # transition bias for parallel byte decoding. prev_ids row 258 is the
+        # window-start sentinel (no previous byte).
+        if c.decoder_markov > 0:
+            self.markov_embed = nn.Embedding(259, c.decoder_markov)
+            self.markov_out = nn.Linear(c.decoder_markov, 258, bias=False)
 
-    def forward(self, cond: torch.Tensor, token_mask: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        cond: torch.Tensor,
+        token_mask: torch.Tensor,
+        prev_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         bsz, chunks, dim = cond.shape
         h = self.slot.view(1, 1, *self.slot.shape).expand(bsz, chunks, -1, -1) + cond.unsqueeze(2)
         h = h.reshape(bsz * chunks, self.slot.size(0), dim)
@@ -797,6 +819,10 @@ class GlobalSpanDecoder(nn.Module):
         logits = self.scale.clamp(1.0, 100.0) * torch.matmul(
             F.normalize(h, dim=-1), F.normalize(table, dim=-1).transpose(0, 1)
         )
+        if prev_ids is not None and hasattr(self, "markov_out"):
+            # prev_ids: (B, C, span) long, 258 = window-start sentinel
+            bias = self.markov_out(self.markov_embed(prev_ids.reshape(bsz * chunks, -1)))
+            logits = logits + bias.to(logits.dtype)
         logits = logits.view(bsz, chunks, self.slot.size(0), -1)
         return logits.masked_fill(~token_mask.unsqueeze(-1), 0.0)
 

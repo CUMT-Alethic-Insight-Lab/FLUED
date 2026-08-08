@@ -597,3 +597,57 @@ def test_draft_intermediate_matrix_in_grad_zone():
         else:
             assert m.last_intermediate is None
     assert seen_mid > 0
+
+
+def test_draft_round_hook_fires_and_modifies():
+    """Probe hook (vitality suite): fires once per round and can modify h."""
+    from flued.v36.model import DraftBackbone
+
+    torch.manual_seed(0)
+    cfg = tiny_config()
+    m = DraftBackbone(cfg)
+    m.eval()
+    readout = torch.randn(2, cfg.d_pack)
+    memory = torch.randn(2, 4, cfg.d_mem)
+    mask = torch.ones(2, 4, dtype=torch.bool)
+    pos = torch.randn(1, 4, cfg.d_backbone)
+    seen = []
+
+    def rec(h, t):
+        seen.append(t)
+        return h
+
+    with torch.no_grad():
+        torch.manual_seed(3)
+        base, _ = m.think(readout, memory, mask, pos, n_steps=5, round_hook=rec)
+    assert seen == [0, 1, 2, 3, 4]
+
+    def zero_round1(h, t):
+        return torch.zeros_like(h) if t == 1 else h
+
+    with torch.no_grad():
+        torch.manual_seed(3)
+        hit, _ = m.think(readout, memory, mask, pos, n_steps=5, round_hook=zero_round1)
+    assert not torch.allclose(base, hit, atol=1e-4)
+
+
+def test_decoder_markov_bias():
+    """DSpark Markov head: bias shifts logits with prev byte; off by default."""
+    torch.manual_seed(0)
+    cfg = tiny_config(decoder_markov=8)
+    model = FLUEDV36(cfg)
+    dec = model.decoder
+    assert hasattr(dec, "markov_out")
+    cond = torch.randn(2, 4, cfg.d_backbone)
+    token_mask = torch.ones(2, 4, 8, dtype=torch.bool)
+    prev_a = torch.ones(2, 4, 8, dtype=torch.long)
+    prev_b = torch.full((2, 4, 8), 100, dtype=torch.long)
+    with torch.no_grad():
+        la = dec(cond, token_mask, prev_a)
+        lb = dec(cond, token_mask, prev_b)
+    assert la.shape == (2, 4, 8, 258)
+    assert torch.isfinite(la).all()
+    assert not torch.allclose(la, lb, atol=1e-6)
+    # default decoder has no markov modules
+    plain = FLUEDV36(tiny_config()).decoder
+    assert not hasattr(plain, "markov_out")

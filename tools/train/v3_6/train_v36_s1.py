@@ -175,6 +175,17 @@ def make_mixed_mask(
     return mask
 
 
+def _prev_ids(tgts: torch.Tensor) -> torch.Tensor:
+    """Teacher-forced previous-byte ids over the flattened (B, C*span) grid;
+    258 = window-start sentinel (DSpark Markov head, decoder_markov>0)."""
+    bsz = tgts.size(0)
+    flat = tgts.reshape(bsz, -1)
+    prev = torch.cat(
+        [torch.full((bsz, 1), 258, dtype=tgts.dtype, device=tgts.device), flat[:, :-1]], dim=1
+    )
+    return prev.reshape(tgts.shape).clamp(min=0, max=258)
+
+
 def s1_forward(model, source: torch.Tensor, args) -> dict:
     byte_states, confidence, valid, _ = model._encode(source)
     hard_cut, utf8_cont, cut_overflow = model._cuts(source, confidence, valid)
@@ -316,6 +327,16 @@ def step_model(model, batch, args, device, train: bool):
 
     direct_loss = _ce(out["logits_direct"], encoded_targets, encoded_slot_mask)
     completion_loss = _ce(out["logits_backbone"], targets, slot_mask)
+    if getattr(args, "decoder_markov", 0) > 0 and hasattr(model.decoder, "markov_out"):
+        # DSpark Markov head (post-hoc on logits, teacher-forced prev byte):
+        # NOTE this makes the metrics a teacher-forced protocol -- arms using
+        # it are only comparable among themselves.
+        b_d = model.decoder.markov_out(model.decoder.markov_embed(_prev_ids(encoded_targets)))
+        b_b = model.decoder.markov_out(model.decoder.markov_embed(_prev_ids(targets)))
+        direct_loss = _ce(out["logits_direct"] + b_d, encoded_targets, encoded_slot_mask)
+        completion_loss = _ce(out["logits_backbone"] + b_b, targets, slot_mask)
+        out["logits_direct"] = out["logits_direct"] + b_d
+        out["logits_backbone"] = out["logits_backbone"] + b_b
     if out.get("logits_backbone_mid") is not None:
         # s35 supervised arm: intermediate thinking matrix eats completion CE
         # (weight default 0.1, LoopFormer short-trajectory recipe)
