@@ -72,6 +72,13 @@ def build_model(args: Namespace) -> FLUEDV36:
             think_steps_max=getattr(args, "think_steps_max", 16),
             think_visibility=getattr(args, "think_visibility", "readout"),
             think_stop_cos=getattr(args, "think_stop_cos", 0.995),
+            draft_init=getattr(args, "draft_init", "noise"),
+            draft_inject=getattr(args, "draft_inject", "cross"),
+            draft_depth_dist=getattr(args, "draft_depth_dist", "uniform"),
+            draft_trunc_bptt=getattr(args, "draft_trunc_bptt", 0),
+            draft_sandwich=getattr(args, "draft_sandwich", False),
+            draft_mem_pos=getattr(args, "draft_mem_pos", False),
+            draft_intermediate_weight=getattr(args, "draft_intermediate_weight", 0.0),
             decoder_hidden=args.decoder_hidden,
             decoder_layers=args.decoder_layers,
             max_chunks=args.max_chunks,
@@ -235,6 +242,13 @@ def build_parser() -> argparse.ArgumentParser:
         "pre-state memory rows (arm B); causal honesty sits at the input level",
     )
     parser.add_argument("--think-stop-cos", type=float, default=0.995)
+    parser.add_argument("--draft-init", choices=["noise", "content_seed"], default="noise")
+    parser.add_argument("--draft-inject", choices=["cross", "concat"], default="cross")
+    parser.add_argument("--draft-depth-dist", choices=["uniform", "poisson"], default="uniform")
+    parser.add_argument("--draft-trunc-bptt", type=int, default=0)
+    parser.add_argument("--draft-sandwich", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--draft-mem-pos", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--draft-intermediate-weight", type=float, default=0.0)
     parser.add_argument("--decoder-hidden", type=int, default=1024)
     parser.add_argument("--decoder-layers", type=int, default=3)
     parser.add_argument("--max-chunks", type=int, default=64)

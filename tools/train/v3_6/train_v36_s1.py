@@ -201,7 +201,7 @@ def s1_forward(model, source: torch.Tensor, args) -> dict:
         last = chunks.chunk_mask.long().sum(dim=1).clamp(min=1) - 1
         ar = torch.arange(content.size(0), device=content.device)
         backbone_out, think_steps = model.backbone.think(
-            content[ar, last], memory, chunks.chunk_mask, pos
+            content[ar, last], memory, chunks.chunk_mask, pos, content=content
         )
         cond_backbone = backbone_out + pos
     elif getattr(model.config, "backbone_readout", "per_chunk") == "final":
@@ -228,9 +228,22 @@ def s1_forward(model, source: torch.Tensor, args) -> dict:
         cond_backbone = backbone_out + pos
     logits_direct = model.decoder(cond_direct, chunks.token_mask)
     logits_backbone = model.decoder(cond_backbone, chunks.token_mask)
+    logits_backbone_mid = None
+    if (
+        getattr(model.config, "backbone_mode", "") == "draft"
+        and getattr(model.config, "draft_intermediate_weight", 0.0) > 0
+        and getattr(model.backbone, "last_intermediate", None) is not None
+    ):
+        # s35 supervised arm (LoopFormer-style short-trajectory CE): the
+        # uniformly sampled intermediate thinking matrix also eats the
+        # completion loss, so intermediate states are anchored without
+        # per-step trajectory labels
+        cond_mid = model.backbone.last_intermediate + pos
+        logits_backbone_mid = model.decoder(cond_mid, chunks.token_mask)
     return {
         "logits_direct": logits_direct,
         "logits_backbone": logits_backbone,
+        "logits_backbone_mid": logits_backbone_mid,
         "content": content,
         "backbone_out": backbone_out,
         "memory": memory,
@@ -303,6 +316,12 @@ def step_model(model, batch, args, device, train: bool):
 
     direct_loss = _ce(out["logits_direct"], encoded_targets, encoded_slot_mask)
     completion_loss = _ce(out["logits_backbone"], targets, slot_mask)
+    if out.get("logits_backbone_mid") is not None:
+        # s35 supervised arm: intermediate thinking matrix eats completion CE
+        # (weight default 0.1, LoopFormer short-trajectory recipe)
+        completion_loss = completion_loss + getattr(args, "draft_intermediate_weight", 0.1) * _ce(
+            out["logits_backbone_mid"], targets, slot_mask
+        )
 
     if getattr(args, "backbone_mode", "") == "draft":
         # predict rollout (spec SS23): a second thinking pass whose INPUT is
@@ -315,7 +334,9 @@ def step_model(model, batch, args, device, train: bool):
         pmask = chunks.chunk_mask & (cidx <= (last - 1).unsqueeze(1))
         ppos = model.chunk_pos.weight.unsqueeze(0)[:, : chunks.chunk_mask.size(1)]
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=args.amp and device.type == "cuda"):
-            pthink, _ = model.backbone.think(out["content"][ar, last - 1], out["memory"], pmask, ppos)
+            pthink, _ = model.backbone.think(
+                out["content"][ar, last - 1], out["memory"], pmask, ppos, content=out["content"]
+            )
         pred = (pthink.float() * pmask.unsqueeze(-1)).sum(dim=1) / pmask.sum(dim=1, keepdim=True).clamp(min=1)
         with torch.no_grad():
             tgt = model.decoder_in(out["content"].float())[ar, last].detach()

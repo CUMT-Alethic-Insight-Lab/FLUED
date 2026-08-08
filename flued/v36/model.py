@@ -107,6 +107,26 @@ class V36Config:
     think_steps_max: int = 16
     think_visibility: str = "readout"
     think_stop_cos: float = 0.995
+    # Draft anti-collapse / cold-start levers (research sweep 2026-08-08,
+    # docs/research/RESEARCH_SWEEP_20260808_CN.md; arms s34/s35):
+    # draft_init "content_seed" = content-preheated slot init h0 += W(content)
+    # (SmoothSA 2508.05417 / QSA: noise+pos is the known worst init).
+    # draft_inject "concat" = per-round h += W(cat[h, readout]) -- the Huginn
+    # re-injection that attention cannot learn to ignore (2502.05171 Bad Run 2).
+    # draft_depth_dist "poisson" = 1+Poisson(max/2) clamped, heavy-tail depth
+    # sampling instead of uniform (Huginn). draft_trunc_bptt k>0 = backprop
+    # only the last k rounds (Huginn k=8). draft_sandwich = post-LN after each
+    # sublayer. draft_mem_pos = add chunk position to memory K (shelf row
+    # numbers, Retrievit 2603.02874). draft_intermediate_weight>0 = completion
+    # loss also at a uniformly sampled in-gradient-zone intermediate round
+    # (LoopFormer 2602.11451 short-trajectory CE -- the SUPERVISED arm s35).
+    draft_init: str = "noise"
+    draft_inject: str = "cross"
+    draft_depth_dist: str = "uniform"
+    draft_trunc_bptt: int = 0
+    draft_sandwich: bool = False
+    draft_mem_pos: bool = False
+    draft_intermediate_weight: float = 0.0
 
 
 @dataclass
@@ -490,6 +510,12 @@ class DraftBackbone(nn.Module):
         self.q_mem = nn.Linear(d, d, bias=False)
         self.o_proj = nn.Linear(d, d, bias=False)
         self.o_mem = nn.Linear(d, d, bias=False)
+        # s34/s35 levers (docs/research/RESEARCH_SWEEP_20260808_CN.md)
+        if c.draft_init == "content_seed":
+            self.content_in = nn.Linear(c.d_pack, d, bias=False)
+        if c.draft_inject == "concat":
+            self.inj_proj = nn.Linear(c.d_pack, d, bias=False)
+            self.inj_mix = nn.Linear(2 * d, d, bias=False)
         self.blocks = nn.ModuleList(
             [
                 nn.ModuleDict(
@@ -502,6 +528,15 @@ class DraftBackbone(nn.Module):
                             nn.GELU(),
                             nn.Linear(c.backbone_ffn, d),
                         ),
+                        **(
+                            {
+                                "ln_s2": nn.LayerNorm(d),
+                                "ln_c2": nn.LayerNorm(d),
+                                "ln_f2": nn.LayerNorm(d),
+                            }
+                            if c.draft_sandwich
+                            else {}
+                        ),
                     }
                 )
                 for _ in range(c.backbone_layers)
@@ -509,6 +544,7 @@ class DraftBackbone(nn.Module):
         )
         self.norm = nn.LayerNorm(d)
         self.last_steps = 0  # eval-time bookkeeping for the think-steps metric
+        self.last_intermediate = None  # intermediate matrix for the s35 loss
 
     def _sdpa(self, q, k, v, allowed):
         # allowed: (B, 1 or nh, Nq, Nk) bool. Fully-masked rows would NaN --
@@ -523,26 +559,37 @@ class DraftBackbone(nn.Module):
         chunk_mask: torch.Tensor,
         pos: torch.Tensor,
         n_steps: int | None = None,
+        content: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, int]:
         """readout: (B, d_pack) k=1 input state. memory: (B, C, d_mem) pre-state
-        rows. chunk_mask: (B, C) bool. pos: (1, C, d). Returns the output
-        matrix (B, C, d_backbone) and the number of thinking rounds used."""
+        rows. chunk_mask: (B, C) bool. pos: (1, C, d). content: (B, C, d_pack)
+        per-chunk readouts (only used by draft_init="content_seed"). Returns
+        the output matrix (B, C, d_backbone) and the number of thinking
+        rounds used."""
         bsz, n = chunk_mask.shape
         device, dtype = readout.device, readout.dtype
         d = self.c.d_backbone
-        nh, hd = self.nhead, d // self.nhead
-        # thinking matrix init: learned seed + position + fresh noise (the
-        # draft starts blank every rollout; content enters via conditioning)
+        self.last_intermediate = None
+        # thinking matrix init: learned seed + position + fresh noise.
+        # content_seed (SmoothSA/QSA lesson): preheat the cold-start slots with
+        # a content projection -- noise+position is the known worst init.
         h = self.seed + pos.to(dtype) + torch.randn(bsz, n, d, device=device, dtype=dtype)
+        if self.c.draft_init == "content_seed":
+            if content is None:
+                raise ValueError("draft_init='content_seed' requires content")
+            h = h + self.content_in(content)
         # conditioning store: the readout token is always visible; memory rows
-        # (visibility arm B) are visible strictly causally (slot i <- mem[0..i])
+        # (visibility arm B) are visible to all slots (global revision; padded
+        # rows excluded). draft_mem_pos adds chunk position to the memory keys
+        # -- shelf row numbers (Retrievit lesson).
         rk = self.readout_k(readout).unsqueeze(1)  # (B, 1, d)
         rv = self.readout_v(readout).unsqueeze(1)
         if self.c.think_visibility == "readout_memory":
-            ck = torch.cat([rk, self.mem_k(memory)], dim=1)  # (B, 1+C, d)
+            mk = self.mem_k(memory)
+            if self.c.draft_mem_pos:
+                mk = mk + pos.to(dtype)
+            ck = torch.cat([rk, mk], dim=1)  # (B, 1+C, d)
             cv = torch.cat([rv, self.mem_v(memory)], dim=1)
-            # the whole offered store is visible within a thinking pass
-            # (global revision); padded memory rows stay excluded
             cross_allowed = torch.cat(
                 [
                     torch.ones(bsz, n, 1, dtype=torch.bool, device=device),
@@ -558,32 +605,41 @@ class DraftBackbone(nn.Module):
         if n_steps is None:
             if self.training:
                 # CPU-side sampling: a GPU randint + .item() here would sync
-                # the pipeline twice per step (the E33 sync tax).
-                n_steps = int(
-                    torch.randint(self.c.think_steps_min, self.c.think_steps_max + 1, (1,), device="cpu")
-                )
+                # the pipeline twice per step (the E33 sync tax). poisson =
+                # Huginn-style heavy-tail depth sampling.
+                if self.c.draft_depth_dist == "poisson":
+                    lam = max(1, self.c.think_steps_max // 2)
+                    n_steps = 1 + int(torch.poisson(torch.tensor(float(lam))))
+                    n_steps = min(max(n_steps, self.c.think_steps_min), self.c.think_steps_max)
+                else:
+                    n_steps = int(
+                        torch.randint(self.c.think_steps_min, self.c.think_steps_max + 1, (1,), device="cpu")
+                    )
             else:
                 n_steps = -1  # stability-stop mode (below)
         max_steps = self.c.think_steps_max
+        trunc = self.c.draft_trunc_bptt
+        nograd_rounds = max(0, n_steps - trunc) if (self.training and trunc > 0 and n_steps > 0) else 0
+        # intermediate round for the s35 supervision: sampled inside the
+        # gradient zone so the loss actually reaches the shared weights
+        k_mid = -1
+        if self.training and self.c.draft_intermediate_weight > 0 and n_steps >= 2:
+            k_lo = max(1, nograd_rounds + 1)
+            k_mid = int(torch.randint(k_lo, n_steps, (1,), device="cpu"))  # 1-based round
+        inj = None
+        if self.c.draft_inject == "concat":
+            inj = self.inj_proj(readout).unsqueeze(1).expand(bsz, n, d)  # (B, C, d)
         steps_used = 0
         prev = None
         for t in range(max_steps):
             steps_used = t + 1
-            h = h + self.time_emb.weight[min(t, max_steps)].to(dtype)
-            for blk in self.blocks:
-                hn = blk["ln_s"](h)
-                q = self.q_proj(hn).view(bsz, n, nh, hd).transpose(1, 2)
-                k = self.k_proj(hn).view(bsz, n, nh, hd).transpose(1, 2)
-                v = self.v_proj(hn).view(bsz, n, nh, hd).transpose(1, 2)
-                o = self._sdpa(q, k, v, self_allowed.unsqueeze(1))
-                h = h + self.o_proj(o.transpose(1, 2).reshape(bsz, n, d))
-                hn = blk["ln_c"](h)
-                qm = self.q_mem(hn).view(bsz, n, nh, hd).transpose(1, 2)
-                km = ck.view(bsz, -1, nh, hd).transpose(1, 2)
-                vm = cv.view(bsz, -1, nh, hd).transpose(1, 2)
-                om = self._sdpa(qm, km, vm, cross_allowed.unsqueeze(1))
-                h = h + self.o_mem(om.transpose(1, 2).reshape(bsz, n, d))
-                h = h + blk["ffn"](blk["ln_f"](h))
+            if t < nograd_rounds:
+                with torch.no_grad():
+                    h = self._round(h, inj, ck, cv, self_allowed, cross_allowed, t, dtype)
+            else:
+                h = self._round(h, inj, ck, cv, self_allowed, cross_allowed, t, dtype)
+            if steps_used == k_mid:
+                self.last_intermediate = h
             if n_steps >= 0 and steps_used >= n_steps:
                 break
             if n_steps < 0 and prev is not None and steps_used >= self.c.think_steps_min:
@@ -597,6 +653,37 @@ class DraftBackbone(nn.Module):
         self.last_steps = steps_used
         return self.norm(h), steps_used
 
+    def _round(self, h, inj, ck, cv, self_allowed, cross_allowed, t, dtype):
+        """One thinking round: time condition + optional concat re-injection
+        (Huginn: the operator must depend on the input EVERY round, and the
+        concat form cannot be attentioned away), then the DiT blocks."""
+        bsz, n, d = h.shape
+        nh, hd = self.nhead, d // self.nhead
+        h = h + self.time_emb.weight[min(t, self.c.think_steps_max)].to(dtype)
+        if inj is not None:
+            h = h + self.inj_mix(torch.cat([h, inj], dim=-1))
+        for blk in self.blocks:
+            hn = blk["ln_s"](h)
+            q = self.q_proj(hn).view(bsz, n, nh, hd).transpose(1, 2)
+            k = self.k_proj(hn).view(bsz, n, nh, hd).transpose(1, 2)
+            v = self.v_proj(hn).view(bsz, n, nh, hd).transpose(1, 2)
+            o = self._sdpa(q, k, v, self_allowed.unsqueeze(1))
+            h = h + self.o_proj(o.transpose(1, 2).reshape(bsz, n, d))
+            if self.c.draft_sandwich:
+                h = blk["ln_s2"](h)
+            hn = blk["ln_c"](h)
+            qm = self.q_mem(hn).view(bsz, n, nh, hd).transpose(1, 2)
+            km = ck.view(bsz, -1, nh, hd).transpose(1, 2)
+            vm = cv.view(bsz, -1, nh, hd).transpose(1, 2)
+            om = self._sdpa(qm, km, vm, cross_allowed.unsqueeze(1))
+            h = h + self.o_mem(om.transpose(1, 2).reshape(bsz, n, d))
+            if self.c.draft_sandwich:
+                h = blk["ln_c2"](h)
+            h = h + blk["ffn"](blk["ln_f"](h))
+            if self.c.draft_sandwich:
+                h = blk["ln_f2"](h)
+        return h
+
     def forward(
         self,
         readout: torch.Tensor,
@@ -604,8 +691,9 @@ class DraftBackbone(nn.Module):
         chunk_mask: torch.Tensor,
         pos: torch.Tensor,
         n_steps: int | None = None,
+        content: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return self.think(readout, memory, chunk_mask, pos, n_steps)[0]
+        return self.think(readout, memory, chunk_mask, pos, n_steps, content)[0]
 
 
 class PointwiseBackbone(nn.Module):
@@ -815,7 +903,9 @@ class FLUEDV36(nn.Module):
                 # over T rounds; the output matrix conditions each chunk row.
                 last = chunks.chunk_mask.long().sum(dim=1).clamp(min=1) - 1
                 ar = torch.arange(content.size(0), device=content.device)
-                backbone_out = self.backbone(content[ar, last], memory, chunks.chunk_mask, pos)
+                backbone_out = self.backbone(
+                    content[ar, last], memory, chunks.chunk_mask, pos, content=content
+                )
                 cond_backbone = backbone_out + pos
             elif self.config.backbone_readout == "final":
                 if self.config.prefix_task:

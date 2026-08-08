@@ -499,3 +499,101 @@ def test_draft_padding_rows_stay_finite():
     with torch.no_grad():
         out, _ = m.think(readout, memory, mask, pos)
     assert torch.isfinite(out).all()
+
+
+def test_draft_s34_package_shapes():
+    """s34 base (RESEARCH_SWEEP A1-A3): content-seeded init + concat
+    re-injection + shelf row numbers + sandwich norms all wired."""
+    from flued.v36.model import DraftBackbone
+
+    torch.manual_seed(0)
+    cfg = tiny_config(
+        think_visibility="readout_memory",
+        draft_init="content_seed",
+        draft_inject="concat",
+        draft_mem_pos=True,
+        draft_sandwich=True,
+    )
+    m = DraftBackbone(cfg)
+    m.eval()
+    readout = torch.randn(2, cfg.d_pack)
+    memory = torch.randn(2, 4, cfg.d_mem)
+    content = torch.randn(2, 4, cfg.d_pack)
+    mask = torch.ones(2, 4, dtype=torch.bool)
+    pos = torch.randn(1, 4, cfg.d_backbone)
+    with torch.no_grad():
+        out, _ = m.think(readout, memory, mask, pos, n_steps=4, content=content)
+    assert out.shape == (2, 4, cfg.d_backbone)
+    assert torch.isfinite(out).all()
+    # content_seed actually changes the init: identical noise but different
+    # content must move the output
+    with torch.no_grad():
+        torch.manual_seed(7)
+        a, _ = m.think(readout, memory, mask, pos, n_steps=2, content=content)
+        torch.manual_seed(7)
+        b, _ = m.think(readout, memory, mask, pos, n_steps=2, content=content * 2)
+    assert not torch.allclose(a, b, atol=1e-3)
+
+
+def test_draft_poisson_depth_bounds():
+    """Poisson heavy-tail sampling stays inside [min, max] and spreads."""
+    from flued.v36.model import DraftBackbone
+
+    torch.manual_seed(0)
+    cfg = tiny_config(draft_depth_dist="poisson")
+    m = DraftBackbone(cfg)
+    m.train()
+    readout = torch.randn(2, cfg.d_pack)
+    memory = torch.randn(2, 4, cfg.d_mem)
+    mask = torch.ones(2, 4, dtype=torch.bool)
+    pos = torch.randn(1, 4, cfg.d_backbone)
+    seen = set()
+    for _ in range(24):
+        _, t = m.think(readout, memory, mask, pos)
+        assert 1 <= t <= 16
+        seen.add(t)
+    assert len(seen) > 3
+
+
+def test_draft_truncated_bptt_keeps_grads():
+    """Truncated BPTT (Huginn k): early rounds detached, gradients still
+    flow through the conditioning path of the last k rounds."""
+    from flued.v36.model import DraftBackbone
+
+    torch.manual_seed(0)
+    cfg = tiny_config(draft_trunc_bptt=4)
+    m = DraftBackbone(cfg)
+    m.train()
+    readout = torch.randn(2, cfg.d_pack, requires_grad=True)
+    memory = torch.randn(2, 4, cfg.d_mem)
+    mask = torch.ones(2, 4, dtype=torch.bool)
+    pos = torch.randn(1, 4, cfg.d_backbone)
+    out, t = m.think(readout, memory, mask, pos, n_steps=8)
+    assert t == 8
+    out.sum().backward()
+    assert readout.grad is not None and readout.grad.abs().sum() > 0
+
+
+def test_draft_intermediate_matrix_in_grad_zone():
+    """s35 lever: the sampled intermediate matrix exists (T>=2) and carries
+    gradients (sampled inside the truncation-free zone)."""
+    from flued.v36.model import DraftBackbone
+
+    torch.manual_seed(0)
+    cfg = tiny_config(draft_intermediate_weight=0.1, draft_trunc_bptt=4)
+    m = DraftBackbone(cfg)
+    m.train()
+    readout = torch.randn(2, cfg.d_pack)
+    memory = torch.randn(2, 4, cfg.d_mem)
+    mask = torch.ones(2, 4, dtype=torch.bool)
+    pos = torch.randn(1, 4, cfg.d_backbone)
+    seen_mid = 0
+    for _ in range(8):
+        _, t = m.think(readout, memory, mask, pos)
+        if t >= 2:
+            assert m.last_intermediate is not None
+            assert m.last_intermediate.requires_grad
+            seen_mid += 1
+        else:
+            assert m.last_intermediate is None
+    assert seen_mid > 0
