@@ -42,16 +42,25 @@ import tools.train.v3_6.train_v36_s1 as s1  # noqa: E402
 BYTE_OFFSET = 1  # data.py PAD-offset convention: byte b -> id b+1, PAD=0
 
 
-def _load_texts(path: Path, limit: int) -> list[bytes]:
+def _load_texts(path: Path, limit: int, max_bytes: int) -> list[bytes]:
     if path.suffix == ".jsonl":
         rows = []
         with path.open(encoding="utf-8") as fh:
             for line in fh:
-                rows.append(json.loads(line)["context"].encode("utf-8"))
+                rows.append(json.loads(line)["context"].encode("utf-8")[:max_bytes])
                 if len(rows) >= limit:
                     break
         return rows
-    return [path.read_bytes()[: 1 << 22]]
+    # plain text: one SAMPLE PER LINE (truncated to max_bytes)
+    rows = []
+    with path.open("rb") as fh:
+        for line in fh:
+            line = line.rstrip(b"\r\n")
+            if len(line) >= 64:
+                rows.append(line[:max_bytes])
+            if len(rows) >= limit:
+                break
+    return rows
 
 
 @torch.no_grad()
@@ -73,7 +82,7 @@ def probe(run_dir: Path, data_path: str, args) -> dict:
     reports = []
     for spec in args.samples:
         label, _, p = spec.partition("=")
-        texts = _load_texts(Path(p), args.limit)
+        texts = _load_texts(Path(p), args.limit, args.max_bytes)
         rows = []
         for raw in texts:
             ids = torch.tensor([b + BYTE_OFFSET for b in raw], dtype=torch.long).unsqueeze(0).to(device)
@@ -146,6 +155,7 @@ def main() -> None:
     parser.add_argument("--data-path", required=True)
     parser.add_argument("--samples", nargs="+", required=True, help="label=path entries")
     parser.add_argument("--max-chunks", type=int, default=192)
+    parser.add_argument("--max-bytes", type=int, default=3000)
     parser.add_argument("--limit", type=int, default=3)
     args = parser.parse_args()
     report = probe(Path(args.run_dir), args.data_path, args)
