@@ -20,6 +20,21 @@ def tiny_lm(**overrides):
     return KDALMConfig(**base)
 
 
+def test_gdn2_mixer_forward_and_causal():
+    """GDN-2 mixer variant (2026 baseline): shapes, finiteness, causality."""
+    torch.manual_seed(0)
+    model = KDALM(tiny_lm(mixer="gdn2")).to(_device()).eval()
+    ids = torch.randint(1, 258, (2, 24), device="cuda")
+    ids2 = ids.clone()
+    ids2[:, 12:] = torch.randint(1, 258, (2, 12), device="cuda")
+    with torch.no_grad():
+        logits = model(ids)
+        logits2 = model(ids2)
+    assert logits.shape == (2, 24, 258)
+    assert torch.isfinite(logits).all()
+    assert torch.allclose(logits[:, :12], logits2[:, :12], atol=1e-5)
+
+
 def test_forward_shapes_and_finite():
     torch.manual_seed(0)
     model = KDALM(tiny_lm()).to(_device())

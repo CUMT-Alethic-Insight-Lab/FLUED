@@ -27,6 +27,10 @@ try:
     from fla.layers.kda import KimiDeltaAttention as _KDA
 except Exception:  # fla is optional (tests / non-GPU environments)
     _KDA = None
+try:
+    from fla.layers.gdn2 import GatedDeltaNet2 as _GDN2
+except Exception:
+    _GDN2 = None
 
 
 @dataclass
@@ -42,6 +46,10 @@ class KDALMConfig:
     ffn_dim: int = 1792
     max_seq: int = 512
     tie_embeddings: bool = True
+    # mixer: "kda" (R0 baseline) or "gdn2" (2026-08-09 scout ruling: GDN-2 is
+    # the current strongest public long-context retrieval baseline -- erase/
+    # write gate decoupling, arXiv 2605.22791)
+    mixer: str = "kda"
 
 
 class _Block(nn.Module):
@@ -75,6 +83,8 @@ class KDALM(nn.Module):
         c = self.config
         if _KDA is None:
             raise RuntimeError("KDALM requires the fla package (KimiDeltaAttention)")
+        if c.mixer == "gdn2" and _GDN2 is None:
+            raise RuntimeError("GDN-2 mixer requires fla >= the gdn2 layer build")
         self.embed = nn.Embedding(c.vocab_size, c.d_model)
         nn.init.trunc_normal_(self.embed.weight, std=0.02)
         blocks = []
@@ -82,6 +92,15 @@ class KDALM(nn.Module):
             if i % 4 == 3:  # every 4th layer is full causal attention (3:1)
                 mixer = nn.MultiheadAttention(
                     c.d_model, c.attn_nhead, dropout=0.0, batch_first=True, bias=False
+                )
+                blocks.append(_Block(mixer, c.d_model, c.ffn_dim))
+            elif c.mixer == "gdn2":
+                mixer = _GDN2(
+                    hidden_size=c.d_model,
+                    head_dim=c.kda_head_dim,
+                    num_heads=max(1, c.d_model // c.kda_head_dim),
+                    mode="chunk",
+                    layer_idx=i,
                 )
                 blocks.append(_Block(mixer, c.d_model, c.ffn_dim))
             else:

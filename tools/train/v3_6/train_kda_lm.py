@@ -108,6 +108,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--kda-head-dim", type=int, default=128)
     parser.add_argument("--attn-nhead", type=int, default=8)
     parser.add_argument("--ffn-dim", type=int, default=1792)
+    parser.add_argument("--mixer", choices=["kda", "gdn2"], default="kda")
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--optimizer", default="fused_adamw")
@@ -139,6 +140,7 @@ def main() -> None:
             kda_head_dim=args.kda_head_dim,
             attn_nhead=args.attn_nhead,
             ffn_dim=args.ffn_dim,
+            mixer=getattr(args, "mixer", "kda"),
         )
     ).to(device)
     trainable = [p for p in model.parameters() if p.requires_grad]
