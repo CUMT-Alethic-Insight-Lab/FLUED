@@ -97,3 +97,5 @@ Full project status: [README.md](README.md) · Versioned documentation: [docs/RE
 5. **Duplicate process check**: Always inspect active Python/GPU processes before launching training.
 
 6. **Versioned paths**: v3 experiment code lives under `tools/*/v3_*`; do not reintroduce pre-reorganization import paths.
+
+7. **证据表编辑序号核对（2026-08-09 两次事故的教训）**：编辑 `docs/CURRENT_STATE.md` 证据注册表后，必须立刻核对序号完整性——`grep -n "^| E[0-9]" docs/CURRENT_STATE.md` 对比编辑前后的编号清单，确认无丢行、无重号。整行替换式 Edit 的 new_string 必须显式带回原行内容（事故 1：E48 登记时 E47 行被原地替换，缺席 5 个 commit 才被发现；事故 2：E50 登记时吃掉 E49 行首）。并发会话（fork/主）同编一表时风险加倍，提交前再核一次。
