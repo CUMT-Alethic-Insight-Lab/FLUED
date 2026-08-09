@@ -705,6 +705,59 @@ def test_xcache_select_respects_rank_and_mask():
     assert (zero == -1).all()
 
 
+def test_s38_supplementary_entries():
+    """S38 supplementary readouts: entry for chunk i is visible only to
+    positions j>=i; unselected chunks' supp content moves nothing; the
+    read_supplementary path produces finite per-chunk slices."""
+    from flued.v36.model import CrossReadBackbone
+
+    torch.manual_seed(0)
+    cfg = tiny_config(xcache_gist=True)
+    m = CrossReadBackbone(cfg)
+    content = torch.randn(2, 5, cfg.d_pack)
+    memory = torch.randn(2, 5, cfg.d_mem)
+    supp = torch.randn(2, 5, cfg.d_pack)
+    mask = torch.ones(2, 5, dtype=torch.bool)
+    pos = torch.randn(1, 5, cfg.d_backbone)
+    gist = torch.randn(2, cfg.d_pack)
+    cache = torch.tensor([[0, -1, -1, -1, -1], [0, -1, -1, -1, -1]])
+    supp_idx = torch.tensor([[2, 4, -1, -1, -1], [2, 4, -1, -1, -1]])
+    with torch.no_grad():
+        out = m(content, memory, mask, pos, cache, gist, supp=supp, supp_idx=supp_idx)
+        assert torch.isfinite(out).all()
+        # supp entry at chunk 4 invisible to positions 0-2, visible from 4 on:
+        # moving chunk 4's supp content must leave rows 0-2 untouched
+        supp2 = supp.clone()
+        supp2[:, 4] = torch.randn(2, cfg.d_pack)
+        out2 = m(content, memory, mask, pos, cache, gist, supp=supp2, supp_idx=supp_idx)
+        assert torch.allclose(out[:, :3], out2[:, :3], atol=1e-5)
+        assert not torch.allclose(out[:, 4], out2[:, 4], atol=1e-3)
+        # unselected chunk (1) supp content moves nothing
+        supp3 = supp.clone()
+        supp3[:, 1] = torch.randn(2, cfg.d_pack)
+        out3 = m(content, memory, mask, pos, cache, gist, supp=supp3, supp_idx=supp_idx)
+        assert torch.allclose(out, out3, atol=1e-5)
+
+
+def test_s38_read_supplementary_torch_path():
+    """read_supplementary (torch fallback): finite, content-conditioned
+    (different content -> different slice), correct shape."""
+    torch.manual_seed(0)
+    cfg = tiny_config(xcache_supp=4)
+    model = FLUEDV36(cfg)
+    sm = model.state_machine
+    memory = torch.randn(2, 3, cfg.d_mem)
+    gates = model.write_head(memory)
+    chunk_mask = torch.ones(2, 3, dtype=torch.bool)
+    content = torch.randn(2, 3, cfg.d_pack)
+    with torch.no_grad():
+        a = sm.read_supplementary(content, gates, chunk_mask)
+        b = sm.read_supplementary(torch.randn_like(content), gates, chunk_mask)
+    assert a.shape == (2, 3, cfg.d_pack)
+    assert torch.isfinite(a).all()
+    assert not torch.allclose(a, b, atol=1e-4)
+
+
 def test_paged_xattn_page_causality():
     """S37 (spec SS24): entry-level page causality -- changing a LATER page's
     gist entry or cache row must not move earlier pages' outputs."""

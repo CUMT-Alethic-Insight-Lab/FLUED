@@ -273,7 +273,36 @@ def s1_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None) ->
                 chunks.chunk_mask,
                 getattr(model.config, "xcache_frac", 1.0),
             )
-        backbone_out = model.backbone(content, memory, chunks.chunk_mask, pos, cache_idx, gist)
+        supp, supp_idx = None, None
+        if getattr(model.config, "xcache_supp", 0) > 0:
+            # S38: supplementary content-conditioned readouts for the top-N
+            # hardest chunks NOT in the cache (decode-CE gated, CUIB pattern)
+            if not getattr(model.config, "xcache_gist", False):
+                raise ValueError("xcache_supp requires --xcache-gist (supp entries reuse the gist projections)")
+            if resid is None:
+                if clean is None or byte_mask is None:
+                    raise ValueError("xcache_supp requires clean+byte_mask (S1 trainer passes them)")
+                logits_direct = model.decoder(cond_direct, chunks.token_mask)
+                targets_r, slot_mask_r, _ = make_targets(
+                    clean, byte_mask, chunks.chunk_ids, chunks.offsets, args.max_chunks, args.max_span
+                )
+                ce = F.cross_entropy(
+                    logits_direct.float().reshape(-1, logits_direct.size(-1)),
+                    targets_r.reshape(-1).clamp(min=0, max=257),
+                    reduction="none",
+                    ignore_index=PAD_ID,
+                ).reshape(targets_r.shape)
+                resid = (ce * slot_mask_r.float()).sum(dim=-1) / slot_mask_r.float().sum(dim=-1).clamp(min=1.0)
+            supp = model.state_machine.read_supplementary(content, gates, chunks.chunk_mask)
+            cached = torch.zeros_like(chunks.chunk_mask)
+            if cache_idx is not None:
+                cached.scatter_(1, cache_idx.clamp(min=0), cache_idx >= 0)
+            supp_scores = resid.masked_fill(~chunks.chunk_mask | cached, float("-inf"))
+            n_supp = min(model.config.xcache_supp, supp_scores.size(1))
+            top = supp_scores.topk(n_supp, dim=1).indices
+            valid_s = supp_scores.gather(1, top) > float("-inf") / 2
+            supp_idx = torch.where(valid_s, top, torch.full_like(top, -1)).sort(dim=1).values
+        backbone_out = model.backbone(content, memory, chunks.chunk_mask, pos, cache_idx, gist, supp=supp, supp_idx=supp_idx)
         cond_backbone = backbone_out + pos
     elif getattr(model.config, "backbone_mode", "attn") == "draft":
         # three-state drafting (spec SS23, user-ruled 2026-08-08): input = the
