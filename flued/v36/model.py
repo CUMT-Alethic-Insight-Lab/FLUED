@@ -142,6 +142,12 @@ class V36Config:
     # rows (= s31 with optional gist token -- the sanity arm).
     xcache_frac: float = 1.0
     xcache_gist: bool = False
+    # S37 (spec SS24, user-proposed 2026-08-09): backbone_mode="paged_xattn" --
+    # page gists (paged_reads pages) + per-page residual cache rows
+    # (paged_cache_rows per page) with entry-level causal attention; the
+    # decoder conditions each chunk on its page's output row. Needs targets
+    # for the residual criterion (S1 trainer path only).
+    paged_cache_rows: int = 1
 
 
 @dataclass
@@ -462,8 +468,9 @@ class CrossReadBackbone(nn.Module):
         self.o_proj = nn.Linear(c.d_backbone, c.d_backbone, bias=False)
         # S36 gist token projections (k=1 final readout as the first store
         # entry); created only when the gist is enabled so s31 checkpoints
-        # keep loading strict-clean
-        if getattr(c, "xcache_gist", False):
+        # keep loading strict-clean. S37 (paged_xattn) always needs them --
+        # page gist entries go through these projections.
+        if getattr(c, "xcache_gist", False) or getattr(c, "backbone_mode", "") == "paged_xattn":
             self.gist_k = nn.Linear(c.d_pack, c.d_backbone, bias=False)
             self.gist_v = nn.Linear(c.d_pack, c.d_backbone, bias=False)
         self.blocks = nn.ModuleList(
@@ -487,6 +494,8 @@ class CrossReadBackbone(nn.Module):
         pos: torch.Tensor,
         cache_idx: torch.Tensor | None = None,
         gist: torch.Tensor | None = None,
+        query_pos: torch.Tensor | None = None,
+        gist_pos: torch.Tensor | None = None,
     ) -> torch.Tensor:
         bsz, n, _ = content.shape
         h = self.in_proj(content)
@@ -504,24 +513,33 @@ class CrossReadBackbone(nn.Module):
             allowed = allowed | torch.eye(n, dtype=torch.bool, device=content.device).view(1, 1, n, n)
             o = F.scaled_dot_product_attention(q, k, v, attn_mask=allowed)
         else:
-            # S36 residual-gated cache (HOLA/HAM): the store is [gist token]
-            # + selected memory rows (original chunk indices in cache_idx).
-            # The gist token is visible to every position (it is the state's
-            # job to carry cross-chunk context); a selected row with original
-            # index j is visible to position i iff j <= i (strict causality);
-            # padded/not-selected rows are excluded. The gist guarantees no
-            # fully-masked row can arise.
+            # S36/S36-store path, generalized for S37: the store is
+            # [gist entries] + [selected memory rows]. gist may be (B, d_pack)
+            # (single token, visible to all) or (B, G, d_pack) with gist_pos --
+            # then entry g is visible to query i iff gist_pos[g] <= query_pos[i]
+            # (page-level causality for the paged-gist form). Cache rows carry
+            # original chunk indices in cache_idx with the same comparison.
             if gist is None:
                 raise ValueError("residual-gated cache requires the gist token")
-            ks = [self.gist_k(gist).unsqueeze(1)]  # (B, 1, d)
-            vs = [self.gist_v(gist).unsqueeze(1)]
-            allowed_parts = [torch.ones(bsz, n, 1, dtype=torch.bool, device=content.device)]
+            device = content.device
+            if query_pos is None:
+                query_pos = torch.arange(n, device=device).unsqueeze(0).expand(bsz, n)
+            if gist.dim() == 2:
+                gist = gist.unsqueeze(1)
+            gsz = gist.size(1)
+            ks = [self.gist_k(gist)]
+            vs = [self.gist_v(gist)]
+            if gist_pos is None:
+                allowed_g = torch.ones(bsz, n, gsz, dtype=torch.bool, device=device)
+            else:
+                allowed_g = gist_pos.view(bsz, 1, gsz) <= query_pos.view(bsz, n, 1)
+            allowed_parts = [allowed_g]
             kk = cache_idx.size(1)
             sel_mem = memory.gather(1, cache_idx.clamp(min=0).unsqueeze(-1).expand(-1, -1, memory.size(-1)))
             ks.append(self.k_proj(sel_mem))
             vs.append(self.v_proj(sel_mem))
             valid_cache = chunk_mask.gather(1, cache_idx.clamp(min=0)) & (cache_idx >= 0)  # (B, K)
-            causal = cache_idx.view(bsz, 1, kk) <= torch.arange(n, device=content.device).view(1, n, 1)
+            causal = cache_idx.view(bsz, 1, kk) <= query_pos.view(bsz, n, 1)
             allowed_parts.append(causal & valid_cache.view(bsz, 1, kk))
             k = torch.cat(ks, dim=1).view(bsz, -1, nh, hd).transpose(1, 2)
             v = torch.cat(vs, dim=1).view(bsz, -1, nh, hd).transpose(1, 2)
@@ -905,6 +923,8 @@ class FLUEDV36(nn.Module):
             self.backbone = TinyBackbone(c)
         elif c.backbone_mode == "xattn":
             self.backbone = CrossReadBackbone(c)
+        elif c.backbone_mode == "paged_xattn":
+            self.backbone = CrossReadBackbone(c)
         elif c.backbone_mode == "draft":
             self.backbone = DraftBackbone(c)
         else:
@@ -975,6 +995,10 @@ class FLUEDV36(nn.Module):
             n_chunks = chunks.chunk_mask.size(1)
             pos = self.chunk_pos.weight.unsqueeze(0)[:, :n_chunks]
             cond_direct = self.decoder_in(content) + pos
+            if self.config.backbone_mode == "paged_xattn":
+                raise ValueError(
+                    "paged_xattn (S37) requires per-chunk residuals; use the S1 trainer path"
+                )
             if self.config.backbone_mode == "xattn":
                 # causal cross-read: queries = per-chunk content, K/V = memory,
                 # position i sees memory[0..i] only. S36: optional gist token +

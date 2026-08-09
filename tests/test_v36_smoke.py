@@ -700,3 +700,42 @@ def test_xcache_select_respects_rank_and_mask():
     # frac=1.0 keeps all real rows
     full = _xcache_select(scores, mask, 1.0)
     assert (full[0] >= 0).sum().item() == 3 and (full[1] >= 0).sum().item() == 4
+
+
+def test_paged_xattn_page_causality():
+    """S37 (spec SS24): entry-level page causality -- changing a LATER page's
+    gist entry or cache row must not move earlier pages' outputs."""
+    from flued.v36.model import CrossReadBackbone
+
+    torch.manual_seed(0)
+    cfg = tiny_config(backbone_mode="paged_xattn")
+    m = CrossReadBackbone(cfg)
+    n, n_chunks = 3, 6
+    reads = torch.randn(2, n, cfg.d_pack)
+    memory = torch.randn(2, n_chunks, cfg.d_mem)
+    chunk_mask = torch.ones(2, n_chunks, dtype=torch.bool)
+    page_pos = torch.randn(2, n, cfg.d_backbone)
+    boundary = torch.tensor([[1, 3, 5], [1, 3, 5]])  # pages {0,1} {2,3} {4,5}
+    cache = torch.tensor([[0, 3, 5], [0, 3, 5]])     # one cache row per page
+    with torch.no_grad():
+        out = m(reads, memory, chunk_mask, page_pos, cache_idx=cache, gist=reads,
+                query_pos=boundary, gist_pos=boundary)
+        reads2 = reads.clone()
+        reads2[:, 2] = torch.randn(2, cfg.d_pack)
+        mem2 = memory.clone()
+        mem2[:, 5] = torch.randn(2, cfg.d_mem)
+        out2 = m(reads2, mem2, chunk_mask, page_pos, cache_idx=cache, gist=reads2,
+                 query_pos=boundary, gist_pos=boundary)
+    assert torch.allclose(out[:, :2], out2[:, :2], atol=1e-5)
+    assert not torch.allclose(out[:, 2], out2[:, 2], atol=1e-3)
+    assert torch.isfinite(out).all()
+
+
+def test_paged_xattn_class_forward_requires_s1():
+    """The class-level forward has no targets; S37 must refuse it loudly."""
+    import pytest
+
+    model = FLUEDV36(tiny_config(per_chunk_readout=True, backbone_mode="paged_xattn"))
+    ids = torch.randint(1, 258, (2, 32))
+    with pytest.raises(ValueError, match="paged_xattn"):
+        model(ids)

@@ -201,7 +201,48 @@ def s1_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None) ->
     pos = model.chunk_pos.weight.unsqueeze(0)[:, :n_chunks]
     cond_direct = model.decoder_in(content) + pos
     logits_direct = None
-    if getattr(model.config, "backbone_mode", "attn") == "xattn":
+    if getattr(model.config, "backbone_mode", "attn") == "paged_xattn":
+        # S37 (spec SS24, user-proposed): page gists + per-page residual cache
+        # rows; entry-level causal attention; each chunk is conditioned on its
+        # page's output row (one-shot entry backbone, no iterative loop).
+        boundary, serve = paged_boundaries(chunks.chunk_mask, model.config.paged_reads)
+        reads = content.gather(1, boundary.unsqueeze(-1).expand(-1, -1, content.size(-1)))
+        n_pages = boundary.size(1)
+        page_pos = model.chunk_pos.weight[boundary]  # (B, n, d_bb) page-index embedding
+        if clean is None or byte_mask is None:
+            raise ValueError("paged_xattn requires clean+byte_mask (S1 trainer passes them)")
+        logits_direct = model.decoder(cond_direct, chunks.token_mask)
+        targets_r, slot_mask_r, _ = make_targets(
+            clean, byte_mask, chunks.chunk_ids, chunks.offsets, args.max_chunks, args.max_span
+        )
+        ce = F.cross_entropy(
+            logits_direct.float().reshape(-1, logits_direct.size(-1)),
+            targets_r.reshape(-1).clamp(min=0, max=257),
+            reduction="none",
+            ignore_index=PAD_ID,
+        ).reshape(targets_r.shape)
+        resid = (ce * slot_mask_r.float()).sum(dim=-1) / slot_mask_r.float().sum(dim=-1).clamp(min=1.0)
+        # per-page residual top-k (S37: the page's hardest chunks get exact rows)
+        k_per = model.config.paged_cache_rows
+        cgrid = torch.arange(chunks.chunk_mask.size(1), device=content.device).unsqueeze(0)
+        cache_rows = []
+        for p in range(n_pages):
+            lo = boundary[:, p - 1] + 1 if p > 0 else torch.zeros_like(boundary[:, 0])
+            hi = boundary[:, p]
+            in_page = (cgrid >= lo.unsqueeze(1)) & (cgrid <= hi.unsqueeze(1)) & chunks.chunk_mask
+            scores_p = resid.masked_fill(~in_page, float("-inf"))
+            top = scores_p.topk(min(k_per, in_page.size(1)), dim=1).indices
+            valid_p = scores_p.gather(1, top) > float("-inf") / 2
+            cache_rows.append(torch.where(valid_p, top, torch.full_like(top, -1)))
+        cache_idx = torch.cat(cache_rows, dim=1)  # (B, n*k_per)
+        backbone_out = model.backbone(
+            reads, memory, chunks.chunk_mask, page_pos,
+            cache_idx=cache_idx, gist=reads, query_pos=boundary, gist_pos=boundary,
+        )
+        cond_backbone = backbone_out.gather(
+            1, serve.unsqueeze(-1).expand(-1, -1, backbone_out.size(-1))
+        ) + pos
+    elif getattr(model.config, "backbone_mode", "attn") == "xattn":
         # causal cross-read backbone (s31): queries = per-chunk content,
         # K/V = pre-state memory, position i sees memory[0..i] only.
         # S36 (user-ruled 2026-08-08): optional k=1 gist token + residual-gated
@@ -374,7 +415,20 @@ def step_model(model, batch, args, device, train: bool):
             out["logits_backbone_mid"], targets, slot_mask
         )
 
-    if getattr(args, "backbone_mode", "") == "draft":
+    if getattr(args, "backbone_mode", "") == "paged_xattn":
+        # S37 page-level latent predict: the penultimate page's output row
+        # predicts the last chunk's latent (chunk-level autoregression at
+        # page granularity; the page row causally covers chunks < last)
+        last = chunks.chunk_mask.long().sum(dim=1).clamp(min=2) - 1
+        ar = torch.arange(out["content"].size(0), device=device)
+        pred = out["backbone_out"][:, -2].float()
+        with torch.no_grad():
+            tgt = model.decoder_in(out["content"].float())[ar, last].detach()
+        se = (pred - tgt).square().mean(dim=-1).mean()
+        with torch.no_grad():
+            predict_cos = F.cosine_similarity(pred, tgt, dim=-1).mean()
+        pair_mask = chunks.chunk_mask.new_ones((1,))  # placeholder, unused
+    elif getattr(args, "backbone_mode", "") == "draft":
         # predict rollout (spec SS23): a second thinking pass whose INPUT is
         # the penultimate readout S_{last-1} (causal to the target chunk);
         # arm B's memory view is truncated at last-1. The predict vector is

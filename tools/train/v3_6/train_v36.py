@@ -82,6 +82,7 @@ def build_model(args: Namespace) -> FLUEDV36:
             decoder_markov=getattr(args, "decoder_markov", 0),
             xcache_frac=getattr(args, "xcache_frac", 1.0),
             xcache_gist=getattr(args, "xcache_gist", False),
+            paged_cache_rows=getattr(args, "paged_cache_rows", 1),
             decoder_hidden=args.decoder_hidden,
             decoder_layers=args.decoder_layers,
             max_chunks=args.max_chunks,
@@ -225,7 +226,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--backbone-layers", type=int, default=3)
     parser.add_argument("--backbone-nhead", type=int, default=8)
     parser.add_argument("--backbone-ffn", type=int, default=1024)
-    parser.add_argument("--backbone-mode", choices=["attn", "mlp", "xattn", "draft"], default="attn")
+    parser.add_argument("--backbone-mode", choices=["attn", "mlp", "xattn", "draft", "paged_xattn"], default="attn")
     parser.add_argument(
         "--backbone-readout",
         choices=["per_chunk", "final", "paged"],
@@ -234,6 +235,7 @@ def build_parser() -> argparse.ArgumentParser:
         "paged = /n paging (one causal read per sub-page boundary)",
     )
     parser.add_argument("--paged-reads", type=int, default=4)
+    parser.add_argument("--paged-cache-rows", type=int, default=1)
     parser.add_argument("--think-steps-min", type=int, default=1)
     parser.add_argument("--think-steps-max", type=int, default=16)
     parser.add_argument(
