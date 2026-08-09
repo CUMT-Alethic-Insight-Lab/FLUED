@@ -83,6 +83,8 @@ def build_model(args: Namespace) -> FLUEDV36:
             xcache_frac=getattr(args, "xcache_frac", 1.0),
             xcache_gist=getattr(args, "xcache_gist", False),
             xcache_supp=getattr(args, "xcache_supp", 0),
+            supp_source=getattr(args, "supp_source", "state"),
+            residual_gate_temp=getattr(args, "residual_gate_temp", 1.0),
             paged_cache_rows=getattr(args, "paged_cache_rows", 1),
             decoder_hidden=args.decoder_hidden,
             decoder_layers=args.decoder_layers,
@@ -279,6 +281,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="S38: number of supplementary content-conditioned state readouts "
         "for the hardest uncached chunks (requires --xcache-gist)",
     )
+    parser.add_argument("--supp-source", choices=["state", "residual"], default="state")
+    parser.add_argument("--residual-gate-temp", type=float, default=1.0)
     parser.add_argument("--decoder-hidden", type=int, default=1024)
     parser.add_argument("--decoder-layers", type=int, default=3)
     parser.add_argument("--max-chunks", type=int, default=64)

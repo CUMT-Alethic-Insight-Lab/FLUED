@@ -293,7 +293,17 @@ def s1_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None) ->
                     ignore_index=PAD_ID,
                 ).reshape(targets_r.shape)
                 resid = (ce * slot_mask_r.float()).sum(dim=-1) / slot_mask_r.float().sum(dim=-1).clamp(min=1.0)
-            supp = model.state_machine.read_supplementary(content, gates, chunks.chunk_mask)
+            if getattr(model.config, "supp_source", "state") == "residual":
+                # S38B: S' write weights from detached downstream decode CE
+                # (CUIB gating: above-median failure writes harder)
+                resid_nan = resid.masked_fill(~chunks.chunk_mask, float("nan"))
+                med = resid_nan.nanmedian(dim=1, keepdim=True).values.nan_to_num(0.0)
+                write_w = torch.sigmoid(
+                    (resid - med) / getattr(model.config, "residual_gate_temp", 1.0)
+                ).detach()
+                supp = model.state_machine.read_residual(content, gates, chunks.chunk_mask, write_w)
+            else:
+                supp = model.state_machine.read_supplementary(content, gates, chunks.chunk_mask)
             cached = torch.zeros_like(chunks.chunk_mask)
             if cache_idx is not None:
                 cached.scatter_(1, cache_idx.clamp(min=0), cache_idx >= 0)

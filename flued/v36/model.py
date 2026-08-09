@@ -149,6 +149,14 @@ class V36Config:
     # surgery; "under-served content gets its own readout matrix" (RDN-frame
     # with CUIB gating: downstream decode CE decides who gets a second read).
     xcache_supp: int = 0
+    # S38B (user-ruled 2026-08-10): the supplementary entries come from a
+    # RESIDUAL SECOND STATE S' instead of the main state. S' accumulates
+    # decode-CE-gated writes only (beta_i x sigmoid((CE_i - median)/temp),
+    # detached -- CUIB pattern: downstream failure drives the write); the
+    # readout uses independent content-conditioned queries. The point: a
+    # fixed-size residual matrix vs linearly growing verbatim cache rows.
+    supp_source: str = "state"  # "state" (arm A) | "residual" (arm B)
+    residual_gate_temp: float = 1.0
     # S37 (spec SS24, user-proposed 2026-08-09): backbone_mode="paged_xattn" --
     # page gists (paged_reads pages) + per-page residual cache rows
     # (paged_cache_rows per page) with entry-level causal attention; the
@@ -272,6 +280,60 @@ class KDAStateMachine(nn.Module):
         if getattr(c, "xcache_supp", 0) > 0:
             self.supp_q = nn.Linear(c.d_pack, c.kda_heads * c.kda_head_k, bias=False)
             self.supp_out = nn.Linear(c.kda_heads * c.kda_head_v, c.d_pack, bias=False)
+
+    def read_residual(
+        self,
+        content: torch.Tensor,
+        gates: dict[str, torch.Tensor],
+        chunk_mask: torch.Tensor,
+        write_w: torch.Tensor,
+    ) -> torch.Tensor:
+        """S38B residual second state S': the SAME gated recurrence but with
+        write rates modulated by the detached downstream-failure weight
+        write_w (B, C) -- only chunks the codec fails on get written hard
+        (CUIB pattern: downstream utility drives upstream allocation).
+        Readout reuses the content-conditioned supp projections (independent
+        from the main state's fixed readout query)."""
+        c = self.c
+        k, v, beta, alpha = gates["k"], gates["v"], gates["beta"], gates["alpha"]
+        keep = chunk_mask.unsqueeze(-1).unsqueeze(-1).to(k.dtype)
+        bsz, chunks, heads, dk = k.shape
+        q = F.normalize(self.supp_q(content).view(bsz, chunks, heads, dk).float(), dim=-1).to(k.dtype)
+        w = write_w.unsqueeze(-1).to(beta.dtype)  # (B, C, 1)
+        if c.kda_impl == "fla" and _fla_chunk_kda is not None:
+            kk = k * keep
+            vv = v * keep
+            bb = beta * w * chunk_mask.unsqueeze(-1).to(beta.dtype)
+            g = torch.log(alpha.clamp_min(1.0e-6)).to(k.dtype) * keep
+            o, _ = _fla_chunk_kda(
+                q=q.contiguous(),
+                k=kk,
+                v=vv,
+                g=g.expand(bsz, chunks, -1, -1).contiguous(),
+                beta=bb,
+                scale=1.0,
+                use_qk_l2norm_in_kernel=False,
+                output_final_state=False,
+            )
+            read = o.reshape(bsz, chunks, heads * v.size(-1))
+        else:
+            kf, vf = (k * keep).float(), (v * keep).float()
+            bf = beta.float() * w.float() * chunk_mask.float().unsqueeze(-1)
+            alpha_eff = 1.0 - chunk_mask.float().view(bsz, chunks, 1, 1, 1) + chunk_mask.float().view(
+                bsz, chunks, 1, 1, 1
+            ) * gates["alpha"][0].float().unsqueeze(0).unsqueeze(-1)
+            state = k.new_zeros(bsz, heads, dk, v.size(-1), dtype=torch.float32)
+            reads = []
+            qf = q.float()
+            for i in range(chunks):
+                ki, vi, bi, ai = kf[:, i], vf[:, i], bf[:, i], alpha_eff[:, i]
+                state = ai * state
+                kTs = torch.einsum("bhk,bhkv->bhv", ki, state)
+                state = state - bi.view(bsz, heads, 1, 1) * ki.unsqueeze(-1) * kTs.unsqueeze(-2)
+                state = state + bi.view(bsz, heads, 1, 1) * ki.unsqueeze(-1) * vi.unsqueeze(-2)
+                reads.append(torch.einsum("bhk,bhkv->bhv", qf[:, i], state))
+            read = torch.stack(reads, dim=1).reshape(bsz, chunks, heads * v.size(-1))
+        return self.supp_out(read.to(k.dtype))
 
     def read_supplementary(
         self, content: torch.Tensor, gates: dict[str, torch.Tensor], chunk_mask: torch.Tensor

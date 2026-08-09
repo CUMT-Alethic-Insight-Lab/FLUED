@@ -758,6 +758,28 @@ def test_s38_read_supplementary_torch_path():
     assert not torch.allclose(a, b, atol=1e-4)
 
 
+def test_s38b_residual_state_gating():
+    """S38B residual second state: zero write weights -> zero state readout;
+    heavier weights -> larger response (the write gate actually gates)."""
+    torch.manual_seed(0)
+    cfg = tiny_config(xcache_supp=4)
+    model = FLUEDV36(cfg)
+    sm = model.state_machine
+    memory = torch.randn(2, 3, cfg.d_mem)
+    gates = model.write_head(memory)
+    chunk_mask = torch.ones(2, 3, dtype=torch.bool)
+    content = torch.randn(2, 3, cfg.d_pack)
+    w_zero = torch.zeros(2, 3)
+    w_full = torch.ones(2, 3)
+    w_half = torch.full((2, 3), 0.5)
+    with torch.no_grad():
+        zero = sm.read_residual(content, gates, chunk_mask, w_zero)
+        half = sm.read_residual(content, gates, chunk_mask, w_half)
+        full = sm.read_residual(content, gates, chunk_mask, w_full)
+    assert zero.abs().max() < 1e-6  # nothing written -> nothing to read
+    assert full.abs().mean() > half.abs().mean() > 0
+
+
 def test_paged_xattn_page_causality():
     """S37 (spec SS24): entry-level page causality -- changing a LATER page's
     gist entry or cache row must not move earlier pages' outputs."""
