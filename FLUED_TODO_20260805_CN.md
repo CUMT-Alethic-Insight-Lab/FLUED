@@ -62,6 +62,16 @@ v36.4/v36.5 三臂（s13 预测 v2.0 / s14 per-readout+锚0.1 / s14b per-readout
   解码残差——先离线探针定相关性）。下一步：残差判据探针（s31 checkpoint
   离线）→ 残差门控缓存实现 → 缓存预算 25/50/75/100% 四档 RD 曲线臂；
   评测加状态通道消融对照（盯 state_norm 降权签名）。
+- **S36 RD 曲线（E47，2026-08-08）**：frac 1.0→0.7981 / 0.5→0.7982（零损失）/
+  0.25→0.7958（−0.24pp 噪声带内）——实测优于探针静态预测（模型在预算下
+  自适应+gist 兜底）；膝盖未现，s36d（frac 0.125）在跑。
+- **长文本+翻页（用户已授权"别干等我消息"）**：S36 符合预期→直接开跑。
+  配置（显存实测已松，Q6 值修正）：2048 臂 `--seq-len 2048 --stride 1024
+  --max-chunks 256 --batch-size 4`；4096 臂 `--seq-len 4096 --stride 2048
+  --max-chunks 320 --batch-size 1`（320 替代旧标定 1024，防 logits 张量
+  GB 化）；硬闸门 cut_capacity_overflow=0 且 truncated_tokens=0。之后写
+  翻页信号探针（stream_step 增量编码，64/128 段前缀衰减曲线+分域方差，
+  定字节预算 vs 门控翻页）。
 - **工具新增（第二摞，2026-08-08）**：`tools/analysis/v3_6/probe_draft_vitality.py`
   循环死活探针（r-scan/扰动敏感度/逐轮范数与有效秩轨迹，round_hook 实现）；
   DSpark 式 Markov 偏置头（`--decoder-markov N`，teacher-forced 口径、仅 s1
