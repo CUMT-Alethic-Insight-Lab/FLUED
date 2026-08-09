@@ -420,6 +420,10 @@ def _xcache_select(scores: torch.Tensor, chunk_mask: torch.Tensor, frac: float) 
     is the static chunk grid."""
     bsz, n = chunk_mask.shape
     n_real = chunk_mask.long().sum(dim=1)
+    if frac <= 0.0:
+        # honest zero-row control (methodology fix 2026-08-09): the store is
+        # the gist token only; every cache slot is -1 (masked downstream)
+        return torch.full((bsz, n), -1, dtype=torch.long, device=chunk_mask.device)
     k_keep = (n_real.float() * frac).round().long().clamp(min=1)  # (B,)
     order = scores.masked_fill(~chunk_mask, float("-inf")).argsort(dim=1, descending=True)
     rank = torch.arange(n, device=chunk_mask.device).unsqueeze(0)

@@ -700,6 +700,9 @@ def test_xcache_select_respects_rank_and_mask():
     # frac=1.0 keeps all real rows
     full = _xcache_select(scores, mask, 1.0)
     assert (full[0] >= 0).sum().item() == 3 and (full[1] >= 0).sum().item() == 4
+    # frac=0 is the gist-only control: no cache rows at all
+    zero = _xcache_select(scores, mask, 0.0)
+    assert (zero == -1).all()
 
 
 def test_paged_xattn_page_causality():
