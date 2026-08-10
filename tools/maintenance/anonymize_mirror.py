@@ -22,7 +22,7 @@ import sys
 from pathlib import Path
 
 MAIN = Path(__file__).resolve().parents[2]
-MIRROR = MAIN.parent / "seglin_mirror"
+MIRROR = MAIN.parent / "mentiner_mirror"
 # PLACEHOLDER — set to the anonymous host (anonymous.4open.science or a
 # throwaway account). NEVER point this at the owner's real account: the
 # project name is publicly linked to the owner's homepage/lab site.
@@ -45,9 +45,11 @@ REPLACEMENTS = [
     ("wdd9700", "anonymous"),
     ("740904068@qq.com", "anonymous@example.org"),
     ("74090", "user"),
-    ("FLUED", "SEGLIN"),
-    ("Flued", "Seglin"),
-    ("flued", "seglin"),
+    # the acronym expansion is itself distinctive/searchable -- neutralize
+    ("FLexible Unified Encoder-Decoder", "flexible unified encoder-decoder"),
+    ("FLUED", "MENTINER"),
+    ("Flued", "Mentiner"),
+    ("flued", "mentiner"),
     ("fursuit", "proj_x"),
 ]
 
@@ -103,12 +105,12 @@ def mirror_path(rel: str) -> str:
     """Path rewrite: package dir and filename renames (any case variant)."""
     out = rel
     if out.startswith("flued/"):
-        out = "seglin/" + out[len("flued/"):]
+        out = "mentiner/" + out[len("flued/"):]
     if out == "flued":
-        out = "seglin"
+        out = "mentiner"
     parts = out.split("/")
     parts = [
-        p.replace("FLUED", "SEGLIN").replace("Flued", "Seglin").replace("flued", "seglin")
+        p.replace("FLUED", "MENTINER").replace("Flued", "Mentiner").replace("flued", "mentiner")
         for p in parts
     ]
     return "/".join(parts)
@@ -152,7 +154,6 @@ def build() -> None:
 
 
 def commit_and_maybe_push(push: bool, remote: str) -> None:
-    head = run(["git", "rev-parse", "--short", "HEAD"], MAIN).stdout.strip()
     if not (MIRROR / ".git").exists():
         run(["git", "init", "-q"], MIRROR)
         run(["git", "checkout", "-q", "-b", "main"], MIRROR)
@@ -162,7 +163,9 @@ def commit_and_maybe_push(push: bool, remote: str) -> None:
     if not status:
         print("[mirror] no changes vs last sync")
         return
-    msg = f"sync from dev {head}"
+    # neutral message: NEVER embed the dev HEAD hash -- the main repo is
+    # public, so a hash in the mirror history is a direct de-anonymizing link
+    msg = "sync snapshot"
     env = {
         **os.environ,
         "GIT_AUTHOR_NAME": "Anonymous",
