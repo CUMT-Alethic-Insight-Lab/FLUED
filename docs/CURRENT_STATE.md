@@ -642,3 +642,18 @@ overflow 真凶是 URL 编码/base64 类**无语言边界的高熵字节流**（
   `verify_corpus_v5.py`：37.58M 条全检——零 v4 基线重叠、零内容哈希错配、
   零分隔符/布局/manifest 错配、零缺片，passed=true。codeparrot 代码源
   （~280G，X: 盘）待挂载后启用并增量续跑（管线幂等）。
+- 2026-08-11：**镜像泄漏语义排查 + 两轮加固（镜像纪律执行）**——六路排查
+  （库存 3 + 泄漏 3，subagent 并行）发现镜像实质泄漏七宗：① audit_export
+  docx 二进制原文未脱敏（最高危）；② README 展开词首字母拼出真名（上轮
+  "已修"的指纹换了形态存活）；③ changelog 镜像运维条目自曝（代号史/
+  托管 URL/小号仓）；④ AGENTS.md 匿名纪律条款全文入镜；⑤ REVIEW_CHECKLIST
+  含主仓分支名+commit hash；⑥ 代码注释"user-ruled+日期"裁定话语 29 处
+  系统性漏网；⑦ extract_v4_log.py 含 AI 会话导出 UUID 路径。两轮加固
+  （`anonymize_mirror.py`）：排除清单扩（audit_export/REVIEW_CHECKLIST/
+  extract_v4_log）+二进制禁入保险+内容过滤器（运维条目/规则 6/断链引用行）
+  +注释裁定话语正则中性化+md hash 清理+路径/平台泛化+.gitignore 误杀修复。
+  重建后 487 文件、全词表零命中（含误伤核对：规格指针与 arXiv 引用无净
+  信息损失）。**线上匿名页仍带旧版泄漏，重推待用户（凭证在用户侧）**。
+  遗留裁定项：run 名/浮点指纹 16 文件 32 处（主仓已转 private，风险降级）、
+  第三方机构名替换（语料范例）、盘符拓扑（L/Y/W/X 盘提及）、逃逸日期
+  括注 1 处。
