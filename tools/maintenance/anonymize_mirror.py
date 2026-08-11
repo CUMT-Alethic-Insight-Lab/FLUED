@@ -77,6 +77,7 @@ REPLACEMENTS = [
     ("(launched around 13:42 on 2026-06-11)", ""),
     ("(read 2026-08-02)", ""),
     ("(2026-08-05)", ""),
+    ("(QA spot-check recommendation, 2026-08-05)", ""),
     ("built 2026-08-09", ""),
     # bare ruling words (backstop for non-parenthesized forms; fragment-joined
     # so this file's own mirror copy stays clean)
@@ -95,6 +96,35 @@ REPLACEMENTS = [
     ("E盘", "数据盘"),
     ("N 盘", "语料盘"),
     ("N盘", "语料盘"),
+    # drive-letter topology, continued: compound forms first (longest wins),
+    # then single letters. X/Y/W/Z/O are external data-source drives, L is
+    # the retired archive drive, C is the system drive.
+    ("L/Y/W/X 盘", "外挂盘"),
+    ("W/X/Y/Z", "外挂盘"),
+    ("W/X/Y 三盘", "外挂盘"),
+    ("W/X/Y 盘", "外挂盘"),
+    ("W / X 盘", "外挂盘"),
+    ("Y / Z 盘", "外挂盘"),
+    ("W/X Common Crawl", "Common Crawl"),
+    ("Y/Z", "外挂盘"),
+    ("L 盘", "旧归档盘"),
+    ("L盘", "旧归档盘"),
+    ("Y 盘", "外挂盘"),
+    ("Y盘", "外挂盘"),
+    ("W 盘", "外挂盘"),
+    ("W盘", "外挂盘"),
+    ("X 盘", "外挂盘"),
+    ("X盘", "外挂盘"),
+    ("X: 盘", "外挂盘"),
+    ("O 盘", "外挂盘"),
+    ("O盘", "外挂盘"),
+    ("Z 盘", "外挂盘"),
+    ("Z盘", "外挂盘"),
+    ("C 盘", "系统盘"),
+    ("C盘", "系统盘"),
+    ("（原 W）", ""),
+    ("X: drive", "external drive"),
+    ("Y: drive", "external drive"),
 ]
 
 # internal collaboration docs never leave the main repo
