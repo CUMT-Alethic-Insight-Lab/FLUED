@@ -80,7 +80,7 @@ Non-claims:
 | v3.3 | Byte-to-latent decision interface | Current architecture target for public documentation and future implementation. |
 | v3.4 | Parallel memory, marginal coding rate, position/AR probes, hard emit control | Corrected 20K tests favor normalized no-self historical memory; current-memory helps early but plateaus lower. 2026-07-16 attribution matrices: hard emit collapses capacity before the boundary switch; memory usage weight 0.05 is the first rate-distortion improvement. 2026-07-17 CBIU three rounds: learnable emit-action utility, not yet calibrated enough for boundary takeover. |
 | v3.5 | Staged freeze L0-L5 and offline counterfactual utility datasets (v3.4 wrap-up series) | Independent-decoder codec saturates (recon 0.993, two seeds); quantile budget annealing is the first smooth compression mechanism; class-level additive factor model (27 params) is the best L3 form but misses the AUC admission bar; 14-arm long-context memory ablation shows zero gain at 512-4096B. |
-| v3.6 | KDA state machine compresses the whole prompt into exactly 1 readout package | Component pretraining beats end-to-end (S0-takeover 0.189 vs e2e 0.131, e2e bridge dead); attribution: all gain from S0 dynamic boundaries (+4.4pp), 4x capacity alone zero, k in {1,4,16} indifferent; fair masked-infilling comparison: v3.6 0.149 ~ bottleneck HNet-DiT 0.142 with ~60x fewer transmitted scalars (1,536 vs ~97,000). Current default: `configs/canonical_v36.json`. |
+| v3.6 | KDA generation (S36): encoder produces a single gist readout per 512-byte page; cross-attention backbone queries segment states with strict causality and a residual-gated verbatim cache | Mainline S36: per-segment query + k=1 gist readout + residual-gated exact cache (criterion = direct decoding CE). Strongest single-seed engineering numbers: s36g2 (4096B, batch 4) backbone **0.8134** (highest to date); s36a (512B) backbone **0.7981**; P0 RULER needle retrieval **0.848**; v4 out-of-domain three-arm replication consistent. The 0.206 plateau root cause is a fixed single-query addressing wall (E50); storage is redundant at 512B/2048B and becomes valuable at 4096B (+1.78pp, E55). Baseline anchors: H-Net reproduction **0.653** BPB, KDA-LM **1.80**, GDN-2 **1.828**. Current default: `configs/canonical_v36.json`; trainer entrypoint `tools/train/v3_6/train_v36_s1.py`. In progress: S39 archive content-addressed remote query interface (spec §26). |
 
 See [docs/research/FLUED_RESEARCH_RETROSPECTIVE_CN.md](docs/research/FLUED_RESEARCH_RETROSPECTIVE_CN.md)
 for the full v1-v3.3 narrative; v3.4 evidence is indexed separately below.
@@ -158,77 +158,19 @@ backbone's masked-byte completion difficulty.
 
 ## FLUED v3.4 Architecture
 
-v3.4 keeps FLUED as a reversible byte-to-latent interface while moving memory
-construction off the serial critical path:
+v3.4 kept FLUED as a reversible byte-to-latent interface while moving memory
+construction off the serial critical path. It introduced parallel per-chunk
+memory summaries, marginal coding-rate boundary selection, plain byte lookup,
+and hard readout emission with real backbone compaction. The corrected 20K probe
+and the 5K structural screen established historical validation points for the
+v3-family interface, but they are not the current mainline. Details, raw logs,
+and the document reading order remain in the version-frozen v3.4 index.
 
-```mermaid
-flowchart TD
-    A["Byte IDs"] --> B["Plain Byte Lookup"]
-    B --> C["Contextual Signed Segmentor"]
-    C --> D["Hard Chunk Policy / Soft Gradient"]
-    D --> E["Chunk-local Byte States"]
-    E --> M["Parallel Per-chunk Memory Summaries"]
-    E --> F["One-shot Interpreter"]
-    M --> X["All Other Chunk Memories"]
-    X --> F
-    F --> R["1 Fallback + 15 Optional Readouts"]
-    R --> G["Hard Emit and Real Compaction"]
-    G --> H["External Latent Backbone"]
-    H --> I["Completed Readout Sequence"]
-    I --> J["Memory-free Tied Decoder"]
-    J --> K["Byte Distribution"]
-```
-
-Main principles:
-
-1. Segmentation depends on the byte sequence, not memory.
-2. Each memory summarizes only its own chunk; memory generation is parallel.
-3. The interpreter may read other chunks' memories but never the current chunk's
-   memory, preventing the direct self-copy shortcut.
-4. Readout emit controls the number of latent vectors that actually enter the
-   backbone; the fallback readout is always retained.
-5. The decoder reverses byte-to-readout translation and does not consume memory.
-
-See the [v3.4 documentation index](docs/versions/v3.4/README.md) for the full
-reading order. Current highest-priority entries:
-
-- [CBIU three-round results](docs/versions/v3.4/FLUED_V3_4_CBIU_THREE_ROUND_RESULTS_20260717_CN.md) (2026-07-17)
-- [Attribution matrices](docs/versions/v3.4/FLUED_V3_4_ATTRIBUTION_MATRICES_RESULTS_20260716_CN.md) (2026-07-16)
-- [Post-migration experiment report](docs/versions/v3.4/FLUED_V3_4_POST_MIGRATION_EXPERIMENTS_20260715_CN.md) (2026-07-15)
-
-Documents dated before 2026-07-14 describe pre-correction implementations
-(fixed Top-K boundary bypass, energy-proxy `l2`, independent decoder skeleton)
-and must be read together with the self-audit and correction reports.
-
-### v3.4 5K Structural Screen
-
-| Variant | Reconstruction | Masked completion | Actual latent / byte | Reading |
-| --- | ---: | ---: | ---: | --- |
-| Exact marginal rate, full | 0.5970 | 0.1343 | 0.7852 | Stable boundaries, early suboptimal lock-in |
-| **L2 marginal rate** | **0.7041** | **0.1477** | **0.6804** | Best candidate in this historical 5K screen |
-| Uniform boundaries | 0.9873 | 0.1485 | 0.9694 | Near-no-compression upper control |
-| Soft emit, no compaction | 0.6795 | 0.1334 | 1.0752 | Soft gates do not save backbone compute |
-
-All 17 raw logs and curve artifacts are published under
-[`results/v3.4/5k_ablation/`](results/v3.4/5k_ablation/README.md).
-
-### v3.4 Corrected 20K Memory Comparison
-
-All groups below were trained from scratch with the same 38.3M FLUED, 4.8M
-temporary backbone, seed, data, 512-byte context, 5% strict source masking, and
-20K learning-rate schedule.
-
-| Variant | Reconstruction | Masked completion | PPL | Actual latent / byte |
-| --- | ---: | ---: | ---: | ---: |
-| No memory | 0.8743 | 0.1164 | 45.05 | **0.4356** |
-| **Normalized other-only memory** | **0.9689** | **0.1380** | **35.76** | 0.5834 |
-| Other + detached current memory | 0.8544 | 0.1295 | 38.63 | 0.5288 |
-
-The 20K trajectory reverses the provisional 5K preference for a detached
-current-memory channel. Historical no-self memory becomes the best long-run
-route after a substantial 9K-12K representation reorganization. Raw logs and
-all 21 checkpoint-threshold evaluations are under
-[`results/v3.4/memory_position_20k_20260713/`](results/v3.4/memory_position_20k_20260713/README.md).
+See the [v3.4 documentation index](docs/versions/v3.4/README.md) for CBIU
+results, attribution matrices, the corrected 20K memory comparison, and the 5K
+structural screen. Documents dated before 2026-07-14 describe pre-correction
+implementations and must be read together with the self-audit and correction
+reports.
 
 ## Public Documentation Map
 

@@ -636,3 +636,9 @@ overflow 真凶是 URL 编码/base64 类**无语言边界的高熵字节流**（
   存照）。矩阵定形：**S39-A（形态 3：删 interpreter+summarizer 直产逐段
   低秩键+池化 gist）vs S39-B（interpreter 保留对照）= R1 补考对**，机制
   对照层挂主臂；干扰项增强（含 D=64 档）升级为训练任务（用户裁定）。
+- 2026-08-11：**v5 语料清洗收官 + verify 全过**——128.611 GiB /
+  37,575,172 条新增唯一条目（fineweb 87.8G + fineweb_edu_2024 25.4G +
+  fineweb_edu_2025 15.4G，总耗时 44.98h，断点续跑正常退出）；
+  `verify_corpus_v5.py`：37.58M 条全检——零 v4 基线重叠、零内容哈希错配、
+  零分隔符/布局/manifest 错配、零缺片，passed=true。codeparrot 代码源
+  （~280G，X: 盘）待挂载后启用并增量续跑（管线幂等）。
