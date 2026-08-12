@@ -41,21 +41,21 @@ Current defensible claims:
    still behind the BPE baselines on bits-per-byte.
 4. v3.2.1 strict masked-source training is the first FLUED v3-family result that
    clearly makes a small latent backbone outperform a byte baseline.
-5. v3.4 implements parallel per-chunk memory, marginal coding-rate boundary
-   selection, plain byte lookup (structured lookup lost the corrected 20K
-   same-budget comparison), and hard readout emission with real backbone
-   compaction.
+5. v3.4 (historical wrap-up line, see `docs/versions/v3.4/`) implemented
+   parallel per-chunk memory, marginal coding-rate boundary selection, plain
+   byte lookup (structured lookup lost the corrected 20K same-budget
+   comparison), and hard readout emission with real backbone compaction.
 6. In a corrected 38M / 20K single-seed probe, normalized historical
-   other-chunk memory reaches `96.89%` reconstruction and `35.76` masked-byte
-   completion perplexity at `0.58` actual latent/byte. In the fixed-mask
-   threshold scan, it also outperforms no-memory at the matched `0.58-0.59`
-   latent/byte point. This is not a scaling claim.
-7. CBIU (counterfactual byte-interface utility) shows a learnable but weak
-   emit-action value signal: the MLP-64 controller reaches `AUC=0.584`,
+   other-chunk memory reached `96.89%` reconstruction and `35.76` masked-byte
+   completion perplexity at `0.58` actual latent/byte. This is a historical
+   v3.4 result; the memory line was later closed (E7/E13, no measurable gain
+   across 512–4096B).
+7. CBIU (historical v3.4 emit-utility line) showed a learnable but weak
+   emit-action value signal: the MLP-64 controller reached `AUC=0.584`,
    `Spearman=0.240`, `ECE=0.149` with about 40% fewer actual latents than the
-   legacy target. It does not yet pass the boundary-takeover admission bar.
+   legacy target. It did not pass the boundary-takeover admission bar.
    The shared approximate-inverse decoder remains the largest blocker: at a
-   matched `0.20` latent/byte budget it reaches `21.00%` reconstruction /
+   matched `0.20` latent/byte budget it reached `21.00%` reconstruction /
    `43.37` PPL versus `40.92%` / `30.83` for an independent decoder.
 
 Non-claims:
@@ -63,8 +63,9 @@ Non-claims:
 1. FLUED does not currently beat BPE as a production tokenizer replacement.
 2. FLUED does not currently beat BLT, H-Net, ByteFlow, Bolmo, or other recent
    tokenizer-free systems.
-3. The current-memory/self-memory branch is not the default. The supported
-   v3.4 route reads only normalized summaries of other chunks.
+3. The current-memory/self-memory branch is closed. Historical v3.4 read only
+   normalized summaries of other chunks; the memory line was later closed
+   (E7/E13).
 4. The historical v1 BPB signal should not be treated as reproduced under the
    current fair 2048-original-byte / 100K downstream protocol.
 
@@ -191,15 +192,18 @@ reports.
 flued/model.py                         FLUED v2 model
 flued/v33/                             v3.3 byte-to-latent interface prototype
 flued/v34/                             v3.4 rate/emit and parallel-memory extension
+flued/v36/                             v3.6 KDA-generation current mainline
 flued/e1_stage_a.py                    v2 denoising reconstruction trainer
 flued/e3_train.py                      downstream language-model training
 flued/e3_downstream.py                 FLUED/BPE/BLT downstream wrappers
-tools/*/v3_0...v3_4/                   versioned experiment utilities
-tools/train/v3_4/                      current v3.4 training entrypoint
+tools/*/v3_0...v3_6/                   versioned experiment utilities
+tools/train/v3_6/                      current v3.6 training entrypoint
+configs/canonical_v36.json             current canonical default
 configs/v3_3/, configs/v3_4/           versioned experiment matrices
 docs/versions/                         version-frozen design and result records
-results/v3.4/5k_ablation/              public raw logs and curve artifacts
-results/v3.4/memory_position_20k_20260713/ corrected P3/P4 logs and threshold trajectories
+results/v3.4/5k_ablation/              v3.4 public raw logs and curve artifacts
+results/v3.4/memory_position_20k_20260713/ v3.4 corrected P3/P4 logs and threshold trajectories
+results/v3.6/rd_frontier_20260802/     v3.6 RD frontier public artifacts
 ```
 
 ## Quick Start
@@ -212,17 +216,27 @@ pip install tokenizers numpy tqdm
 python -m flued.e1_stage_a --preset smoke_cpu
 ```
 
-Run a v3.4 short smoke test:
+Run the current v3.6 canonical smoke test:
 
 ```bash
-python tools/train/v3_4/train_v34_pos_ar_probe.py \
-  --config configs/v3_4/v34_rate_emit_40m_probe.json \
+python tools/train/v3_6/train_v36_s1.py \
+  --config configs/canonical_v36.json \
   --data-path /path/to/corpus.txt \
-  --out-dir outputs/v34_smoke \
+  --out-dir outputs/v36_smoke \
   --device cpu --max-steps 2
 ```
 
-Run the current 38M / 20K recommended v3.4 route:
+Run the current v3.6 20K route:
+
+```bash
+python tools/train/v3_6/train_v36_s1.py \
+  --config configs/canonical_v36.json \
+  --data-path /path/to/corpus.txt \
+  --out-dir outputs/v36_default
+```
+
+The v3.4 historical route (single-seed 38M / 20K probe, see
+`docs/versions/v3.4/`):
 
 ```bash
 python tools/train/v3_4/train_v34_pos_ar_probe.py \
@@ -231,11 +245,7 @@ python tools/train/v3_4/train_v34_pos_ar_probe.py \
   --out-dir outputs/v34_default_38m_20k
 ```
 
-The direct configuration is intentionally explicit. Bare command-line defaults
-remain backward-compatible with historical checkpoints and are not the current
-recommended experiment.
-
-Run the v3.4 matrix on GPU:
+Run the v3.4 matrix on GPU (historical ablation line):
 
 ```bash
 python tools/launcher/v3_4/run_v34_pos_ar_matrix.py \
@@ -244,7 +254,7 @@ python tools/launcher/v3_4/run_v34_pos_ar_matrix.py \
   --batch-size 8
 ```
 
-Rebuild the public curve summary:
+Rebuild the v3.4 public curve summary:
 
 ```bash
 python tools/analysis/v3_4/analyze_v34_5k_curves.py \
@@ -277,9 +287,8 @@ python -m flued.e1_stage_a \
    FLUED probe rather than the planned 300M / 4096-byte scale.
 4. L2 marginal rate and hard emit reorganize substantially between 9K and 12K;
    semantic boundary quality is not established by long-context downstream tasks.
-5. Historical no-self memory improves the current paired probe, but the result
-   has not yet been confirmed across seeds, data domains, context lengths, or
-   larger backbones. Raw memory norms also continue to grow before normalization.
+5. The memory line is closed (E7/E13): no measurable gain across 512–4096B,
+   with the gate learning to shut itself off and an 11–26% throughput tax.
 6. The current public claim is a traceable research process and executable
    architecture, not benchmark dominance.
 

@@ -32,6 +32,17 @@ Mask modes (--mask-mode):
 
 Protocol: from-scratch ablation (only S0 four prefixes loaded), same
 data/seed/eval as canonical.
+
+Strict codec-retention arm (``--codec-final-state``, user-ruled 2026-08-11,
+prereg FLUED_TODO_20260805 §0.3 item 0): the three standard tasks never
+required the KDA state machine to RETAIN past chunks (direct reads the fresh
+S_i, completion restores chunk i from row i, predict is one-step detached), so
+the retention training signal is exactly zero. This arm welds every bypass
+shut: direct and completion both decode from ONE read of the final state
+S_final (``KDAStateMachine.read_all_final``), the backbone is excluded from
+the loss path, and the predict task is disabled (weight 0, not computed).
+Eval adds an n-scan {1,4,8,last}: n uniformly subsampled query rows serve the
+whole window (/n paging geometry), reporting full-window byte-restore acc.
 """
 
 from __future__ import annotations
@@ -187,21 +198,40 @@ def _prev_ids(tgts: torch.Tensor) -> torch.Tensor:
 
 
 def s1_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None) -> dict:
+    codec_final = getattr(args, "codec_final_state", False)
     byte_states, confidence, valid, _ = model._encode(source)
     hard_cut, utf8_cont, cut_overflow = model._cuts(source, confidence, valid)
     chunks = model.chunk_builder(byte_states, valid, hard_cut, confidence)
     chunks = model.bridge(chunks, byte_states, confidence, valid, utf8_cont)
     memory = model.summarizer(chunks.span_embeddings, chunks.token_mask)
     gates = model.write_head(memory)
-    package, state_norm = model.state_machine(gates, chunks.chunk_mask)
-    if not model.config.per_chunk_readout:
-        raise ValueError("S1.0 requires per_chunk_readout=True")
-    content = package.mean(dim=2)  # (B, C, d_pack) — readout of S_i per chunk
+    if codec_final:
+        # Strict codec-retention arm (user-ruled 2026-08-11): ONE read of the
+        # final state S_final serves every chunk row of the window -- the
+        # fresh per-chunk reads of S_i are welded shut, so the codec losses
+        # train retention directly. Per-chunk rows differ only through the
+        # position embedding added below (the "/n query row" identity).
+        package_final, state_norm = model.state_machine.read_all_final(gates, chunks.chunk_mask)
+        n_chunks = chunks.chunk_mask.size(1)
+        content = package_final.mean(dim=1).unsqueeze(1).expand(-1, n_chunks, -1)  # (B, C, d_pack)
+    else:
+        package, state_norm = model.state_machine(gates, chunks.chunk_mask)
+        if not model.config.per_chunk_readout:
+            raise ValueError("S1.0 requires per_chunk_readout=True")
+        content = package.mean(dim=2)  # (B, C, d_pack) — readout of S_i per chunk
     n_chunks = chunks.chunk_mask.size(1)
     pos = model.chunk_pos.weight.unsqueeze(0)[:, :n_chunks]
     cond_direct = model.decoder_in(content) + pos
     logits_direct = None
-    if getattr(model.config, "backbone_mode", "attn") == "paged_xattn":
+    if codec_final:
+        # Backbone excluded from the loss path: the xattn backbone reads
+        # pre-state memory (a state-machine bypass), and this arm exists to
+        # examine the state machine itself. Completion decodes from the SAME
+        # final-state conditioning as direct -- two target views (as-encoded
+        # vs clean) of one codec head. Predict is disabled in step_model.
+        cond_backbone = cond_direct
+        backbone_out = content  # metrics plumbing only
+    elif getattr(model.config, "backbone_mode", "attn") == "paged_xattn":
         # S37 (spec SS24, user-proposed): page gists + per-page residual cache
         # rows; entry-level causal attention; each chunk is conditioned on its
         # page's output row (one-shot entry backbone, no iterative loop).
@@ -348,7 +378,12 @@ def s1_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None) ->
         cond_backbone = backbone_out + pos
     if logits_direct is None:
         logits_direct = model.decoder(cond_direct, chunks.token_mask)
-    logits_backbone = model.decoder(cond_backbone, chunks.token_mask)
+    if codec_final:
+        # one conditioning, one decode: direct and completion share the logits
+        # tensor and differ only in targets (encoded vs clean) downstream
+        logits_backbone = logits_direct
+    else:
+        logits_backbone = model.decoder(cond_backbone, chunks.token_mask)
     logits_backbone_mid = None
     if (
         getattr(model.config, "backbone_mode", "") == "draft"
@@ -454,7 +489,15 @@ def step_model(model, batch, args, device, train: bool):
             out["logits_backbone_mid"], targets, slot_mask
         )
 
-    if getattr(args, "backbone_mode", "") == "paged_xattn":
+    codec_final = getattr(args, "codec_final_state", False)
+    if codec_final:
+        # Predict task OFF in this arm (user-ruled 2026-08-11): it carries no
+        # retention signal and would only muddy the variable set. Not computed
+        # at all; zero metrics keep the log schema aligned with other arms.
+        se = torch.zeros((), device=device)
+        predict_cos = torch.zeros((), device=device)
+        pair_mask = chunks.chunk_mask.new_ones((1,))  # placeholder, unused
+    elif getattr(args, "backbone_mode", "") == "paged_xattn":
         # S37 page-level latent predict: the penultimate page's output row
         # predicts the last chunk's latent (chunk-level autoregression at
         # page granularity; the page row causally covers chunks < last)
@@ -516,7 +559,9 @@ def step_model(model, batch, args, device, train: bool):
     predict_mode = getattr(args, "predict_mode", "latent")
     predict_ce = torch.zeros((), device=device)
     predict_byte_acc = torch.zeros((), device=device)
-    if predict_mode == "decode":
+    if codec_final:
+        predict_loss = torch.zeros((), device=device)
+    elif predict_mode == "decode":
         # frozen-decoder supervision, v2.1: the predict branch consumes
         # content.detach() -- predict CE trains the BACKBONE ONLY. s13 (E31)
         # showed that letting this gradient reach the encoder/KDA side collapses
@@ -564,6 +609,30 @@ def step_model(model, batch, args, device, train: bool):
         "boundary_confidence_mean": out["boundary_confidence_mean"].detach(),
         "think_steps": torch.tensor(out["think_steps"], device=loss.device),
     }
+    if codec_final and not train:
+        # Eval n-scan (user-ruled 2026-08-11): subsample n of the C per-chunk
+        # query rows uniformly (/n paging geometry, paged_boundaries) and serve
+        # the WHOLE window from the kept rows -- a served chunk eats its
+        # covering anchor row's full conditioning (shared final-state readout
+        # + the ANCHOR's position embedding), so n measures how many
+        # position-anchored query rows the window needs. n=last reproduces the
+        # training form exactly (sanity anchor: equals backbone_acc).
+        with torch.no_grad():
+            c_max = int(chunks.chunk_mask.long().sum(dim=1).max().item())
+            pos_c = model.chunk_pos.weight.unsqueeze(0)[:, : chunks.chunk_mask.size(1)]
+            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=args.amp and device.type == "cuda"):
+                row_cond = model.decoder_in(out["content"]) + pos_c  # == cond_direct
+                for tag, n in (("n1", 1), ("n4", 4), ("n8", 8), ("nlast", c_max)):
+                    n_eff = min(n, max(c_max, 1))
+                    boundary, serve = paged_boundaries(chunks.chunk_mask, n_eff)
+                    anchors = row_cond.gather(
+                        1, boundary.unsqueeze(-1).expand(-1, -1, row_cond.size(-1))
+                    )
+                    cond_n = anchors.gather(
+                        1, serve.unsqueeze(-1).expand(-1, -1, row_cond.size(-1))
+                    )
+                    logits_n = model.decoder(cond_n, chunks.token_mask)
+                    metrics[f"final_scan_acc_{tag}"] = _acc_tensor(logits_n.argmax(dim=-1), targets, slot_mask)
     return loss, metrics
 
 
@@ -589,13 +658,9 @@ def evaluate(model, eval_loader, args, device):
     return merged
 
 
-def main() -> None:
-    from tools.train.v3_6.train_v36 import build_parser
-
-    pre = argparse.ArgumentParser(add_help=False)
-    pre.add_argument("--config", default="")
-    pre_args, _ = pre.parse_known_args()
-    parser = build_parser()
+def _add_s1_args(parser: argparse.ArgumentParser) -> None:
+    """S1.0-specific CLI args on top of train_v36.build_parser (kept separate
+    so the canonical-sync guard sees the base defaults untouched)."""
     parser.add_argument("--predict-weight", type=float, default=1.0)
     parser.add_argument("--predict-mode", choices=["latent", "decode"], default="latent")
     parser.add_argument("--predict-latent-weight", type=float, default=0.1)
@@ -607,6 +672,27 @@ def main() -> None:
         type=str,
         default="checkpoints/bpe_tokenizer_128k_v4/tokenizer.json",
     )
+    parser.add_argument(
+        "--codec-final-state",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="strict codec-retention arm (user-ruled 2026-08-11): every chunk "
+        "row decodes from ONE read of the final KDA state S_final (no fresh "
+        "per-chunk S_i reads); the backbone is excluded from the loss path; "
+        "the predict task is disabled (weight forced 0, not computed); eval "
+        "adds an n-scan {1,4,8,last} of subsampled query rows serving the "
+        "whole window. Default off -- canonical runs are unaffected.",
+    )
+
+
+def main() -> None:
+    from tools.train.v3_6.train_v36 import build_parser
+
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config", default="")
+    pre_args, _ = pre.parse_known_args()
+    parser = build_parser()
+    _add_s1_args(parser)
     if pre_args.config:
         parser.set_defaults(**json.loads(Path(pre_args.config).read_text(encoding="utf-8")))
     args = parser.parse_args()
@@ -621,6 +707,20 @@ def main() -> None:
         raise SystemExit(
             "--backbone-mode draft supports --predict-mode latent only "
             "(decode CE is the E34-poisoned loss form)"
+        )
+    if args.codec_final_state:
+        if not getattr(args, "state_channel", True):
+            raise SystemExit("--codec-final-state requires --state-channel (this arm trains the state channel itself)")
+        # predict is orthogonal to retention and stays OFF in this arm:
+        # force the weight to 0 (it is never computed in step_model) and say
+        # so in the log, per the preregistration.
+        if args.predict_weight != 0:
+            print("[s1] codec-final-state: predict task disabled (weight forced 0, not computed)", flush=True)
+            args.predict_weight = 0.0
+        print(
+            "[s1] codec-final-state arm: direct+completion decode from ONE S_final "
+            "readout (no fresh S_i reads); backbone excluded from the loss path",
+            flush=True,
         )
     if args.mask_mode == "mixed":
         _load_bpe_tokenizer(args.bpe_tokenizer_path)
@@ -655,6 +755,14 @@ def main() -> None:
                 param.requires_grad_(False)
                 n += 1
         print(f"[s1] frozen params={n} prefixes={frozen}", flush=True)
+    if args.codec_final_state:
+        # the backbone never enters the loss path in this arm -- freeze it so
+        # the optimizer state and any stray decay stay out of the variable set
+        n_bb = 0
+        for param in model.backbone.parameters():
+            param.requires_grad_(False)
+            n_bb += 1
+        print(f"[s1] codec-final-state: backbone frozen (params={n_bb})", flush=True)
     trainable = [p for p in model.parameters() if p.requires_grad]
     opt = build_optimizer(args, iter(trainable))
     sched = _cosine_with_warmup(opt, args.warmup_steps, args.max_steps)

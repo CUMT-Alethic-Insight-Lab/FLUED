@@ -4,7 +4,7 @@
 
 | 文件 | 对应实现 | 内容 |
 | --- | --- | --- |
-| [`canonical_v36.json`](canonical_v36.json) | `flued/v36` + `tools/train/v3_6/` | **v3.6 线当前默认起点**（v36.1-20260731）：S0 预训接管、动态边界、4× KDA 状态、k=1 readout 包 |
+| [`canonical_v36.json`](canonical_v36.json) | `flued/v36` + `tools/train/v3_6/` | **v3.6 线当前默认起点**（v36.7-20260806）：S0″ 双源教师预训 byte embedder+segmentor 冻结接管、DiT summarizer、逐段条件化读出、动态边界、4× KDA 状态、S1.0 三任务、预测默认回 latent、fla chunk_kda 核、k=1 主干读出 + 残差门控精确缓存（S36） |
 | [`canonical_v35.json`](canonical_v35.json) | `flued/v34` + `tools/train/v3_4/` | v3.4 收尾系列旧口径（v35.1-20260717），保留有效 |
 
 ## 版本实验矩阵（可复现实验记录，非默认起点）

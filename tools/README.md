@@ -5,8 +5,10 @@
 ```text
 tools/
   analysis/       日志汇总、曲线、机制审计
+  baselines/      BPE/BLT/H-Net 等基线训练与评估
   eval/           ROI、边界、memory、严格补全评估
   launcher/       PowerShell/Python 实验矩阵入口
+  maintenance/    归档迁移、匿名镜像同步等维护脚本
   train/          正式训练入口
   data/           语料构建
   debug/          v1/v2 与基线诊断
@@ -18,7 +20,8 @@ tools/
 当前主线入口（v3.6）：
 
 ```text
-tools/train/v3_6/train_v36.py            # 主训练器，--config 吃 configs/canonical_v36.json
+tools/train/v3_6/train_v36_s1.py         # 当前 canonical 训练器，--config 吃 configs/canonical_v36.json
+tools/train/v3_6/train_v36.py            # 早期训练器（v36.0 形态，历史兼容）
 tools/train/v3_6/train_s0_segmentor.py   # S0 segmentor 预训
 tools/analysis/v3_6/build_s0_teacher_dataset.py  # S0 教师标注数据生产
 ```

@@ -1,5 +1,7 @@
 # FLUED v3.4 第一轮最小归因结果
 
+> 【状态：历史首轮结果】本文结论以 `FLUED_V3_4_ATTRIBUTION_MATRICES_RESULTS_20260716_CN.md` 与 `docs/CURRENT_STATE.md` 为准。
+
 日期：2026-07-15
 
 ## 1. 实验范围

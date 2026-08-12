@@ -1,5 +1,7 @@
 # FLUED v3.4 修正版实验矩阵
 
+> 【状态：历史操作矩阵】本文结论以 `FLUED_V3_4_POST_MIGRATION_EXPERIMENTS_20260715_CN.md` 与 `docs/CURRENT_STATE.md` 为准。
+
 日期：2026-07-14
 
 ## 0. 当前暂停点（硬盘迁移前）

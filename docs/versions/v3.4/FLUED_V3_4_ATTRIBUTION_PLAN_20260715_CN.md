@@ -1,5 +1,7 @@
 # FLUED v3.4 扩模前最小归因计划
 
+> 【状态：历史决策计划】本文结论以 `FLUED_V3_4_POST_MIGRATION_EXPERIMENTS_20260715_CN.md` 与 `docs/CURRENT_STATE.md` 为准。
+
 日期：2026-07-15
 
 ## 1. 目的

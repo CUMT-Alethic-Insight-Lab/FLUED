@@ -383,6 +383,51 @@ class KDAStateMachine(nn.Module):
             read = torch.stack(reads, dim=1).reshape(bsz, chunks, heads * v.size(-1))
         return self.supp_out(read.to(k.dtype))
 
+    def read_all_final(
+        self, gates: dict[str, torch.Tensor], chunk_mask: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Strict codec-retention arm (user-ruled 2026-08-11, prereg
+        FLUED_TODO_20260805 §0.3 item 0): scan the recurrence all the way to
+        the FINAL state S_final and read it with the SAME query construction
+        as the normal per-chunk path (readout_query -> realign). Every chunk
+        row of the window is then served from this single final readout, so
+        the fresh per-chunk reads of S_i never enter the loss path and
+        retention becomes a trained objective instead of an untested freebie.
+        Correctness invariant: for each sample the last valid chunk's normal
+        readout already reads S_last == S_final (padded chunks are identity
+        steps), so this package must equal the normal per-chunk package at the
+        last valid row -- unit-tested at 1e-5. Always uses the serial torch
+        scan in fp32: grad-safe under autocast, and independent of whether the
+        fla kernel wires a gradient path through its final_state output.
+        Returns (package_final, state_norm) with package_final (B, nq, d_pack)
+        -- no chunk dim, by construction there is exactly one readout per
+        sample."""
+        if not self.c.state_channel:
+            raise ValueError("read_all_final requires state_channel=True (this arm trains the state channel itself)")
+        k, v, beta = gates["k"], gates["v"], gates["beta"]
+        keep = chunk_mask.unsqueeze(-1).unsqueeze(-1).to(k.dtype)
+        k = k * keep
+        v = v * keep
+        bsz, chunks, heads, dk = k.shape
+        dv = v.size(-1)
+        state = k.new_zeros(bsz, heads, dk, dv, dtype=torch.float32)
+        kf, vf = k.float(), v.float()
+        beta = beta.float() * chunk_mask.float().unsqueeze(-1)
+        alpha = gates["alpha"][0].unsqueeze(0).unsqueeze(-1)
+        mask5 = chunk_mask.float().view(bsz, chunks, 1, 1, 1)
+        alpha_eff = 1.0 - mask5 + mask5 * alpha
+        for i in range(chunks):
+            ki, vi, bi, ai = kf[:, i], vf[:, i], beta[:, i], alpha_eff[:, i]
+            state = ai * state
+            kTs = torch.einsum("bhk,bhkv->bhv", ki, state)
+            state = state - bi.view(bsz, heads, 1, 1) * ki.unsqueeze(-1) * kTs.unsqueeze(-2)
+            state = state + bi.view(bsz, heads, 1, 1) * ki.unsqueeze(-1) * vi.unsqueeze(-2)
+        q = self.readout_query.float()
+        read = torch.einsum("qhk,bhkv->bqhv", q, state)
+        read = read.reshape(bsz, q.size(0), heads * dv).to(k.dtype)
+        package = self.realign(read)
+        return package, state.norm(dim=(-2, -1)).mean()
+
     def forward(self, gates: dict[str, torch.Tensor], chunk_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if not self.c.state_channel:
             # R1 relative baseline: bypass the recurrence entirely -- readout
