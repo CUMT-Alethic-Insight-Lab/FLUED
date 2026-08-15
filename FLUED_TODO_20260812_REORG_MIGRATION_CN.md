@@ -16,13 +16,13 @@
 ### A.1 结构层动作（本方案核心）
 
 1. **根目录内部文档归置 → `docs/internal/`**：FLUED_HANDOFF_20260717_CN.md、
-   FLUED_HANDOFF_20260802_CN.md、FLUED_TODO_20260805_CN.md、
-   FLUED_TODO_20260811_DOCMAINT_PROMPTS_CN.md、FLUED_TODO_20260811_DOCMAINT_PKG2_CN.md、
-   session-ses_090d.md、本文件。
+   FLUED_TODO_20260805_CN.md、本文件。（2026-08-12 用户裁定已删：
+   FLUED_HANDOFF_20260802_CN.md、session-ses_090d.md、两个已执行的维护
+   任务包 DOCMAINT_PROMPTS/DOCMAINT_PKG2——四件已从 git 移除，历史可查。）
    - 镜像安全：排除模式按路径子串匹配（FLUED_TODO/FLUED_HANDOFF/session-），
      移入子目录不影响排除。
    - 引用更新：grep 全仓逐个改（CURRENT_STATE/TODO/规格/AGENTS.md 里的文件名引用）。
-   - 分两批降风险：先历史件（HANDOFF×2 + session 导出），后活文件（TODO 族）。
+   - 分两批降风险：先历史件（HANDOFF_20260717），后活文件（TODO 族）。
 2. **outputs/ 悬空引用修复**：`outputs/s05_k25_qa_spotcheck_20260802.md` 与
    `outputs/s05_pro_qa_spotcheck_20260805.md`（+样本包）迁入
    `docs/research/evidence/s05_qa/`，CURRENT_STATE 引用改路径——证据可追溯原则
