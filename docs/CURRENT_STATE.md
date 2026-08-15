@@ -694,6 +694,18 @@ overflow 真凶是 URL 编码/base64 类**无语言边界的高熵字节流**（
   转"定义问题的鼻祖"视角（2026-08-03 已有论文占 ~1/3 核心 claim 但不体系化），
   §26 形态按 fork 争执最终口径修订。最终形态确定后正式切 v4 版本号。文档重组
   与数据迁移方案见 `FLUED_TODO_20260812_REORG_MIGRATION_CN.md`。
+- 2026-08-12：**迁移方案执行启动**——① corpus_v3 已迁 P:（双侧 sha256
+  一致，E: 源文件待用户确认后删）；② **codeparrot 流式管线建成并启动**
+  （`tools/data/download_codeparrot_stream.py`：6 下载+3 清洗 worker，
+  F: 缓冲→P: 产出独立库 `FLUED_corpus_codeparrot`，去重对 v4+v5 双参考库，
+  F: 余量 <50GiB 守卫删已清洗原料，断点续跑幂等；输出上限按全量预期提至
+  150 GiB——偏离 v5 合同 75 GiB 口径，登记在案）；③ **存档迁移执行器
+  启动**（outputs/migrate_archive_20260812.py）：N: 已空（931G 可用，
+  fineweb 已被用户迁走），MOVE-N 75 项 621.9G + DEL-E 重复副本清理 50 项
+  65.2G，全程逐文件 sha256 校验后删源；20 项子集归档转 MOVE-N 保
+  milestone（陷阱 1），v3_full_model_5080 双份互不包含全保留，KEEP-L
+  canonical init 原地不动。完工后待办：v34_cbiu_round1_emit_5k.json 的
+  L: 断链修复、AGENTS.md"L: 只读"条款更新、提醒用户换盘。
 - 2026-08-11：**保持臂宽度格封尾——"架构本性"判词封口**：V×2
   （kda_head_v 512）终态还原 0.2014 ≈ 现配 0.2033（噪声带内），n 扫描
   同平、0 NaN——双宽度一致落 0.20 档，"宽度不够"活口封死。E44"保持力

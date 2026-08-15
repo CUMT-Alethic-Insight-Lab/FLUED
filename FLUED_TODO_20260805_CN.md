@@ -179,7 +179,7 @@ v5/英文域行为健康（段数 79-88、段长 p90 41-46B、无超长不切段
 ## 3. 环境速查
 
 - 训练：`C:\Users\74090\Miniconda3\envs\soulvlm\python.exe`（直接调，勿 conda run）；测试/绘图：`py -3.14`；内核：`kda-kernels` 环境（需 PYTHONUTF8=1）。
-- 语料：v3 `E:\projects\SoulMamba\soulvlm_project\temp\corpus_v3.txt`；v4 `P:\FLUED_corpus\FLUED_corpus_v4\shards\`（57 shards, 230G）。
+- 语料：v3 `P:\FLUED_corpus\corpus_v3\corpus_v3.txt`（2026-08-12 由 E: 迁入，双侧 sha256 一致）；v4 `P:\FLUED_corpus\FLUED_corpus_v4\shards\`（57 shards, 230G）。
 - Moonshot token：`C:\Users\74090\.moonshot_api_key`（勿进仓库）。
 - 训练纪律：OMP/MKL=4；分配器红线 15.9/16.3GB；启动前查重进程。
 - **归档盘（2026-08-06 用户裁定）**：新归档 → `K:\FLUED_archive\`（含 SHA256SUMS）；L 盘存量只读不迁移，历史 L: 引用保持有效。
