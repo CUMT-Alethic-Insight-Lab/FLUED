@@ -12,7 +12,7 @@ compressed.
 Chinese architecture note:
 
 ```text
-Read `docs/versions/v3.1/docs\versions\v3.1\FLUED_V3_1_ARCHITECTURE_CN.md` for the current Chinese explanation of
+Read `./FLUED_V3_1_ARCHITECTURE_CN.md` for the current Chinese explanation of
 the v3.1 architecture, the corrected codec/backbone role split, and the open
 design details that are not yet finalized.
 

@@ -6,17 +6,17 @@ This document preserves the recent design turn after the v3 active-memory
 experiments, DSpark / ELF / DiffusionGemma review, and the discussion about why
 plain reconstruction / coding-rate objectives are insufficient.
 
-It is intentionally separate from `docs/versions/v3.0/docs\versions\v3.0\FLUED_V3_CONTROL.md` so that future context
+It is intentionally separate from `../v3.0/FLUED_V3_CONTROL.md` so that future context
 compression does not erase the current reasoning state.
 
 Current handoff note:
 
 ```text
-Read `docs/versions/v3.1/docs\versions\v3.1\FLUED_V3_1_REVIEW_AND_NEXT_STEPS.md` first after any context compression.
+Read `./FLUED_V3_1_REVIEW_AND_NEXT_STEPS.md` first after any context compression.
 It summarizes the 2M / seq128 evidence, four-agent review, corrected failure
 interpretation, and the next diagnostics that should precede any larger run.
 
-Then read `docs/versions/v3.1/docs\versions\v3.1\FLUED_V3_1_ARCHITECTURE_CN.md` for the current Chinese architecture
+Then read `./FLUED_V3_1_ARCHITECTURE_CN.md` for the current Chinese architecture
 explanation and the corrected FLUED codec / backbone / memory role split.
 
 The corrected role split is:

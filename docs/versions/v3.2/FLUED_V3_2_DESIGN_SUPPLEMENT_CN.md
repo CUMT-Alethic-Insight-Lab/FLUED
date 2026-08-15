@@ -7,7 +7,7 @@
 执行目标、迁移路径和验收标准见：
 
 ```text
-docs/versions/v3.2/docs\versions\v3.2\FLUED_V3_2_EXECUTION_GOALS_CN.md
+./FLUED_V3_2_EXECUTION_GOALS_CN.md
 ```
 
 核心目标不变：

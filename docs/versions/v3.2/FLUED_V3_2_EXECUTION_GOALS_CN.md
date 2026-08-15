@@ -7,8 +7,8 @@
 先读顺序：
 
 ```text
-1. docs/versions/v3.1/docs\versions\v3.1\FLUED_V3_1_ARCHITECTURE_CN.md
-2. docs/versions/v3.2/docs\versions\v3.2\FLUED_V3_2_DESIGN_SUPPLEMENT_CN.md
+1. ../v3.1/FLUED_V3_1_ARCHITECTURE_CN.md
+2. ./FLUED_V3_2_DESIGN_SUPPLEMENT_CN.md
 3. 本文
 ```
 
@@ -19,9 +19,9 @@
 新执行者在只读取以下三份文档后，必须能恢复 v3.2 的执行状态：
 
 ```text
-docs/versions/v3.1/docs\versions\v3.1\FLUED_V3_1_ARCHITECTURE_CN.md
-docs/versions/v3.2/docs\versions\v3.2\FLUED_V3_2_DESIGN_SUPPLEMENT_CN.md
-docs/versions/v3.2/docs\versions\v3.2\FLUED_V3_2_EXECUTION_GOALS_CN.md
+../v3.1/FLUED_V3_1_ARCHITECTURE_CN.md
+./FLUED_V3_2_DESIGN_SUPPLEMENT_CN.md
+./FLUED_V3_2_EXECUTION_GOALS_CN.md
 ```
 
 恢复后必须能独立说清：
@@ -471,7 +471,7 @@ overflow 只在实体/变量/专名密集样本明显改善，
 行动：
 
 ```text
-1. 完成 docs/versions/v3.2/docs\versions\v3.2\FLUED_V3_2_DESIGN_SUPPLEMENT_CN.md。
+1. 完成 ./FLUED_V3_2_DESIGN_SUPPLEMENT_CN.md。
 2. 完成本文。
 3. 在 README 或 v3.1 review 中链接本文。
 ```
