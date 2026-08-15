@@ -74,6 +74,7 @@ Full project status: [README.md](README.md) · Versioned documentation: [docs/RE
 - **E1 presets**: `smoke_cpu`, `small_gpu`, `class300m_16gb` — defined in `flued/e1_stage_a.py`
 - **skip_hard**: Always pass `skip_hard=True` during training/eval. Hard segmentation is for logging only.
 - **归档盘（2026-08-06 起）**：新归档落 `K:\FLUED_archive\<run_name>`（含 SHA256SUMS）；存量 `L:\FLUED_archive` 只读、不迁移，历史文档中的 L: 路径保持有效（含 canonical 的 `init_checkpoint`）。
+- **存储布局（2026-08-12 用户裁定）**：代码/文档在 E: 核心区；语料在 P:（v3 由 E: 迁入、v4 原在 P:）；存档点由用户提供的两块盘单独备份；W: 内容已验证全量在 N:（fineweb 三源 265 parquet，哈希校验真失败 0）→ 格式化后承接 v3.4 及以前的存档点；X: 源盘缺席且无撤离副本，codeparrot 需用户提供盘后重新下载。
 
 ## 协作协议（2026-08-06 与用户共同制定）
 
