@@ -47,6 +47,7 @@ import os
 import queue
 import shutil
 import sqlite3
+import subprocess
 import sys
 import threading
 import time
@@ -444,6 +445,43 @@ def download_one(args: argparse.Namespace, client, name: str, size: int, worker:
     return True
 
 
+def download_one_curl(args: argparse.Namespace, name: str, size: int, worker: str) -> bool:
+    """curl-subprocess variant of download_one.
+
+    Fallback for networks where Python's TLS handshake is cut by a middlebox
+    but curl's client fingerprint passes (observed 2026-08-16 on hf-mirror).
+    Resume is handled by ``curl -C -`` against the ``.part`` file.
+    """
+
+    url = f"{args.hf_endpoint}/datasets/{args.repo_id}/resolve/main/data/{name}"
+    final_path = args.buffer_dir / name
+    part_path = args.buffer_dir / (name + ".part")
+    if part_path.exists() and part_path.stat().st_size >= size:
+        part_path.unlink()
+    started = time.time()
+    cmd = [
+        "curl", "--fail", "-L", "-sS",
+        "--connect-timeout", "30",
+        "--speed-time", "120", "--speed-limit", "10240",
+        "--retry", "3", "--retry-delay", "5", "--retry-all-errors",
+        "-C", "-", "-o", str(part_path), url,
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        if proc.returncode == 33:  # server ignored the range; restart clean
+            part_path.unlink(missing_ok=True)
+        raise IOError(f"curl rc={proc.returncode}: {proc.stderr.strip()[:200]}")
+    if part_path.stat().st_size != size:
+        raise IOError(f"size mismatch: got {part_path.stat().st_size}, expected {size}")
+    part_path.replace(final_path)
+    elapsed = time.time() - started
+    log(
+        f"downloaded {name} ({size/1024**2:.0f} MiB in {elapsed:.0f}s, {size/max(elapsed,1)/1024**2:.1f} MiB/s)",
+        thread=worker,
+    )
+    return True
+
+
 def verify_sha256_if_requested(args: argparse.Namespace, path: Path, expected: str, worker: str) -> None:
     if args.verify_sha256 and expected:
         actual = v5.file_sha256(path)
@@ -453,7 +491,7 @@ def verify_sha256_if_requested(args: argparse.Namespace, path: Path, expected: s
 
 
 def download_worker(args: argparse.Namespace, state: StateDB, stop: threading.Event, worker: str) -> None:
-    client = http_client(args)
+    client = http_client(args) if args.download_backend == "httpx" else None
     while not stop.is_set():
         nxt = state.query("SELECT name,size,sha256 FROM files WHERE state='pending' ORDER BY name LIMIT 1")
         if not nxt:
@@ -485,7 +523,10 @@ def download_worker(args: argparse.Namespace, state: StateDB, stop: threading.Ev
             continue
         attempts = state.query("SELECT attempts FROM files WHERE name=?", (name,))[0][0]
         try:
-            download_one(args, client, name, size, worker)
+            if args.download_backend == "curl":
+                download_one_curl(args, name, size, worker)
+            else:
+                download_one(args, client, name, size, worker)
             verify_sha256_if_requested(args, args.buffer_dir / name, sha256, worker)
             state.set_state(name, "downloaded", downloaded_at=time.time(), worker="")
         except Exception as exc:
@@ -784,6 +825,8 @@ def parse_args() -> argparse.Namespace:
         ],
     )
     parser.add_argument("--download-workers", type=int, default=6)
+    parser.add_argument("--download-backend", choices=["httpx", "curl"], default="httpx",
+                        help="curl = shell out to curl.exe (use when Python TLS is blocked but curl passes)")
     parser.add_argument("--clean-workers", type=int, default=3)
     parser.add_argument("--max-files", type=int, default=0, help="Limit to the first N parquets (smoke tests)")
     parser.add_argument("--refresh-manifest", action="store_true", help="Re-fetch the repo file list and register new files")
