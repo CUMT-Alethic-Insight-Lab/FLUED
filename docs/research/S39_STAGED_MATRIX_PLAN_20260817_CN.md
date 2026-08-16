@@ -254,7 +254,9 @@ a−b/a−c 差分按 §4 判读线裁定，桥接臂（bash-pv602s03，在跑�
   `k_row_source=memory` 组合（与 state 组合直接 raise——a+pos 是 a 格的 K 侧单变量臂，
   组合放开会污染归因）。
 - 覆盖路径：legacy 全行路径与 cache 选择路径都要注入（cache 路径用 cache_idx 的真实段索引
-  取特征行）；实现者需先确认 `xcache_frac=1.0` 实际走哪条路径再动手。
+  取特征行）。路径归属已实测封版（2026-08-17）：`xcache_frac=1.0` 且不开 gist 时
+  `cache_idx=None`（`model.py:1229-1238` 与 `train_v36_s1.py:388-411` 同语义）——
+  **四格与 a+pos 实际走 legacy 路径**，cache 路径分支仅由单测覆盖。
 - 单测：特征形状/窗口内偏移累积正确性、门零初始化时与 a 格逐点一致、非法组合 raise；
   验收线照 §4 判读线（a+pos−a 差分 >2pp 轴复活，否则探针+端到端双死刑）。
 
