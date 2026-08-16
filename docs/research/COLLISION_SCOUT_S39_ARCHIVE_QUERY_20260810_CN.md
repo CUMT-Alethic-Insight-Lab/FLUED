@@ -182,3 +182,68 @@ Memory（2508.01832，摘要片段）、AllMem（2026，仅第三方引用）、
 期刊版已核实，无 arXiv 版）、SSA 数字细节（摘要级）、Block-Attention 微调数字
 （2409.15355，摘要级）。NUGGET 与 Block-Recurrent Transformer 因 ID 定位失败未
 入表（宁缺毋滥）。
+
+## 增补 A（2026-08-16）：DART 全文精读 + KQV 二分框架四路排雷 + 第四形态登记
+
+> 触发：fork 会话完成"压缩记忆两类正交失败模式"（K 侧索引坍塌 ⊥ V 侧内容模糊）
+> 四路并行排雷（60+ 次检索，分报告 flued_priorart_dim01-04），并命中最近邻
+> DART。本增补由主会话对 DART 原文（文字版+图版全 19 页）逐节精读后落笔，
+> 工作件在 `outputs/_dart_2608.02032.txt` 与 `outputs/_dart_pages/`。
+
+### A.1 DART（arXiv:2608.02032v1，2026-08-03，浙大/NUS/港理工，preprint）占了什么
+
+- **核心观察逐字**："Mamba-2 decodes token-conditioned values from this state but
+  does not decode token-conditioned keys"——即 K 侧索引坍塌在固定 chunk 的
+  SSD/Mamba-2 世界的精确表述，且给了可跑解法：保留 chunk scan 的逐 chunk 状态
+  贡献 ΔH[c]∈R^{N×P} 作"chunk 状态记忆"，从其**值轴**收缩解码 token 条件键
+  （K=ΔH[c]E_t）、从键轴读出值（V=C_tΔH[c]），对解码 KV 做 softmax 注意力
+  （SMA），读出门控残差并入 SSM 分支；SMA 用 FlashAttention 式 kernel 实现。
+- **因此修正 dim01 的"K 侧全线缺席"**：K 侧坍塌的"观察+解法"在固定等长 chunk 的
+  SSD 线上已被 DART 占位（2026-08-03）。仍空的格子：① 两类失败的**正交分类学
+  本身**（四路排雷一致：无人形式化）；② **学习型边界的 byte 分层模型池化接口处**
+  的寻址坍塌（dim03 确认空，Scratchpad Patching 是 staleness 非 addressability）；
+  ③ delta rule 底座（KDA/GDN2 擦写语义）+ 状态解码的组合；④ 单一终态的可逆解码
+  （DART 保留全部逐 chunk 状态，cache 随 L/S 线性增长，非 O(1)）；⑤ 迭代式/多步
+  读出精化（见 A.3）。
+
+### A.2 DART 论文内三个可直接引用的证据点（投稿弹药）
+
+1. **K 修复后残余失败恰落在 V 侧**（Table 3/4）：SMA 把 MQAR 刷到近满分、
+   SWDE/FDA 大涨（K 侧修复有效的正面证据），但 NIAH-Single-2/3 @4096 仍塌到
+   1-6%、与 Mamba-2 同烂——needle 细节在 256-token chunk 状态内部已被叠加糊掉。
+   **对方表格自带"两类失败正交、须独立修复"的活体实证**，无需我方跑实验。
+2. **shared-C_t 消融**（Table 6）：给 SMA 支路配独立读出向量 → MQAR 直接归零；
+   只有与原生 SSM 读出共享 C_t 才学得会。**设计教训：重建的 K/Q 通道不能是全新
+   独立头，必须与既有读出通路参数级对齐。** 此约束直接进 S39 预注册：形态 2
+   "interpreter 加独立索引头"有高踩坑风险；形态 3（summarizer 同源产 K+V）天然规避。
+3. **cache 口径**：其"75% 节省"= N/(2S)（N=128, S=256 → 25%），**随 L 线性增长**
+   的非 O(1) cache；且 chunk 固定等长无学习边界，Pile PPL 几乎不动
+   （12.36→12.25，增益全在检索侧）。与我方档案馆/读出路线的压缩量级与边界学习
+   均不同源。
+
+### A.3 第四形态登记：主干追问式读出（用户 2026-08-16 提出）
+
+**形态**：主干对压缩记忆的查询不是一次性发射，而是**条件链式追问**——读到什么
+决定下一问问什么，查询发射本身是一个多步策略（每步查询条件于此前各步的读出）。
+与 §6 约束 1 的"多查询/逐位置重选"（单页内并行重选）正交：追问式增加的是
+**时序上的条件依赖链**。
+**占位核查**：DART 的 SMA 是逐 token 单次解码；Kalman Linear Attention 是单次
+线性-高斯读出；FwPKM 是单步寻址——fork 的 2026-08-14 扫描确认"迭代式/多步读出
+精化"格为空。**此形态目前无人做。**
+**与我方资产的衔接**：CUIB 反事实监督（以下游效果反训上游）是追问链的天然奖励
+信号来源——"上一问取回的内容够不够、下一问该问什么"正是可反事实度量的动作；
+用户此前"让模型对自己的结果诚实、对前面结果补充修正"（半个 latent thought 的架构
+层级）与三态草稿架构（规格 §23）在追问式读出上合流。
+**下一步**：待用户给 S39 最终形态口径后，将"追问式读出 vs 一次性多查询"列为
+预注册消融轴，并吸收 A.2-2 的 shared-readout 硬约束进形态 1/2/3 实现规格。
+
+### A.4 命名警示（排雷带回，术语登记见 TERMS.md）
+
+"index/codebook collapse"被 VQ 占用（死码语义）、"slot collapsing"被 FwPKM 占用
+（负载不均）、"post-compression access failure"被 agent 压缩 preprint（2026-07）
+占用——我方框架命名候选 **Addressing Collapse（寻址坍塌）/ Key-channel Collapse
+（键通道坍塌）vs Value Blur（值模糊）**，定名前再搜一次确认。投稿 related work
+必须逐段区分：GDN2（操作二分 vs 失败二分）、Scratchpad Patching（staleness vs
+addressability）、Thin Keys Full Values（设计原则 vs 失败语义）、FwPKM（存储/检索
+过程分离 vs 失败模式正交分解）、DART（固定 chunk SSD 的 K 解码 vs 学习边界 byte
+分层接口的 K 坍塌 + 正交分类学）。

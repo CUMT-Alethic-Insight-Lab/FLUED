@@ -150,6 +150,8 @@
 | 智能密度 | 智能密度（intelligence density） | 用户研究纲领的核心优化目标：单位容量/算力下模型承载的智能量；压缩率不是硬瓶颈，智能密度才是（2026-08-07 裁定，nq 扩容轴因此关闭） | 用户研究纲领（规格 §22） | 用户 | 2026-08-07 | 已注册 |
 | 三态草稿架构 | 三态草稿架构（three-state drafting） | 用户提案的 latent thought 形态候选：输入态（k=1 单读出矩阵，职责=给思考提供 grist 而非字节保真）、思考态（新矩阵迭代去噪，步数主干定、min/max 兜底、逐步不设监督——"输出干净，思考可以脏"，允许分支回退）、输出态（one-shot 新矩阵交 decoder 并行解字节）；三态同种皆为潜矩阵（规格 §23） | 用户提案（规格 §23） | 用户 | 2026-08-08 | 已注册 |
 | 远程查询 token | 远程查询 token（remote query token） | S39 拟开臂的专用学习内容寻址查询：每页除 gist 外由主干额外吐出的少量查询向量，与页级缓存行 key 点积、top-k 硬选择+STE 传梯度，选中行加入该页读出集；监督来自针位字节生成损失。与"捎带查询"（当前 token 隐藏态）和"自查询"（段自摘要）相区分；与 SSA 的 gist 索引同名异物——我方 gist 是存储本体读出项，SSA gist 是块索引 | COLLISION_SCOUT_S39_20260810 | AI(Kimi) | 2026-08-10 | 候选 |
+| K侧索引坍塌 / V侧内容模糊 | K侧索引坍塌 / V侧内容模糊（命名候选：Addressing Collapse 寻址坍塌 / Key-channel Collapse 键通道坍塌 vs Value Blur 值模糊） | 压缩记忆的两类正交失败模式：K 侧=内容已写入但无可寻址键（有内容没索引，检索原理上不可达）；V 侧=索引可达但内容被干扰/叠加糊掉（有索引没精确内容）。二者可独立发生、独立诊断、独立修复。命名避开：index/codebook collapse（VQ 死码占用）、slot collapsing（FwPKM 负载不均占用）、post-compression access failure（agent 压缩占用） | COLLISION_SCOUT_S39 增补A（2026-08-16） | AI(Kimi)提名，四路排雷确认分类学无占位 | 2026-08-16 | 候选 |
+| 追问式读出 | 追问式读出（follow-up readout / iterative querying） | 主干对压缩记忆的查询为条件链式多步策略：读到什么决定下一问问什么，每步查询条件于此前各步读出；与单次发射（DART 的 SMA）和单页内并行重选（多查询/逐位置重选）均正交。2026-08-14 扫描确认"迭代式/多步读出精化"无占位 | COLLISION_SCOUT_S39 增补A.3 | 用户提出形态，AI(Kimi)提名名称 | 2026-08-16 | 候选 |
 
 ## 8. Changelog
 
@@ -184,3 +186,7 @@
 - 2026-08-10：新增候选术语远程查询 token（remote query token，AI 提名待转正）——
   S39 撞车侦察报告（docs/research/COLLISION_SCOUT_S39_ARCHIVE_QUERY_20260810_CN.md）
   落地，拟开臂的专用学习内容寻址查询之定义与同名异物区分（SSA gist）见词条。
+- 2026-08-16：S39 侦察报告增补 A（DART 2608.02032 全文精读+第四形态）。新增候选
+  术语 2 条：K侧索引坍塌/V侧内容模糊（KQV 正交失败二分，AI 提名，命名候选
+  Addressing Collapse/Value Blur 待定名后再转正）；追问式读出（follow-up readout，
+  用户提出形态、AI 提名名称——主干对压缩记忆的条件链式多步查询）。
