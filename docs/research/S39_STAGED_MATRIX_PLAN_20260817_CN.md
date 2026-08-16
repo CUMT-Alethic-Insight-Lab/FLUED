@@ -232,6 +232,31 @@ python -X utf8 tools/train/v3_6/train_v36_s1.py \
 a−b/a−c 差分按 §4 判读线裁定，桥接臂（bash-pv602s03，在跑）终评对 s36e 0.8006 的偏离幅度
 同表登记。
 
+## 附录 C：a+pos 位置注入键实现规格（2026-08-17 主会话钉死，与 0a 探针同语义）
+
+**探针侧原型**（`tools/analysis/v3_6/probe_archive_addressing.py:457-499`，E58 实测件）：
+`position_features` = 每键行两个绝对位置标量的正弦特征——段序（0..n-1）与段起始 byte 偏移
+（各 16 频率 × sin/cos，max period 1e4，`POS_FEAT_DIM=64`）；注入形式 =
+键先 L2 归一，再加 `pos_gate（零初始化标量）* pos_proj(pos_feat)`（`Linear(64, d_key)`），
+再归一。零门控使 step-0 恰等于无注入锚。
+
+**端到端臂映射**（挂在 agent-61 的双开关之上，`CrossReadBackbone`）：
+
+- 特征：与探针同式 64 维正弦特征；段序=行索引（0..n-1，padding 行由 chunk_mask 遮蔽），
+  段起始偏移=**窗口内**累积 byte 起点（由 token_mask 逐段 byte 数累积推得，作为新可选入参
+  `chunk_byte_off` 传入 backbone；探针用文档级偏移，训练窗内相对偏移携带同等的段间距信息，
+  差异立此存照）。
+- 注入点：`k = k_proj(k_in) + pos_proj(pos_feat)`（`pos_proj: Linear(64, d_backbone)`，
+  在 head reshape 前加，全头共享同一位置身份）；**保留零初始化标量门**（从零训练虽不必需，
+  但与探针同构且门值本身是诊断读数：20K 后仍 ≈0 ⇒ 位置端到端也无人要，判词更硬）。
+- 开关：`k_pos_inject`（config 同键，CLI `--k-pos-inject`）；仅允许与
+  `k_row_source=memory` 组合（与 state 组合直接 raise——a+pos 是 a 格的 K 侧单变量臂，
+  组合放开会污染归因）。
+- 覆盖路径：legacy 全行路径与 cache 选择路径都要注入（cache 路径用 cache_idx 的真实段索引
+  取特征行）；实现者需先确认 `xcache_frac=1.0` 实际走哪条路径再动手。
+- 单测：特征形状/窗口内偏移累积正确性、门零初始化时与 a 格逐点一致、非法组合 raise；
+  验收线照 §4 判读线（a+pos−a 差分 >2pp 轴复活，否则探针+端到端双死刑）。
+
 ## 5. 纪律约束
 
 - 全程单 seed 工程口径起步；主结果臂（1a）出数后评估是否补 seed。
