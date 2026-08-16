@@ -12,6 +12,7 @@ integration is a later acceleration step).
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 import warnings
 
 import torch
@@ -151,6 +152,14 @@ class V36Config:
     # a=(memory,memory) b=(state,memory) c=(memory,state) d=(state,state).
     k_row_source: str = "memory"
     v_row_source: str = "memory"
+    # S39 a+pos arm (same plan, appendix C): position-injected keys on the
+    # xattn K side -- per key row, sinusoidal features of (segment order,
+    # window-relative start byte offset) projected by pos_proj (POS_FEAT_DIM
+    # -> d_backbone) and added through a zero-init scalar gate pos_gate, so
+    # step 0 is exactly the a-grid anchor and the gate value is itself the
+    # diagnostic readout. Memory-source only (k/v_row_source must both be
+    # "memory"; the state combination is rejected to protect attribution).
+    k_pos_inject: bool = False
     # S38 (user-ruled 2026-08-09): supplementary content-conditioned readouts
     # for the top-N hardest chunks that were NOT cached -- a second, targeted
     # slice of the state per hard chunk (query generated from the chunk's own
@@ -608,6 +617,33 @@ def _xcache_select(scores: torch.Tensor, chunk_mask: torch.Tensor, frac: float) 
     return cache_idx.sort(dim=1).values  # -1 sinks first; masked downstream
 
 
+POS_FEAT_DIM = 64  # 16 frequencies x (sin, cos) x 2 scalars (segment order, start byte)
+
+
+def chunk_byte_offsets(token_mask: torch.Tensor) -> torch.Tensor:
+    """Window-relative per-chunk start byte offsets (S39 a+pos): exclusive
+    cumsum of the per-chunk byte counts derived from token_mask (B, C, S);
+    returns (B, C) long. Padded chunks (zero bytes) inherit the running
+    offset; they are masked downstream."""
+    clen = token_mask.long().sum(dim=2)
+    return clen.cumsum(dim=1) - clen
+
+
+def _pos_features(seg_idx: torch.Tensor, byte_off: torch.Tensor) -> torch.Tensor:
+    """Sinusoidal key-row position features (S39 a+pos, same form as the 0a
+    probe's position_features): per key row, 16 frequencies x (sin, cos) for
+    each of two absolute-position scalars -- the segment order (row index)
+    and the segment's window-relative start byte offset; max period 1e4.
+    seg_idx/byte_off: (B, n) -> (B, n, POS_FEAT_DIM)."""
+
+    def sincos(x: torch.Tensor) -> torch.Tensor:
+        freqs = torch.exp(-math.log(1e4) * torch.arange(16, dtype=torch.float32, device=x.device) / 16)
+        ang = x.float().unsqueeze(-1) * freqs
+        return torch.cat([ang.sin(), ang.cos()], dim=-1)
+
+    return torch.cat([sincos(seg_idx), sincos(byte_off)], dim=-1)
+
+
 def paged_boundaries(chunk_mask: torch.Tensor, n: int) -> tuple[torch.Tensor, torch.Tensor]:
     """/n paging geometry (backbone_readout="paged", user-ruled 2026-08-07).
 
@@ -670,6 +706,21 @@ class CrossReadBackbone(nn.Module):
             self.k_proj_state = nn.Linear(c.d_pack, c.d_backbone, bias=False)
         if self.v_from_state:
             self.v_proj_state = nn.Linear(c.d_pack, c.d_backbone, bias=False)
+        # S39 a+pos arm (appendix C): position-injected keys -- pos_proj maps
+        # the sinusoidal (segment order, window-relative start byte) features
+        # into the key space, added through the zero-init scalar gate
+        # pos_gate (step 0 == the a-grid anchor; the gate value is itself the
+        # diagnostic readout). Memory-source only; created only when enabled
+        # so old checkpoints keep loading strict-clean.
+        self.k_pos_inject = getattr(c, "k_pos_inject", False)
+        if self.k_pos_inject:
+            if k_src != "memory" or v_src != "memory":
+                raise ValueError(
+                    "k_pos_inject requires k/v_row_source='memory' "
+                    "(a+pos is the a-grid K-side single-variable arm)"
+                )
+            self.pos_proj = nn.Linear(POS_FEAT_DIM, c.d_backbone, bias=False)
+            self.pos_gate = nn.Parameter(torch.zeros(()))
         self.blocks = nn.ModuleList(
             [
                 nn.Sequential(
@@ -695,6 +746,7 @@ class CrossReadBackbone(nn.Module):
         gist_pos: torch.Tensor | None = None,
         supp: torch.Tensor | None = None,
         supp_idx: torch.Tensor | None = None,
+        chunk_byte_off: torch.Tensor | None = None,
     ) -> torch.Tensor:
         bsz, n, _ = content.shape
         h = self.in_proj(content)
@@ -709,7 +761,15 @@ class CrossReadBackbone(nn.Module):
             v_proj = self.v_proj_state if self.v_from_state else self.v_proj
             k_in = content if self.k_from_state else memory
             v_in = content if self.v_from_state else memory
-            k = k_proj(k_in).view(bsz, n, nh, hd).transpose(1, 2)
+            k_flat = k_proj(k_in)
+            if self.k_pos_inject:
+                # a+pos: add the sinusoidal key-row features through the
+                # zero-init gate, before the head reshape (shared by all heads)
+                if chunk_byte_off is None:
+                    raise ValueError("k_pos_inject requires chunk_byte_off (window-relative per-chunk start byte offsets)")
+                seg_idx = torch.arange(n, device=content.device).unsqueeze(0).expand(bsz, n)
+                k_flat = k_flat + self.pos_gate * self.pos_proj(_pos_features(seg_idx, chunk_byte_off))
+            k = k_flat.view(bsz, n, nh, hd).transpose(1, 2)
             v = v_proj(v_in).view(bsz, n, nh, hd).transpose(1, 2)
             future = torch.triu(torch.ones(n, n, dtype=torch.bool, device=content.device), diagonal=1)
             allowed = (~future).view(1, 1, n, n) & chunk_mask.view(bsz, 1, 1, n)
@@ -748,7 +808,16 @@ class CrossReadBackbone(nn.Module):
                 sel_state = content.gather(1, gidx.expand(-1, -1, content.size(-1)))
             if not (self.k_from_state and self.v_from_state):
                 sel_mem = memory.gather(1, gidx.expand(-1, -1, memory.size(-1)))
-            ks.append(self.k_proj_state(sel_state) if self.k_from_state else self.k_proj(sel_mem))
+            k_rows = self.k_proj_state(sel_state) if self.k_from_state else self.k_proj(sel_mem)
+            if self.k_pos_inject:
+                # a+pos: features taken at the selected rows' real chunk indices
+                if chunk_byte_off is None:
+                    raise ValueError("k_pos_inject requires chunk_byte_off (window-relative per-chunk start byte offsets)")
+                sel_idx = cache_idx.clamp(min=0)
+                k_rows = k_rows + self.pos_gate * self.pos_proj(
+                    _pos_features(sel_idx, chunk_byte_off.gather(1, sel_idx))
+                )
+            ks.append(k_rows)
             vs.append(self.v_proj_state(sel_state) if self.v_from_state else self.v_proj(sel_mem))
             valid_cache = chunk_mask.gather(1, cache_idx.clamp(min=0)) & (cache_idx >= 0)  # (B, K)
             causal = cache_idx.view(bsz, 1, kk) <= query_pos.view(bsz, n, 1)
@@ -1236,7 +1305,16 @@ class FLUEDV36(nn.Module):
                             "xcache_frac<1 requires per-chunk residuals; use the S1 trainer path"
                         )
                     cache_idx = _xcache_select(chunks.chunk_mask.float(), chunks.chunk_mask, 1.0)
-                backbone_out = self.backbone(content, memory, chunks.chunk_mask, pos, cache_idx, gist)
+                # S39 a+pos: window-relative per-chunk start byte offsets
+                # (None = feature off)
+                chunk_byte_off = (
+                    chunk_byte_offsets(chunks.token_mask)
+                    if getattr(self.config, "k_pos_inject", False)
+                    else None
+                )
+                backbone_out = self.backbone(
+                    content, memory, chunks.chunk_mask, pos, cache_idx, gist, chunk_byte_off=chunk_byte_off
+                )
                 cond_backbone = backbone_out + pos
             elif self.config.backbone_mode == "draft":
                 # three-state drafting (spec SS23): input = the k=1 final

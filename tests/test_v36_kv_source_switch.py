@@ -8,6 +8,8 @@ d_pack -> d_backbone projections. Grid mapping:
 a=(memory,memory) b=(state,memory) c=(memory,state) d=(state,state).
 """
 
+import math
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -238,3 +240,174 @@ def test_state_source_rejected_for_paged_xattn():
     source is undefined there and must fail loudly, not silently misalign."""
     with pytest.raises(ValueError, match="paged_xattn"):
         CrossReadBackbone(tiny_config(backbone_mode="paged_xattn", k_row_source="state"))
+
+
+# --- S39 a+pos: position-injected keys (appendix C of the plan doc) ---------
+
+from flued.v36.model import _pos_features, chunk_byte_offsets  # noqa: E402
+
+
+def test_chunk_byte_offsets_window_relative():
+    """chunk_byte_offsets: exclusive cumsum of per-chunk byte counts from
+    token_mask; padded chunks inherit the running offset."""
+    token_mask = torch.zeros(2, 4, 8, dtype=torch.bool)
+    token_mask[0, 0, :3] = True   # chunk 0: 3 bytes
+    token_mask[0, 1, :5] = True   # chunk 1: 5 bytes
+    token_mask[0, 2, :2] = True   # chunk 2: 2 bytes
+    # chunk 3 padded
+    token_mask[1, 0, :8] = True   # chunk 0: 8 bytes
+    token_mask[1, 1, :1] = True   # chunk 1: 1 byte
+    off = chunk_byte_offsets(token_mask)
+    assert off.dtype == torch.long
+    assert off.tolist() == [[0, 3, 8, 10], [0, 8, 9, 9]]
+
+
+def test_pos_features_shape_and_values():
+    """_pos_features: (B, n, 64) = sincos(segment order) ++ sincos(start byte),
+    16 frequencies each, max period 1e4 (0a-probe form)."""
+    seg = torch.tensor([[0, 1, 2]])
+    off = torch.tensor([[0, 7, 20]])
+    feat = _pos_features(seg, off)
+    assert feat.shape == (1, 3, 64)
+    freqs = torch.exp(-math.log(1e4) * torch.arange(16, dtype=torch.float32) / 16)
+    # row 0: seg=0, off=0 -> sin 0 / cos 1 blocks
+    assert torch.allclose(feat[0, 0, :16], torch.zeros(16), atol=1e-7)
+    assert torch.allclose(feat[0, 0, 16:32], torch.ones(16), atol=1e-7)
+    assert torch.allclose(feat[0, 0, 32:48], torch.zeros(16), atol=1e-7)
+    assert torch.allclose(feat[0, 0, 48:], torch.ones(16), atol=1e-7)
+    # row 2: seg=2, off=20 against the manual formula
+    assert torch.allclose(feat[0, 2, :16], (2 * freqs).sin(), atol=1e-6)
+    assert torch.allclose(feat[0, 2, 48:], (20 * freqs).cos(), atol=1e-6)
+
+
+def test_pos_inject_gate_zero_matches_grid_a_bitwise():
+    """Zero-init gate: the a+pos model at step 0 is EXACTLY the a grid
+    (legacy path, xcache_frac=1.0 without gist -- the stage-1 arm form)."""
+    torch.manual_seed(0)
+    ref = FLUEDV36(tiny_config(backbone_mode="xattn"))
+    torch.manual_seed(1)
+    pos_m = FLUEDV36(tiny_config(backbone_mode="xattn", k_pos_inject=True))
+    missing, unexpected = pos_m.load_state_dict(ref.state_dict(), strict=False)
+    assert set(missing) == {"backbone.pos_proj.weight", "backbone.pos_gate"}
+    assert not unexpected
+    assert float(pos_m.backbone.pos_gate.detach()) == 0.0
+    torch.manual_seed(2)
+    ids = torch.randint(1, 258, (2, 32))
+    with torch.no_grad():
+        a = ref(ids)
+        b = pos_m(ids)
+    assert torch.equal(a.logits_backbone, b.logits_backbone)
+    assert torch.equal(a.logits_direct, b.logits_direct)
+
+
+def test_pos_inject_requires_memory_sources():
+    """a+pos is the a-grid K-side single-variable arm: any state-source
+    combination is rejected to protect attribution."""
+    with pytest.raises(ValueError, match="k_pos_inject"):
+        CrossReadBackbone(tiny_config(k_row_source="state", k_pos_inject=True))
+    with pytest.raises(ValueError, match="k_pos_inject"):
+        CrossReadBackbone(tiny_config(v_row_source="state", k_pos_inject=True))
+
+
+def test_pos_inject_gate_moves_keys_legacy():
+    """Gate nonzero -> the keys fed to SDPA shift by exactly
+    gate * pos_proj(feat) (legacy path); gate 0 matches the plain a-grid K."""
+    torch.manual_seed(0)
+    cfg = tiny_config(k_pos_inject=True)
+    m = CrossReadBackbone(cfg).eval()
+    bsz, n = 2, 5
+    content = torch.randn(bsz, n, cfg.d_pack)
+    memory = torch.randn(bsz, n, cfg.d_mem)
+    mask = torch.ones(bsz, n, dtype=torch.bool)
+    pos = torch.randn(1, n, cfg.d_backbone)
+    byte_off = chunk_byte_offsets(torch.ones(bsz, n, 8, dtype=torch.bool))  # 8 bytes/chunk
+    with torch.no_grad():
+        out0 = m(content, memory, mask, pos, chunk_byte_off=byte_off)
+    # capture K at gate 0 and gate 0.7
+    ks = {}
+    real = F.scaled_dot_product_attention
+
+    def spy(q, k, v, attn_mask=None, **kw):
+        ks["k"] = k
+        return real(q, k, v, attn_mask=attn_mask, **kw)
+
+    nh, hd = _heads(m, cfg)
+    feat = _pos_features(torch.arange(n).unsqueeze(0).expand(bsz, n), byte_off)
+    with torch.no_grad():
+        assert float(m.pos_gate) == 0.0
+        F.scaled_dot_product_attention = spy
+        try:
+            m(content, memory, mask, pos, chunk_byte_off=byte_off)
+        finally:
+            F.scaled_dot_product_attention = real
+        base = ks["k"].clone()
+        m.pos_gate.data.fill_(0.7)
+        F.scaled_dot_product_attention = spy
+        try:
+            out1 = m(content, memory, mask, pos, chunk_byte_off=byte_off)
+        finally:
+            F.scaled_dot_product_attention = real
+    exp_base = m.k_proj(memory).view(bsz, n, nh, hd).transpose(1, 2)
+    assert torch.allclose(base, exp_base, atol=1e-6)  # gate 0 == plain a-grid K
+    delta = (ks["k"] - base).transpose(1, 2).reshape(bsz, n, nh * hd)
+    assert torch.allclose(delta, 0.7 * m.pos_proj(feat), atol=1e-5)
+    assert not torch.allclose(out0, out1, atol=1e-3)
+
+
+def test_pos_inject_gate_moves_keys_store_path():
+    """Store path: features are taken at the selected rows' REAL chunk indices
+    (cache_idx), and the gist entry is never position-injected."""
+    torch.manual_seed(0)
+    cfg = tiny_config(xcache_gist=True, k_pos_inject=True)
+    m = CrossReadBackbone(cfg).eval()
+    bsz, n = 2, 5
+    content = torch.randn(bsz, n, cfg.d_pack)
+    memory = torch.randn(bsz, n, cfg.d_mem)
+    mask = torch.ones(bsz, n, dtype=torch.bool)
+    pos = torch.randn(1, n, cfg.d_backbone)
+    gist = torch.randn(bsz, cfg.d_pack)
+    cache_idx = torch.tensor([[0, 3, 4, -1, -1], [0, 3, 4, -1, -1]])
+    byte_off = chunk_byte_offsets(torch.ones(bsz, n, 8, dtype=torch.bool))
+    ks = {}
+    real = F.scaled_dot_product_attention
+
+    def spy(q, k, v, attn_mask=None, **kw):
+        ks["k"] = k
+        return real(q, k, v, attn_mask=attn_mask, **kw)
+
+    nh, hd = _heads(m, cfg)
+    kk = cache_idx.size(1)
+    with torch.no_grad():
+        m.pos_gate.data.fill_(0.7)
+        F.scaled_dot_product_attention = spy
+        try:
+            out = m(content, memory, mask, pos, cache_idx, gist, chunk_byte_off=byte_off)
+        finally:
+            F.scaled_dot_product_attention = real
+    assert torch.isfinite(out).all()
+    sel_idx = cache_idx.clamp(min=0)
+    sel_mem = memory.gather(1, sel_idx.unsqueeze(-1).expand(-1, -1, cfg.d_mem))
+    feat = _pos_features(sel_idx, byte_off.gather(1, sel_idx))
+    exp_rows = m.k_proj(sel_mem) + 0.7 * m.pos_proj(feat)
+    exp_k = torch.cat([m.gist_k(gist.unsqueeze(1)), exp_rows], dim=1).view(bsz, 1 + kk, nh, hd).transpose(1, 2)
+    assert torch.allclose(ks["k"], exp_k, atol=1e-5)
+
+
+def test_pos_inject_missing_offsets_raises():
+    torch.manual_seed(0)
+    m = CrossReadBackbone(tiny_config(k_pos_inject=True)).eval()
+    content = torch.randn(2, 5, 64)
+    memory = torch.randn(2, 5, 96)
+    mask = torch.ones(2, 5, dtype=torch.bool)
+    pos = torch.randn(1, 5, 64)
+    with pytest.raises(ValueError, match="chunk_byte_off"):
+        m(content, memory, mask, pos)
+
+
+def test_default_off_has_no_pos_modules():
+    """Default config: no pos modules, no new state-dict keys (strict-load
+    discipline unchanged), and CLI/default equivalence holds."""
+    torch.manual_seed(0)
+    model = FLUEDV36(tiny_config(backbone_mode="xattn", xcache_gist=True))
+    assert not any("pos_proj" in k or "pos_gate" in k for k in model.state_dict())
+    assert not model.backbone.k_pos_inject

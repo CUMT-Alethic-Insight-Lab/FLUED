@@ -84,6 +84,7 @@ def build_model(args: Namespace) -> FLUEDV36:
             xcache_gist=getattr(args, "xcache_gist", False),
             k_row_source=getattr(args, "k_row_source", "memory"),
             v_row_source=getattr(args, "v_row_source", "memory"),
+            k_pos_inject=getattr(args, "k_pos_inject", False),
             xcache_supp=getattr(args, "xcache_supp", 0),
             supp_source=getattr(args, "supp_source", "state"),
             residual_gate_temp=getattr(args, "residual_gate_temp", 1.0),
@@ -290,6 +291,14 @@ def build_parser() -> argparse.ArgumentParser:
         default="memory",
         help="S39 stage-1 taxonomy: V source for the xattn store rows "
         "(same convention as --k-row-source)",
+    )
+    parser.add_argument(
+        "--k-pos-inject",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="S39 a+pos arm: add sinusoidal (segment order, window-relative "
+        "start byte) key-row features to the xattn K side through a zero-init "
+        "scalar gate; requires --k-row-source/--v-row-source memory",
     )
     parser.add_argument(
         "--xcache-supp",

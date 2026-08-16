@@ -71,7 +71,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from flued.data import BYTE_OFFSET, MASK_ID, PAD_ID  # noqa: E402
-from flued.v36.model import _xcache_select, paged_boundaries  # noqa: E402
+from flued.v36.model import _xcache_select, chunk_byte_offsets, paged_boundaries  # noqa: E402
 from tools.train.v3_3.train_v33 import (  # noqa: E402
     _append_jsonl,
     _cosine_with_warmup,
@@ -449,7 +449,14 @@ def s1_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None) ->
             top = supp_scores.topk(n_supp, dim=1).indices
             valid_s = supp_scores.gather(1, top) > float("-inf") / 2
             supp_idx = torch.where(valid_s, top, torch.full_like(top, -1)).sort(dim=1).values
-        backbone_out = model.backbone(content, memory, chunks.chunk_mask, pos, cache_idx, gist, supp=supp, supp_idx=supp_idx)
+        # S39 a+pos: window-relative per-chunk start byte offsets for the
+        # position-injected keys (None = feature off)
+        chunk_byte_off = (
+            chunk_byte_offsets(chunks.token_mask)
+            if getattr(model.config, "k_pos_inject", False)
+            else None
+        )
+        backbone_out = model.backbone(content, memory, chunks.chunk_mask, pos, cache_idx, gist, supp=supp, supp_idx=supp_idx, chunk_byte_off=chunk_byte_off)
         cond_backbone = backbone_out + pos
     elif getattr(model.config, "backbone_mode", "attn") == "draft":
         # three-state drafting (spec SS23, user-ruled 2026-08-08): input = the
