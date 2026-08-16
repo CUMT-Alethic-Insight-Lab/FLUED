@@ -21,9 +21,14 @@ being cleaned on the fly:
   DBs are attached read-only per batch; unlike build_corpus_v5 they are NOT
   copied into the local state DB (saves ~16 GiB of backup copies).
 * A disk guard polls the buffer drive; when free space drops below
-  ``--min-free-gib`` (default 50 GiB) it deletes raw parquets whose state is
-  ``cleaned`` (oldest first, with hysteresis). Files still pending download or
-  cleaning are never deleted. With ample space, downloaded originals are kept.
+  ``--min-free-gib`` + ``--guard-hysteresis-gib`` (defaults 50+10=60 GiB) it
+  deletes raw parquets whose state is ``cleaned`` (oldest first, until free
+  space is back above that band). The trigger MUST stay above the download
+  guard's park threshold (``min-free-gib`` + 2 GiB + one file size) —
+  triggering at ``min-free-gib`` itself deadlocks: downloads park while the
+  sweep still waits (hit 2026-08-17 with free pinned at 51.6 GiB). Files
+  still pending download or cleaning are never deleted. With ample space,
+  downloaded originals are kept.
 * All per-file state transitions live in
   ``<output_dir>/state/pipeline_state.sqlite3`` so restarts are idempotent:
   ``downloading`` files fall back to ``pending`` (``.part`` files resume via
@@ -729,7 +734,10 @@ def guard_sweep(args: argparse.Namespace, state: StateDB, stop: threading.Event)
     min_free = int(args.min_free_gib * GIB)
     hysteresis = int(args.guard_hysteresis_gib * GIB)
     free = shutil.disk_usage(args.buffer_dir).free
-    if free >= min_free:
+    # Trigger above the download guard's park threshold (min_free + 2 GiB +
+    # one file size) so parked downloads always find the sweep already
+    # running -- triggering at min_free itself deadlocks in the gap.
+    if free >= min_free + hysteresis:
         return
     candidates = state.query(
         "SELECT name,size FROM files WHERE state='cleaned' AND deleted=0 ORDER BY cleaned_at"
@@ -845,7 +853,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-output-gib", type=float, default=75.0)
     parser.add_argument("--output-min-free-gib", type=float, default=30.0, help="Free-space reserve on the P: output drive")
     # Buffer guard
-    parser.add_argument("--min-free-gib", type=float, default=50.0, help="Delete cleaned raw parquets below this free space on the buffer drive")
+    parser.add_argument("--min-free-gib", type=float, default=50.0, help="Buffer-drive free-space floor (GiB); cleaned raw parquets are deleted once free drops below this + --guard-hysteresis-gib")
     parser.add_argument("--guard-hysteresis-gib", type=float, default=10.0)
     parser.add_argument("--guard-interval", type=float, default=30.0)
     parser.add_argument("--status", action="store_true", help="Print pipeline progress and exit")
