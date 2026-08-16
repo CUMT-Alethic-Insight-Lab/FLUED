@@ -188,7 +188,7 @@ dstate=128 类非常规形状；20K 步长训无先例。
 **工程意见（采纳）**：阶段2 只跑 GDN2；GDN2 与 KDA 打平即"存储侧不是问题"闭环、mamba-2 永久
 裁掉（防守靠 DART 外部数据点）；仅当显著差异时补 mamba-2 且把多变量更换的归因折扣写进判读线。
 
-## 附录 B：阶段1 发射命令模板（2026-08-17 主会话，agent-61 交付后核对 CLI 名回写）
+## 附录 B：阶段1 发射命令模板（2026-08-17 主会话；CLI 名已于 agent-61 交付前经 `--help` 实测封版）
 
 **公共底座**（逐臂仅改 run-id/out-dir 与格子的两个开关）：
 
@@ -213,8 +213,9 @@ python -X utf8 tools/train/v3_6/train_v36_s1.py \
   truncated_tokens=0，同 E52 口径）。
 - store 规模四格统一全行（`--xcache-frac` 默认 1.0，不加 `--xcache-gist`）——"同 store 规模可比"
   原则（§4 实现规格注）。桥接臂的 `--xcache-frac 0.04 --xcache-gist` 是复刻 s36e 专用，不外溢。
-- CLI 开关名以 agent-61 实际交付为准（config 键已落地为 `k_row_source`/`v_row_source`，
-  `train_v36_s1.py:820-825` 复用 `train_v36.build_parser`，一处加旗两处生效）；交付核对后此处回写定稿。
+- CLI 开关名已封版（2026-08-17 `--help` 实测）：`--k-row-source {memory,state}` /
+  `--v-row-source {memory,state}`（config 键 `k_row_source`/`v_row_source`，
+  `train_v36_s1.py:820-825` 复用 `train_v36.build_parser`，一处加旗两处生效）。
 
 **臂次与 run-id**（GPU 串行，一臂一跑，点火前 `nvidia-smi` 查重）：
 
