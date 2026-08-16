@@ -7,6 +7,10 @@ Tasks (spec section 20, user-designed):
 2. backbone completion: readout -> backbone -> new matrix -> decoder restores
    the CLEAN text. Masked completion is ONLY scored on this path, so the
    backbone has an irreplaceable role (no more idling).
+   v36.8 (S39 stage-0c recipe fix, user-ruled 2026-08-17): completion is
+   CUMULATIVE -- row i restores the masked bytes of chunks 0..i (was: chunk i
+   only), the first non-zero retention training signal for the state machine.
+   ``--no-cumulative-mask-retention`` restores the old per-chunk targets.
 3. backbone prediction: ``--predict-mode decode`` (v36.4+ default) decodes
    backbone_out[i] into chunk i+1's bytes through the FROZEN decoder
    (functional_call with detached params — gradients reach the backbone only,
@@ -43,6 +47,10 @@ S_final (``KDAStateMachine.read_all_final``), the backbone is excluded from
 the loss path, and the predict task is disabled (weight 0, not computed).
 Eval adds an n-scan {1,4,8,last}: n uniformly subsampled query rows serve the
 whole window (/n paging geometry), reporting full-window byte-restore acc.
+Note: the "retention signal is exactly zero" diagnosis above describes the
+pre-v36.8 recipe; v36.8 completion is cumulative (task 2), so the standard
+recipe now carries a retention signal and this arm remains the strict
+welded-shut reference.
 """
 
 from __future__ import annotations
@@ -195,6 +203,105 @@ def _prev_ids(tgts: torch.Tensor) -> torch.Tensor:
         [torch.full((bsz, 1), 258, dtype=tgts.dtype, device=tgts.device), flat[:, :-1]], dim=1
     )
     return prev.reshape(tgts.shape).clamp(min=0, max=258)
+
+
+def make_cumulative_retention_targets(
+    clean: torch.Tensor,
+    byte_mask: torch.Tensor,
+    chunk_ids: torch.Tensor,
+    offsets: torch.Tensor,
+    max_chunks: int,
+    max_span: int,
+):
+    """Cumulative-retention completion targets (S39 stage-0c recipe fix,
+    user-ruled 2026-08-17, prereg S39_STAGED_MATRIX_PLAN §4 阶段0c).
+
+    Row i restores the masked bytes of chunks 0..i instead of chunk i only,
+    so the state machine / backbone receive a non-zero RETENTION gradient
+    (the pre-v36.8 per-chunk layout required nothing to survive past a
+    chunk's own read -- the three tasks' retention signal was exactly zero).
+
+    Layout (minimal-invasion): the base per-chunk grid from ``make_targets``
+    is kept verbatim -- chunk i's own bytes stay at their natural slots, and
+    the masked bytes of chunks 0..i-1 are appended in byte order right after
+    row i's last occupied slot. The decoder is a parallel slot decoder (slot
+    embedding + chunk conditioning, no autoregression), so extra target slots
+    need no architectural change and the (B, C, max_span) layout is
+    unchanged. Trade-off: a row's target count grows with i and can exceed
+    ``max_span``; overflow drops the appended tail (oldest masked bytes keep
+    their slots) and is counted in the returned truncation counter. Unmasked
+    bytes of earlier chunks never enter row i's target -- only bytes that
+    never entered the state (masked) must be recalled from it.
+
+    Returns (targets, slot_mask, masked_slot, n_truncated) with base-grid
+    semantics: slot_mask marks every scored slot, masked_slot the subset that
+    was masked in the source (own masked + recalled masked).
+    """
+    targets, slot_mask, masked_slot = make_targets(
+        clean, byte_mask, chunk_ids, offsets, max_chunks, max_span
+    )
+    valid_byte = (
+        chunk_ids.ge(0)
+        & chunk_ids.lt(max_chunks)
+        & offsets.ge(0)
+        & offsets.lt(max_span)
+        & clean.ne(PAD_ID)
+    )
+    m = byte_mask & valid_byte
+    if not bool(m.any()):
+        return targets, slot_mask, masked_slot, torch.zeros((), device=clean.device)
+    slot_idx = torch.arange(max_span, device=clean.device).view(1, 1, max_span)
+    row_valid = slot_mask.any(dim=-1)  # (B, C) real chunk rows only
+    # First slot after the row's own bytes (own offsets are 0-based contiguous
+    # from chunk packing, so this equals the row's byte count).
+    start = torch.where(slot_mask, slot_idx, torch.full_like(slot_idx, -1)).amax(dim=-1) + 1  # (B, C)
+    # rank of each masked byte among the sample's masked bytes, in byte order
+    rank = m.long().cumsum(dim=1) - m.long()  # (B, T), strictly-before count
+    b_idx, t_idx = m.nonzero(as_tuple=True)  # (M,) masked byte positions
+    c_t = chunk_ids[b_idx, t_idx]
+    r_t = rank[b_idx, t_idx]
+    rows = torch.arange(max_chunks, device=clean.device).view(1, -1)  # (1, C)
+    # A masked byte of chunk c enters every REAL row i > c (row i already
+    # carries chunk i's own masked bytes in the base grid). Row i's appended
+    # set is exactly {masked bytes of chunks 0..i-1} in byte order because
+    # chunks are contiguous: rank over all masked bytes equals rank within
+    # chunks < i for any byte of a chunk < i.
+    dest_ok = rows.gt(c_t.view(-1, 1)) & row_valid[b_idx]  # (M, C)
+    dest_slot = start[b_idx] + r_t.view(-1, 1)  # (M, C)
+    fits = dest_ok & dest_slot.lt(max_span)
+    flat = (b_idx.view(-1, 1) * max_chunks + rows) * max_span + dest_slot  # (M, C)
+    sel = fits.reshape(-1)
+    flat_sel = flat.reshape(-1)[sel]
+    vals = clean[b_idx, t_idx].view(-1, 1).expand(-1, max_chunks).reshape(-1)[sel]
+    # (row, rank) pairs are unique, so scatter cannot collide.
+    targets.view(-1).scatter_(0, flat_sel, vals)
+    ones = torch.ones_like(flat_sel, dtype=torch.bool)
+    slot_mask.view(-1).scatter_(0, flat_sel, ones)
+    masked_slot.view(-1).scatter_(0, flat_sel, ones)
+    n_truncated = (dest_ok & dest_slot.ge(max_span)).sum()
+    return targets, slot_mask, masked_slot, n_truncated
+
+
+def _completion_target_grids(
+    clean: torch.Tensor,
+    byte_mask: torch.Tensor,
+    chunk_ids: torch.Tensor,
+    offsets: torch.Tensor,
+    max_chunks: int,
+    max_span: int,
+    cumulative: bool,
+):
+    """Completion-task target grids: cumulative mask retention (v36.8
+    default) or the pre-v36.8 per-chunk layout (``--no-cumulative-mask-retention``
+    ablation). Direct/predict keep the per-chunk base grids either way."""
+    if cumulative:
+        return make_cumulative_retention_targets(
+            clean, byte_mask, chunk_ids, offsets, max_chunks, max_span
+        )
+    targets, slot_mask, masked_slot = make_targets(
+        clean, byte_mask, chunk_ids, offsets, max_chunks, max_span
+    )
+    return targets, slot_mask, masked_slot, torch.zeros((), device=clean.device)
 
 
 def s1_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None) -> dict:
@@ -461,32 +568,44 @@ def step_model(model, batch, args, device, train: bool):
     with torch.autocast("cuda", dtype=torch.bfloat16, enabled=args.amp and device.type == "cuda"):
         out = s1_forward(model, source, args, clean=clean, byte_mask=byte_mask)
     chunks = out["chunks"]
+    # Per-chunk base grids: direct (encoded) and predict views keep these.
     targets, slot_mask, masked_slot = make_targets(
         clean, byte_mask, chunks.chunk_ids, chunks.offsets, args.max_chunks, args.max_span
+    )
+    # Completion grids: v36.8 cumulative mask retention (row i restores the
+    # masked bytes of chunks 0..i) unless the ablation switch is off.
+    comp_targets, comp_slot_mask, comp_masked_slot, retention_trunc = _completion_target_grids(
+        clean,
+        byte_mask,
+        chunks.chunk_ids,
+        chunks.offsets,
+        args.max_chunks,
+        args.max_span,
+        getattr(args, "cumulative_mask_retention", True),
     )
     # as-encoded targets: the masked source itself (MASK_ID at masked slots)
     encoded_targets, encoded_slot_mask, _ = make_targets(
         source, torch.zeros_like(byte_mask), chunks.chunk_ids, chunks.offsets, args.max_chunks, args.max_span
     )
-    unmasked_slot = slot_mask & ~masked_slot
+    unmasked_slot = comp_slot_mask & ~comp_masked_slot
 
     direct_loss = _ce(out["logits_direct"], encoded_targets, encoded_slot_mask)
-    completion_loss = _ce(out["logits_backbone"], targets, slot_mask)
+    completion_loss = _ce(out["logits_backbone"], comp_targets, comp_slot_mask)
     if getattr(args, "decoder_markov", 0) > 0 and hasattr(model.decoder, "markov_out"):
         # DSpark Markov head (post-hoc on logits, teacher-forced prev byte):
         # NOTE this makes the metrics a teacher-forced protocol -- arms using
         # it are only comparable among themselves.
         b_d = model.decoder.markov_out(model.decoder.markov_embed(_prev_ids(encoded_targets)))
-        b_b = model.decoder.markov_out(model.decoder.markov_embed(_prev_ids(targets)))
+        b_b = model.decoder.markov_out(model.decoder.markov_embed(_prev_ids(comp_targets)))
         direct_loss = _ce(out["logits_direct"] + b_d, encoded_targets, encoded_slot_mask)
-        completion_loss = _ce(out["logits_backbone"] + b_b, targets, slot_mask)
+        completion_loss = _ce(out["logits_backbone"] + b_b, comp_targets, comp_slot_mask)
         out["logits_direct"] = out["logits_direct"] + b_d
         out["logits_backbone"] = out["logits_backbone"] + b_b
     if out.get("logits_backbone_mid") is not None:
         # s35 supervised arm: intermediate thinking matrix eats completion CE
         # (weight default 0.1, LoopFormer short-trajectory recipe)
         completion_loss = completion_loss + getattr(args, "draft_intermediate_weight", 0.1) * _ce(
-            out["logits_backbone_mid"], targets, slot_mask
+            out["logits_backbone_mid"], comp_targets, comp_slot_mask
         )
 
     codec_final = getattr(args, "codec_final_state", False)
@@ -596,9 +715,10 @@ def step_model(model, batch, args, device, train: bool):
         "predict_ce": predict_ce.detach(),
         "predict_byte_acc": predict_byte_acc.detach(),
         "direct_acc": _acc_tensor(out["logits_direct"].argmax(dim=-1), encoded_targets, encoded_slot_mask),
-        "backbone_acc": _acc_tensor(out["logits_backbone"].argmax(dim=-1), targets, slot_mask),
-        "backbone_masked_acc": _acc_tensor(out["logits_backbone"].argmax(dim=-1), targets, masked_slot),
-        "backbone_unmasked_acc": _acc_tensor(out["logits_backbone"].argmax(dim=-1), targets, unmasked_slot),
+        "backbone_acc": _acc_tensor(out["logits_backbone"].argmax(dim=-1), comp_targets, comp_slot_mask),
+        "backbone_masked_acc": _acc_tensor(out["logits_backbone"].argmax(dim=-1), comp_targets, comp_masked_slot),
+        "backbone_unmasked_acc": _acc_tensor(out["logits_backbone"].argmax(dim=-1), comp_targets, unmasked_slot),
+        "retention_truncated_slots": retention_trunc.detach().float(),
         "predict_cos": predict_cos.detach(),
         "mask_rate": (byte_mask.float().sum() / valid.float().sum().clamp(min=1.0)).detach(),
         "truncated_tokens": chunks.pack_info["truncated_tokens"].float().sum().detach(),
@@ -682,6 +802,17 @@ def _add_s1_args(parser: argparse.ArgumentParser) -> None:
         "the predict task is disabled (weight forced 0, not computed); eval "
         "adds an n-scan {1,4,8,last} of subsampled query rows serving the "
         "whole window. Default off -- canonical runs are unaffected.",
+    )
+    parser.add_argument(
+        "--cumulative-mask-retention",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="S39 stage-0c recipe fix (user-ruled 2026-08-17): completion row "
+        "i restores the masked bytes of chunks 0..i (cumulative retention) "
+        "instead of chunk i only, so the state machine/backbone get a "
+        "non-zero retention training signal. Default ON (fixed recipe); "
+        "--no-cumulative-mask-retention restores the pre-v36.8 zero-retention "
+        "per-chunk targets for ablation. Direct and predict are unaffected.",
     )
 
 
