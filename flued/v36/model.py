@@ -142,6 +142,15 @@ class V36Config:
     # rows (= s31 with optional gist token -- the sanity arm).
     xcache_frac: float = 1.0
     xcache_gist: bool = False
+    # S39 stage-1 taxonomy 2x2 (S39_STAGED_MATRIX_PLAN_20260817_CN §4, v3 axis
+    # semantics): per-side K/V source switches for the xattn backbone store
+    # rows. "memory" (default) = project the pre-state memory rows (existing
+    # behavior); "state" = project the per-chunk state readouts (content,
+    # d_pack wide) through dedicated projections, created only when selected
+    # so old checkpoints keep loading strict-clean. Grid mapping:
+    # a=(memory,memory) b=(state,memory) c=(memory,state) d=(state,state).
+    k_row_source: str = "memory"
+    v_row_source: str = "memory"
     # S38 (user-ruled 2026-08-09): supplementary content-conditioned readouts
     # for the top-N hardest chunks that were NOT cached -- a second, targeted
     # slice of the state per hard chunk (query generated from the chunk's own
@@ -645,6 +654,22 @@ class CrossReadBackbone(nn.Module):
         if getattr(c, "xcache_gist", False) or getattr(c, "backbone_mode", "") == "paged_xattn":
             self.gist_k = nn.Linear(c.d_pack, c.d_backbone, bias=False)
             self.gist_v = nn.Linear(c.d_pack, c.d_backbone, bias=False)
+        # S39 stage-1 taxonomy 2x2: dedicated d_pack -> d_backbone projections
+        # for the "state" K/V source (per-chunk state readouts); created only
+        # when selected so (memory,memory) checkpoints keep loading
+        # strict-clean (same precedent as gist_k/gist_v above).
+        k_src = getattr(c, "k_row_source", "memory")
+        v_src = getattr(c, "v_row_source", "memory")
+        if k_src not in ("memory", "state") or v_src not in ("memory", "state"):
+            raise ValueError(f"k/v_row_source must be 'memory' or 'state', got {k_src!r}/{v_src!r}")
+        if (k_src == "state" or v_src == "state") and getattr(c, "backbone_mode", "") == "paged_xattn":
+            raise ValueError("k/v_row_source='state' is undefined for paged_xattn (content rows are page-level there)")
+        self.k_from_state = k_src == "state"
+        self.v_from_state = v_src == "state"
+        if self.k_from_state:
+            self.k_proj_state = nn.Linear(c.d_pack, c.d_backbone, bias=False)
+        if self.v_from_state:
+            self.v_proj_state = nn.Linear(c.d_pack, c.d_backbone, bias=False)
         self.blocks = nn.ModuleList(
             [
                 nn.Sequential(
@@ -677,9 +702,15 @@ class CrossReadBackbone(nn.Module):
         hd = h.size(-1) // nh
         q = (self.q_proj(h) + pos).view(bsz, n, nh, hd).transpose(1, 2)
         if cache_idx is None and gist is None:
-            # legacy s31 path: causal over all real memory rows
-            k = self.k_proj(memory).view(bsz, n, nh, hd).transpose(1, 2)
-            v = self.v_proj(memory).view(bsz, n, nh, hd).transpose(1, 2)
+            # legacy s31 path: causal over all real rows; the S39 source
+            # switches pick the K/V source tensor per side (memory rows by
+            # default, the per-chunk state readouts when "state")
+            k_proj = self.k_proj_state if self.k_from_state else self.k_proj
+            v_proj = self.v_proj_state if self.v_from_state else self.v_proj
+            k_in = content if self.k_from_state else memory
+            v_in = content if self.v_from_state else memory
+            k = k_proj(k_in).view(bsz, n, nh, hd).transpose(1, 2)
+            v = v_proj(v_in).view(bsz, n, nh, hd).transpose(1, 2)
             future = torch.triu(torch.ones(n, n, dtype=torch.bool, device=content.device), diagonal=1)
             allowed = (~future).view(1, 1, n, n) & chunk_mask.view(bsz, 1, 1, n)
             # keep the diagonal even on padded rows: a fully-masked SDPA row yields
@@ -709,9 +740,16 @@ class CrossReadBackbone(nn.Module):
                 allowed_g = gist_pos.view(bsz, 1, gsz) <= query_pos.view(bsz, n, 1)
             allowed_parts = [allowed_g]
             kk = cache_idx.size(1)
-            sel_mem = memory.gather(1, cache_idx.clamp(min=0).unsqueeze(-1).expand(-1, -1, memory.size(-1)))
-            ks.append(self.k_proj(sel_mem))
-            vs.append(self.v_proj(sel_mem))
+            gidx = cache_idx.clamp(min=0).unsqueeze(-1)
+            # S39 source switches: the selected store entries take their K/V
+            # side inputs from the state readouts (content) when "state" is
+            # selected, else from the pre-state memory rows (default)
+            if self.k_from_state or self.v_from_state:
+                sel_state = content.gather(1, gidx.expand(-1, -1, content.size(-1)))
+            if not (self.k_from_state and self.v_from_state):
+                sel_mem = memory.gather(1, gidx.expand(-1, -1, memory.size(-1)))
+            ks.append(self.k_proj_state(sel_state) if self.k_from_state else self.k_proj(sel_mem))
+            vs.append(self.v_proj_state(sel_state) if self.v_from_state else self.v_proj(sel_mem))
             valid_cache = chunk_mask.gather(1, cache_idx.clamp(min=0)) & (cache_idx >= 0)  # (B, K)
             causal = cache_idx.view(bsz, 1, kk) <= query_pos.view(bsz, n, 1)
             allowed_parts.append(causal & valid_cache.view(bsz, 1, kk))

@@ -82,6 +82,8 @@ def build_model(args: Namespace) -> FLUEDV36:
             decoder_markov=getattr(args, "decoder_markov", 0),
             xcache_frac=getattr(args, "xcache_frac", 1.0),
             xcache_gist=getattr(args, "xcache_gist", False),
+            k_row_source=getattr(args, "k_row_source", "memory"),
+            v_row_source=getattr(args, "v_row_source", "memory"),
             xcache_supp=getattr(args, "xcache_supp", 0),
             supp_source=getattr(args, "supp_source", "state"),
             residual_gate_temp=getattr(args, "residual_gate_temp", 1.0),
@@ -273,6 +275,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="S36: prepend the k=1 final readout as a gist token to the "
         "cross-read store; with --xcache-frac<1 the memory rows are "
         "residual-gated (HOLA/HAM)",
+    )
+    parser.add_argument(
+        "--k-row-source",
+        choices=["memory", "state"],
+        default="memory",
+        help="S39 stage-1 taxonomy: K source for the xattn store rows -- "
+        "memory = pre-state memory rows (default, existing behavior); "
+        "state = per-chunk state readouts (content) via a dedicated projection",
+    )
+    parser.add_argument(
+        "--v-row-source",
+        choices=["memory", "state"],
+        default="memory",
+        help="S39 stage-1 taxonomy: V source for the xattn store rows "
+        "(same convention as --k-row-source)",
     )
     parser.add_argument(
         "--xcache-supp",
