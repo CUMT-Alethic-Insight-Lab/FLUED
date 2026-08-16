@@ -73,7 +73,7 @@ Full project status: [README.md](README.md) · Versioned documentation: [docs/RE
 - **Tied inverse**: blocks reversed, MHA/FFN subtracted instead of added. Forward and inverse share parameters. `dropout=0.0` in E1 (tied inverse is dropout-sensitive).
 - **E1 presets**: `smoke_cpu`, `small_gpu`, `class300m_16gb` — defined in `flued/e1_stage_a.py`
 - **skip_hard**: Always pass `skip_hard=True` during training/eval. Hard segmentation is for logging only.
-- **归档盘（2026-08-06 起）**：新归档落 `K:\FLUED_archive\<run_name>`（含 SHA256SUMS）；存量 `L:\FLUED_archive` 只读、不迁移，历史文档中的 L: 路径保持有效（含 canonical 的 `init_checkpoint`）。
+- **归档盘（2026-08-06 起）**：新归档落 `K:\FLUED_archive\<run_name>`（含 SHA256SUMS）；~~存量 `L:\FLUED_archive` 只读、不迁移~~（2026-08-12 迁移修订：L: 499G 已迁 `N:\FLUED_archive_migration_20260812\`，canonical init `s0pp_pro_v4_sft_20260805` 原地保留；历史文档中的 L: 路径经 `outputs/migration_manifest_20260812.json` 映射到新位置）。
 - **存储布局（2026-08-12 用户裁定）**：代码/文档在 E: 核心区；语料在 P:（v3 由 E: 迁入、v4 原在 P:）；存档点由用户提供的两块盘单独备份；W: 内容已验证全量在 N:（fineweb 三源 265 parquet，哈希校验真失败 0）→ 格式化后承接 v3.4 及以前的存档点；X: 源盘缺席且无撤离副本，codeparrot 需用户提供盘后重新下载。
 
 ## 协作协议（2026-08-06 与用户共同制定）
