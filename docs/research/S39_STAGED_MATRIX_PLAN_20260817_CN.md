@@ -188,6 +188,50 @@ dstate=128 类非常规形状；20K 步长训无先例。
 **工程意见（采纳）**：阶段2 只跑 GDN2；GDN2 与 KDA 打平即"存储侧不是问题"闭环、mamba-2 永久
 裁掉（防守靠 DART 外部数据点）；仅当显著差异时补 mamba-2 且把多变量更换的归因折扣写进判读线。
 
+## 附录 B：阶段1 发射命令模板（2026-08-17 主会话，agent-61 交付后核对 CLI 名回写）
+
+**公共底座**（逐臂仅改 run-id/out-dir 与格子的两个开关）：
+
+```bash
+export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 KMP_DUPLICATE_LIB_OK=TRUE PYTHONUTF8=1
+python -X utf8 tools/train/v3_6/train_v36_s1.py \
+  --config configs/canonical_v36.json \
+  --data-path "P:\FLUED_corpus\corpus_v3\corpus_v3.txt" \
+  --backbone-mode xattn \
+  --seq-len 4096 --stride 2048 --max-chunks 1024 --batch-size 1 \
+  --max-steps 20000 \
+  --k-row-source <memory|state> --v-row-source <memory|state> \
+  --run-id <run_id> --out-dir checkpoints/<run_id> \
+  > checkpoints/<run_id>_stdout.log 2>&1
+```
+
+- 配方：canonical v36.8（累积保持默认开）；`--config` 已带 `init_checkpoint`（K: 的 S0′′ 快照，
+  segmentor 冻结接管）——除该快照外全部从零，符合用户既定纪律。
+- 4096 标定采用 Q6 实测值：max_chunks 1024 / stride 2048 / **batch 1**（峰值 12.2GB、~2.3 step/s、
+  20K≈2.4h）。s38d 的 batch 4 是 gist-only（store 一行）的轻载特例，不作四格全行 store 的默认值；
+  单臂稳定后可逐格上探 batch（红线：峰值 <15.9GB 分配器抖动线，守卫 cut_capacity_overflow=0 且
+  truncated_tokens=0，同 E52 口径）。
+- store 规模四格统一全行（`--xcache-frac` 默认 1.0，不加 `--xcache-gist`）——"同 store 规模可比"
+  原则（§4 实现规格注）。桥接臂的 `--xcache-frac 0.04 --xcache-gist` 是复刻 s36e 专用，不外溢。
+- CLI 开关名以 agent-61 实际交付为准（config 键已落地为 `k_row_source`/`v_row_source`，
+  `train_v36_s1.py:820-825` 复用 `train_v36.build_parser`，一处加旗两处生效）；交付核对后此处回写定稿。
+
+**臂次与 run-id**（GPU 串行，一臂一跑，点火前 `nvidia-smi` 查重）：
+
+| 序 | 臂 | k-row-source | v-row-source | run-id |
+|---|---|---|---|---|
+| 1 | a 索引直读+内容直读 | memory | memory | s39_a_mm_v368_20k_ctx4096_20260817 |
+| 2 | d 双过状态机 | state | state | s39_d_ss_v368_20k_ctx4096_20260817 |
+| 3 | b 索引过状态机+内容直读 | state | memory | s39_b_sm_v368_20k_ctx4096_20260817 |
+| 4 | c 索引直读+内容过状态机 | memory | state | s39_c_ms_v368_20k_ctx4096_20260817 |
+| 5 | a+pos 位置注入键版 | memory(+pos) | memory | s39_apos_mm_v368_20k_ctx4096_20260817 |
+| 6 | 锥形宽度附带臂 | 同胜者格子 | 同胜者格子 | s39_w2_<cell>_v368_20k_ctx4096_20260817 |
+
+（a+pos 的位置注入实现为 agent-61 交付后的追加增量；宽度臂在胜者格子判出后定 `--d-backbone`/
+`--backbone-*` 翻倍参数。）每臂终评 backbone_acc 原地入 CURRENT_STATE 证据表（E 连续），
+a−b/a−c 差分按 §4 判读线裁定，桥接臂（bash-pv602s03，在跑）终评对 s36e 0.8006 的偏离幅度
+同表登记。
+
 ## 5. 纪律约束
 
 - 全程单 seed 工程口径起步；主结果臂（1a）出数后评估是否补 seed。
