@@ -135,6 +135,9 @@ V36_CURATED_KEYS = (
     "stride",
     "batch_size",
     "max_steps",
+    "xcache_frac",
+    "xcache_gist",
+    "xcache_supp",
 )
 
 
@@ -171,4 +174,41 @@ def test_current_state_mentions_v36_canonical_version() -> None:
     text = CURRENT_STATE.read_text(encoding="utf-8")
     assert canonical["canonical_version"] in text, (
         "docs/CURRENT_STATE.md does not reference the canonical_version of configs/canonical_v36.json"
+    )
+
+
+# --- v3.6 S1 layer: train_v36_s1 adds its recipe flags in _add_s1_args on top
+# --- of build_parser; these defaults are behavior-critical (the v36.8 recipe
+# --- fix lives here) and must drift-guard against canonical_v36.json too.
+
+V36_S1_CURATED_KEYS = (
+    "cumulative_mask_retention",
+    "mask_mode",
+    "mask_char_frac",
+    "mask_char_span_max",
+    "predict_mode",
+    "predict_latent_weight",
+    "predict_weight",
+    "bpe_tokenizer_path",
+    "k_row_source",
+    "v_row_source",
+    "k_pos_inject",
+)
+
+
+def test_v36_s1_layer_defaults_match_canonical() -> None:
+    canonical = json.loads(CANONICAL_V36.read_text(encoding="utf-8"))
+    from tools.train.v3_6.train_v36 import build_parser
+    from tools.train.v3_6.train_v36_s1 import _add_s1_args
+
+    parser = build_parser()
+    _add_s1_args(parser)
+    defaults = vars(parser.parse_args([]))
+    mismatches = {
+        key: (defaults.get(key), canonical.get(key))
+        for key in V36_S1_CURATED_KEYS
+        if defaults.get(key) != canonical.get(key)
+    }
+    assert not mismatches, (
+        f"train_v36_s1 layer defaults drifted from canonical_v36.json: {mismatches}"
     )

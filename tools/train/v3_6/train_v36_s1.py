@@ -786,8 +786,9 @@ def evaluate(model, eval_loader, args, device):
 
 
 def _add_s1_args(parser: argparse.ArgumentParser) -> None:
-    """S1.0-specific CLI args on top of train_v36.build_parser (kept separate
-    so the canonical-sync guard sees the base defaults untouched)."""
+    """S1.0-specific CLI args on top of train_v36.build_parser (its defaults
+    are drift-guarded against canonical_v36.json by
+    tests/test_canonical_sync.py::test_v36_s1_layer_defaults_match_canonical)."""
     parser.add_argument("--predict-weight", type=float, default=1.0)
     parser.add_argument("--predict-mode", choices=["latent", "decode"], default="latent")
     parser.add_argument("--predict-latent-weight", type=float, default=0.1)
