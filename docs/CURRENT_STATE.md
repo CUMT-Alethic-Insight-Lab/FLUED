@@ -147,6 +147,7 @@ overflow 真凶是 URL 编码/base64 类**无语言边界的高熵字节流**（
 | Q6 | 2048/4096 长上下文 + encoder 速度（scaling 前必测）。可行性已实测（2026-07-23）：2048=max_chunks 256/stride 1024/batch 4（峰值 14.3GB，~3.6 step/s，20K≈93min）；4096=max_chunks 1024/stride 2048/batch 1（峰值 12.2GB，~2.3 step/s，20K≈2.4h）；硬闸门 cut_capacity_overflow=0 且 truncated_tokens=0（实测全 0）。注：`expandable_segments` 在本 torch 构建上不支持（启动警告），无效；有效手段是 batch 压到峰值 <15.9GB 分配器抖动红线以下 | 配置标定完成，长上下文臂待跑（k=1 联动见规格 §21/D12） |
 | Q7 | 300M L0 codec（无条件安全的纯 codec 层）启动时机 | 待跑（Q1 已关闭，启动时机随主线形态裁定后排期） |
 | Q8 | S0.5/S0.6 后岔口：decoder 逐段条件化改造（治 E22 锁定的均值通道，~半天含测试；会改变 GRPO 奖励地形，先做可避免 10K 白跑）vs GRPO 10K 续训（R4 臂 masked 趋势未封顶，便宜但可能只是在天花板下抛光） | **已裁定（2026-08-02）：先改造→S0.7 大阳性（E23）。用户裁定后续三条：① masked 是必备项不降级（不作降级为观察项处理，口径归因讨论关闭）；② S0.7 不设默认（canonical 不切 v36.2，`per_chunk_readout` 保持默认关）；③ 新条件化下 GRPO 是否重跑仍待定** |
+| Q9 | S39 KQV 分阶段实验矩阵（用户原案 48–96 臂全因子 → 主会话修订为序贯筛选 14 臂量级，用户 2026-08-17 批准开跑阶段0–2）。全文与判读线见 `docs/research/S39_STAGED_MATRIX_PLAN_20260817_CN.md`：阶段0a 位置注入键 probe（过线 +5pp 才开位置编码轴）、0b mamba-2 移植可行性（只评估）；阶段1 分类学 2×2 @4096B（KDA 固定；V单状态两格 10K 降预算确认臂，512B 已被 E57 封口）+ 锥形猜想 backbone 宽度 ×2 生死臂；阶段2 GDN2 vs KDA（打平则"存储侧不是问题"闭环、mamba-2 裁掉）。阶段3（位置编码轴）/4（追问，依赖 CUIB harness）不在本轮 | **进行中（2026-08-17 启动）**：阶段0 探针先行 |
 
 ## 6. Changelog
 
@@ -720,3 +721,15 @@ overflow 真凶是 URL 编码/base64 类**无语言边界的高熵字节流**（
   （107+/1126 文件、10.4+ GiB 产出、断线自动恢复）；注意：启动命令经
   Git Bash 传参吞了一个反斜杠，产出实际落 `P:\FLUED_corpusFLUED_corpus_codeparrot\`，
   数据完好，完工后改名归位。
+- 2026-08-16（晚）：**换盘与归并收官**——新 N: 盘 `N:\FLUED_archive` 159G/106 目录
+  SHA256 双侧全绿（L: 全量 103G + K: v3.6 世代 47G 验证副本）；v3.6 世代 34 目录
+  从 L: 归并迁 K: 统一管理（校验后删源）；canonical_v36 与 codec_retention_final_v512
+  的 init_checkpoint 翻转引用至 K: 路径（test_canonical_sync 6 passed）；L: `FLUED_archive`
+  清空（v3.4/v3.5 在 N: 有验证副本，flashkda_msvc_patch 移 K:）；留痕
+  `outputs/migration_manifest_20260816.json`；AGENTS.md 存储布局 2026-08-16 修订。
+- 2026-08-17：**S39 KQV 分阶段实验矩阵立项（Q9）**——用户提出全因子矩阵
+  （3 机制×4 K/V格×2 位置编码×追问轴），主会话逐条核实推理链后修订为序贯筛选
+  14 臂量级（已测格子划出、位置编码轴降为条件启动、追问轴后置），用户批准开跑
+  阶段0–2。计划全文 `docs/research/S39_STAGED_MATRIX_PLAN_20260817_CN.md`；
+  TERMS 新增候选"位置注入键"。方法论口径确立：形式化给出可死的问题定义 →
+  实验决定定义生死与边界 → 解法只认领活下来的格子。

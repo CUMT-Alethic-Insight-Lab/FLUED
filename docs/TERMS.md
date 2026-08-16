@@ -152,6 +152,7 @@
 | 远程查询 token | 远程查询 token（remote query token） | S39 拟开臂的专用学习内容寻址查询：每页除 gist 外由主干额外吐出的少量查询向量，与页级缓存行 key 点积、top-k 硬选择+STE 传梯度，选中行加入该页读出集；监督来自针位字节生成损失。与"捎带查询"（当前 token 隐藏态）和"自查询"（段自摘要）相区分；与 SSA 的 gist 索引同名异物——我方 gist 是存储本体读出项，SSA gist 是块索引 | COLLISION_SCOUT_S39_20260810 | AI(Kimi) | 2026-08-10 | 候选 |
 | K侧索引坍塌 / V侧内容模糊 | K侧索引坍塌 / V侧内容模糊（命名候选：Addressing Collapse 寻址坍塌 / Key-channel Collapse 键通道坍塌 vs Value Blur 值模糊） | 压缩记忆的两类正交失败模式：K 侧=内容已写入但无可寻址键（有内容没索引，检索原理上不可达）；V 侧=索引可达但内容被干扰/叠加糊掉（有索引没精确内容）。二者可独立发生、独立诊断、独立修复。命名避开：index/codebook collapse（VQ 死码占用）、slot collapsing（FwPKM 负载不均占用）、post-compression access failure（agent 压缩占用） | COLLISION_SCOUT_S39 增补A（2026-08-16） | AI(Kimi)提名，四路排雷确认分类学无占位 | 2026-08-16 | 候选 |
 | 追问式读出 | 追问式读出（follow-up readout / iterative querying） | 主干对压缩记忆的查询为条件链式多步策略：读到什么决定下一问问什么，每步查询条件于此前各步读出；与单次发射（DART 的 SMA）和单页内并行重选（多查询/逐位置重选）均正交。2026-08-14 扫描确认"迭代式/多步读出精化"无占位 | COLLISION_SCOUT_S39 增补A.3 | 用户提出形态，AI(Kimi)提名名称 | 2026-08-16 | 候选 |
+| 位置注入键 | 位置注入键（position-injected key） | S39 阶段0a 探针变量：summarizer 直产逐段键时重注入绝对位置编码（段序+段内 byte 位置），使键携带"书的大概位置"式身份（差异性/因果先后），治 E56 块末键 0.06 的末段主导病；判读线 hit@1 相对 0.31 基线 +5pp | S39_STAGED_MATRIX_PLAN_20260817 §4 | 用户提出概念（人脑位置记忆类比），AI(Kimi)提名名称 | 2026-08-17 | 候选 |
 
 ## 8. Changelog
 
@@ -190,3 +191,6 @@
   术语 2 条：K侧索引坍塌/V侧内容模糊（KQV 正交失败二分，AI 提名，命名候选
   Addressing Collapse/Value Blur 待定名后再转正）；追问式读出（follow-up readout，
   用户提出形态、AI 提名名称——主干对压缩记忆的条件链式多步查询）。
+- 2026-08-17：新增候选术语位置注入键（position-injected key）——S39 分阶段矩阵
+  （docs/research/S39_STAGED_MATRIX_PLAN_20260817_CN.md）阶段0a 探针变量，
+  用户以人脑位置记忆类比提出概念，AI 提名名称。
