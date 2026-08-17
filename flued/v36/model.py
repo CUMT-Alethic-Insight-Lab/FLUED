@@ -172,6 +172,12 @@ class V36Config:
     # diagnostic readout. Memory-source only (k/v_row_source must both be
     # "memory"; the state combination is rejected to protect attribution).
     k_pos_inject: bool = False
+    # S39 K-block eval probe (user-ruled 2026-08-17): eval-time-only ablation
+    # switch -- zero the aligned K rows so block-1 cross-attention goes uniform
+    # (the index channel carries zero information). Tests whether the slm
+    # backbone actually reads the index. Behavioral only: no parameters,
+    # checkpoints and training are unaffected.
+    k_block_eval: bool = False
     # v3.7 mode (docs/versions/v3.7/FLUED_V3_7_ARCHITECTURE_CONSENSUS_20260817_CN.md,
     # user-ruled 2026-08-17): backbone_mode="slm" -- fully config-gated; the
     # default stays "attn" and every v36 path is bit-preserved. In slm mode the
@@ -1116,6 +1122,8 @@ class SLMBackbone(nn.Module):
         # a+pos arm: position-injected keys on the fine-grained index rows
         # (zero-init gate -> step 0 bitwise-equals the a grid)
         self.k_pos_inject = getattr(c, "k_pos_inject", False)
+        # S39 K-block eval probe: eval-time K-channel ablation (zero keys)
+        self.k_block_eval = getattr(c, "k_block_eval", False)
         if self.k_pos_inject:
             if k_src != "index":
                 raise ValueError(
@@ -1155,6 +1163,11 @@ class SLMBackbone(nn.Module):
                 raise ValueError("k_pos_inject requires chunk_byte_off (window-relative per-chunk start byte offsets)")
             seg_idx = torch.arange(n, device=k_rows.device).unsqueeze(0).expand(bsz, n)
             k_flat = k_flat + self.pos_gate * self.pos_proj(_pos_features(seg_idx, chunk_byte_off))
+        if self.k_block_eval:
+            # S39 K-block probe (user-ruled 2026-08-17): zero the keys so
+            # block-1 attention is uniform -- the index channel carries zero
+            # information. Absolute: overrides any pos injection above.
+            k_flat = torch.zeros_like(k_flat)
         k = k_flat.view(bsz, n, nh, hd).transpose(1, 2)
         v = store_v.view(bsz, n, nh, hd).transpose(1, 2)
         # causal over the store; keep the diagonal even on padded rows (a

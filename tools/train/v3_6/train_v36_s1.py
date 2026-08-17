@@ -991,6 +991,16 @@ def main() -> None:
     (out_dir / "resolved_config.json").write_text(json.dumps(vars(args), indent=2), encoding="utf-8")
 
     model = build_model(args).to(device)
+    if args.eval_only:
+        # S39 probes (e.g. --k-block-eval, user-ruled 2026-08-17): load one
+        # checkpoint strict, run the standard eval pass, print JSON, exit.
+        payload = torch.load(args.eval_only, map_location=device, weights_only=False)
+        model.load_state_dict(payload["model"], strict=True)
+        model.eval()
+        _t, eval_loader = make_dataloaders(args)
+        stats = evaluate(model, eval_loader, args, device)
+        print(json.dumps(stats, ensure_ascii=False, indent=2), flush=True)
+        return
     if args.init_checkpoint:
         payload = torch.load(args.init_checkpoint, map_location=device, weights_only=False)
         current = model.state_dict()

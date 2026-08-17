@@ -581,3 +581,33 @@ def test_full_model_forward_finite_per_grid(grid):
     assert torch.isfinite(out.logits_direct).all()
     assert torch.isfinite(out.logits_backbone).all()
     assert out.package is None  # the content channel is retired in slm mode
+
+
+# --- 8. K-block eval probe (user-ruled 2026-08-17) ---------------------------
+
+
+def test_k_block_eval_zeroes_block1_keys(monkeypatch):
+    """k_block_eval=True: block-1 SDPA keys are exactly zero (uniform
+    attention) and the output equals running with zeroed k_rows -- under the
+    probe the index channel carries zero information."""
+    torch.manual_seed(0)
+    m = SLMBackbone(tiny_config(k_block_eval=True)).eval()
+    bsz, n = 2, 5
+    k_rows, v_rows = _store_rows(cfg=tiny_config(), grid="a", bsz=bsz, n=n)
+    mask = torch.ones(bsz, n, dtype=torch.bool)
+    mask[1, 4:] = False
+    pos = torch.randn(1, n, 64)
+    calls = _spy_sdpa_all(monkeypatch)
+    with torch.no_grad():
+        out = m(k_rows, v_rows, mask, pos)
+        out_zero = m(torch.zeros_like(k_rows), v_rows, mask, pos)
+    assert torch.isfinite(out).all()
+    _q, k, _v, _attn = calls[0]
+    assert torch.count_nonzero(k) == 0
+    assert torch.allclose(out, out_zero, atol=1e-6)
+    # non-vacuous: probe OFF (same weights) gives a different output
+    m2 = SLMBackbone(tiny_config()).eval()
+    m2.load_state_dict(m.state_dict())
+    with torch.no_grad():
+        out_on = m2(k_rows, v_rows, mask, pos)
+    assert not torch.allclose(out, out_on, atol=1e-4)

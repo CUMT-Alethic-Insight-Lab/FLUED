@@ -85,6 +85,7 @@ def build_model(args: Namespace) -> FLUEDV36:
             k_row_source=getattr(args, "k_row_source", "memory"),
             v_row_source=getattr(args, "v_row_source", "memory"),
             k_pos_inject=getattr(args, "k_pos_inject", False),
+            k_block_eval=getattr(args, "k_block_eval", False),
             xcache_supp=getattr(args, "xcache_supp", 0),
             supp_source=getattr(args, "supp_source", "state"),
             residual_gate_temp=getattr(args, "residual_gate_temp", 1.0),
@@ -303,6 +304,14 @@ def build_parser() -> argparse.ArgumentParser:
         "scalar gate; legacy/xattn path requires --k-row-source/--v-row-source "
         "memory; v3.7 slm path requires k=index and v=memory (model raises "
         "otherwise)",
+    )
+    parser.add_argument(
+        "--k-block-eval",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="S39 K-block eval probe (user-ruled 2026-08-17): zero the aligned "
+        "K rows at eval so block-1 cross-attention is uniform -- tests whether "
+        "the slm backbone actually reads the index channel. Eval-time only.",
     )
     parser.add_argument(
         "--xcache-supp",
