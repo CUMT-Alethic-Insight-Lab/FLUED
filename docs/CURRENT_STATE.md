@@ -127,6 +127,7 @@ overflow 真凶是 URL 编码/base64 类**无语言边界的高熵字节流**（
 | E58 | **S39 阶段0a 位置注入键 probe（v4，冻结 s36g2 库存，同池同 seed 1042 配对）**：summarizer 直产逐段键（memrow/g1）叠加位置注入（段序+段内 byte 偏移各 16 频率正弦→64 维，零初始化标量门控）vs 无注入锚——**hit@1 差分 D=4 −18.75pp（明确回退：hit@3 0.69→0.12、hit@5 0.94→0.12、best_rank 3.6→222 同步崩）、D=16 +6.25pp、D=64 +6.25pp（均在 CI ±12pp 内）、三档均值 −2.5pp——未过预注册 +5pp 判读线 → 位置编码轴取消、阶段3 不发生**。唯一强信号 D=64 hit@5 +25pp（0.06→0.31，噪声内，立此存照）。锚重跑与 v2 逐点完全一致（配对完整性内置校验过）；训练 loss 注入 6.62<锚 6.83（位置特征在训练池可学但泛化不增益）。含义：冻结库存上外挂位置身份对键寻址无增益甚至有害（D=4 干扰少时位置特征稀释内容相似度）——E56"末段主导=无位置身份"病不因外加位置编码而愈；位置身份若要起效须端到端与内容键共学（超出探针口径，存照不立项） | 已验证（工程口径，冻结库存；16 文档/档，CI ±12pp） | probe_archive_addressing v4（2026-08-17） |
 | E59 | **S39 桥接臂：s36e 同配置 × v36.8 累积保持配方（20K@512B）——配方不变量全对齐，backbone_acc 悬崖系指标语义变更而非能力损失**：与 s36e（旧零保持配方，E50 的 0.8006 锚出处）同配置同预算同 eval seed 1042 配对：direct_acc 0.8399 vs 0.8450（−0.5pp）、unmasked_acc 0.8347 vs 0.8405（−0.6pp）、direct_ppl 1.791 vs 1.768——三个配方不变量全在噪声带内；predict_cos 0.9614 vs 0.9458 反升 1.6pp；state_norm 10.38 vs 8.85（8-16 健康带内，保持训练下略升符合预期）；0 NaN、守卫 overflow/truncated 全 0、5.42 step/s、61.5min。**backbone_acc 0.4799 vs 0.8006 不可直接比**：该指标=补全任务精度（`train_v36_s1.py:725`，对 comp_targets/comp_slot_mask 计），v36.8 起第 i 行还原 0…i 段遮蔽字节，行目标量随 i 线性膨胀，绝对值结构性低于旧逐段口径；masked_acc 0.0128 vs 0.1609 同理（陈旧段遮蔽位须从"从未见过该内容"的状态推理，聚合被陈旧行稀释）。判读：v36.8 未伤主干核心能力，E44–E56 旧口径"能力"读数整体有效、无需加注；凡跨配方边界引用 backbone_acc/masked_acc 绝对值须带"旧口径"限定（TODO §0.3 解读注意同口径）。阶段1 四格基线由 a 格 4096B 自产，本臂为 512B 新配方参照点 | 已验证（单 seed，20K/512B 工程口径；与 s36e 同 eval seed 配对） | s39_bridge_s36e_v368_20k_20260817（2026-08-17） |
 | E60 | **S39 阶段1 四格 a 格（index 直读+memory 直读，SLM 主干，20K@4096B）——v3.7 新口径四格自产基线锚**：v37.1 共识形态首格落地：summarizer（DiT，冻结 S0″ 前端接管）直产 index/memory 双通道直通、interpreter 完全出链（state_norm=0 占位、不建任何状态机）、主干=3 层标准因果 SLM（全模 41.5M 参数）：eval direct_acc 0.7923 / backbone_acc 0.7468 / masked_acc 0.1341 / unmasked_acc 0.7796 / direct_ppl 2.141 / backbone_ppl 2.642 / predict_cos 0.562；~166 段/样本、hard_cut 3.97%；0 NaN、守卫 overflow/truncated 全 0、2.90 step/s、114.8min。口径声明：backbone_acc/masked_acc 为 v36.8 起累积保持配方口径（第 i 行还原 0…i 段，行目标量随 i 膨胀），与 E44–E56 旧口径绝对值不可直接比（E59 已立同例）；四格横向差分（a−b=索引过状态机代价、a−c=内容过状态机代价、a+pos−a>2pp 复活位置轴）以本格为锚 | 已验证（单 seed，v37.1 口径，20K/4096B 工程口径） | v37_a_im_v371_20k_ctx4096_20260817（2026-08-17） |
+| E61 | **S39 阶段1 四格 d 格（K 单状态+V 单状态，SLM 主干，20K@4096B）——双通道过状态机对 codec 灾难性：direct_ppl 40.26 vs a 格 2.141**：v37.1 四格第二格：summarizer 直产 index/memory 双通道均过 KDA 状态机（recurrence=kda）、主干与 decoder 均读终态矩阵、54.8M 参数（较 a 格 +13.3M，差额为两套 interpreter）：eval direct_acc 0.2956 / backbone_acc 0.2785 / masked_acc 0.0045（近零，a 格 0.1341）/ unmasked_acc 0.6927 / direct_ppl 40.264 / backbone_ppl 43.463 / predict_cos 0.924；state_norm 终态 191.7（轨迹 9→54→105→174→192 全程缓升后平台，state 每次前向清零、非跨样本泄漏）；~166 段/样本、hard_cut 3.97%（与 a 格同管线同 seed）；0 NaN、守卫 overflow/truncated 全 0、2.99 step/s、111.5min。口径声明：predict_cos 0.924 反高于 a 格 0.562 但 predict_byte_acc=0.0（latent 模式下终态累积均值 cos 虚高，跨形态不可直接比）；retention_truncated_slots 23944 为粗粒度口径预期值（a 格=0.0）。判读：a−d 差≈双通道过状态机总代价（direct_ppl 差 38.1），K/V 同压时单一终态矩阵容量远不足以承载 codec 全前缀信息，为 b/c 单通道臂立下界参照 | 已验证（单 seed，v37.1 口径，20K/4096B 工程口径） | v37_d_ss_v371_20k_ctx4096_20260817（2026-08-17） |
 
 ## 4. 闸门注册表
 
@@ -796,3 +797,10 @@ overflow 真凶是 URL 编码/base64 类**无语言边界的高熵字节流**（
   direct_ppl 2.141 / backbone_ppl 2.642 / predict_cos 0.562；0 NaN、守卫全 0；
   四格差分锚确立（a−b=索引过状态机代价、a−c=内容过状态机代价），
   d/b/c/a+pos 串行点火序列启动。
+- 2026-08-17（七）：**S39 阶段1 d 格收官（E61 登记）**——v37.1 四格第二格
+  （K 单状态+V 单状态，SLM 主干，54.8M，20K@4096B，~166 段/样本）：direct
+  0.2956 / backbone 0.2785 / masked 0.0045 / unmasked 0.6927 / direct_ppl
+  40.264 / backbone_ppl 43.463 / predict_cos 0.924（latent 模式 state 形态
+  虚高、byte_acc=0，口径限定见 E61）；state_norm 终态 191.7 全程缓升后平台
+  （每前向清零、非泄漏）；0 NaN、守卫全 0、111.5min。a−d 差≈双通道过状态
+  机总代价（direct_ppl 差 38.1），b 格（state,memory）接续点火。
