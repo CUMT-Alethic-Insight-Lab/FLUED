@@ -777,3 +777,15 @@ overflow 真凶是 URL 编码/base64 类**无语言边界的高熵字节流**（
   26 分片偏移链与文件尺寸全绿），管线 09:29 恢复续跑（1061/1126 起，F: 265G/
   P: 305G 余量）。**a 格正式 20K@4096B 点火**（v37_a_im_v371_20k_ctx4096_20260817，
   2.69 步/s ≈2.0h，起步 loss 6.7 降、零 NaN、state_norm=0 占位正确），终评入 E60。
+- 2026-08-17（五）：**codeparrot 全量收官 + GDN2 预建制成形**——codeparrot
+  管线 11:02 零失败完工（1126/1126 清洗、写入 19,132,945 条、dup 366,789、
+  106.71 GiB）；收官脚本归位 `P:\FLUED_corpus\FLUED_corpus_codeparrot`、
+  v5_records 重键 19,164,240 行、27 分片偏移链终验全绿、逐分片 sha256 重建
+  manifest+shards.txt；F: 缓冲残留 164 parquet/43.8 GiB（按"近满盘才清"
+  裁定保留）。GDN2 预建制入仓（commit 16994e8）：`recurrence` 配置项
+  kda/gdn2，WriteHead 条件建 to_b/to_w（xcache_supp 先例，旧 ckpt
+  strict-clean），状态机全读出面 gdn2 分支（torch 参考与 fla
+  naive_recurrent_gdn2 逐比特一致），CLI --recurrence 默认 kda，12 新单测
+  （默认路径逐比特不变 + b=w=beta 塌缩复现 KDA），全量 pytest
+  282 passed/4 skipped；TERMS.md 登记 GDN2（候选）。阶段2 机制甄别臂
+  代码就绪，待阶段1 胜者格子选定后点火。
