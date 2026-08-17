@@ -55,6 +55,10 @@ def label_block(text: str, exemplars, endpoint: str, model: str, timeout: int, a
             last = bs.call_teacher(endpoint, model, bs.build_prompt(exemplars, text), timeout, api_key)
         except Exception as exc:  # noqa: BLE001
             last = f"__error__ {exc}"
+            if "429" in str(exc):
+                # rate-limited: back off instead of burning the attempt budget
+                time.sleep(30)
+                continue
         boundaries = bs.validate_and_convert(text, last)
         if boundaries is not None:
             return boundaries, last

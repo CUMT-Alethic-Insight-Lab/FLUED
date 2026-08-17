@@ -324,6 +324,33 @@ def build_parser() -> argparse.ArgumentParser:
         "retrieval (index channel becomes load-bearing)",
     )
     parser.add_argument(
+        "--cloze-prob",
+        type=float,
+        default=0.0,
+        help="v3.7 slm cloze 检索回执 (user-ruled 2026-08-17): per-window "
+        "probability of splicing one --cloze-bank passage into the window's "
+        "first 60%% (UTF-8-snapped offset) and appending "
+        "'\\n'+query+'\\n答案是：'+answer at the tail; the passage answer is "
+        "force-UNMASKED (E23), the echo answer force-MASKED, byte CE on the "
+        "echo slots rides the completion conditioning. Wired in "
+        "train_v36_s1.py only, slm mode only; default 0.0 = off, "
+        "bitwise-identical legacy path.",
+    )
+    parser.add_argument(
+        "--cloze-weight",
+        type=float,
+        default=0.3,
+        help="loss weight of the cloze task; added ON TOP of the three main "
+        "tasks (their weights are untouched)",
+    )
+    parser.add_argument(
+        "--cloze-bank",
+        type=str,
+        default="",
+        help="cloze bank JSONL ({\"id\",\"passage\",\"answer\",\"query\",\"answer_bytes\"}; "
+        "tools/data/mine_cloze_bank.py contract); required when --cloze-prob>0",
+    )
+    parser.add_argument(
         "--xcache-supp",
         type=int,
         default=0,
@@ -396,6 +423,12 @@ def main() -> None:
     if pre_args.config:
         parser.set_defaults(**json.loads(Path(pre_args.config).read_text(encoding="utf-8")))
     args = parser.parse_args()
+    if getattr(args, "cloze_prob", 0.0) > 0:
+        raise SystemExit(
+            "--cloze-prob>0 is wired in the S1 trainer only: run "
+            "tools/train/v3_6/train_v36_s1.py (v3.7 slm cloze 检索回执, "
+            "user-ruled 2026-08-17)"
+        )
 
     device = torch.device(args.device if args.device == "cpu" or torch.cuda.is_available() else "cpu")
     torch.manual_seed(args.seed)

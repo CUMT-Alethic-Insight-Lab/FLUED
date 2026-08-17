@@ -21,6 +21,21 @@ Tasks (spec section 20, user-designed):
    deform the encoder/KDA compressed representation (E31: full-gradient v2.0
    collapsed the KDA state and destroyed the codec tasks).
    ``--predict-mode latent`` keeps the old pure-MSE behaviour for historical runs.
+4. cloze retrieval receipt (v3.7 slm only, user-ruled 2026-08-17; spec note
+   docs/versions/v3.7/FLUED_V3_7_CLOZE_TASK_20260817_CN.md): with probability
+   ``--cloze-prob`` one bank passage (``--cloze-bank`` JSONL, the
+   tools/data/mine_cloze_bank.py contract) is spliced into the window's first
+   60% at a uniform UTF-8-snapped byte offset, and ``\n`` + query +
+   ``\n答案是：`` + answer is appended at the window tail. The passage's
+   answer span is force-UNMASKED (E23 discipline: the readback tests the
+   retention of already-encoded content); the tail echo answer is force-MASKED
+   (no copying from the window tail). Byte CE over the echo slots rides the
+   SAME completion conditioning (decoder(backbone_out+pos)), weighted by
+   ``--cloze-weight`` ON TOP of the three main tasks. Metrics: cloze_byte_acc
+   / cloze_exact / cloze_count. Default off (``--cloze-prob 0.0`` = zero
+   intrusion: the legacy path stays bitwise-identical). Motivation: E64/E66
+   showed the three tasks put zero retrieval load on the K channel inside a
+   4096B window; cloze makes "retrieve or lose points" part of the gradient.
 
 Metric redefinition (S1.0+): direct fidelity excludes nothing but MASK_ID
 positions are reported separately (trivially correct); masked acc is backbone
@@ -93,6 +108,190 @@ _BPE_TOKENIZER = None
 # Dedicated CPU generator: evaluate() re-seeds it so the eval mask is
 # deterministic regardless of dataset-RNG consumption order.
 _MASK_GENERATOR = torch.Generator()
+
+# ---------------------------------------------------------------------------
+# cloze 检索回执 (v3.7 slm-only 4th task, user-ruled 2026-08-17)
+# ---------------------------------------------------------------------------
+
+# Module-level so the bank never lands in vars(args) dumps (same discipline as
+# _BPE_TOKENIZER); only the path string lives in args.
+_CLOZE_BANK = None
+# Dedicated CPU generator (same discipline as _MASK_GENERATOR): main() seeds
+# it from args.seed, evaluate() re-seeds it from args.eval_mask_seed, so eval
+# splices are deterministic regardless of dataset/mask RNG consumption order.
+# The offset decorrelates the cloze draw stream from the mask stream (same
+# seed family, different stream).
+_CLOZE_GENERATOR = torch.Generator()
+_CLOZE_SEED_OFFSET = 101_003
+_CLOZE_ECHO_PROMPT = "\n答案是：".encode("utf-8")
+
+
+def _cloze_enabled(args) -> bool:
+    return float(getattr(args, "cloze_prob", 0.0)) > 0.0
+
+
+def _load_cloze_bank(path: str) -> int:
+    """Load and contract-validate the cloze bank JSONL; returns entry count.
+
+    Contract (tools/data/mine_cloze_bank.py, 勿改字段名): each line
+    {"id", "passage", "answer", "query", "answer_bytes"} with answer_bytes =
+    int, the answer's UTF-8 byte count; passage 96-192B; answer 28-36B;
+    query == passage with the answer replaced by exactly one ``___``. The
+    answer's byte span inside the passage is recovered from the query's blank
+    position and cross-checked against the raw strings. Any violation raises
+    ValueError with the line number (loud, never silent).
+    """
+    global _CLOZE_BANK
+    resolved = Path(path)
+    if not resolved.is_absolute():
+        resolved = REPO_ROOT / resolved
+    bank = []
+    with resolved.open("r", encoding="utf-8") as fh:
+        for ln, line in enumerate(fh, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            missing = {"id", "passage", "answer", "query", "answer_bytes"} - set(row)
+            if missing:
+                raise ValueError(f"cloze bank line {ln}: missing fields {sorted(missing)}")
+            pb = row["passage"].encode("utf-8")
+            ab = row["answer"].encode("utf-8")
+            qb = row["query"].encode("utf-8")
+            if row["answer_bytes"] != len(ab):
+                raise ValueError(
+                    f"cloze bank line {ln}: answer_bytes={row['answer_bytes']} != actual {len(ab)}"
+                )
+            if not (28 <= len(ab) <= 36):
+                raise ValueError(f"cloze bank line {ln}: answer {len(ab)}B outside 28-36B")
+            if not (96 <= len(pb) <= 192):
+                raise ValueError(f"cloze bank line {ln}: passage {len(pb)}B outside 96-192B")
+            if qb.count(b"___") != 1:
+                raise ValueError(f"cloze bank line {ln}: query must contain exactly one '___' blank")
+            lo = qb.find(b"___")
+            if qb != pb[:lo] + b"___" + pb[lo + len(ab) :] or pb[lo : lo + len(ab)] != ab:
+                raise ValueError(f"cloze bank line {ln}: query.replace('___', answer) != passage")
+            bank.append({"id": row["id"], "passage_b": pb, "query_b": qb, "answer_b": ab, "ans_lo": lo})
+    if not bank:
+        raise ValueError(f"cloze bank empty: {resolved}")
+    _CLOZE_BANK = bank
+    return len(bank)
+
+
+def _splice_cloze(clean: torch.Tensor, bank: list, prob: float, generator: torch.Generator):
+    """Splice one cloze instance into each selected window (CPU, pre-encode).
+
+    Per row, in a fixed draw order on ``generator`` (selection uniform, then
+    bank index, then insertion offset): with probability ``prob`` insert the
+    bank passage at a uniform byte offset inside the window's first 60%
+    (snapped FORWARD to a UTF-8 char boundary) and append ``\\n`` + query +
+    ``\\n答案是：`` + answer at the window tail. The batch tensor WIDENS past
+    seq_len to hold the splice (the v3.7 front end carries no byte-level
+    positional embedding, so a slightly wider window is legal; the chunk
+    packer's capacity accounting is unchanged) -- the task counts only when
+    the echo survives packing whole; ``_cloze_slot_grid`` enforces that skip
+    rule (echo 必须在窗内才算数).
+
+    Unselected rows stay byte-identical. Returns (new_clean, metas); metas[b]
+    is None or {"echo_span": (lo, hi), "passage_answer_span": (lo, hi),
+    "bank_id": int}.
+    """
+    bsz, width = clean.shape
+    metas: list[dict | None] = [None] * bsz
+    spliced: dict[int, bytes] = {}
+    for b in range(bsz):
+        ids = clean[b]
+        valid = ids.ne(PAD_ID)
+        n = int(valid.sum())
+        u = float(torch.rand((), generator=generator))
+        # defense: only prefix-valid rows are eligible (corpus windows always
+        # are); ineligible rows keep their content byte-identical.
+        if u >= prob or n == 0 or not bool(valid[:n].all()) or bool(valid[n:].any()):
+            continue
+        raw = bytes(int(i) - BYTE_OFFSET for i in ids[:n].tolist())
+        entry = bank[int(torch.randint(len(bank), (1,), generator=generator))]
+        max_off = int(0.6 * n)
+        p = int(torch.randint(0, max_off + 1, (1,), generator=generator)) if max_off > 0 else 0
+        while p < n and (raw[p] & 0xC0) == 0x80:
+            p += 1
+        new = raw[:p] + entry["passage_b"] + raw[p:] + b"\n" + entry["query_b"] + _CLOZE_ECHO_PROMPT + entry["answer_b"]
+        echo_lo = len(new) - len(entry["answer_b"])
+        ans_lo = p + entry["ans_lo"]
+        metas[b] = {
+            "echo_span": (echo_lo, len(new)),
+            "passage_answer_span": (ans_lo, ans_lo + len(entry["answer_b"])),
+            "bank_id": entry["id"],
+        }
+        spliced[b] = new
+    out = clean
+    if spliced:
+        new_width = max([width] + [len(r) for r in spliced.values()])
+        out = clean.new_full((bsz, new_width), PAD_ID)
+        out[:, :width] = clean
+        for b, r in spliced.items():
+            out[b] = PAD_ID
+            out[b, : len(r)] = torch.tensor([x + BYTE_OFFSET for x in r], dtype=clean.dtype)
+    return out, metas
+
+
+def _cloze_mask_overrides(byte_mask: torch.Tensor, metas: list) -> torch.Tensor:
+    """E23 discipline, applied AFTER the regular mask: the passage's answer
+    span is force-UNMASKED (the readback tests the retention of
+    already-encoded content); the tail echo answer is force-MASKED (no copying
+    the answer from the window tail)."""
+    for b, m in enumerate(metas):
+        if m is None:
+            continue
+        lo, hi = m["passage_answer_span"]
+        byte_mask[b, lo:hi] = False
+        lo, hi = m["echo_span"]
+        byte_mask[b, lo:hi] = True
+    return byte_mask
+
+
+def _cloze_slot_grid(metas: list, chunk_ids: torch.Tensor, offsets: torch.Tensor, max_chunks: int, max_span: int):
+    """Map each sample's echo bytes through the chunk packing into the (B, C,
+    S) completion grid. A sample counts (active) only when EVERY echo byte
+    lands on a valid (chunk, slot) cell -- echo 必须在窗内/网格内才算数;
+    capacity-truncated samples skip the task (cloze_count=0) but keep their
+    spliced content for the three main tasks."""
+    bsz = chunk_ids.size(0)
+    device = chunk_ids.device
+    slot = torch.zeros((bsz, max_chunks, max_span), dtype=torch.bool, device=device)
+    active = torch.zeros(bsz, dtype=torch.bool, device=device)
+    for b, m in enumerate(metas):
+        if m is None:
+            continue
+        lo, hi = m["echo_span"]
+        if hi > chunk_ids.size(1):
+            continue
+        t = torch.arange(lo, hi, device=device)
+        j = chunk_ids[b, t]
+        s = offsets[b, t]
+        ok = j.ge(0) & j.lt(max_chunks) & s.ge(0) & s.lt(max_span)
+        if not bool(ok.all()):
+            continue
+        slot[b, j, s] = True
+        active[b] = True
+    return slot, active
+
+
+def _cloze_loss_and_metrics(logits_backbone: torch.Tensor, comp_targets: torch.Tensor, cloze_slot: torch.Tensor, active: torch.Tensor):
+    """Byte CE over the echo slots on the SAME completion conditioning as the
+    masked completion task (decoder(backbone_out+pos) logits), plus the
+    train_log metrics: byte accuracy over echo slots; exact = whole answer
+    right (mean over active samples); count = batch hit rate."""
+    cloze_loss = _ce(logits_backbone, comp_targets, cloze_slot)
+    pred = logits_backbone.argmax(dim=-1)
+    hit = pred.eq(comp_targets) & cloze_slot
+    byte_acc = hit.float().sum() / cloze_slot.float().sum().clamp(min=1.0)
+    exact_per = (hit | ~cloze_slot).flatten(1).all(dim=1) & active
+    exact = exact_per.float().sum() / active.float().sum().clamp(min=1.0)
+    return cloze_loss, {
+        "cloze_byte_acc": byte_acc.detach(),
+        "cloze_exact": exact.detach(),
+        "cloze_count": active.float().mean().detach(),
+    }
 
 
 def _load_bpe_tokenizer(path: str) -> None:
@@ -616,7 +815,24 @@ def _frozen_decoder_logits(model, cond: torch.Tensor, token_mask: torch.Tensor) 
 
 
 def step_model(model, batch, args, device, train: bool):
-    clean = batch[0].to(device)
+    clean = batch[0]
+    cloze_metas = None
+    if _cloze_enabled(args):
+        # v3.7 cloze 检索回执 (user-ruled 2026-08-17): slm-only; the legacy
+        # xattn/paged/draft/attn paths and the codec_final/paged/draft/
+        # prefix_task combinations are N/A and must fail loudly, not silently.
+        if getattr(model.config, "backbone_mode", "") != "slm":
+            raise ValueError(
+                "cloze (--cloze-prob>0) requires backbone_mode='slm' (v3.7 检索回执); "
+                "legacy xattn/paged/draft/attn paths are N/A"
+            )
+        if _CLOZE_BANK is None:
+            raise ValueError(
+                "cloze bank not loaded: main() loads --cloze-bank via "
+                "_load_cloze_bank before training/eval"
+            )
+        clean, cloze_metas = _splice_cloze(clean, _CLOZE_BANK, float(args.cloze_prob), _CLOZE_GENERATOR)
+    clean = clean.to(device)
     valid = clean.ne(PAD_ID)
     if getattr(args, "mask_mode", "byte_span") == "mixed":
         byte_mask = make_mixed_mask(
@@ -629,6 +845,10 @@ def step_model(model, batch, args, device, train: bool):
         ).to(device)
     else:
         byte_mask = make_byte_mask(valid, args.mask_prob, args.mask_span_min, args.mask_span_max)
+    if cloze_metas is not None:
+        # E23 overrides AFTER the regular mask: passage answer force-unmasked,
+        # tail echo force-masked (see _cloze_mask_overrides).
+        byte_mask = _cloze_mask_overrides(byte_mask, cloze_metas)
     source = clean.masked_fill(byte_mask, MASK_ID)
     with torch.autocast("cuda", dtype=torch.bfloat16, enabled=args.amp and device.type == "cuda"):
         out = s1_forward(model, source, args, clean=clean, byte_mask=byte_mask)
@@ -807,10 +1027,30 @@ def step_model(model, batch, args, device, train: bool):
     else:
         predict_loss = se
 
+    # cloze 检索回执 (v3.7 slm, user-ruled 2026-08-17): byte CE over the echo
+    # slots on the SAME final completion logits as the masked completion task
+    # (post-Markov-head, same form); the weight sits ON TOP of the three main
+    # tasks (their weights are untouched). Zero placeholders keep the log
+    # schema aligned when the task is off or no sample is active.
+    cloze_loss = torch.zeros((), device=device)
+    cloze_metrics = {
+        "cloze_byte_acc": torch.zeros((), device=device),
+        "cloze_exact": torch.zeros((), device=device),
+        "cloze_count": torch.zeros((), device=device),
+    }
+    if cloze_metas is not None:
+        cloze_slot, cloze_active = _cloze_slot_grid(
+            cloze_metas, chunks.chunk_ids, chunks.offsets, args.max_chunks, args.max_span
+        )
+        cloze_loss, cloze_metrics = _cloze_loss_and_metrics(
+            out["logits_backbone"], comp_targets, cloze_slot, cloze_active
+        )
+
     loss = (
         args.task1_loss_weight * direct_loss
         + args.task2_loss_weight * completion_loss
         + args.predict_weight * predict_loss
+        + getattr(args, "cloze_weight", 0.3) * cloze_loss
     )
     # Metrics stay on device (detached scalars); the training loop accumulates
     # them and only syncs to host at log time -- per-step .item() calls on
@@ -828,6 +1068,10 @@ def step_model(model, batch, args, device, train: bool):
         "backbone_unmasked_acc": _acc_tensor(out["logits_backbone"].argmax(dim=-1), comp_targets, unmasked_slot),
         "retention_truncated_slots": retention_trunc.detach().float(),
         "predict_cos": predict_cos.detach(),
+        "cloze_loss": cloze_loss.detach(),
+        "cloze_byte_acc": cloze_metrics["cloze_byte_acc"],
+        "cloze_exact": cloze_metrics["cloze_exact"],
+        "cloze_count": cloze_metrics["cloze_count"],
         "mask_rate": (byte_mask.float().sum() / valid.float().sum().clamp(min=1.0)).detach(),
         "truncated_tokens": chunks.pack_info["truncated_tokens"].float().sum().detach(),
         "cut_capacity_overflow": out["cut_overflow"].float().sum().detach(),
@@ -871,6 +1115,9 @@ def evaluate(model, eval_loader, args, device):
     if device.type == "cuda":
         torch.cuda.manual_seed_all(args.eval_mask_seed)
     _MASK_GENERATOR.manual_seed(args.eval_mask_seed)
+    # cloze eval determinism (same seed family as the eval mask): fixed
+    # splices per eval batch regardless of the training-time draw count.
+    _CLOZE_GENERATOR.manual_seed(args.eval_mask_seed + _CLOZE_SEED_OFFSET)
     rows = []
     for i, batch in enumerate(eval_loader):
         if i >= args.max_eval_batches:
@@ -963,6 +1210,28 @@ def main() -> None:
             )
         if args.prefix_task:
             raise SystemExit("--backbone-mode slm does not combine with --prefix-task (N/A in v3.7)")
+    if getattr(args, "cloze_prob", 0.0) > 0:
+        # v3.7 cloze 检索回执 (user-ruled 2026-08-17): slm-only -- on legacy
+        # xattn/paged/draft/attn paths (and the codec_final/paged/draft/
+        # prefix_task combinations, which are non-slm or already rejected
+        # above) fail loudly, not silently.
+        if getattr(args, "backbone_mode", "") != "slm":
+            raise SystemExit(
+                "--cloze-prob>0 requires --backbone-mode slm (v3.7 cloze 检索回执); "
+                "xattn/paged/draft/attn paths and codec_final/paged/draft/prefix_task "
+                "combinations are N/A"
+            )
+        if not args.cloze_bank:
+            raise SystemExit(
+                "--cloze-prob>0 requires --cloze-bank <jsonl> "
+                "(cloze 题库, tools/data/mine_cloze_bank.py contract)"
+            )
+        n_cloze_bank = _load_cloze_bank(args.cloze_bank)
+        print(
+            f"[s1] cloze 检索回执: bank={args.cloze_bank} entries={n_cloze_bank} "
+            f"prob={args.cloze_prob} weight={args.cloze_weight}",
+            flush=True,
+        )
     if args.codec_final_state:
         if not getattr(args, "state_channel", True):
             raise SystemExit("--codec-final-state requires --state-channel (this arm trains the state channel itself)")
@@ -980,6 +1249,7 @@ def main() -> None:
     if args.mask_mode == "mixed":
         _load_bpe_tokenizer(args.bpe_tokenizer_path)
     _MASK_GENERATOR.manual_seed(args.seed)
+    _CLOZE_GENERATOR.manual_seed(args.seed + _CLOZE_SEED_OFFSET)
 
     device = torch.device(args.device if args.device == "cpu" or torch.cuda.is_available() else "cpu")
     torch.manual_seed(args.seed)

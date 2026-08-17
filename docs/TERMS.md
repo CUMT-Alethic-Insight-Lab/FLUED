@@ -155,6 +155,7 @@
 | 追问式读出 | 追问式读出（follow-up readout / iterative querying） | 主干对压缩记忆的查询为条件链式多步策略：读到什么决定下一问问什么，每步查询条件于此前各步读出；与单次发射（DART 的 SMA）和单页内并行重选（多查询/逐位置重选）均正交。2026-08-14 扫描确认"迭代式/多步读出精化"无占位 | COLLISION_SCOUT_S39 增补A.3 | 用户提出形态，AI(Kimi)提名名称 | 2026-08-16 | 候选 |
 | 位置注入键 | 位置注入键（position-injected key） | S39 阶段0a 探针变量：summarizer 直产逐段键时重注入绝对位置编码（段序+段内 byte 位置），使键携带"书的大概位置"式身份（差异性/因果先后），治 E56 块末键 0.06 的末段主导病；判读线 hit@1 相对 0.31 基线 +5pp | S39_STAGED_MATRIX_PLAN_20260817 §4 | 用户提出概念（人脑位置记忆类比），AI(Kimi)提名名称 | 2026-08-17 | 候选 |
 | codec 全覆盖律 | codec 全覆盖律（full-prefix codec coverage law） | v3.7 铁律：编码到第 i 段时任何涉及内容的任务损失必须覆盖第 1..i 段全部内容，禁止任何鼓励短时记忆的任务/目标网格；细粒度格以逐段联合实现、粗粒度格单点累积（v3.7 共识 §2） | FLUED_V3_7_ARCHITECTURE_CONSENSUS_20260817_CN §2 | 用户裁定内容，AI(Kimi)提名名称 | 2026-08-17 | 候选 |
+| cloze 检索回执 | cloze 检索回执（cloze retrieval receipt） | v3.7 第四训练任务：训练窗内拼接"原文片段（answer 可见）+ 尾部 cloze 问句（___ 挖空）+ 答案是：+echo（answer 重述段，编码时遮蔽）"，损失只打 echo 字节——查不到前面那段就丢分，检索压力进梯度；answer 为 ~32B UTF-8 安全高特异性切片，X 上下文窗内天然唯一 | FLUED_V3_7_CLOZE_TASK_20260817_CN | 用户裁定设计与命名（否定 AI 的 needle 模板方案后提出） | 2026-08-17 | 已注册 |
 
 ## 8. Changelog
 
@@ -200,3 +201,4 @@
   新增候选术语 codec 全覆盖律（full-prefix codec coverage law，用户裁定内容、AI 提名名称）。
 - 2026-08-17：新增候选术语 GDN2（门控 DeltaNet 2）——S39 阶段2 机制轴的写入规则臂
   （擦写门控解耦），AI 落地为 `recurrence` 配置项（kda 默认逐比特不变），登记待转正。
+- 2026-08-17：新增术语 cloze 检索回执（cloze retrieval receipt，v3.7 第四训练任务）——用户裁定设计与命名（否定 needle 模板方案后提出的自然 cloze 形态），直接已注册。
