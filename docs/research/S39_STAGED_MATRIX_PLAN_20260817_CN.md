@@ -188,6 +188,8 @@ forward/read_all_final/read_supplementary/read_residual/init_stream_state/stream
 机制差异仅一处——擦写门控解耦（KDA 标量 beta 同缩放擦除与写入；GDN2 擦除门 b 逐 K 通道、写入门 w
 逐 V 通道）。改动=WriteHead 多一路门（+1.6M 参数）+4 调用点+torch 参考改写+单测孪生；
 **单变量性质成立**（通道衰减与 delta 擦除形式保留），状态布局与 131K 预算口径不变。
+**2026-08-17 追测**：训练实际使用的 soulvlm 环境（fla 0.5.1）同有 `chunk_gdn2`，签名逐参
+比对同构（唯一结构差=b/w 双门张量，与"WriteHead 加一路门"估计一致）——阶段2 无需切换环境。
 
 **mamba-2=中偏大（3-5 天+一臂训练）**：成本三处——① 语义不可 1:1 映射（SSD 的 dt 同时进衰减与
 写入，与 KDA 静态 alpha+动态 beta 解耦不同构，WriteHead 输出语义须重设计）；② 新 torch 参考+

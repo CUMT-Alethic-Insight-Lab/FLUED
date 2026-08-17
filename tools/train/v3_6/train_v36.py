@@ -106,6 +106,7 @@ def build_model(args: Namespace) -> FLUEDV36:
             prefix_task=args.prefix_task,
             prefix_positions=args.prefix_positions,
             kda_impl=args.kda_impl,
+            recurrence=getattr(args, "recurrence", "kda"),
             state_channel=getattr(args, "state_channel", True),
         )
     )
@@ -298,8 +299,10 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=False,
         help="S39 a+pos arm: add sinusoidal (segment order, window-relative "
-        "start byte) key-row features to the xattn K side through a zero-init "
-        "scalar gate; requires --k-row-source/--v-row-source memory",
+        "start byte) key-row features to the K side through a zero-init "
+        "scalar gate; legacy/xattn path requires --k-row-source/--v-row-source "
+        "memory; v3.7 slm path requires k=index and v=memory (model raises "
+        "otherwise)",
     )
     parser.add_argument(
         "--xcache-supp",
@@ -327,6 +330,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prefix-task", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--prefix-positions", type=int, default=4)
     parser.add_argument("--kda-impl", choices=["torch", "fla"], default="fla")
+    parser.add_argument(
+        "--recurrence",
+        choices=["kda", "gdn2"],
+        default="kda",
+        help="state-machine write rule: kda = shared scalar beta gates both "
+        "erase and write (default, canonical); gdn2 = erase/write gate "
+        "decoupling (per-K-channel erase gate b + per-V-channel write gate w "
+        "replace beta; decay and delta form unchanged) -- S39 stage-2 "
+        "single-variable arm (S39_STAGED_MATRIX_PLAN_20260817 appendix A)",
+    )
     parser.add_argument(
         "--state-channel",
         action=argparse.BooleanOptionalAction,

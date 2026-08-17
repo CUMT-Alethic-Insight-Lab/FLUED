@@ -118,6 +118,7 @@
 | 术语 | 中文全称 | 一句话定义 | 首次出现 | 提出方 | 日期 | 状态 |
 |---|---|---|---|---|---|---|
 | KDA | Kimi Delta Attention | 月之暗面 Kimi Linear 的逐通道（channel-wise）门控 delta 规则线性注意力：状态按通道独立衰减，v3.6 的 interpreter 机制 | v3.6 规格 §1 | 外部（月之暗面） | 2026-07-25 | 已注册 |
+| GDN2 | 门控 DeltaNet 2（Gated DeltaNet 2） | KDA 的 delta 族近亲（fla `chunk_gdn2`，arXiv 2605.22791）：擦写门控解耦——擦除门 b 逐 K 通道、写入门 w 逐 V 通道，取代 KDA 同缩放擦写的共享标量 beta；衰减门与 delta 擦除形式不变。S39 阶段2 机制轴单变量消融臂，代码侧为 `recurrence="gdn2"` 配置项（默认 kda 不变） | S39_STAGED_MATRIX_PLAN_20260817 附录A | 外部（fla/论文），AI(Kimi) 落地为配置项 | 2026-08-17 | 候选 |
 | KDA 状态机 | KDA 状态机（新 interpreter） | v3.6 中只读 memory 序列、串行更新状态 S 并产出 readout 的模块，状态随样本生灭（无跨窗无 TBTT） | v3.6 规格 §2 | 用户 | 2026-07-25 | 已注册 |
 | readout 包 | readout 包（readout package） | 主干接口每页/每窗恰好 1 个的逻辑读出单位（k=1 主干接口，规格 §21）；逐段条件化后 decoder 侧另有 C 个逐段读出承担任务密度。物理宽度 d_pack=1536（v36.1 起；旧 384 口径作废） | v3.6 规格 §2；§21 重述 | 用户 | 2026-07-25（2026-08-06 重述） | 已注册 |
 | 相对基线 | 相对基线 | 同切分同 KDA 版 interpreter 但每 chunk 直产 1 个 readout、不读 memory 的对照臂，兼作 R1 消融臂 | v3.6 规格 §4 | 用户 | 2026-07-25 | 已注册 |
@@ -197,3 +198,5 @@
   用户以人脑位置记忆类比提出概念，AI 提名名称。
 - 2026-08-17：v3.7 架构共识落地（docs/versions/v3.7/FLUED_V3_7_ARCHITECTURE_CONSENSUS_20260817_CN.md）。
   新增候选术语 codec 全覆盖律（full-prefix codec coverage law，用户裁定内容、AI 提名名称）。
+- 2026-08-17：新增候选术语 GDN2（门控 DeltaNet 2）——S39 阶段2 机制轴的写入规则臂
+  （擦写门控解耦），AI 落地为 `recurrence` 配置项（kda 默认逐比特不变），登记待转正。

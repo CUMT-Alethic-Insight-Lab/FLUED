@@ -34,6 +34,10 @@ try:
     from fla.ops.kda import chunk_kda as _fla_chunk_kda
 except Exception:  # fla is optional (tests / non-GPU environments)
     _fla_chunk_kda = None
+try:
+    from fla.ops.gdn2 import chunk_gdn2 as _fla_chunk_gdn2
+except Exception:  # fla < gdn2 build: the torch recurrence remains the fallback
+    _fla_chunk_gdn2 = None
 
 
 @dataclass
@@ -91,6 +95,14 @@ class V36Config:
     prefix_task: bool = False
     prefix_positions: int = 4
     kda_impl: str = "fla"  # fla chunk_kda fused kernel (default since v36.6: +15% steps/s at 23 chunks, parity-verified; essential at byte-level lengths for R0). "torch" serial loop retained as fallback.
+    # S39 stage-2 write-rule axis (S39_STAGED_MATRIX_PLAN_20260817_CN appendix A):
+    # "kda" (default; bit-identical to every historical arm) uses the shared
+    # scalar beta for erase+write; "gdn2" decouples them -- a per-K-channel
+    # erase gate b and a per-V-channel write gate w replace beta (Gated
+    # DeltaNet 2, fla chunk_gdn2). The channel decay (log alpha) and the delta
+    # erase form are unchanged: the ONLY mechanism delta is the erase/write
+    # gate decoupling (single-variable arm).
+    recurrence: str = "kda"
     # R1 relative baseline (spec section 4): when False, each chunk's readout
     # comes straight from its own write (same write head, same realign, same
     # transmitted-scalar budget) -- the serial KDA recurrence is bypassed, so
@@ -298,6 +310,9 @@ class WriteHead(nn.Module):
         super().__init__()
         h, hk, hv = c.kda_heads, c.kda_head_k, c.kda_head_v
         self.heads, self.hk, self.hv = h, hk, hv
+        self.recurrence = getattr(c, "recurrence", "kda")
+        if self.recurrence not in ("kda", "gdn2"):
+            raise ValueError(f"recurrence must be 'kda' or 'gdn2', got {self.recurrence!r}")
         self.trunk = nn.Sequential(nn.LayerNorm(c.d_mem), nn.Linear(c.d_mem, c.write_hidden), nn.SiLU())
         self.to_k = nn.Linear(c.write_hidden, h * hk)
         self.to_v = nn.Linear(c.write_hidden, h * hv)
@@ -307,14 +322,28 @@ class WriteHead(nn.Module):
         self.alpha_logit = nn.Parameter(torch.log(tau - 1.0))
         self.to_beta = nn.Linear(c.write_hidden, h)
         nn.init.constant_(self.to_beta.bias, -2.0)
+        if self.recurrence == "gdn2":
+            # S39 stage-2: erase/write gate decoupling -- b (per K channel)
+            # takes over beta's erase role, w (per V channel) its write role.
+            # Created only in gdn2 mode so older checkpoints keep loading
+            # strict-clean (the xcache_supp conditional-creation precedent);
+            # the same -2.0 bias init as to_beta (sigmoid(-2) ~= 0.12).
+            self.to_b = nn.Linear(c.write_hidden, h * hk)
+            self.to_w = nn.Linear(c.write_hidden, h * hv)
+            nn.init.constant_(self.to_b.bias, -2.0)
+            nn.init.constant_(self.to_w.bias, -2.0)
 
     def forward(self, memory: torch.Tensor) -> dict[str, torch.Tensor]:
         bsz, chunks, _ = memory.shape
         h = self.trunk(memory)
         k = F.normalize(self.to_k(h).view(bsz, chunks, self.heads, self.hk), dim=-1)
         v = self.to_v(h).view(bsz, chunks, self.heads, self.hv)
-        beta = torch.sigmoid(self.to_beta(h))
         alpha = torch.sigmoid(self.alpha_logit).view(1, 1, self.heads, self.hk)
+        if self.recurrence == "gdn2":
+            b = torch.sigmoid(self.to_b(h)).view(bsz, chunks, self.heads, self.hk)
+            w = torch.sigmoid(self.to_w(h)).view(bsz, chunks, self.heads, self.hv)
+            return {"k": k, "v": v, "b": b, "w": w, "alpha": alpha}
+        beta = torch.sigmoid(self.to_beta(h))
         return {"k": k, "v": v, "beta": beta, "alpha": alpha}
 
 
@@ -322,6 +351,11 @@ class KDAStateMachine(nn.Module):
     def __init__(self, c: V36Config) -> None:
         super().__init__()
         self.c = c
+        # S39 stage-2: "gdn2" swaps the shared scalar beta for decoupled
+        # per-K-channel erase (b) / per-V-channel write (w) gates; every
+        # readout below branches on this flag, torch reference and fla kernel
+        # alike. The decay gate and delta form are unchanged.
+        self.gdn2 = getattr(c, "recurrence", "kda") == "gdn2"
         self.readout_query = nn.Parameter(torch.empty(c.readout_queries, c.kda_heads, c.kda_head_k))
         nn.init.trunc_normal_(self.readout_query, std=0.02)
         self.realign = nn.Sequential(
@@ -351,43 +385,74 @@ class KDAStateMachine(nn.Module):
         Readout reuses the content-conditioned supp projections (independent
         from the main state's fixed readout query)."""
         c = self.c
-        k, v, beta, alpha = gates["k"], gates["v"], gates["beta"], gates["alpha"]
+        k, v, alpha = gates["k"], gates["v"], gates["alpha"]
+        beta = None if self.gdn2 else gates["beta"]
         keep = chunk_mask.unsqueeze(-1).unsqueeze(-1).to(k.dtype)
         bsz, chunks, heads, dk = k.shape
         q = F.normalize(self.supp_q(content).view(bsz, chunks, heads, dk).float(), dim=-1).to(k.dtype)
-        w = write_w.unsqueeze(-1).to(beta.dtype)  # (B, C, 1)
-        if c.kda_impl == "fla" and _fla_chunk_kda is not None:
+        w = write_w.unsqueeze(-1).to(k.dtype)  # (B, C, 1) -- beta shares k's dtype
+        kernel = _fla_chunk_gdn2 if self.gdn2 else _fla_chunk_kda
+        if c.kda_impl == "fla" and kernel is not None:
             kk = k * keep
             vv = v * keep
-            bb = beta * w * chunk_mask.unsqueeze(-1).to(beta.dtype)
             g = torch.log(alpha.clamp_min(1.0e-6)).to(k.dtype) * keep
-            o, _ = _fla_chunk_kda(
-                q=q.contiguous(),
-                k=kk,
-                v=vv,
-                g=g.expand(bsz, chunks, -1, -1).contiguous(),
-                beta=bb,
-                scale=1.0,
-                use_qk_l2norm_in_kernel=False,
-                output_final_state=False,
-            )
+            if self.gdn2:
+                # gdn2: the detached CUIB weight modulates BOTH decoupled gates
+                # (collapses to kda's beta*w when b == w == beta).
+                mod = (w * chunk_mask.unsqueeze(-1).to(k.dtype)).unsqueeze(-1)  # (B, C, 1, 1)
+                o, _ = _fla_chunk_gdn2(
+                    q=q.contiguous(),
+                    k=kk,
+                    v=vv,
+                    g=g.expand(bsz, chunks, -1, -1).contiguous(),
+                    b=(gates["b"] * mod).contiguous(),
+                    w=(gates["w"] * mod).contiguous(),
+                    scale=1.0,
+                    use_qk_l2norm_in_kernel=False,
+                    output_final_state=False,
+                )
+            else:
+                bb = beta * w * chunk_mask.unsqueeze(-1).to(beta.dtype)
+                o, _ = _fla_chunk_kda(
+                    q=q.contiguous(),
+                    k=kk,
+                    v=vv,
+                    g=g.expand(bsz, chunks, -1, -1).contiguous(),
+                    beta=bb,
+                    scale=1.0,
+                    use_qk_l2norm_in_kernel=False,
+                    output_final_state=False,
+                )
             read = o.reshape(bsz, chunks, heads * v.size(-1))
         else:
             kf, vf = (k * keep).float(), (v * keep).float()
-            bf = beta.float() * w.float() * chunk_mask.float().unsqueeze(-1)
             alpha_eff = 1.0 - chunk_mask.float().view(bsz, chunks, 1, 1, 1) + chunk_mask.float().view(
                 bsz, chunks, 1, 1, 1
             ) * gates["alpha"][0].float().unsqueeze(0).unsqueeze(-1)
             state = k.new_zeros(bsz, heads, dk, v.size(-1), dtype=torch.float32)
             reads = []
             qf = q.float()
-            for i in range(chunks):
-                ki, vi, bi, ai = kf[:, i], vf[:, i], bf[:, i], alpha_eff[:, i]
-                state = ai * state
-                kTs = torch.einsum("bhk,bhkv->bhv", ki, state)
-                state = state - bi.view(bsz, heads, 1, 1) * ki.unsqueeze(-1) * kTs.unsqueeze(-2)
-                state = state + bi.view(bsz, heads, 1, 1) * ki.unsqueeze(-1) * vi.unsqueeze(-2)
-                reads.append(torch.einsum("bhk,bhkv->bhv", qf[:, i], state))
+            if self.gdn2:
+                mod5 = (write_w.float() * chunk_mask.float()).view(bsz, chunks, 1, 1)
+                bf = gates["b"].float() * mod5
+                wf = gates["w"].float() * mod5
+                for i in range(chunks):
+                    ki, vi, bi, wi, ai = kf[:, i], vf[:, i], bf[:, i], wf[:, i], alpha_eff[:, i]
+                    state = ai * state
+                    # gdn2 step: erase along (b * k), commit (w * v) minus the erased read
+                    erase = torch.einsum("bhk,bhkv->bhv", bi * ki, state)
+                    v_new = wi * vi - erase
+                    state = state + ki.unsqueeze(-1) * v_new.unsqueeze(-2)
+                    reads.append(torch.einsum("bhk,bhkv->bhv", qf[:, i], state))
+            else:
+                bf = beta.float() * w.float() * chunk_mask.float().unsqueeze(-1)
+                for i in range(chunks):
+                    ki, vi, bi, ai = kf[:, i], vf[:, i], bf[:, i], alpha_eff[:, i]
+                    state = ai * state
+                    kTs = torch.einsum("bhk,bhkv->bhv", ki, state)
+                    state = state - bi.view(bsz, heads, 1, 1) * ki.unsqueeze(-1) * kTs.unsqueeze(-2)
+                    state = state + bi.view(bsz, heads, 1, 1) * ki.unsqueeze(-1) * vi.unsqueeze(-2)
+                    reads.append(torch.einsum("bhk,bhkv->bhv", qf[:, i], state))
             read = torch.stack(reads, dim=1).reshape(bsz, chunks, heads * v.size(-1))
         return self.supp_out(read.to(k.dtype))
 
@@ -398,44 +463,71 @@ class KDAStateMachine(nn.Module):
         supp_i = normalize(W_q content[i]) . S_i -- a targeted extra slice of
         the state right after chunk i. One extra kernel call."""
         c = self.c
-        k, v, beta, alpha = gates["k"], gates["v"], gates["beta"], gates["alpha"]
+        k, v, alpha = gates["k"], gates["v"], gates["alpha"]
+        beta = None if self.gdn2 else gates["beta"]
         keep = chunk_mask.unsqueeze(-1).unsqueeze(-1).to(k.dtype)
         bsz, chunks, heads, dk = k.shape
         q = F.normalize(
             self.supp_q(content).view(bsz, chunks, heads, dk).float(), dim=-1
         ).to(k.dtype)
-        if c.kda_impl == "fla" and _fla_chunk_kda is not None:
+        kernel = _fla_chunk_gdn2 if self.gdn2 else _fla_chunk_kda
+        if c.kda_impl == "fla" and kernel is not None:
             kk = k * keep
             vv = v * keep
-            bb = beta * chunk_mask.unsqueeze(-1).to(beta.dtype)
             g = torch.log(alpha.clamp_min(1.0e-6)).to(k.dtype) * keep
-            o, _ = _fla_chunk_kda(
-                q=q.contiguous(),
-                k=kk,
-                v=vv,
-                g=g.expand(bsz, chunks, -1, -1).contiguous(),
-                beta=bb,
-                scale=1.0,
-                use_qk_l2norm_in_kernel=False,
-                output_final_state=False,
-            )
+            if self.gdn2:
+                o, _ = _fla_chunk_gdn2(
+                    q=q.contiguous(),
+                    k=kk,
+                    v=vv,
+                    g=g.expand(bsz, chunks, -1, -1).contiguous(),
+                    b=(gates["b"] * keep).contiguous(),
+                    w=(gates["w"] * keep).contiguous(),
+                    scale=1.0,
+                    use_qk_l2norm_in_kernel=False,
+                    output_final_state=False,
+                )
+            else:
+                bb = beta * chunk_mask.unsqueeze(-1).to(beta.dtype)
+                o, _ = _fla_chunk_kda(
+                    q=q.contiguous(),
+                    k=kk,
+                    v=vv,
+                    g=g.expand(bsz, chunks, -1, -1).contiguous(),
+                    beta=bb,
+                    scale=1.0,
+                    use_qk_l2norm_in_kernel=False,
+                    output_final_state=False,
+                )
             read = o.reshape(bsz, chunks, heads * v.size(-1))
         else:
             kf, vf = (k * keep).float(), (v * keep).float()
-            bf = beta.float() * chunk_mask.float().unsqueeze(-1)
             alpha_eff = 1.0 - chunk_mask.float().view(bsz, chunks, 1, 1, 1) + chunk_mask.float().view(
                 bsz, chunks, 1, 1, 1
             ) * gates["alpha"][0].float().unsqueeze(0).unsqueeze(-1)
             state = k.new_zeros(bsz, heads, dk, v.size(-1), dtype=torch.float32)
             reads = []
             qf = q.float()
-            for i in range(chunks):
-                ki, vi, bi, ai = kf[:, i], vf[:, i], bf[:, i], alpha_eff[:, i]
-                state = ai * state
-                kTs = torch.einsum("bhk,bhkv->bhv", ki, state)
-                state = state - bi.view(bsz, heads, 1, 1) * ki.unsqueeze(-1) * kTs.unsqueeze(-2)
-                state = state + bi.view(bsz, heads, 1, 1) * ki.unsqueeze(-1) * vi.unsqueeze(-2)
-                reads.append(torch.einsum("bhk,bhkv->bhv", qf[:, i], state))
+            if self.gdn2:
+                mask4 = chunk_mask.float().view(bsz, chunks, 1, 1)
+                bf = gates["b"].float() * mask4
+                wf = gates["w"].float() * mask4
+                for i in range(chunks):
+                    ki, vi, bi, wi, ai = kf[:, i], vf[:, i], bf[:, i], wf[:, i], alpha_eff[:, i]
+                    state = ai * state
+                    erase = torch.einsum("bhk,bhkv->bhv", bi * ki, state)
+                    v_new = wi * vi - erase
+                    state = state + ki.unsqueeze(-1) * v_new.unsqueeze(-2)
+                    reads.append(torch.einsum("bhk,bhkv->bhv", qf[:, i], state))
+            else:
+                bf = beta.float() * chunk_mask.float().unsqueeze(-1)
+                for i in range(chunks):
+                    ki, vi, bi, ai = kf[:, i], vf[:, i], bf[:, i], alpha_eff[:, i]
+                    state = ai * state
+                    kTs = torch.einsum("bhk,bhkv->bhv", ki, state)
+                    state = state - bi.view(bsz, heads, 1, 1) * ki.unsqueeze(-1) * kTs.unsqueeze(-2)
+                    state = state + bi.view(bsz, heads, 1, 1) * ki.unsqueeze(-1) * vi.unsqueeze(-2)
+                    reads.append(torch.einsum("bhk,bhkv->bhv", qf[:, i], state))
             read = torch.stack(reads, dim=1).reshape(bsz, chunks, heads * v.size(-1))
         return self.supp_out(read.to(k.dtype))
 
@@ -460,7 +552,8 @@ class KDAStateMachine(nn.Module):
         sample."""
         if not self.c.state_channel:
             raise ValueError("read_all_final requires state_channel=True (this arm trains the state channel itself)")
-        k, v, beta = gates["k"], gates["v"], gates["beta"]
+        k, v = gates["k"], gates["v"]
+        beta = None if self.gdn2 else gates["beta"]
         keep = chunk_mask.unsqueeze(-1).unsqueeze(-1).to(k.dtype)
         k = k * keep
         v = v * keep
@@ -468,16 +561,27 @@ class KDAStateMachine(nn.Module):
         dv = v.size(-1)
         state = k.new_zeros(bsz, heads, dk, dv, dtype=torch.float32)
         kf, vf = k.float(), v.float()
-        beta = beta.float() * chunk_mask.float().unsqueeze(-1)
         alpha = gates["alpha"][0].unsqueeze(0).unsqueeze(-1)
         mask5 = chunk_mask.float().view(bsz, chunks, 1, 1, 1)
         alpha_eff = 1.0 - mask5 + mask5 * alpha
-        for i in range(chunks):
-            ki, vi, bi, ai = kf[:, i], vf[:, i], beta[:, i], alpha_eff[:, i]
-            state = ai * state
-            kTs = torch.einsum("bhk,bhkv->bhv", ki, state)
-            state = state - bi.view(bsz, heads, 1, 1) * ki.unsqueeze(-1) * kTs.unsqueeze(-2)
-            state = state + bi.view(bsz, heads, 1, 1) * ki.unsqueeze(-1) * vi.unsqueeze(-2)
+        if self.gdn2:
+            mask4 = chunk_mask.float().view(bsz, chunks, 1, 1)
+            bf = gates["b"].float() * mask4
+            wf = gates["w"].float() * mask4
+            for i in range(chunks):
+                ki, vi, bi, wi, ai = kf[:, i], vf[:, i], bf[:, i], wf[:, i], alpha_eff[:, i]
+                state = ai * state
+                erase = torch.einsum("bhk,bhkv->bhv", bi * ki, state)
+                v_new = wi * vi - erase
+                state = state + ki.unsqueeze(-1) * v_new.unsqueeze(-2)
+        else:
+            beta = beta.float() * chunk_mask.float().unsqueeze(-1)
+            for i in range(chunks):
+                ki, vi, bi, ai = kf[:, i], vf[:, i], beta[:, i], alpha_eff[:, i]
+                state = ai * state
+                kTs = torch.einsum("bhk,bhkv->bhv", ki, state)
+                state = state - bi.view(bsz, heads, 1, 1) * ki.unsqueeze(-1) * kTs.unsqueeze(-2)
+                state = state + bi.view(bsz, heads, 1, 1) * ki.unsqueeze(-1) * vi.unsqueeze(-2)
         q = self.readout_query.float()
         read = torch.einsum("qhk,bhkv->bqhv", q, state)
         read = read.reshape(bsz, q.size(0), heads * dv).to(k.dtype)
@@ -494,7 +598,8 @@ class KDAStateMachine(nn.Module):
             read = v.reshape(v.size(0), v.size(1), 1, self.c.kda_heads * self.c.kda_head_v)
             return self.realign(read), v.new_zeros((), dtype=torch.float32)
         if self.c.kda_impl == "fla":
-            if _fla_chunk_kda is None:
+            kernel = _fla_chunk_gdn2 if self.gdn2 else _fla_chunk_kda
+            if kernel is None:
                 warnings.warn(
                     "kda_impl='fla' but fla is unavailable; falling back to the torch recurrence",
                     stacklevel=2,
@@ -504,28 +609,43 @@ class KDAStateMachine(nn.Module):
         return self._forward_torch(gates, chunk_mask)
 
     def _forward_fla(self, gates: dict[str, torch.Tensor], chunk_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        k, v, beta, alpha = gates["k"], gates["v"], gates["beta"], gates["alpha"]
+        k, v, alpha = gates["k"], gates["v"], gates["alpha"]
+        beta = None if self.gdn2 else gates["beta"]
         keep = chunk_mask.unsqueeze(-1).unsqueeze(-1).to(k.dtype)
         k = k * keep
         v = v * keep
         bsz, chunks, heads, dk = k.shape
-        beta = beta * chunk_mask.unsqueeze(-1).to(beta.dtype)
+        if not self.gdn2:
+            beta = beta * chunk_mask.unsqueeze(-1).to(beta.dtype)
         # g in log space; zero at padded chunks -> decay exp(0)=1 (identity step)
         g = torch.log(alpha.clamp_min(1.0e-6)).to(k.dtype) * keep
         q = self.readout_query
         outs = []
         final_state = None
         for qi in range(q.size(0)):
-            o, final_state = _fla_chunk_kda(
-                q=q[qi].to(k.dtype).unsqueeze(0).unsqueeze(0).expand(bsz, chunks, -1, -1).contiguous(),
-                k=k,
-                v=v,
-                g=g.expand(bsz, chunks, -1, -1).contiguous(),
-                beta=beta,
-                scale=1.0,
-                use_qk_l2norm_in_kernel=False,
-                output_final_state=True,
-            )
+            if self.gdn2:
+                o, final_state = _fla_chunk_gdn2(
+                    q=q[qi].to(k.dtype).unsqueeze(0).unsqueeze(0).expand(bsz, chunks, -1, -1).contiguous(),
+                    k=k,
+                    v=v,
+                    g=g.expand(bsz, chunks, -1, -1).contiguous(),
+                    b=(gates["b"] * keep).contiguous(),
+                    w=(gates["w"] * keep).contiguous(),
+                    scale=1.0,
+                    use_qk_l2norm_in_kernel=False,
+                    output_final_state=True,
+                )
+            else:
+                o, final_state = _fla_chunk_kda(
+                    q=q[qi].to(k.dtype).unsqueeze(0).unsqueeze(0).expand(bsz, chunks, -1, -1).contiguous(),
+                    k=k,
+                    v=v,
+                    g=g.expand(bsz, chunks, -1, -1).contiguous(),
+                    beta=beta,
+                    scale=1.0,
+                    use_qk_l2norm_in_kernel=False,
+                    output_final_state=True,
+                )
             outs.append(o)
         o = torch.stack(outs, dim=2)  # (B, C, nq, H, V)
         read = o.reshape(bsz, chunks, q.size(0), heads * v.size(-1))
@@ -536,7 +656,8 @@ class KDAStateMachine(nn.Module):
         return package, final_state.float().norm(dim=(-2, -1)).mean()
 
     def _forward_torch(self, gates: dict[str, torch.Tensor], chunk_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        k, v, beta, alpha = gates["k"], gates["v"], gates["beta"], gates["alpha"]
+        k, v, alpha = gates["k"], gates["v"], gates["alpha"]
+        beta = None if self.gdn2 else gates["beta"]
         keep = chunk_mask.unsqueeze(-1).unsqueeze(-1).to(k.dtype)
         k = k * keep
         v = v * keep
@@ -544,22 +665,37 @@ class KDAStateMachine(nn.Module):
         dv = v.size(-1)
         state = k.new_zeros(bsz, heads, dk, dv, dtype=torch.float32)
         kf, vf = k.float(), v.float()
-        beta = beta.float() * chunk_mask.float().unsqueeze(-1)
         alpha = gates["alpha"][0].unsqueeze(0).unsqueeze(-1)
         mask5 = chunk_mask.float().view(bsz, chunks, 1, 1, 1)
         alpha_eff = 1.0 - mask5 + mask5 * alpha
         q = self.readout_query.float()
         per_chunk_reads = []
-        for i in range(chunks):
-            ki, vi, bi, ai = kf[:, i], vf[:, i], beta[:, i], alpha_eff[:, i]
-            state = ai * state
-            kTs = torch.einsum("bhk,bhkv->bhv", ki, state)
-            state = state - bi.view(bsz, heads, 1, 1) * ki.unsqueeze(-1) * kTs.unsqueeze(-2)
-            state = state + bi.view(bsz, heads, 1, 1) * ki.unsqueeze(-1) * vi.unsqueeze(-2)
-            if self.c.per_chunk_readout:
-                # Read the state right after consuming chunk i: each chunk gets
-                # its own conditioning vector instead of the whole-prompt mean.
-                per_chunk_reads.append(torch.einsum("qhk,bhkv->bqhv", q, state))
+        if self.gdn2:
+            mask4 = chunk_mask.float().view(bsz, chunks, 1, 1)
+            bf = gates["b"].float() * mask4
+            wf = gates["w"].float() * mask4
+            for i in range(chunks):
+                ki, vi, bi, wi, ai = kf[:, i], vf[:, i], bf[:, i], wf[:, i], alpha_eff[:, i]
+                state = ai * state
+                erase = torch.einsum("bhk,bhkv->bhv", bi * ki, state)
+                v_new = wi * vi - erase
+                state = state + ki.unsqueeze(-1) * v_new.unsqueeze(-2)
+                if self.c.per_chunk_readout:
+                    # Read the state right after consuming chunk i: each chunk gets
+                    # its own conditioning vector instead of the whole-prompt mean.
+                    per_chunk_reads.append(torch.einsum("qhk,bhkv->bqhv", q, state))
+        else:
+            beta = beta.float() * chunk_mask.float().unsqueeze(-1)
+            for i in range(chunks):
+                ki, vi, bi, ai = kf[:, i], vf[:, i], beta[:, i], alpha_eff[:, i]
+                state = ai * state
+                kTs = torch.einsum("bhk,bhkv->bhv", ki, state)
+                state = state - bi.view(bsz, heads, 1, 1) * ki.unsqueeze(-1) * kTs.unsqueeze(-2)
+                state = state + bi.view(bsz, heads, 1, 1) * ki.unsqueeze(-1) * vi.unsqueeze(-2)
+                if self.c.per_chunk_readout:
+                    # Read the state right after consuming chunk i: each chunk gets
+                    # its own conditioning vector instead of the whole-prompt mean.
+                    per_chunk_reads.append(torch.einsum("qhk,bhkv->bqhv", q, state))
         if self.c.per_chunk_readout:
             read = torch.stack(per_chunk_reads, dim=1)  # (B, C, q, heads*dv)
             read = read.reshape(bsz, chunks, q.size(0), heads * dv).to(k.dtype)
@@ -592,44 +728,70 @@ class KDAStateMachine(nn.Module):
         pure-torch update when fla is unavailable).
         """
         c = self.c
-        if c.kda_impl == "fla" and _fla_chunk_kda is not None:
-            from fla.ops.kda import fused_recurrent_kda
-
-            k, v, beta, alpha = gates_i["k"], gates_i["v"], gates_i["beta"], gates_i["alpha"]
+        kernel = _fla_chunk_gdn2 if self.gdn2 else _fla_chunk_kda
+        if c.kda_impl == "fla" and kernel is not None:
+            k, v, alpha = gates_i["k"], gates_i["v"], gates_i["alpha"]
             bsz = k.size(0)
             g = torch.log(alpha.clamp_min(1.0e-6)).to(k.dtype).expand(bsz, 1, -1, -1).contiguous()
             q = self.readout_query
             outs = []
             new_state = state
-            for qi in range(q.size(0)):
-                o, new_state = fused_recurrent_kda(
-                    q=q[qi].to(k.dtype).unsqueeze(0).unsqueeze(0).expand(bsz, 1, -1, -1).contiguous(),
-                    k=k,
-                    v=v,
-                    g=g,
-                    beta=beta,
-                    scale=1.0,
-                    initial_state=state,
-                    output_final_state=True,
-                    use_qk_l2norm_in_kernel=False,
-                )
-                outs.append(o)
+            if self.gdn2:
+                from fla.ops.gdn2 import fused_recurrent_gdn2
+
+                for qi in range(q.size(0)):
+                    o, new_state = fused_recurrent_gdn2(
+                        q=q[qi].to(k.dtype).unsqueeze(0).unsqueeze(0).expand(bsz, 1, -1, -1).contiguous(),
+                        k=k,
+                        v=v,
+                        g=g,
+                        b=gates_i["b"],
+                        w=gates_i["w"],
+                        scale=1.0,
+                        initial_state=state,
+                        output_final_state=True,
+                        use_qk_l2norm_in_kernel=False,
+                    )
+                    outs.append(o)
+            else:
+                from fla.ops.kda import fused_recurrent_kda
+
+                for qi in range(q.size(0)):
+                    o, new_state = fused_recurrent_kda(
+                        q=q[qi].to(k.dtype).unsqueeze(0).unsqueeze(0).expand(bsz, 1, -1, -1).contiguous(),
+                        k=k,
+                        v=v,
+                        g=g,
+                        beta=gates_i["beta"],
+                        scale=1.0,
+                        initial_state=state,
+                        output_final_state=True,
+                        use_qk_l2norm_in_kernel=False,
+                    )
+                    outs.append(o)
             o = torch.stack(outs, dim=2)  # (B, 1, nq, H, V)
             read = o.reshape(bsz, 1, q.size(0), c.kda_heads * c.kda_head_v)
             return self.realign(read), new_state
 
         # Pure-torch fallback: same update math as _forward_torch, one chunk.
-        k, v, beta = gates_i["k"], gates_i["v"], gates_i["beta"]
+        k, v = gates_i["k"], gates_i["v"]
         bsz = k.size(0)
         heads, dv = c.kda_heads, c.kda_head_v
         kf, vf = k.float(), v.float()
-        bi = beta.float()[:, 0]  # (B, H) — a real chunk, mask == 1
         ai = gates_i["alpha"][0].float().unsqueeze(-1)  # (1, H, K, 1)
         ki, vi = kf[:, 0], vf[:, 0]
         state = ai * state
-        kTs = torch.einsum("bhk,bhkv->bhv", ki, state)
-        state = state - bi.view(bsz, heads, 1, 1) * ki.unsqueeze(-1) * kTs.unsqueeze(-2)
-        state = state + bi.view(bsz, heads, 1, 1) * ki.unsqueeze(-1) * vi.unsqueeze(-2)
+        if self.gdn2:
+            bi = gates_i["b"].float()[:, 0]  # (B, H, K) — a real chunk, mask == 1
+            wi = gates_i["w"].float()[:, 0]  # (B, H, V)
+            erase = torch.einsum("bhk,bhkv->bhv", bi * ki, state)
+            v_new = wi * vi - erase
+            state = state + ki.unsqueeze(-1) * v_new.unsqueeze(-2)
+        else:
+            bi = gates_i["beta"].float()[:, 0]  # (B, H) — a real chunk, mask == 1
+            kTs = torch.einsum("bhk,bhkv->bhv", ki, state)
+            state = state - bi.view(bsz, heads, 1, 1) * ki.unsqueeze(-1) * kTs.unsqueeze(-2)
+            state = state + bi.view(bsz, heads, 1, 1) * ki.unsqueeze(-1) * vi.unsqueeze(-2)
         q = self.readout_query.float()
         read = torch.einsum("qhk,bhkv->bqhv", q, state)
         read = read.reshape(bsz, 1, q.size(0), heads * dv).to(k.dtype)
@@ -1383,6 +1545,8 @@ class FLUEDV36(nn.Module):
         self.chunk_builder = ChunkBuilder(c.max_chunks, c.max_span)
         self.summarizer = ChunkSummarizer(c) if c.summarizer_type == "slot" else DiTChunkSummarizer(c)
         slm = c.backbone_mode == "slm"
+        if getattr(c, "recurrence", "kda") not in ("kda", "gdn2"):
+            raise ValueError(f"recurrence must be 'kda' or 'gdn2', got {c.recurrence!r}")
         if slm:
             # v3.7 (consensus, user-ruled 2026-08-17): loud rejections for the
             # combinations that are N/A in the new mode -- no silent mismatch.
