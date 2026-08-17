@@ -92,7 +92,10 @@ QUOTE_CANON = {"“": '"', "”": '"', "‘": "'", "’": "'"}
 
 
 def validate_and_convert(target: str, output: str) -> list[int] | None:
-    cleaned = output.strip()
+    # S06 fix (user-ruled 2026-08-17): strip NEWLINES only. A blanket .strip()
+    # also eats leading indentation, falsely rejecting any target whose first
+    # line is indented (code blocks) even when the teacher output is perfect.
+    cleaned = output.strip("\r\n")
     bare = []
     boundaries_chars = []
     for ch in cleaned:
