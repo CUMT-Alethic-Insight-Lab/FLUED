@@ -246,6 +246,57 @@ python -X utf8 tools/train/v3_6/train_v36_s1.py \
 a−b/a−c 差分按 §4 判读线裁定，桥接臂（bash-pv602s03，在跑）终评对 s36e 0.8006 的偏离幅度
 同表登记。
 
+> **2026-08-17 作废声明**：本附录模板为 v36.8/legacy（xattn + CrossReadBackbone）口径，
+> 已于 v3.7 共识形态落地（commit bc655e0）后被附录 B′ 取代，仅保留备查。格子语义与判读线
+> 不变，承载形态与开关值域以 B′ 为准。
+
+## 附录 B′：阶段1 发射命令模板 v37 版（2026-08-17 主会话封版，实现 bc655e0）
+
+**形态变更**：四格承载形态由 xattn legacy 切换为 **v3.7 共识形态**（正本
+`docs/versions/v3.7/FLUED_V3_7_ARCHITECTURE_CONSENSUS_20260817_CN.md`）：summarizer 直产
+index（K）与 memory（V 标准实现），interpreter 降为可选分通道状态机加工器，主干为标准 SLM
+（第一层 cross-attn 读预算 K/V，深层标准自注意力）。格子语义不变，开关值域扩展为
+`--k-row-source {index,state}` / `--v-row-source {memory,state}`（index=summarizer 直产键
+直读；state=过 interpreter 状态机加工）。codec 全覆盖律已由 v36.8 累积口径 + v37 slm 网格
+分形共同落地（任何内容任务覆盖 1..i 全前缀）。
+
+**公共底座**（逐臂仅改 run-id/out-dir 与格子的两个开关）：
+
+```bash
+export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 KMP_DUPLICATE_LIB_OK=TRUE PYTHONUTF8=1
+/c/Users/74090/Miniconda3/envs/soulvlm/python.exe -X utf8 tools/train/v3_6/train_v36_s1.py \
+  --config configs/canonical_v37.json \
+  --data-path "P:\FLUED_corpus\corpus_v3\corpus_v3.txt" \
+  --seq-len 4096 --stride 2048 --max-chunks 1024 --batch-size 1 \
+  --max-steps 20000 \
+  --k-row-source <index|state> --v-row-source <memory|state> \
+  --run-id <run_id> --out-dir checkpoints/<run_id> \
+  > checkpoints/<run_id>_stdout.log 2>&1
+```
+
+- 配方：canonical v37.1（`backbone_mode=slm`，累积保持口径继承）；`--config` 已带
+  `init_checkpoint`（K: 的 S0″ 快照，segmentor 冻结接管）——除该快照外全部从零。
+- 4096 标定同 Q6 实测值（max_chunks 1024 / stride 2048 / batch 1，实测 ~2.69 step/s、
+  峰值 ~9.7GB、20K≈2.0h）；守卫口径不变（cut_capacity_overflow=0 且 truncated_tokens=0）。
+- a 格不需要任何开关（config 默认即 index/memory）；a+pos = a 格加 `--k-pos-inject`
+  （⭐4 加严守卫：仅允许 k=index **且** v=memory，model 层直接 raise）。
+- GPU 串行一臂一跑，点火前 `nvidia-smi` 查重 + 确认无 train_v36 进程残留。
+
+**臂次与 run-id**（命名：v37_<格>_<kv>_v371_20k_ctx4096_20260817，i=index/m=memory/s=state）：
+
+| 序 | 臂 | k-row-source | v-row-source | run-id |
+|---|---|---|---|---|
+| 1 | a 索引直读+内容直读 | index | memory | v37_a_im_v371_20k_ctx4096_20260817（2026-08-17 09:36 点火，bash-vchx9r9n） |
+| 2 | d 双过状态机 | state | state | v37_d_ss_v371_20k_ctx4096_20260817 |
+| 3 | b 索引过状态机+内容直读 | state | memory | v37_b_sm_v371_20k_ctx4096_20260817 |
+| 4 | c 索引直读+内容过状态机 | index | state | v37_c_is_v371_20k_ctx4096_20260817 |
+| 5 | a+pos 位置注入键版 | index(+pos) | memory | v37_apos_im_v371_20k_ctx4096_20260817 |
+| 6 | 锥形宽度附带臂 | 同胜者格子 | 同胜者格子 | v37_w2_<cell>_v371_20k_ctx4096_20260817 |
+
+每格收官流程：读 `checkpoints/<run_id>/summary.json` 的 eval_* 键 → 原地入 CURRENT_STATE
+证据表（E60 起连续，编辑后必核编号连续性）→ commit+push → 点火下一格。阶段2 胜者格子上
+GDN2 换 KDA 的实施清单见附录 A。
+
 ## 附录 C：a+pos 位置注入键实现规格（2026-08-17 主会话钉死，与 0a 探针同语义）
 
 **探针侧原型**（`tools/analysis/v3_6/probe_archive_addressing.py:457-499`，E58 实测件）：

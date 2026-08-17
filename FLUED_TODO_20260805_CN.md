@@ -56,9 +56,11 @@ interpreter 降格为可选分通道加工器（KDA/GDN2 标准实现）；主�
 Q 自备（"主干本身就是 Q"）；decoder 与主干同一套 V；codec 全覆盖律
 （任何内容任务覆盖 1..i 全前缀，禁短时记忆任务）；predict = predict next chunk。
 四格映射与判读线不变，a−b/a−c 成为真单变量差分。版本暂定 v3.7（不进 v4）。
-**当前状态：a 格 v36.8 试跑已杀止损（~5.9k 步作废），代码未动，下一步 =
-按共识落 v3.7 实现 → 单测/冒烟 → 重发四格。** S36 主线 direct/predict 锚失配
-口径注记随 v3.7 changelog 入 CURRENT_STATE。
+**当前状态（2026-08-17 更新）：v3.7 实现已落地入仓（commit bc655e0，全量 pytest
+271 passed，GPU 冒烟 a/d 两格 30 步零 NaN）；a 格正式 20K@4096B 在跑
+（v37_a_im_v371_20k_ctx4096_20260817），d/b/c/a+pos 串行排队（E60-E64），
+发射模板 = S39 计划文档附录 B′。** S36 主线 direct/predict 锚失配
+口径注记已随 v3.7 changelog（CURRENT_STATE 2026-08-17（四）条）入册。
 
 **活的下一步（按序候选，等用户裁定）**：
 1. **S39 档案馆内容寻址远程查询接口**——侦察绿（组合格无占位）+ §26 预注册 +

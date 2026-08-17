@@ -151,7 +151,7 @@ overflow 真凶是 URL 编码/base64 类**无语言边界的高熵字节流**（
 | Q6 | 2048/4096 长上下文 + encoder 速度（scaling 前必测）。可行性已实测（2026-07-23）：2048=max_chunks 256/stride 1024/batch 4（峰值 14.3GB，~3.6 step/s，20K≈93min）；4096=max_chunks 1024/stride 2048/batch 1（峰值 12.2GB，~2.3 step/s，20K≈2.4h）；硬闸门 cut_capacity_overflow=0 且 truncated_tokens=0（实测全 0）。注：`expandable_segments` 在本 torch 构建上不支持（启动警告），无效；有效手段是 batch 压到峰值 <15.9GB 分配器抖动红线以下 | 配置标定完成，长上下文臂待跑（k=1 联动见规格 §21/D12） |
 | Q7 | 300M L0 codec（无条件安全的纯 codec 层）启动时机 | 待跑（Q1 已关闭，启动时机随主线形态裁定后排期） |
 | Q8 | S0.5/S0.6 后岔口：decoder 逐段条件化改造（治 E22 锁定的均值通道，~半天含测试；会改变 GRPO 奖励地形，先做可避免 10K 白跑）vs GRPO 10K 续训（R4 臂 masked 趋势未封顶，便宜但可能只是在天花板下抛光） | **已裁定（2026-08-02）：先改造→S0.7 大阳性（E23）。用户裁定后续三条：① masked 是必备项不降级（不作降级为观察项处理，口径归因讨论关闭）；② S0.7 不设默认（canonical 不切 v36.2，`per_chunk_readout` 保持默认关）；③ 新条件化下 GRPO 是否重跑仍待定** |
-| Q9 | S39 KQV 分阶段实验矩阵（用户原案 48–96 臂全因子 → 主会话修订为序贯筛选 14 臂量级，用户 2026-08-17 批准开跑阶段0–2）。全文与判读线见 `docs/research/S39_STAGED_MATRIX_PLAN_20260817_CN.md`：阶段0a 位置注入键 probe（过线 +5pp 才开位置编码轴）、0b mamba-2 移植可行性（只评估）；阶段1 分类学 2×2 @4096B（KDA 固定；四格统一 20K，v3 口径裁定后撤销降预算——旧"V单状态两格 10K"表述作废）+ a+pos 位置注入键端到端生死臂 + 锥形猜想 backbone 宽度 ×2 生死臂；阶段2 GDN2 vs KDA（打平则"存储侧不是问题"闭环、mamba-2 裁掉）。阶段3（位置编码轴，其生死改由 a+pos 臂裁定）/4（追问，依赖 CUIB harness）不在本轮 | **进行中**：阶段0 收官（E58）、0c 配方修复 v36.8、桥接臂收官（E59）、阶段1 代码就绪（--k/v-row-source + --k-pos-inject 封版、legacy 路径 smoke 全绿），a 格 4096B 点火中 |
+| Q9 | S39 KQV 分阶段实验矩阵（用户原案 48–96 臂全因子 → 主会话修订为序贯筛选 14 臂量级，用户 2026-08-17 批准开跑阶段0–2）。全文与判读线见 `docs/research/S39_STAGED_MATRIX_PLAN_20260817_CN.md`：阶段0a 位置注入键 probe（过线 +5pp 才开位置编码轴）、0b mamba-2 移植可行性（只评估）；阶段1 分类学 2×2 @4096B（KDA 固定；四格统一 20K，v3 口径裁定后撤销降预算——旧"V单状态两格 10K"表述作废）+ a+pos 位置注入键端到端生死臂 + 锥形猜想 backbone 宽度 ×2 生死臂；阶段2 GDN2 vs KDA（打平则"存储侧不是问题"闭环、mamba-2 裁掉）。阶段3（位置编码轴，其生死改由 a+pos 臂裁定）/4（追问，依赖 CUIB harness）不在本轮 | **进行中**：阶段0 收官（E58）、0c 配方修复 v36.8、桥接臂收官（E59）、阶段1 由 v3.7 共识形态承载（canonical_v37/slm 形态，实现 commit bc655e0，模板改见计划附录 B′；legacy/xattn 口径作废备查），a 格正式 20K@4096B 在跑（v37_a_im_v371_20k_ctx4096_20260817），d/b/c/a+pos 串行排队（E60-E64） |
 
 ## 6. Changelog
 
@@ -757,3 +757,23 @@ overflow 真凶是 URL 编码/base64 类**无语言边界的高熵字节流**（
   --k-row-source/--v-row-source 双开关 + --k-pos-inject 位置注入键（附录 C
   规格，与 0a 探针同语义），24 单测 + 四格/a+pos legacy 路径 smoke 全绿
   （零 NaN，pos_gate 250 步离 0）；发射模板封版（计划附录 B），a 格 4096B 点火。
+- 2026-08-17（四）：**v3.7 共识形态落地接管阶段1**——架构口径统一（正本
+  `docs/versions/v3.7/FLUED_V3_7_ARCHITECTURE_CONSENSUS_20260817_CN.md`，共识 commit
+  746e2b5）：encoder=segmentor+summarizer+interpreter（interpreter 降为可选分通道
+  状态机加工器，非必备组件）；summarizer 直产 index（K）与 memory（memory 行本体即
+  V 标准实现）；主干=标准 SLM（第一层 cross-attn 读预算 K/V、位置种子 align_V+pos、
+  深层标准自注意力——"主干本身就是 Q"）；decoder 与主干同一套 V；predict=predict
+  next chunk 的 V；**codec 全覆盖律**：任何内容任务覆盖 1..i 全前缀，禁鼓励短时
+  记忆的任务配方（TERMS 候选已登记）。实现 commit bc655e0：DiTChunkSummarizer
+  index 头 + SLMBackbone + train_v36_s1 slm 分支（网格分形/direct 累积网格/
+  predict slm 分支；slm+decode 响亮报错；k_pos_inject 加严为 k=index 且 v=memory，
+  model 层 raise）+ `configs/canonical_v37.json`（v37.1-20260817）+ 36 项新单测；
+  全量 pytest 271 passed；GPU 冒烟 a/d 两格 30 步零 NaN（41.2M vs 54.4M 差额恰为
+  两套 interpreter）。**S36 失配口径注记**：S36 主线（s31→s36e→E59）direct/predict
+  锚失配，同配方相对比较仍有效，跨配方绝对值引用须带"失配口径"限定。codeparrot
+  管线续跑修复两则：pipeline_sha256 指纹对齐（84e9659 死锁修复改脚本哈希所致）+
+  v5_records 8,258,072 行 shard 路径双拼写重键（早期会话 --output-dir 的 P: 后漏
+  反斜杠生成盘符相对串，致 12 个分片索引劈成两组字符串；纯重键零数据丢失，
+  26 分片偏移链与文件尺寸全绿），管线 09:29 恢复续跑（1061/1126 起，F: 265G/
+  P: 305G 余量）。**a 格正式 20K@4096B 点火**（v37_a_im_v371_20k_ctx4096_20260817，
+  2.69 步/s ≈2.0h，起步 loss 6.7 降、零 NaN、state_norm=0 占位正确），终评入 E60。
