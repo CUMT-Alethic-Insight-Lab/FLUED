@@ -611,3 +611,45 @@ def test_k_block_eval_zeroes_block1_keys(monkeypatch):
     with torch.no_grad():
         out_on = m2(k_rows, v_rows, mask, pos)
     assert not torch.allclose(out, out_on, atol=1e-4)
+
+
+# --- 9. K-seed arm (user-ruled 2026-08-17) -----------------------------------
+
+
+def test_slm_seed_source_k_seeds_from_index():
+    """seed_source='k': the initial hidden state is align_K(K source row_i) +
+    pos -- the index row seeds the backbone, the V row does not."""
+    torch.manual_seed(0)
+    cfg = tiny_config(k_row_source="state", v_row_source="memory", seed_source="k")
+    m = SLMBackbone(cfg).eval()
+    bsz, n = 2, 5
+    k_rows, v_rows = _store_rows(cfg, "b", bsz, n)
+    mask = torch.ones(bsz, n, dtype=torch.bool)
+    pos = torch.randn(1, n, cfg.d_backbone)
+    captured = {}
+    handle = m.q_proj.register_forward_pre_hook(lambda module, inputs: captured.update(h=inputs[0]))
+    with torch.no_grad():
+        m(k_rows, v_rows, mask, pos)
+    handle.remove()
+    exp = m.align_k(k_rows) + pos
+    assert torch.allclose(captured["h"], exp, atol=1e-6)
+    # the V row is NOT in the seed under the K-seed arm
+    assert not torch.allclose(captured["h"], m.align_v(v_rows) + pos, atol=1e-3)
+
+
+def test_seed_source_rejects_bad_value():
+    with pytest.raises(ValueError, match="seed_source"):
+        SLMBackbone(tiny_config(seed_source="q"))
+
+
+@pytest.mark.parametrize("grid", sorted(GRIDS))
+def test_full_model_forward_finite_k_seed_per_grid(grid):
+    """Full FLUEDV36 forward per grid under seed_source='k': finite logits."""
+    k_src, v_src = GRIDS[grid]
+    torch.manual_seed(0)
+    model = FLUEDV36(tiny_config(k_row_source=k_src, v_row_source=v_src, seed_source="k"))
+    ids = torch.randint(1, 258, (2, 32))
+    with torch.no_grad():
+        out = model(ids)
+    assert torch.isfinite(out.logits_direct).all()
+    assert torch.isfinite(out.logits_backbone).all()

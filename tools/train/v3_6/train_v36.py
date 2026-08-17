@@ -86,6 +86,7 @@ def build_model(args: Namespace) -> FLUEDV36:
             v_row_source=getattr(args, "v_row_source", "memory"),
             k_pos_inject=getattr(args, "k_pos_inject", False),
             k_block_eval=getattr(args, "k_block_eval", False),
+            seed_source=getattr(args, "seed_source", "v"),
             xcache_supp=getattr(args, "xcache_supp", 0),
             supp_source=getattr(args, "supp_source", "state"),
             residual_gate_temp=getattr(args, "residual_gate_temp", 1.0),
@@ -312,6 +313,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="S39 K-block eval probe (user-ruled 2026-08-17): zero the aligned "
         "K rows at eval so block-1 cross-attention is uniform -- tests whether "
         "the slm backbone actually reads the index channel. Eval-time only.",
+    )
+    parser.add_argument(
+        "--seed-source",
+        choices=["v", "k"],
+        default="v",
+        help="S39 K-seed arm (user-ruled 2026-08-17): which aligned row seeds "
+        "the slm backbone hidden state -- v = V/memory row (default, "
+        "consensus §1.3); k = index row, forcing content through K/V "
+        "retrieval (index channel becomes load-bearing)",
     )
     parser.add_argument(
         "--xcache-supp",

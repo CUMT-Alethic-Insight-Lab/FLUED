@@ -175,9 +175,15 @@ class V36Config:
     # S39 K-block eval probe (user-ruled 2026-08-17): eval-time-only ablation
     # switch -- zero the aligned K rows so block-1 cross-attention goes uniform
     # (the index channel carries zero information). Tests whether the slm
-    # backbone actually reads the index. Behavioral only: no parameters,
-    # checkpoints and training are unaffected.
+    # behavioral-only eval probe -- no parameters, checkpoints unaffected.
     k_block_eval: bool = False
+    # S39 K-seed arm (user-ruled 2026-08-17): which aligned row seeds the slm
+    # backbone hidden state. "v" (default) = seed from the V/memory row
+    # (consensus §1.3, bit-preserved); "k" = seed from the INDEX row, so the
+    # hidden state starts address-only and content must be retrieved through
+    # the K/V store -- the index channel becomes load-bearing (the K-block
+    # probe showed it is decorative under "v").
+    seed_source: str = "v"
     # v3.7 mode (docs/versions/v3.7/FLUED_V3_7_ARCHITECTURE_CONSENSUS_20260817_CN.md,
     # user-ruled 2026-08-17): backbone_mode="slm" -- fully config-gated; the
     # default stays "attn" and every v36 path is bit-preserved. In slm mode the
@@ -1124,6 +1130,11 @@ class SLMBackbone(nn.Module):
         self.k_pos_inject = getattr(c, "k_pos_inject", False)
         # S39 K-block eval probe: eval-time K-channel ablation (zero keys)
         self.k_block_eval = getattr(c, "k_block_eval", False)
+        # S39 K-seed arm: seed the hidden state from the index row (K becomes
+        # load-bearing) instead of the V row
+        self.seed_source = getattr(c, "seed_source", "v")
+        if self.seed_source not in ("v", "k"):
+            raise ValueError(f"slm seed_source must be 'v' or 'k', got {self.seed_source!r}")
         if self.k_pos_inject:
             if k_src != "index":
                 raise ValueError(
@@ -1154,9 +1165,15 @@ class SLMBackbone(nn.Module):
         nh = self.nhead
         hd = pos.size(-1) // nh
         store_v = self.align_v(v_rows)  # (B, C, d) -- shared: store V side AND seeds
-        # position seed: each chunk asks with its own V (consensus §1.3)
-        h = store_v + pos.to(store_v.dtype)
         k_flat = self.align_k(k_rows)
+        # position seed: default each chunk asks with its own V (consensus
+        # §1.3); S39 K-seed arm (user-ruled 2026-08-17) seeds from the INDEX
+        # row instead, forcing content to flow through K/V retrieval -- the
+        # index channel becomes load-bearing. The seed always uses the plain
+        # aligned K rows (pos-injection/k-block below touch attention keys
+        # only, never the seed).
+        seed = k_flat if self.seed_source == "k" else store_v
+        h = seed + pos.to(seed.dtype)
         if self.k_pos_inject:
             # a+pos: sinusoidal key-row features through the zero-init gate
             if chunk_byte_off is None:
