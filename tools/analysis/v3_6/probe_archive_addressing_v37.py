@@ -32,6 +32,23 @@ v37 适配版：原预注册设计不动（tools/analysis/v3_6/probe_archive_add
 6. **单 checkpoint 运行**：K/V 两侧测同一 cell；跨 cell（a/b/c/d）横向比
    在各份 report 之间进行（命令行见文件尾 usage）。
 
+V 侧双臂同一性核查（2026-08-17 取证，结论：非 bug，口径不变）：
+实跑后曾报"direct 与 backbone 臂 byte_acc 逐位相同"。取证脚本
+outputs/s39_addressing_probe_v37_20260817/cond_sensitivity_forensics.py
+（结果 cond_sensitivity_a_grid.json，a 格 20k checkpoint，CPU）：
+(a) needle chunk 的 cond 清零 → 数字 byte_acc 0.71/0.57 → **0.00**，且与
+base 预测的逐位一致率 0.00；(b) cond 跨 doc 置换（同 (页,chunk) 位、同位
+置嵌入、内容错误）→ byte_acc **0.00**；(c) 两臂 cond 行 cosine ≈0.955–0.969。
+结论：该 decode 形态 100% 由 cond 决定——GlobalSpanDecoder 是并行段解码，
+只见 cond 行 + chunk 有效槽位 mask，**从不接触任何 byte 上下文**（训练侧
+direct/补全任务同形，make_targets 全槽位 CE、无 teacher forcing），因此
+不存在"模板上下文可见主导预测"的泄漏通道，也无需再 mask 模板尾。两臂
+数字接近的根因是几何的：共享 decoder + 共享重建目标 + 同一 V 源 ⇒ 两个
+cond 被训到近平行（cos~0.96），余弦读出下 argmax 只在边际字节上分叉——
+full 报告每格 36 docs 中 8–16 个 per-doc byte_acc 不同、arm 级差 ≤3pp，
+这正是"同目标训练相关"而非接线别名（别名会使 per-doc 差异为 0/36）。
+因此 V 侧维持原 decode 口径，不做 mask 改造。
+
 复用（import 自原探针与 harness，未改一字）：base.load_model（hard-freeze
 + eval + CPU 强制 torch KDA）、base.Retriever / train_retriever /
 eval_retriever / prep_k_index / positive_keys——为此 enc["memory"] 别名指向

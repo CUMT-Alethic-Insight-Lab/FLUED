@@ -182,3 +182,46 @@ def test_k_side_train_eval_and_v_side_decode():
     for arm in ("direct", "backbone"):
         assert out[arm]["n_bytes"] == probe.CODE_DIGITS
         assert 0.0 <= out[arm]["byte_acc"] <= 1.0
+
+
+# --- V-side cond wiring guards (2026-08-17 identity-scare regression) --------
+# Forensics on the a-grid 20k checkpoint (cond_sensitivity_a_grid.json):
+# zero-cond and cross-doc-swapped cond both crash needle byte_acc to 0.00 —
+# the parallel span decode is 100% cond-driven (no byte context exists), and
+# the direct/backbone arms read DISTINCT cond rows (cosine ~0.96 near-parallel
+# from shared-target training, not a wiring alias). These tests pin the wiring.
+
+
+def test_v_side_arms_are_not_aliased():
+    """direct and backbone arms must read DIFFERENT cond rows."""
+    model, enc = _encode_grid("a")
+    w, j, _slot, _tgt = enc["code_units"][0]
+    g = enc["metas"][w]["offset"] + j
+    pos = model.chunk_pos.weight[j : j + 1].unsqueeze(0)
+    direct = model.decoder_in_mem(enc["v_rows"][g : g + 1].float().unsqueeze(0)) + pos
+    backbone = enc["backbone"][g : g + 1].float().unsqueeze(0) + pos
+    assert direct.abs().sum() > 0 and backbone.abs().sum() > 0
+    assert not torch.allclose(direct, backbone, atol=1e-3)
+
+
+def test_decode_logits_depend_on_cond():
+    """Mechanism guard: zeroing the cond row, or swapping in another chunk's
+    row (same position embedding, wrong content), must change the logits."""
+    model, enc = _encode_grid("a")
+    w, j, _slot, _tgt = enc["code_units"][0]
+    m = enc["metas"][w]
+    tm = m["tm"][j : j + 1].unsqueeze(0)
+
+    def row(glob):
+        return model.decoder_in_mem(enc["v_rows"][glob : glob + 1].float().unsqueeze(0))
+
+    pos = model.chunk_pos.weight[j : j + 1].unsqueeze(0)
+    cond = row(m["offset"] + j) + pos
+    j2 = (j + 1) % m["n_real"]
+    cond_swap = row(m["offset"] + j2) + pos
+    with torch.no_grad():
+        logits_base = model.decoder(cond, tm)
+        logits_zero = model.decoder(torch.zeros_like(cond), tm)
+        logits_swap = model.decoder(cond_swap, tm)
+    assert not torch.allclose(logits_base, logits_zero, atol=1e-4)
+    assert not torch.allclose(logits_base, logits_swap, atol=1e-4)
