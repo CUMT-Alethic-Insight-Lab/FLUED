@@ -306,6 +306,18 @@ def _completion_target_grids(
 
 def s1_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None) -> dict:
     codec_final = getattr(args, "codec_final_state", False)
+    if getattr(model.config, "backbone_mode", "") == "slm":
+        # v3.7 (consensus §1-2): dedicated branch. codec_final / paged / draft
+        # / prefix combinations are N/A in the new mode and rejected loudly
+        # (no silent mismatches); paged/draft are mutually exclusive
+        # backbone_mode values by construction.
+        if codec_final:
+            raise ValueError(
+                "codec_final_state is N/A for backbone_mode='slm' (v3.7: the state "
+                "machine is an optional per-channel interpreter, not the pipeline "
+                "keystone this arm welds shut)"
+            )
+        return _slm_forward(model, source, args, clean=clean, byte_mask=byte_mask)
     byte_states, confidence, valid, _ = model._encode(source)
     hard_cut, utf8_cont, cut_overflow = model._cuts(source, confidence, valid)
     chunks = model.chunk_builder(byte_states, valid, hard_cut, confidence)
@@ -526,6 +538,52 @@ def s1_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None) ->
     }
 
 
+def _slm_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None) -> dict:
+    """v3.7 slm branch (docs/versions/v3.7/FLUED_V3_7_ARCHITECTURE_CONSENSUS_20260817_CN.md).
+
+    Codec full-coverage law (consensus §2): any content task's loss covers the
+    full prefix 1..i -- the fine grids achieve it by per-chunk joint coverage
+    (row j restores chunk j, no chunk exempt), the coarse grids by the
+    cumulative retention layout (row i restores 0..i). The grid fracture is
+    driven by v_row_source in step_model. Conditioning (§1.4): direct eats the
+    decoder-aligned V source rows (fine: decoder_in_mem(memory); coarse:
+    decoder_in(V~)), completion eats the backbone's output matrix (V^), and
+    predict anchors the NEXT chunk's V source row (step_model).
+    """
+    byte_states, confidence, valid, _ = model._encode(source)
+    hard_cut, utf8_cont, cut_overflow = model._cuts(source, confidence, valid)
+    chunks = model.chunk_builder(byte_states, valid, hard_cut, confidence)
+    chunks = model.bridge(chunks, byte_states, confidence, valid, utf8_cont)
+    k_rows, v_rows, state_norm, memory, _index = model._slm_store_rows(chunks)
+    n_chunks = chunks.chunk_mask.size(1)
+    pos = model.chunk_pos.weight.unsqueeze(0)[:, :n_chunks]
+    # a+pos arm: window-relative per-chunk start byte offsets (None = off)
+    chunk_byte_off = (
+        chunk_byte_offsets(chunks.token_mask) if getattr(model.config, "k_pos_inject", False) else None
+    )
+    backbone_out = model.backbone(k_rows, v_rows, chunks.chunk_mask, pos, chunk_byte_off=chunk_byte_off)
+    cond_backbone = backbone_out + pos
+    dec_in = model.decoder_in if model.config.v_row_source == "state" else model.decoder_in_mem
+    cond_direct = dec_in(v_rows) + pos
+    logits_direct = model.decoder(cond_direct, chunks.token_mask)
+    logits_backbone = model.decoder(cond_backbone, chunks.token_mask)
+    return {
+        "logits_direct": logits_direct,
+        "logits_backbone": logits_backbone,
+        "logits_backbone_mid": None,
+        "content": None,  # content channel retired in slm mode (consensus §4)
+        "backbone_out": backbone_out,
+        "v_rows": v_rows,  # decoder-side V source rows (the predict anchor, §1.4)
+        "memory": memory,
+        "think_steps": 0.0,
+        "chunks": chunks,
+        "cut_overflow": cut_overflow,
+        "state_norm": state_norm,
+        "boundary_confidence_mean": confidence[valid].mean() if valid.any() else confidence.mean(),
+        "hard_cut_fraction": hard_cut.float()[valid].mean() if valid.any() else hard_cut.float().mean(),
+    }
+
+
 def _acc_tensor(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     """Sync-free accuracy as a GPU scalar tensor (0.0 on empty mask).
 
@@ -579,8 +637,16 @@ def step_model(model, batch, args, device, train: bool):
     targets, slot_mask, masked_slot = make_targets(
         clean, byte_mask, chunks.chunk_ids, chunks.offsets, args.max_chunks, args.max_span
     )
-    # Completion grids: v36.8 cumulative mask retention (row i restores the
-    # masked bytes of chunks 0..i) unless the ablation switch is off.
+    # v3.7 slm (consensus §2 codec full-coverage law): the target grids
+    # fracture by V granularity -- fine V (memory rows) keeps the per-chunk
+    # base grids (row j restores chunk j; the 1..i rows are jointly
+    # supervised, no chunk exempt), coarse V (state readouts) uses the
+    # cumulative retention grid (row i restores 0..i) for BOTH completion and
+    # direct. The --cumulative-mask-retention flag governs the legacy xattn
+    # path only; in slm mode the fracture is driven by v_row_source.
+    slm_mode = getattr(model.config, "backbone_mode", "") == "slm"
+    slm_coarse_v = slm_mode and getattr(model.config, "v_row_source", "memory") == "state"
+    comp_cumulative = slm_coarse_v if slm_mode else getattr(args, "cumulative_mask_retention", True)
     comp_targets, comp_slot_mask, comp_masked_slot, retention_trunc = _completion_target_grids(
         clean,
         byte_mask,
@@ -588,12 +654,21 @@ def step_model(model, batch, args, device, train: bool):
         chunks.offsets,
         args.max_chunks,
         args.max_span,
-        getattr(args, "cumulative_mask_retention", True),
+        comp_cumulative,
     )
     # as-encoded targets: the masked source itself (MASK_ID at masked slots)
-    encoded_targets, encoded_slot_mask, _ = make_targets(
-        source, torch.zeros_like(byte_mask), chunks.chunk_ids, chunks.offsets, args.max_chunks, args.max_span
-    )
+    if slm_coarse_v:
+        # coarse-V direct: cumulative as-encoded grid (row i restores the
+        # as-encoded bytes of chunks 0..i; truncation counted together with
+        # the completion side)
+        encoded_targets, encoded_slot_mask, _m, direct_trunc = make_cumulative_retention_targets(
+            source, byte_mask, chunks.chunk_ids, chunks.offsets, args.max_chunks, args.max_span
+        )
+        retention_trunc = retention_trunc + direct_trunc
+    else:
+        encoded_targets, encoded_slot_mask, _ = make_targets(
+            source, torch.zeros_like(byte_mask), chunks.chunk_ids, chunks.offsets, args.max_chunks, args.max_span
+        )
     unmasked_slot = comp_slot_mask & ~comp_masked_slot
 
     direct_loss = _ce(out["logits_direct"], encoded_targets, encoded_slot_mask)
@@ -671,6 +746,32 @@ def step_model(model, batch, args, device, train: bool):
         with torch.no_grad():
             predict_cos = F.cosine_similarity(pred, tgt, dim=-1).mean()
         pair_mask = chunks.chunk_mask.new_ones((1,))  # placeholder, unused in final mode
+    elif getattr(model.config, "backbone_mode", "") == "slm":
+        # v3.7 predict next chunk (consensus §1.4): backbone row i predicts
+        # the NEXT chunk's V source row (decoder-side aligned, detached);
+        # the old content-channel anchor is retired. predict_weight /
+        # predict_mode semantics unchanged (latent MSE + predict_cos).
+        # NB: model.config-driven, consistent with the s1_forward slm branch.
+        if getattr(args, "predict_mode", "latent") == "decode":
+            raise ValueError(
+                "predict_mode='decode' is N/A for backbone_mode='slm' (the "
+                "frozen-decoder CE form belongs to the xattn line; slm predict "
+                "is latent next-chunk V anchoring)"
+            )
+        backbone_out = out["backbone_out"].float()
+        pair_mask = (chunks.chunk_mask[:, :-1] & chunks.chunk_mask[:, 1:]).float()
+        pred = backbone_out[:, :-1]
+        with torch.no_grad():
+            dec_in = (
+                model.decoder_in
+                if getattr(model.config, "v_row_source", "memory") == "state"
+                else model.decoder_in_mem
+            )
+            tgt = dec_in(out["v_rows"].float())[:, 1:].detach()
+        se = ((pred - tgt).square().mean(dim=-1) * pair_mask).sum() / pair_mask.sum().clamp(min=1.0)
+        with torch.no_grad():
+            cos = F.cosine_similarity(pred, tgt.float(), dim=-1)
+            predict_cos = (cos * pair_mask).sum() / pair_mask.sum().clamp(min=1.0)
     else:
         backbone_out = out["backbone_out"].float()
         pair_mask = (chunks.chunk_mask[:, :-1] & chunks.chunk_mask[:, 1:]).float()
@@ -847,6 +948,21 @@ def main() -> None:
             "--backbone-mode draft supports --predict-mode latent only "
             "(decode CE is the E34-poisoned loss form)"
         )
+    if getattr(args, "backbone_mode", "") == "slm":
+        # v3.7 (consensus §2, user-ruled 2026-08-17): combinations that are
+        # N/A in the new mode fail loudly, not silently.
+        if args.codec_final_state:
+            raise SystemExit(
+                "--backbone-mode slm does not combine with --codec-final-state "
+                "(the state machine is an optional per-channel interpreter in v3.7)"
+            )
+        if args.predict_mode == "decode":
+            raise SystemExit(
+                "--backbone-mode slm supports --predict-mode latent only "
+                "(predict anchors the next chunk's decoder-aligned V row)"
+            )
+        if args.prefix_task:
+            raise SystemExit("--backbone-mode slm does not combine with --prefix-task (N/A in v3.7)")
     if args.codec_final_state:
         if not getattr(args, "state_channel", True):
             raise SystemExit("--codec-final-state requires --state-channel (this arm trains the state channel itself)")

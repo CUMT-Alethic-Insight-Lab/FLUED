@@ -232,7 +232,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--backbone-layers", type=int, default=3)
     parser.add_argument("--backbone-nhead", type=int, default=8)
     parser.add_argument("--backbone-ffn", type=int, default=1024)
-    parser.add_argument("--backbone-mode", choices=["attn", "mlp", "xattn", "draft", "paged_xattn"], default="attn")
+    parser.add_argument("--backbone-mode", choices=["attn", "mlp", "xattn", "draft", "paged_xattn", "slm"], default="attn")
     parser.add_argument(
         "--backbone-readout",
         choices=["per_chunk", "final", "paged"],
@@ -279,11 +279,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--k-row-source",
-        choices=["memory", "state"],
+        choices=["memory", "state", "index"],
         default="memory",
         help="S39 stage-1 taxonomy: K source for the xattn store rows -- "
         "memory = pre-state memory rows (default, existing behavior); "
-        "state = per-chunk state readouts (content) via a dedicated projection",
+        "state = per-chunk state readouts (content) via a dedicated projection; "
+        "index = summarizer index rows (v3.7 slm mode only)",
     )
     parser.add_argument(
         "--v-row-source",

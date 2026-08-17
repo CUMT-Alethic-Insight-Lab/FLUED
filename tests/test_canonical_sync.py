@@ -212,3 +212,25 @@ def test_v36_s1_layer_defaults_match_canonical() -> None:
     assert not mismatches, (
         f"train_v36_s1 layer defaults drifted from canonical_v36.json: {mismatches}"
     )
+
+
+# --- v3.7 line: canonical_v37.json must parse through the S1 trainer's
+# --- --config mechanism and resolve to the slm a-grid anchor (the v37 mode is
+# --- config-gated; v35/v36 guards above are untouched).
+
+CANONICAL_V37 = REPO_ROOT / "configs" / "canonical_v37.json"
+
+
+def test_v37_canonical_parses_to_slm_a_grid() -> None:
+    canonical = json.loads(CANONICAL_V37.read_text(encoding="utf-8"))
+    from tools.train.v3_6.train_v36 import build_parser
+    from tools.train.v3_6.train_v36_s1 import _add_s1_args
+
+    parser = build_parser()
+    _add_s1_args(parser)
+    parser.set_defaults(**canonical)
+    args = parser.parse_args([])
+    assert args.backbone_mode == "slm"
+    assert args.k_row_source == "index"
+    assert args.v_row_source == "memory"
+    assert canonical.get("canonical_version") == "v37.1-20260817"

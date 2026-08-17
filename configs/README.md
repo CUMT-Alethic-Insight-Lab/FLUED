@@ -5,6 +5,7 @@
 | 文件 | 对应实现 | 内容 |
 | --- | --- | --- |
 | [`canonical_v36.json`](canonical_v36.json) | `flued/v36` + `tools/train/v3_6/` | **v3.6 线当前默认起点**（v36.7-20260806）：S0″ 双源教师预训 byte embedder+segmentor 冻结接管、DiT summarizer、逐段条件化读出、动态边界、4× KDA 状态、S1.0 三任务、预测默认回 latent、fla chunk_kda 核、k=1 主干读出 + 残差门控精确缓存（S36） |
+| [`canonical_v37.json`](canonical_v37.json) | `flued/v36`（slm 模式）+ `tools/train/v3_6/` | **v3.7 线默认起点**（v37.1-20260817，[架构共识](../docs/versions/v3.7/FLUED_V3_7_ARCHITECTURE_CONSENSUS_20260817_CN.md)）：summarizer 直产 K/V、interpreter 可选分通道加工、SLM 标准小 LM 主干、codec 全覆盖律；默认锚 a 格（index,memory 双直通） |
 | [`canonical_v35.json`](canonical_v35.json) | `flued/v34` + `tools/train/v3_4/` | v3.4 收尾系列旧口径（v35.1-20260717），保留有效 |
 
 ## 版本实验矩阵（可复现实验记录，非默认起点）

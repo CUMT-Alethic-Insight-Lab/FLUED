@@ -160,6 +160,22 @@ class V36Config:
     # diagnostic readout. Memory-source only (k/v_row_source must both be
     # "memory"; the state combination is rejected to protect attribution).
     k_pos_inject: bool = False
+    # v3.7 mode (docs/versions/v3.7/FLUED_V3_7_ARCHITECTURE_CONSENSUS_20260817_CN.md,
+    # user-ruled 2026-08-17): backbone_mode="slm" -- fully config-gated; the
+    # default stays "attn" and every v36 path is bit-preserved. In slm mode the
+    # summarizer owns the K/V interface (§1.1): DiTChunkSummarizer grows a
+    # second head producing one index vector per chunk (the K side; the memory
+    # row itself IS the standard V). The backbone is a standard small LM
+    # (SLMBackbone): block 1 cross-reads the precomputed store rows causally,
+    # deeper blocks are standard causal self-attention; Q is self-produced from
+    # the backbone hidden state and the seed at position i is align_V(V_i)+pos
+    # ("each chunk asks with its own V", §1.3). The interpreter (§1.2) becomes
+    # an OPTIONAL per-channel processor: k_row_source in {"index", "state"}
+    # ("memory" is ILLEGAL for K in slm mode), v_row_source in {"memory",
+    # "state"}; each "state" channel gets its own WriteHead+KDAStateMachine
+    # pair (K eats the index rows, V the memory rows). Grid (§3):
+    # a=(index,memory) b=(state,memory) c=(index,state) d=(state,state);
+    # a+pos=(index+pos,memory) via k_pos_inject (k_row_source="index" only).
     # S38 (user-ruled 2026-08-09): supplementary content-conditioned readouts
     # for the top-N hardest chunks that were NOT cached -- a second, targeted
     # slice of the state per hard chunk (query generated from the chunk's own
@@ -187,7 +203,7 @@ class V36Config:
 class V36Output:
     logits_direct: torch.Tensor
     logits_backbone: torch.Tensor
-    package: torch.Tensor
+    package: torch.Tensor | None  # None in slm mode (the content channel is retired there, consensus §4)
     backbone_out: torch.Tensor
     chunks: ChunkBatch
     boundary_confidence: torch.Tensor
@@ -242,8 +258,18 @@ class DiTChunkSummarizer(nn.Module):
             nn.SiLU(),
             nn.Linear(c.summarizer_hidden, c.d_mem),
         )
+        # v3.7 (consensus §1.1): the summarizer owns the K interface -- one
+        # index vector per chunk, same width as memory (d_mem). Created ONLY in
+        # slm mode so pre-v3.7 checkpoints keep loading strict-clean.
+        if getattr(c, "backbone_mode", "") == "slm":
+            self.index_ffn = nn.Sequential(
+                nn.LayerNorm(c.d_byte),
+                nn.Linear(c.d_byte, c.summarizer_hidden),
+                nn.SiLU(),
+                nn.Linear(c.summarizer_hidden, c.d_mem),
+            )
 
-    def forward(self, spans: torch.Tensor, token_mask: torch.Tensor) -> torch.Tensor:
+    def _pool(self, spans: torch.Tensor, token_mask: torch.Tensor) -> torch.Tensor:
         bsz, chunks, span, dim = spans.shape
         h = spans.reshape(bsz * chunks, span, dim)
         valid = token_mask.reshape(bsz * chunks, span)
@@ -251,8 +277,20 @@ class DiTChunkSummarizer(nn.Module):
         for block in self.blocks:
             h = block(h, valid, noise)
         denom = valid.sum(dim=1, keepdim=False).clamp(min=1).unsqueeze(-1).to(h.dtype)
-        pooled = (h * valid.unsqueeze(-1).to(h.dtype)).sum(dim=1) / denom
-        return self.ffn(pooled).view(bsz, chunks, -1)
+        return (h * valid.unsqueeze(-1).to(h.dtype)).sum(dim=1) / denom  # (B*C, d_byte)
+
+    def forward(self, spans: torch.Tensor, token_mask: torch.Tensor) -> torch.Tensor:
+        bsz, chunks = spans.shape[0], spans.shape[1]
+        return self.ffn(self._pool(spans, token_mask)).view(bsz, chunks, -1)
+
+    def forward_with_index(self, spans: torch.Tensor, token_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """v3.7 slm mode: shared DiT stack + pooling, two heads -- memory (the
+        V rows) and index (the K rows), one vector per chunk each."""
+        bsz, chunks = spans.shape[0], spans.shape[1]
+        pooled = self._pool(spans, token_mask)
+        memory = self.ffn(pooled).view(bsz, chunks, -1)
+        index = self.index_ffn(pooled).view(bsz, chunks, -1)
+        return memory, index
 
 
 class WriteHead(nn.Module):
@@ -844,6 +882,141 @@ class CrossReadBackbone(nn.Module):
         return self.norm(h)
 
 
+class SLMBackbone(nn.Module):
+    """v3.7 SLM backbone (consensus §1.3, user-ruled 2026-08-17): a standard
+    small LM in the traditional decoder-only shape.
+
+    - Block 1 is a causal cross-attention over the PRECOMPUTED store rows
+      (Q = each position's hidden state, K/V = the store rows) + FFN; blocks
+      2..L are standard causal self-attention + FFN (pre-norm, residual).
+    - Seed: the initial hidden state at position i is align_V(V source row_i)
+      + chunk_pos[i] -- "each chunk asks with its own V", isomorphic to
+      h_i^0 = embedding_i in a traditional LM. The store's V side and the
+      seeds share the SAME align_V (one interface).
+    - align_K/align_V are PURE dimensional alignments (d_mem or d_pack ->
+      d_backbone), NOT content parsers -- content parsing is internalized in
+      the summarizer (consensus §1.1).
+    - Q is entirely self-produced by the backbone hidden state (q = W_q(h)
+      every layer, use-and-discard; "the backbone itself is Q"): in slm mode
+      there is no Q-side content channel.
+    - Position i sees store rows 0..i only (causal mask with the
+      diagonal-keep padding-NaN guard, same pattern as CrossReadBackbone).
+    - k_pos_inject (the a+pos arm, consensus §3): pos_gate * pos_proj of the
+      sinusoidal (segment order, window-relative start byte) features is added
+      to the aligned fine-grained index K rows; zero-init scalar gate, so
+      step 0 is exactly the a grid. Legal only for k_row_source="index".
+    """
+
+    def __init__(self, c: V36Config) -> None:
+        super().__init__()
+        d = c.d_backbone
+        self.nhead = c.backbone_nhead
+        k_src = getattr(c, "k_row_source", "index")
+        v_src = getattr(c, "v_row_source", "memory")
+        if k_src not in ("index", "state"):
+            raise ValueError(
+                f"slm k_row_source must be 'index' or 'state', got {k_src!r} "
+                "('memory' is illegal for the K channel in slm mode: the memory row is the V standard, consensus §3)"
+            )
+        if v_src not in ("memory", "state"):
+            raise ValueError(f"slm v_row_source must be 'memory' or 'state', got {v_src!r}")
+        self.k_from_state = k_src == "state"
+        self.v_from_state = v_src == "state"
+        k_dim = c.d_pack if self.k_from_state else c.d_mem
+        v_dim = c.d_pack if self.v_from_state else c.d_mem
+        self.align_k = nn.Linear(k_dim, d, bias=False)
+        self.align_v = nn.Linear(v_dim, d, bias=False)
+        # block 1: causal cross-attention over the store + FFN
+        self.q_proj = nn.Linear(d, d, bias=False)
+        self.o_proj = nn.Linear(d, d, bias=False)
+        self.ln_ffn1 = nn.LayerNorm(d)
+        self.ffn1 = nn.Sequential(nn.Linear(d, c.backbone_ffn), nn.GELU(), nn.Linear(c.backbone_ffn, d))
+        # blocks 2..L: standard causal self-attention + FFN (pre-norm)
+        self.self_blocks = nn.ModuleList(
+            [
+                nn.ModuleDict(
+                    {
+                        "ln_s": nn.LayerNorm(d),
+                        "q": nn.Linear(d, d, bias=False),
+                        "k": nn.Linear(d, d, bias=False),
+                        "v": nn.Linear(d, d, bias=False),
+                        "o": nn.Linear(d, d, bias=False),
+                        "ln_f": nn.LayerNorm(d),
+                        "ffn": nn.Sequential(
+                            nn.Linear(d, c.backbone_ffn), nn.GELU(), nn.Linear(c.backbone_ffn, d)
+                        ),
+                    }
+                )
+                for _ in range(max(c.backbone_layers - 1, 0))
+            ]
+        )
+        self.norm = nn.LayerNorm(d)
+        # a+pos arm: position-injected keys on the fine-grained index rows
+        # (zero-init gate -> step 0 bitwise-equals the a grid)
+        self.k_pos_inject = getattr(c, "k_pos_inject", False)
+        if self.k_pos_inject:
+            if k_src != "index":
+                raise ValueError(
+                    "slm k_pos_inject requires k_row_source='index' "
+                    "(a+pos = (index+pos, memory), the a-grid K-side single-variable arm, consensus §3)"
+                )
+            if v_src != "memory":
+                raise ValueError(
+                    "slm k_pos_inject requires v_row_source='memory' "
+                    "(a+pos is the a-grid K-side SINGLE-VARIABLE arm; "
+                    "(index+pos, state) would confound attribution, consensus §3)"
+                )
+            self.pos_proj = nn.Linear(POS_FEAT_DIM, d, bias=False)
+            self.pos_gate = nn.Parameter(torch.zeros(()))
+
+    def forward(
+        self,
+        k_rows: torch.Tensor,
+        v_rows: torch.Tensor,
+        chunk_mask: torch.Tensor,
+        pos: torch.Tensor,
+        chunk_byte_off: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """k_rows: (B, C, d_mem|d_pack) K source rows (index or K~);
+        v_rows: (B, C, d_mem|d_pack) V source rows (memory or V~);
+        pos: (1, C, d_backbone) chunk position embedding."""
+        bsz, n = chunk_mask.shape
+        nh = self.nhead
+        hd = pos.size(-1) // nh
+        store_v = self.align_v(v_rows)  # (B, C, d) -- shared: store V side AND seeds
+        # position seed: each chunk asks with its own V (consensus §1.3)
+        h = store_v + pos.to(store_v.dtype)
+        k_flat = self.align_k(k_rows)
+        if self.k_pos_inject:
+            # a+pos: sinusoidal key-row features through the zero-init gate
+            if chunk_byte_off is None:
+                raise ValueError("k_pos_inject requires chunk_byte_off (window-relative per-chunk start byte offsets)")
+            seg_idx = torch.arange(n, device=k_rows.device).unsqueeze(0).expand(bsz, n)
+            k_flat = k_flat + self.pos_gate * self.pos_proj(_pos_features(seg_idx, chunk_byte_off))
+        k = k_flat.view(bsz, n, nh, hd).transpose(1, 2)
+        v = store_v.view(bsz, n, nh, hd).transpose(1, 2)
+        # causal over the store; keep the diagonal even on padded rows (a
+        # fully-masked SDPA row yields NaN, and 0*NaN poisons downstream)
+        future = torch.triu(torch.ones(n, n, dtype=torch.bool, device=k_rows.device), diagonal=1)
+        allowed = (~future).view(1, 1, n, n) & chunk_mask.view(bsz, 1, 1, n)
+        allowed = allowed | torch.eye(n, dtype=torch.bool, device=k_rows.device).view(1, 1, n, n)
+        # block 1: cross-read; Q self-produced from the hidden state
+        q = self.q_proj(h).view(bsz, n, nh, hd).transpose(1, 2)
+        o = F.scaled_dot_product_attention(q, k, v, attn_mask=allowed)
+        h = h + self.o_proj(o.transpose(1, 2).reshape(bsz, n, nh * hd))
+        h = h + self.ffn1(self.ln_ffn1(h))
+        # blocks 2..L: standard causal self-attention + FFN
+        for blk in self.self_blocks:
+            hn = blk["ln_s"](h)
+            q = blk["q"](hn).view(bsz, n, nh, hd).transpose(1, 2)
+            kk = blk["k"](hn).view(bsz, n, nh, hd).transpose(1, 2)
+            vv = blk["v"](hn).view(bsz, n, nh, hd).transpose(1, 2)
+            o = F.scaled_dot_product_attention(q, kk, vv, attn_mask=allowed)
+            h = h + blk["o"](o.transpose(1, 2).reshape(bsz, n, nh * hd))
+            h = h + blk["ffn"](blk["ln_f"](h))
+        return self.norm(h)
+
+
 class DraftBackbone(nn.Module):
     """Three-state drafting backbone (spec SS23, user-ruled 2026-08-08).
 
@@ -1209,8 +1382,31 @@ class FLUEDV36(nn.Module):
         self.segmentor_head = nn.Sequential(nn.LayerNorm(c.d_byte), nn.Linear(c.d_byte, 1))
         self.chunk_builder = ChunkBuilder(c.max_chunks, c.max_span)
         self.summarizer = ChunkSummarizer(c) if c.summarizer_type == "slot" else DiTChunkSummarizer(c)
-        self.write_head = WriteHead(c)
-        self.state_machine = KDAStateMachine(c)
+        slm = c.backbone_mode == "slm"
+        if slm:
+            # v3.7 (consensus, user-ruled 2026-08-17): loud rejections for the
+            # combinations that are N/A in the new mode -- no silent mismatch.
+            if c.summarizer_type != "dit":
+                raise ValueError(
+                    "backbone_mode='slm' requires summarizer_type='dit' "
+                    "(the K-side index head lives on DiTChunkSummarizer, consensus §1.1)"
+                )
+            if c.k_row_source == "memory":
+                raise ValueError(
+                    "backbone_mode='slm': k_row_source='memory' is illegal for the K channel "
+                    "(consensus §3: K is 'index' or 'state'; the memory row is the V standard)"
+                )
+            if not c.per_chunk_readout:
+                raise ValueError("backbone_mode='slm' requires per_chunk_readout=True")
+            if c.backbone_readout != "per_chunk":
+                raise ValueError(
+                    "backbone_mode='slm' replaces the readout interface; backbone_readout final/paged is N/A"
+                )
+            if c.prefix_task:
+                raise ValueError("prefix_task is N/A for backbone_mode='slm' (v3.7 codec full-coverage law, consensus §2)")
+        else:
+            self.write_head = WriteHead(c)
+            self.state_machine = KDAStateMachine(c)
         if c.backbone_mode == "attn":
             self.backbone = TinyBackbone(c)
         elif c.backbone_mode == "xattn":
@@ -1219,12 +1415,37 @@ class FLUEDV36(nn.Module):
             self.backbone = CrossReadBackbone(c)
         elif c.backbone_mode == "draft":
             self.backbone = DraftBackbone(c)
+        elif slm:
+            self.backbone = SLMBackbone(c)
+            # interpreter (consensus §1.2): each ENGAGED state channel is an
+            # independent WriteHead+KDAStateMachine pair -- the WriteHead as it
+            # stands IS the standard KDA write gate, reused unchanged
+            # (dimensional alignment only, no extra design). The V channel
+            # keeps the legacy attribute names (the standard implementation
+            # over the memory rows); the K channel eats the summarizer's index
+            # rows (d_mem wide, matching WriteHead's input). The a grid
+            # (index, memory) creates NEITHER pair: the interpreter is
+            # entirely off the chain there (a ruling, not an omission).
+            if c.k_row_source == "state":
+                self.write_head_k = WriteHead(c)
+                self.state_machine_k = KDAStateMachine(c)
+            if c.v_row_source == "state":
+                self.write_head = WriteHead(c)
+                self.state_machine = KDAStateMachine(c)
+            # decoder-side fine-V alignment (direct/predict condition on the
+            # memory rows); coarse-V grids use decoder_in instead, so this is
+            # created only when engaged (conditional-creation discipline)
+            if c.v_row_source == "memory":
+                self.decoder_in_mem = nn.Linear(c.d_mem, c.d_backbone)
         else:
             self.backbone = PointwiseBackbone(c)
         self.bridge = SoftBoundaryBridge(
             c.max_chunks, c.tau_cut, c.boundary_temperature, c.boundary_bridge_gradient_scale
         )
-        self.decoder_in = nn.Linear(c.d_pack, c.d_backbone) if c.d_pack != c.d_backbone else nn.Identity()
+        if not slm or c.v_row_source == "state":
+            # slm fine-V grids condition the decoder on decoder_in_mem instead;
+            # the d_pack decoder_in exists only where a coarse V readout does
+            self.decoder_in = nn.Linear(c.d_pack, c.d_backbone) if c.d_pack != c.d_backbone else nn.Identity()
         self.decoder = GlobalSpanDecoder(c, self.byte_lookup)
         self.chunk_pos = nn.Embedding(c.max_chunks, c.d_backbone)
         nn.init.trunc_normal_(self.chunk_pos.weight, std=0.02)
@@ -1273,11 +1494,83 @@ class FLUEDV36(nn.Module):
         )
         return executable, utf8_cont, overflow
 
+    def _slm_store_rows(self, chunks: ChunkBatch) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """v3.7 encoder after the segmentor (consensus §1): the summarizer
+        directly produces (memory = the V rows, index = the K rows); each
+        channel then either passes through DIRECTLY (fine granularity) or via
+        its own KDA-standard interpreter (coarse granularity). Returns
+        (k_rows, v_rows, state_norm, memory, index) -- k_rows/v_rows are the
+        backbone store source rows; state_norm averages the engaged channels'
+        norms, with a 0 placeholder when no state machine exists (the a grid,
+        per the ruling)."""
+        memory, index = self.summarizer.forward_with_index(chunks.span_embeddings, chunks.token_mask)
+        norms = []
+        if self.config.k_row_source == "state":
+            package_k, sn_k = self.state_machine_k(self.write_head_k(index), chunks.chunk_mask)
+            k_rows = package_k.mean(dim=2)  # K~ per chunk (B, C, d_pack)
+            norms.append(sn_k)
+        else:
+            k_rows = index
+        if self.config.v_row_source == "state":
+            package_v, sn_v = self.state_machine(self.write_head(memory), chunks.chunk_mask)
+            v_rows = package_v.mean(dim=2)  # V~ per chunk (B, C, d_pack)
+            norms.append(sn_v)
+        else:
+            v_rows = memory
+        if norms:
+            state_norm = torch.stack([n.float() for n in norms]).mean()
+        else:
+            state_norm = memory.new_zeros((), dtype=torch.float32)
+        return k_rows, v_rows, state_norm, memory, index
+
+    def _forward_slm(self, chunks: ChunkBatch, confidence: torch.Tensor, valid: torch.Tensor, hard_cut: torch.Tensor, cut_overflow: torch.Tensor) -> V36Output:
+        """v3.7 slm forward (consensus §1-2): the SLM backbone reads the
+        summarizer-owned store; the decoder conditions on the SAME V source
+        rows as the backbone store (direct), and completion reads the
+        backbone's output matrix -- three tasks, one V (§1.4)."""
+        k_rows, v_rows, state_norm, memory, _index = self._slm_store_rows(chunks)
+        n_chunks = chunks.chunk_mask.size(1)
+        pos = self.chunk_pos.weight.unsqueeze(0)[:, :n_chunks]
+        chunk_byte_off = (
+            chunk_byte_offsets(chunks.token_mask) if getattr(self.config, "k_pos_inject", False) else None
+        )
+        backbone_out = self.backbone(k_rows, v_rows, chunks.chunk_mask, pos, chunk_byte_off=chunk_byte_off)
+        cond_backbone = backbone_out + pos
+        dec_in = self.decoder_in if self.config.v_row_source == "state" else self.decoder_in_mem
+        cond_direct = dec_in(v_rows) + pos
+        logits_direct = self.decoder(cond_direct, chunks.token_mask)
+        logits_backbone = self.decoder(cond_backbone, chunks.token_mask)
+        aux = {
+            "truncated_tokens": chunks.pack_info["truncated_tokens"].float(),
+            "cut_capacity_overflow": cut_overflow.float().sum(),
+            "chunks_per_sample": chunks.chunk_mask.float().sum(dim=1),
+            "boundary_confidence_mean": confidence[valid].mean() if valid.any() else confidence.mean(),
+            "hard_cut_fraction": hard_cut.float()[valid].mean() if valid.any() else hard_cut.float().mean(),
+            "state_norm": state_norm,
+        }
+        return V36Output(
+            logits_direct=logits_direct,
+            logits_backbone=logits_backbone,
+            package=None,
+            backbone_out=backbone_out,
+            chunks=chunks,
+            boundary_confidence=confidence,
+            memory=memory,
+            state_norm=state_norm,
+            aux=aux,
+            prefix=None,
+        )
+
     def forward(self, token_ids: torch.Tensor) -> V36Output:
         byte_states, confidence, valid, _logits = self._encode(token_ids)
         hard_cut, utf8_cont, cut_overflow = self._cuts(token_ids, confidence, valid)
         chunks = self.chunk_builder(byte_states, valid, hard_cut, confidence)
         chunks = self.bridge(chunks, byte_states, confidence, valid, utf8_cont)
+        if self.config.backbone_mode == "slm":
+            # v3.7 slm mode: dedicated path (summarizer-owned K/V + SLM
+            # backbone + decoder on the same V); the legacy content channel
+            # below is bypassed entirely.
+            return self._forward_slm(chunks, confidence, valid, hard_cut, cut_overflow)
         memory = self.summarizer(chunks.span_embeddings, chunks.token_mask)
         gates = self.write_head(memory)
         package, state_norm = self.state_machine(gates, chunks.chunk_mask)
