@@ -847,3 +847,7 @@ overflow 真凶是 URL 编码/base64 类**无语言边界的高熵字节流**（
   索引压缩代价≈0。探针补跑 ks_b/ks_c：寻址全员弱格局不变。S39 阶段1 八格（V-seed×4
   + K-seed×4）+ 七格检索考场全部落地：V 必须细（双考场互证）、K 粗化种子路径无损、
   检索能力全员缺失（待检索任务施压）。
+- 2026-08-17（十四）：**canonical v37.2：默认种子切 K（用户裁定）**——`configs/canonical_v37.json`
+  `seed_source="k"` 入默认、`canonical_version` 升 v37.2-20260817；依据 E66（K-seed a 格略优
+  V-seed 锚且无害）+ E64/E66（V-seed 下索引通道装饰化，K-block 双次零漂移）。同步守卫更新
+  （v37 测试断言 seed_source=="k"），全量 pytest 300 passed/4 skipped。

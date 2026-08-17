@@ -233,4 +233,5 @@ def test_v37_canonical_parses_to_slm_a_grid() -> None:
     assert args.backbone_mode == "slm"
     assert args.k_row_source == "index"
     assert args.v_row_source == "memory"
-    assert canonical.get("canonical_version") == "v37.1-20260817"
+    assert args.seed_source == "k"  # v37.2: K-seed is the default (E66, user-ruled 2026-08-17)
+    assert canonical.get("canonical_version") == "v37.2-20260817"
