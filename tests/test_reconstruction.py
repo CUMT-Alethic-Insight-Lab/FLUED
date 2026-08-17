@@ -25,8 +25,8 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from blt_baseline.model import BLTAutoencoder
-from bpe_baseline.model import BPETransformerAutoencoder
+from tools.baselines.blt_baseline.model import BLTAutoencoder
+from tools.baselines.bpe_baseline.model import BPETransformerAutoencoder
 from flued.config import ModelConfig, TrainConfig
 from flued.data import STUB_CORPUS, ByteTextDataset, get_dataloader, safe_train_eval_split
 from flued.model import FLUEDAutoencoder, VOCAB_SIZE, MASK_ID
@@ -262,7 +262,7 @@ class TestFLUEDAutoencoder:
 
 
 class TestBPETransformerAutoencoder:
-    """Tests for bpe_baseline/model.py -- BPETransformerAutoencoder."""
+    """Tests for tools/baselines/bpe_baseline/model.py -- BPETransformerAutoencoder."""
 
     def _make_model(self, vocab_size: int = 512) -> BPETransformerAutoencoder:
         return BPETransformerAutoencoder(vocab_size=vocab_size, **_TINY)
@@ -311,7 +311,7 @@ class TestBPETransformerAutoencoder:
 
 
 class TestBLTAutoencoder:
-    """Tests for blt_baseline/model.py -- BLTAutoencoder with vocab_size=257."""
+    """Tests for tools/baselines/blt_baseline/model.py -- BLTAutoencoder with vocab_size=257."""
 
     def _make_model(self) -> BLTAutoencoder:
         # vocab_size=257 matches FLUED PAD-offset encoding (PAD=0, byte b -> b+1)

@@ -39,7 +39,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("blt.stage1")
 
-from blt_baseline.model import ByteLanguageModel
+from tools.baselines.blt_baseline.model import ByteLanguageModel
 from flued.data import StreamingReconstructionDataset
 
 

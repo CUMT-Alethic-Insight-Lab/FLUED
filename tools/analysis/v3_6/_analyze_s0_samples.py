@@ -12,8 +12,7 @@ import sys
 from pathlib import Path
 from statistics import median
 
-ROOT = Path(__file__).resolve().parents[3]
-SRC = ROOT / "s0_annotation_samples.txt"
+SRC = Path(__file__).resolve().parent / "s0_annotation_samples.txt"  # 与脚本同目录
 
 
 def parse_samples(text: str):

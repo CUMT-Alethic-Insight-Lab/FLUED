@@ -62,7 +62,7 @@ def build_model(model_cfg: ModelConfig) -> nn.Module:
         )
 
     elif model_cfg.model_type == "bpe":
-        from bpe_baseline.model import BPETransformerAutoencoder
+        from tools.baselines.bpe_baseline.model import BPETransformerAutoencoder
 
         return BPETransformerAutoencoder(
             vocab_size=model_cfg.token_vocab_size,
@@ -76,7 +76,7 @@ def build_model(model_cfg: ModelConfig) -> nn.Module:
         )
 
     elif model_cfg.model_type == "blt":
-        from blt_baseline.model import BLTAutoencoder
+        from tools.baselines.blt_baseline.model import BLTAutoencoder
 
         return BLTAutoencoder(
             vocab_size=model_cfg.vocab_size,

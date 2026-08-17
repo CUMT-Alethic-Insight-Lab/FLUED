@@ -303,7 +303,7 @@ overflow 真凶是 URL 编码/base64 类**无语言边界的高熵字节流**（
   对比分布漂移）；② **masked 口径定为 40% 整 UTF-8 字 + 60% 整 BPE 词混合**
   （练单字理解、避免养成高级 BPE；废 1-8B 随机 span），HNet-DiT 需同口径
   重跑、R2 需 Mamba-2 忠实版 H-Net（现仓复现主干为 causal transformer，
-  已披露）。详见 `FLUED_TODO_20260805_CN.md` T1/T3。
+  已披露）。详见 `docs/internal/FLUED_TODO_20260805_CN.md` T1/T3。
 - 2026-08-05：**E28 混合口径主臂落地**（`s11_mixedmask_20k_20260805`，52 分钟/6.4
   步每秒）：direct 0.789 / unmasked 0.782 / PPL 2.637 / masked 0.141——口径切换
   零回退、三主项小幅上行；predict_cos 0.862（略降，观察）；state_norm 12.1 回落。
@@ -701,7 +701,7 @@ overflow 真凶是 URL 编码/base64 类**无语言边界的高熵字节流**（
   codeparrot ~280GiB 需新盘重新下载（配置 notes 已更新）。S39 方向用户裁定：
   转"定义问题的鼻祖"视角（2026-08-03 已有论文占 ~1/3 核心 claim 但不体系化），
   §26 形态按 fork 争执最终口径修订。最终形态确定后正式切 v4 版本号。文档重组
-  与数据迁移方案见 `FLUED_TODO_20260812_REORG_MIGRATION_CN.md`。
+  与数据迁移方案见 `docs/internal/FLUED_TODO_20260812_REORG_MIGRATION_CN.md`。
 - 2026-08-12：**迁移方案执行启动**——① corpus_v3 已迁 P:（双侧 sha256
   一致，E: 源文件待用户确认后删）；② **codeparrot 流式管线建成并启动**
   （`tools/data/download_codeparrot_stream.py`：6 下载+3 清洗 worker，

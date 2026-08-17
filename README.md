@@ -198,6 +198,7 @@ flued/e3_train.py                      downstream language-model training
 flued/e3_downstream.py                 FLUED/BPE/BLT downstream wrappers
 tools/*/v3_0...v3_6/                   versioned experiment utilities
 tools/train/v3_6/                      current v3.6 training entrypoint
+tools/baselines/                       BPE/BLT/H-Net baseline reproductions
 configs/canonical_v36.json             current canonical default
 configs/v3_3/, configs/v3_4/           versioned experiment matrices
 docs/versions/                         version-frozen design and result records

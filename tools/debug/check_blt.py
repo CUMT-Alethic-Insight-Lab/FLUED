@@ -1,6 +1,6 @@
 """Check BLT 300m params and VRAM before training."""
 import torch
-from blt_baseline.model import BLTAutoencoder
+from tools.baselines.blt_baseline.model import BLTAutoencoder
 
 m = BLTAutoencoder(
     vocab_size=257, d_model=1024, nhead=16, dim_feedforward=4096,
