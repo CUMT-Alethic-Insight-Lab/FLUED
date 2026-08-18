@@ -68,11 +68,13 @@ SILU_SAT_THRESHOLD = -4.0  # SiLU(x) ≈ -0.018 below this: effectively dead zon
 @torch.no_grad()
 def layerwise_write_head(wh, rows: torch.Tensor) -> dict:
     """One window: rows (n, d_mem) -> per-layer geometry + mechanism stats.
-    Uses the module's own submodules (no hooks); verified against wh.forward."""
+    Uses the module's own submodules (no hooks); verified against wh.forward.
+    E79 split-trunk aware: the key path reads trunk_k when split."""
+    trunk = wh.trunk_k if getattr(wh, "split_trunk", False) else wh.trunk
     x0 = rows.float()
-    l1 = wh.trunk[0](x0)  # LayerNorm (affine)
-    l2 = wh.trunk[1](l1)  # Linear, pre-SiLU
-    l3 = wh.trunk[2](l2)  # SiLU = trunk output
+    l1 = trunk[0](x0)  # LayerNorm (affine)
+    l2 = trunk[1](l1)  # Linear, pre-SiLU
+    l3 = trunk[2](l2)  # SiLU = trunk output
     k_raw = wh.to_k(l3)  # (n, H*hk), bias included
     H, hk = wh.heads, wh.hk
     k_heads = k_raw.view(-1, H, hk)
@@ -137,15 +139,29 @@ def main() -> None:
     p.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     p.add_argument("--max-windows", type=int, default=16)
     p.add_argument("--out-dir", default="outputs/key_collapse_survey_20260818")
+    p.add_argument("--runs", default="",
+                   help="override TARGETS: comma-separated label:run_dir:channel triples "
+                   "(channel v=write_head@memory, k=write_head_k@index)")
+    p.add_argument("--report-name", default="layerwise_decomposition.json",
+                   help="JSON filename under out-dir (override for side runs so the main artifact is never clobbered)")
+    p.add_argument("--section-tag", default="",
+                   help="summary section title suffix (unique per side run; section-scoped replace)")
     args = p.parse_args()
     device = torch.device("cuda" if (args.device == "auto" and torch.cuda.is_available()) or args.device == "cuda" else "cpu")
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
 
+    targets = TARGETS
+    if args.runs:
+        targets = []
+        for item in args.runs.split(","):
+            label, run, channel = item.split(":")
+            targets.append((label, run, channel))
+
     windows = masks = None
     results = []
-    for label, run, channel in TARGETS:
+    for label, run, channel in targets:
         model, ns, step = load_model(Path(run), device)
         if windows is None:
             windows = build_eval_windows(ns, args.max_windows)
@@ -219,14 +235,14 @@ def main() -> None:
         "results": results,
         "timing_sec": round(time.time() - t0, 1),
     }
-    out_path = out_dir / "layerwise_decomposition.json"
+    out_path = out_dir / args.report_name
     out_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
 
     # append the one-page section to the survey SUMMARY.txt
     lines = [
         "",
         "=" * 78,
-        "LAYERWISE DECOMPOSITION — WriteHead 键塌缩逐层定位（16 窗同口径）",
+        f"LAYERWISE DECOMPOSITION{(' — ' + args.section_tag) if args.section_tag else ''} — WriteHead 键塌缩逐层定位（16 窗同口径）",
         f"日期 {report['created']}  设备 {device.type}",
         "",
         "逐层 μ（L0 输入行 → L1 LayerNorm → L2 Linear(pre-SiLU) → L3 SiLU → L4 to_k → L5 归一化）:",
@@ -263,10 +279,18 @@ def main() -> None:
     ]
     summary_path = out_dir / "SUMMARY.txt"
     existing = summary_path.read_text(encoding="utf-8") if summary_path.exists() else ""
-    marker = "LAYERWISE DECOMPOSITION"
-    if marker in existing:  # idempotent re-append: drop the previous section
-        existing = existing[: existing.index(marker)].rstrip("=\n ")
-        summary_path.write_text(existing + "\n", encoding="utf-8")
+    marker = f"LAYERWISE DECOMPOSITION{(' — ' + args.section_tag) if args.section_tag else ''}"
+    if marker in existing:
+        # section-scoped replace: cut ONLY this section (to the next section
+        # separator or EOF) — never truncate later sections (2026-08-19 lesson:
+        # the previous marker-to-EOF truncation ate four later sections)
+        start = existing.index(marker)
+        head = existing[:start].rstrip("=\n ")
+        rest = existing[start:]
+        next_sep = rest.find("\n" + "=" * 21)  # next section's separator line
+        tail = rest[next_sep:] if next_sep != -1 else ""
+        summary_path.write_text(head + "\n" + tail.lstrip("\n"), encoding="utf-8")
+        existing = summary_path.read_text(encoding="utf-8")
     with summary_path.open("a", encoding="utf-8") as fh:
         fh.write("\n".join(lines) + "\n")
     print("\n".join(lines), flush=True)

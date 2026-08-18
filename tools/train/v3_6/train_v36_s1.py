@@ -753,7 +753,7 @@ def _slm_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None) 
     hard_cut, utf8_cont, cut_overflow = model._cuts(source, confidence, valid)
     chunks = model.chunk_builder(byte_states, valid, hard_cut, confidence)
     chunks = model.bridge(chunks, byte_states, confidence, valid, utf8_cont)
-    k_rows, v_rows, state_norm, memory, _index = model._slm_store_rows(chunks)
+    k_rows, v_rows, state_norm, memory, index = model._slm_store_rows(chunks)
     n_chunks = chunks.chunk_mask.size(1)
     pos = model.chunk_pos.weight.unsqueeze(0)[:, :n_chunks]
     # a+pos arm: window-relative per-chunk start byte offsets (None = off)
@@ -774,6 +774,7 @@ def _slm_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None) 
         "backbone_out": backbone_out,
         "v_rows": v_rows,  # decoder-side V source rows (the predict anchor, §1.4)
         "memory": memory,
+        "index": index,  # summarizer K rows (resident key-geometry metrics, E80 补充 2)
         "think_steps": 0.0,
         "chunks": chunks,
         "cut_overflow": cut_overflow,
@@ -781,6 +782,51 @@ def _slm_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None) 
         "boundary_confidence_mean": confidence[valid].mean() if valid.any() else confidence.mean(),
         "hard_cut_fraction": hard_cut.float()[valid].mean() if valid.any() else hard_cut.float().mean(),
     }
+
+
+@torch.no_grad()
+def _key_geometry_metrics(model, out: dict, device) -> dict:
+    """E80 补充 2 (user-ruled 2026-08-18): resident WriteHead key-geometry
+    dashboard on the current training batch (slm mode only; legacy paths
+    untouched). Per engaged state channel — V: write_head over the memory rows
+    (bare names), K: write_head_k over the index rows (_k suffix) — report
+    mu (mean off-diagonal |cos|), mu_max (worst pair), PR/n (Gram eigenvalue
+    participation ratio over n_real, per-head pooled). Zero placeholders for
+    absent channels (the a grid has no WriteHead). One scalar sync per step
+    (n_real); metrics-only path, everything detached."""
+    zero = torch.zeros((), device=device)
+    res = {
+        "key_mu": zero, "key_mu_max": zero.clone(), "key_pr": zero.clone(),
+        "key_mu_k": zero.clone(), "key_mu_max_k": zero.clone(), "key_pr_k": zero.clone(),
+    }
+    chunks = out["chunks"]
+    n_real = int(chunks.chunk_mask[0].sum())
+    if n_real < 2:
+        return res
+
+    def stats(k: torch.Tensor):  # (B, C, H, hk) write keys (unit-norm rows)
+        kr = k[0, :n_real].float()
+        mus, mx, prs = [], [], []
+        for h in range(kr.size(1)):
+            kh = kr[:, h]
+            G = kh @ kh.T
+            off = G.abs()[~torch.eye(kh.size(0), dtype=torch.bool, device=kh.device)]
+            eig = torch.linalg.eigvalsh(G).clamp(min=0.0)
+            mus.append(off.mean())
+            mx.append(off.max())
+            prs.append(eig.sum() ** 2 / eig.square().sum().clamp(min=1e-12) / kh.size(0))
+        return torch.stack(mus).mean().detach(), torch.stack(mx).max().detach(), torch.stack(prs).mean().detach()
+
+    cfg = model.config
+    # metrics run OUTSIDE the autocast region: the forward's rows are bf16
+    # under amp; cast to fp32 before the (fp32-weight) WriteHead modules.
+    if getattr(cfg, "v_row_source", "") == "state":
+        gates = model.write_head(out["memory"].float())
+        res["key_mu"], res["key_mu_max"], res["key_pr"] = stats(gates["k"])
+    if getattr(cfg, "k_row_source", "") == "state":
+        gates_k = model.write_head_k(out["index"].float())
+        res["key_mu_k"], res["key_mu_max_k"], res["key_pr_k"] = stats(gates_k["k"])
+    return res
 
 
 def _acc_tensor(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -1081,6 +1127,10 @@ def step_model(model, batch, args, device, train: bool):
         "boundary_confidence_mean": out["boundary_confidence_mean"].detach(),
         "think_steps": torch.tensor(out["think_steps"], device=loss.device),
     }
+    if slm_mode:
+        # E80 补充 2: resident key-geometry dashboard (slm default-on; legacy
+        # paths never gain these keys)
+        metrics.update(_key_geometry_metrics(model, out, device))
     if codec_final and not train:
         # Eval n-scan (user-ruled 2026-08-11): subsample n of the C per-chunk
         # query rows uniformly (/n paging geometry, paged_boundaries) and serve

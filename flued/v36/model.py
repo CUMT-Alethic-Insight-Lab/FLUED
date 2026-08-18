@@ -202,6 +202,17 @@ class V36Config:
     # every legacy path bit-preserved. Covers BOTH WriteHead instances (K and V
     # channels); the a grid has no WriteHead and is unaffected.
     to_k_center: bool = False
+    # E79 split-trunk (user-ruled 2026-08-18; evidence M3 write-value probe):
+    # the WriteHead trunk was shared by to_k/to_v(/to_beta/to_b/to_w), so the
+    # to_k_center surgery's training dynamics deformed to_v's value content
+    # through the shared trunk (the b-grid K channel lost ~half its linearly
+    # decodable byte content, 0.56->0.23 slot0). When on, the WriteHead holds
+    # TWO independent trunks (trunk_k feeds to_k; trunk_v feeds the value/gate
+    # heads). Default off = the shared `trunk` and every legacy path
+    # bit-preserved (old checkpoints load strict-clean; a split-trunk model
+    # does NOT strict-load a shared-trunk state dict — by design, loud).
+    # Composes with to_k_center (centering applies to the to_k branch only).
+    split_trunk: bool = False
     # v3.7 mode (docs/versions/v3.7/FLUED_V3_7_ARCHITECTURE_CONSENSUS_20260817_CN.md,
     # user-ruled 2026-08-17): backbone_mode="slm" -- fully config-gated; the
     # default stays "attn" and every v36 path is bit-preserved. In slm mode the
@@ -343,7 +354,16 @@ class WriteHead(nn.Module):
         self.recurrence = getattr(c, "recurrence", "kda")
         if self.recurrence not in ("kda", "gdn2"):
             raise ValueError(f"recurrence must be 'kda' or 'gdn2', got {self.recurrence!r}")
-        self.trunk = nn.Sequential(nn.LayerNorm(c.d_mem), nn.Linear(c.d_mem, c.write_hidden), nn.SiLU())
+        # E79 split-trunk (see V36Config.split_trunk): two independent trunks
+        # when on (trunk_k -> to_k; trunk_v -> to_v/to_beta/to_b/to_w), so the
+        # to_k-side training dynamics cannot deform the value content through
+        # a shared trunk. Default off = the shared `trunk` (bit-preserved).
+        self.split_trunk = getattr(c, "split_trunk", False)
+        if self.split_trunk:
+            self.trunk_k = nn.Sequential(nn.LayerNorm(c.d_mem), nn.Linear(c.d_mem, c.write_hidden), nn.SiLU())
+            self.trunk_v = nn.Sequential(nn.LayerNorm(c.d_mem), nn.Linear(c.d_mem, c.write_hidden), nn.SiLU())
+        else:
+            self.trunk = nn.Sequential(nn.LayerNorm(c.d_mem), nn.Linear(c.d_mem, c.write_hidden), nn.SiLU())
         self.to_k = nn.Linear(c.write_hidden, h * hk)
         self.to_v = nn.Linear(c.write_hidden, h * hv)
         # E75 key-decollapse hard constraint (see V36Config.to_k_center):
@@ -370,8 +390,12 @@ class WriteHead(nn.Module):
 
     def forward(self, memory: torch.Tensor) -> dict[str, torch.Tensor]:
         bsz, chunks, _ = memory.shape
-        h = self.trunk(memory)
-        k = self.to_k(h)
+        if self.split_trunk:
+            h_k = self.trunk_k(memory)
+            h_v = self.trunk_v(memory)
+        else:
+            h_k = h_v = self.trunk(memory)
+        k = self.to_k(h_k)
         if self.to_k_center:
             # E75: subtract the running center (EMA momentum 0.99, detached —
             # the gradient path to to_k stays live; cold start initializes from
@@ -386,13 +410,13 @@ class WriteHead(nn.Module):
                         self.k_center.mul_(0.99).add_(m, alpha=0.01)
             k = k - self.k_center.to(k.dtype)
         k = F.normalize(k.view(bsz, chunks, self.heads, self.hk), dim=-1)
-        v = self.to_v(h).view(bsz, chunks, self.heads, self.hv)
+        v = self.to_v(h_v).view(bsz, chunks, self.heads, self.hv)
         alpha = torch.sigmoid(self.alpha_logit).view(1, 1, self.heads, self.hk)
         if self.recurrence == "gdn2":
-            b = torch.sigmoid(self.to_b(h)).view(bsz, chunks, self.heads, self.hk)
-            w = torch.sigmoid(self.to_w(h)).view(bsz, chunks, self.heads, self.hv)
+            b = torch.sigmoid(self.to_b(h_v)).view(bsz, chunks, self.heads, self.hk)
+            w = torch.sigmoid(self.to_w(h_v)).view(bsz, chunks, self.heads, self.hv)
             return {"k": k, "v": v, "b": b, "w": w, "alpha": alpha}
-        beta = torch.sigmoid(self.to_beta(h))
+        beta = torch.sigmoid(self.to_beta(h_v))
         return {"k": k, "v": v, "beta": beta, "alpha": alpha}
 
 

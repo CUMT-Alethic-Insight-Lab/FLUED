@@ -151,3 +151,56 @@ def test_mix_keys_monotonic_mu():
         mus.append(sum(lc.row_geometry(km[0, :, h])["mu"] for h in range(H)) / H)
     assert mus[0] > 0.9 and mus[-1] < 0.3
     assert all(a >= b for a, b in zip(mus, mus[1:]))  # non-increasing
+
+
+# --- μ curriculum (修正一, 2026-08-19) ----------------------------------------
+
+
+def test_mu_curriculum_grid_monotone_realized_mu():
+    """Each default λ level must land at a distinct, decreasing realized μ,
+    spanning ~0.9 down to ~0.07 (the lock-in curve's full axis)."""
+    torch.manual_seed(0)
+    n, H, hk = 48, 2, 64  # hk=64: random-key |cos| floor ~0.11 (hk=16 would floor at ~0.22)
+    u = F.normalize(torch.randn(1, 1, H, hk), dim=-1)
+    z0 = F.normalize(torch.randn(1, n, H, hk), dim=-1)
+    k_real = F.normalize(0.98 * u + 0.02 * z0, dim=-1)  # deeply collapsed keys
+    grid = [float(x) for x in rr.build_parser().parse_args([]).mu_lambda_grid.split(",")]
+    assert len(grid) >= 5
+    mus = []
+    for lam in grid:
+        km = lc.mix_keys(k_real, F.normalize(torch.randn(k_real.shape), dim=-1), lam)
+        mus.append(sum(lc.row_geometry(km[0, :, h])["mu"] for h in range(H)) / H)
+    assert all(a > b for a, b in zip(mus, mus[1:])), mus  # strictly decreasing
+    assert mus[0] > 0.85 and mus[-1] < 0.15, mus
+
+
+def test_retrainer_defaults_updated():
+    args = rr.build_parser().parse_args([])
+    assert args.steps == 20000
+    assert abs(args.oracle_frac_end - 0.3) < 1e-9  # 修正一 endpoint 0.1 -> 0.3
+    assert args.oracle_frac_start == 0.8
+    assert args.unfreeze_backbone_last_n == 0
+
+
+def test_train_step_with_mu_curriculum():
+    model = _tiny_model()
+    rr.unfreeze_readout_chain(model)
+    ns = _ns()
+    opt = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=1e-3)
+    clean = torch.randint(1, 258, (1, 256))
+    byte_mask = torch.zeros_like(clean, dtype=torch.bool)
+    import random
+
+    grid = [0.2, 0.65, 1.0]
+    rng = random.Random(0)
+    seen_lams = set()
+    for _ in range(6):
+        r = rr.train_step(model, ns, clean, byte_mask, 1.0, opt, rng, 1.0, mu_lambda_grid=grid)
+        assert math.isfinite(r["loss"])
+        assert r["use_oracle"] is True  # frac=1.0 forces the oracle branch
+        assert r["mu_lambda"] in grid
+        seen_lams.add(r["mu_lambda"])
+    assert len(seen_lams) >= 1
+    # grid=None keeps the pre-curriculum plain-oracle form working
+    r = rr.train_step(model, ns, clean, byte_mask, 1.0, opt, rng, 1.0, mu_lambda_grid=None)
+    assert r["mu_lambda"] is None and math.isfinite(r["loss"])

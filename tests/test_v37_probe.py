@@ -225,3 +225,36 @@ def test_decode_logits_depend_on_cond():
         logits_swap = model.decoder(cond_swap, tm)
     assert not torch.allclose(logits_base, logits_zero, atol=1e-4)
     assert not torch.allclose(logits_base, logits_swap, atol=1e-4)
+
+
+# --- M2 per-item predicate helpers (probe --per-item-log) ---------------------
+
+
+def test_m2_per_item_predicate_helpers():
+    d = 8
+    retr = base.Retriever(d, d, "full", 0)
+    with torch.no_grad():
+        retr.wq.weight.copy_(torch.eye(d))
+    e = torch.eye(d)
+    keys_a = torch.stack([e[0], e[1], e[2], e[3]])  # needle row isolated
+    keys_b = torch.stack([e[0], e[0].clone(), e[1], e[2]])  # needle row has a collinear twin
+
+    def fake_doc(keys, qi):
+        return {"memory": keys, "query": keys[qi], "pos_code": {1: torch.tensor([qi])}, "eid": "QX-0000", "n_distr": 3}
+
+    cfg = {"key_src": "memrow", "gran": 1, "key_type": "full", "rank": None}
+    rows = probe.per_item_records(retr, [fake_doc(keys_a, 0), fake_doc(keys_b, 0)], cfg)
+    assert rows[0]["mu_i"] < 0.01  # isolated row: no interferer
+    assert rows[1]["mu_i"] > 0.999  # collinear twin: worst interferer ~= itself
+    assert rows[0]["hit1"] == 1.0  # orthogonal needle wins top-1
+    assert rows[0]["n_keys"] == 4 and rows[0]["n_pos"] == 1
+    # summary aggregation on hand-built rows (quartile math)
+    synth = [
+        {"mu_i": 0.1, "hit1": 1.0}, {"mu_i": 0.2, "hit1": 0.0},
+        {"mu_i": 0.9, "hit1": 0.0}, {"mu_i": 0.8, "hit1": 0.0},
+    ]
+    s = probe.summarize_per_item(synth)
+    assert s["quartile_size"] == 1
+    assert s["hit_share_in_low_mu_quartile"] == 1.0  # the only hit is in the low-mu quartile
+    assert s["mean_mu_hits"] == 0.1 and s["mean_mu_misses"] > 0.5
+    assert probe.summarize_per_item([]) == {"n": 0}

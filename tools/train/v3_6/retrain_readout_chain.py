@@ -9,13 +9,17 @@
 （--unfreeze-backbone-last-n 为防翻车设计 2 的备用旋钮，默认 0）。
 
 防翻车设计（用户裁定）：
-1. 对称 OOD 防护：每个样本按 --oracle-frac（余弦退火 0.8→0.1）在
-   **oracle 态**（WriteHead k/v 手工累计 Σ k_j v_jᵀ，无侵蚀）与**自然态**
-   （真实 delta 递推）之间二选一喂链——链同时在两种分布上训练，复训后
-   对自然态不退化、对 oracle 态有救。
-2. backbone 冻结优先（旋钮备用）。
+1. 对称 OOD 防护 + μ 课程（修正一，2026-08-19）：每个样本按
+   --oracle-frac（余弦退火 0.8→--oracle-frac-end，默认回调到 0.3）在
+   **oracle 态**与**自然态**（真实 delta 递推）之间二选一喂链；且 oracle
+   态不再是单一无侵蚀累计态——生成时对键做受控相干混合
+   （k(λ)=normalize(√(1-λ²)·k_real+λ·z)，混合器复用
+   measure_readout_lockin_curve.py），λ 档位表 --mu-lambda-grid 覆盖实测
+   μ≈0.9→0.07（锁死曲线全轴），每步均匀抽档，让链一次学成几何鲁棒。
+2. backbone 冻结优先（--unfreeze-backbone-last-n 旋钮备用，默认 0）。
 3. 验收线：eval direct_acc（state 链，自然态口径）必须超过写死的线性探针
-   地板 0.62（logs 注释常量）；地板以下 = 复训没把链接管能力建起来。
+   地板 0.62（logs 注释常量）；eval 日志加 plateau_acc（末 3 次 eval 自然
+   态均值）供"above_floor 后看平台"判读。
 4. checkpoint 只读；复训产物（三模块 state_dict）单独落 --out-dir，绝不
    回写原 ckpt；独立脚本，不动任何生产训练路径。
 
@@ -59,6 +63,7 @@ from tools.analysis.v3_6.probe_oracle_write_verdict import (  # noqa: E402
     oracle_states,
     trained_states,
 )
+from tools.analysis.v3_6.measure_readout_lockin_curve import mix_keys  # noqa: E402
 
 LINEAR_PROBE_FLOOR = 0.6185  # E73-A6: write-value linear byte probe, slot0 acc
 TRAINABLE_PREFIXES = ("state_machine.realign.", "decoder_in.", "decoder.")
@@ -97,15 +102,22 @@ def oracle_frac_at(step: int, total: int, start: float, end: float, anneal_steps
 
 
 @torch.no_grad()
-def _states_for(model, source: torch.Tensor, use_oracle: bool):
+def _states_for(model, source: torch.Tensor, use_oracle: bool, lam: float | None = None, z: torch.Tensor | None = None):
     """Frozen producers: front end -> memory -> write gates -> per-chunk states
-    (oracle cumsum or the natural delta recurrence). Constants for the chain."""
+    (natural delta recurrence, or oracle cumsum). μ 课程（修正一）：oracle 态
+    的键先按 λ 与随机方向 z 做相干混合（锁死曲线全轴覆盖）再累计；
+    lam=None 保持原始纯累计形态（默认/测试兼容）。"""
     chunks, memory, _index = _front_end(model, source)
     n_real = int(chunks.chunk_mask[0].sum())
     gates = model.write_head(memory)
     sm = model.state_machine
-    S = oracle_states(gates, n_real) if use_oracle else trained_states(sm, gates, n_real)
-    return chunks, n_real, S
+    if not use_oracle:
+        return chunks, n_real, trained_states(sm, gates, n_real)
+    if lam is not None:
+        if z is None:
+            z = torch.nn.functional.normalize(torch.randn(gates["k"].shape, device=gates["k"].device), dim=-1)
+        gates = {**gates, "k": mix_keys(gates["k"].float(), z, lam)}
+    return chunks, n_real, oracle_states(gates, n_real)
 
 
 def _chain_logits(model, chunks, n_real: int, S: torch.Tensor) -> torch.Tensor:
@@ -130,18 +142,19 @@ def _direct_loss(model, ns, chunks, n_real: int, source, byte_mask, logits) -> t
     return s1._ce(logits, targets[:, :n_real], slot_mask[:, :n_real])
 
 
-def train_step(model, ns, clean: torch.Tensor, byte_mask: torch.Tensor, frac: float, opt, rng: random.Random, grad_clip: float) -> dict:
+def train_step(model, ns, clean: torch.Tensor, byte_mask: torch.Tensor, frac: float, opt, rng: random.Random, grad_clip: float, mu_lambda_grid: list | None = None) -> dict:
     model.train()
     source = clean.masked_fill(byte_mask, MASK_ID)
     use_oracle = rng.random() < frac
-    chunks, n_real, S = _states_for(model, source, use_oracle)
+    lam = rng.choice(mu_lambda_grid) if (use_oracle and mu_lambda_grid) else None  # μ 课程：每步均匀抽相干档
+    chunks, n_real, S = _states_for(model, source, use_oracle, lam=lam)
     logits = _chain_logits(model, chunks, n_real, S)
     loss = _direct_loss(model, ns, chunks, n_real, source, byte_mask, logits)
     opt.zero_grad(set_to_none=True)
     loss.backward()
     torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], grad_clip)
     opt.step()
-    return {"loss": float(loss.detach()), "use_oracle": use_oracle, "frac": frac, "n_real": n_real}
+    return {"loss": float(loss.detach()), "use_oracle": use_oracle, "frac": frac, "n_real": n_real, "mu_lambda": lam}
 
 
 @torch.no_grad()
@@ -168,16 +181,19 @@ def evaluate_chain(model, ns, windows, masks, device) -> dict:
     return out
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser()
     p.add_argument("--run-dir", default="checkpoints/v37_c_is_v371_20k_ctx4096_20260817")
     p.add_argument("--out-dir", default="checkpoints/retrain_readout_c_v371_20260818")
     p.add_argument("--data-path", default="", help="empty = the checkpoint's data_path")
-    p.add_argument("--steps", type=int, default=5000)
+    p.add_argument("--steps", type=int, default=20000)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--oracle-frac-start", type=float, default=0.8)
-    p.add_argument("--oracle-frac-end", type=float, default=0.1)
+    p.add_argument("--oracle-frac-end", type=float, default=0.3, help="修正一 (2026-08-19): anneal endpoint raised 0.1 -> 0.3")
     p.add_argument("--oracle-anneal-steps", type=int, default=0, help="0 = --steps")
+    p.add_argument("--mu-lambda-grid", default="0.2,0.45,0.65,0.85,1.0",
+                   help="μ 课程：oracle 态键相干混合 λ 档位（实测 μ≈0.9→0.07，锁死曲线全轴）；"
+                   "每步均匀抽档。空串 = 退回纯累计态（修正一之前的形态）")
     p.add_argument("--eval-every", type=int, default=200)
     p.add_argument("--eval-windows", type=int, default=16)
     p.add_argument("--log-every", type=int, default=50)
@@ -186,7 +202,11 @@ def main() -> None:
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--unfreeze-backbone-last-n", type=int, default=0)
     p.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
-    args = p.parse_args()
+    return p
+
+
+def main() -> None:
+    args = build_parser().parse_args()
     device = torch.device("cuda" if (args.device == "auto" and torch.cuda.is_available()) or args.device == "cuda" else "cpu")
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -217,6 +237,8 @@ def main() -> None:
     eval_masks = build_masks(eval_windows, ns)
 
     log_path = out_dir / "train_log.jsonl"
+    mu_grid = [float(x) for x in args.mu_lambda_grid.split(",") if x.strip()]
+    eval_natural_history: list[float] = []
     with log_path.open("a", encoding="utf-8") as log_fh:
         losses = []
         for step in range(1, args.steps + 1):
@@ -228,18 +250,21 @@ def main() -> None:
                 tokenizer=s1._BPE_TOKENIZER, generator=s1._MASK_GENERATOR,
             ).to(device)
             frac = oracle_frac_at(step, args.steps, args.oracle_frac_start, args.oracle_frac_end, args.oracle_anneal_steps)
-            r = train_step(model, ns, clean, byte_mask, frac, opt, mix_rng, args.grad_clip)
+            r = train_step(model, ns, clean, byte_mask, frac, opt, mix_rng, args.grad_clip, mu_lambda_grid=mu_grid)
             losses.append(r["loss"])
             if step % args.log_every == 0 or step == 1:
                 row = {"step": step, "loss": round(sum(losses) / len(losses), 4), "oracle_frac": round(frac, 4),
-                       "use_oracle_last": r["use_oracle"]}
+                       "use_oracle_last": r["use_oracle"], "mu_lambda_last": r["mu_lambda"]}
                 print(f"[retrain] {row}", flush=True)
                 log_fh.write(json.dumps({"losses_window": len(losses), **row}) + "\n")
                 log_fh.flush()
                 losses = []
             if step % args.eval_every == 0 or step == args.steps:
                 ev = evaluate_chain(model, ns, eval_windows, eval_masks, device)
+                eval_natural_history.append(ev["direct_acc_natural"])
+                plateau = sum(eval_natural_history[-3:]) / min(len(eval_natural_history), 3)
                 row = {"step": step, "eval": ev, "floor": LINEAR_PROBE_FLOOR,
+                       "plateau_acc": round(plateau, 4),
                        "verdict": "PASS" if ev["direct_acc_natural"] > LINEAR_PROBE_FLOOR else "below_floor"}
                 print(f"[retrain][eval] {row}", flush=True)
                 log_fh.write(json.dumps({"eval": row}) + "\n")

@@ -84,6 +84,7 @@ import time
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
@@ -458,6 +459,69 @@ def v_side_doc(model, enc, device: torch.device) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# M2: per-item recoverability predicate (--per-item-log, default off — the
+# historical report schema is untouched when off)
+# ---------------------------------------------------------------------------
+
+
+@torch.no_grad()
+def per_item_records(retr, eval_set, cfg) -> list[dict]:
+    """Per-item coherence and hit records (E78 M2, 2026-08-19). For each eval
+    doc: mu_i = min over the needle's code-covering key rows of
+    max_{j != i} |<k_i, k_j>| (Tropp-style worst interferer; the item is as
+    recoverable as its best-separated row; mu_i_max kept as sensitivity). Keys
+    here are the probe's archive K rows — for b/d grids these are K-channel
+    STATE READOUT rows (not raw write keys). hit1 = the trained retriever's
+    top-1 hits a code-covering row."""
+    rows = []
+    for d in eval_set:
+        keys = base.extract_keys(d, cfg)
+        s = retr.scores(d["query"], keys)
+        order = torch.argsort(s.float(), descending=True).tolist()
+        pos = d["pos_code"][cfg["gran"]].tolist()
+        hit1 = float(any(p in order[:1] for p in pos))
+        kn = F.normalize(keys.float(), dim=-1)
+        sim = (kn @ kn.T).abs().fill_diagonal_(0.0)
+        mu_rows = [float(sim[i].max()) for i in pos]
+        rows.append({
+            "eid": d["eid"],
+            "n_distr": d.get("n_distr"),
+            "hit1": hit1,
+            "mu_i": min(mu_rows),
+            "mu_i_max": max(mu_rows),
+            "n_pos": len(pos),
+            "n_keys": len(order),
+        })
+    return rows
+
+
+def summarize_per_item(rows: list[dict], mu_key: str = "mu_i") -> dict:
+    """Predicate test: 'the hittable item set ≈ the low-mu_i item set' —
+    share of hits in the lowest-mu_i quartile (null = 25%) + mean coherence of
+    hits vs misses."""
+    n = len(rows)
+    if n < 4:
+        return {"n": n}
+    q = max(1, n // 4)
+    ordered = sorted(rows, key=lambda r: r[mu_key])
+    q1 = ordered[:q]
+    q1_ids = {id(r) for r in q1}
+    hits = [r for r in rows if r["hit1"] > 0]
+    misses = [r for r in rows if r["hit1"] == 0]
+    hit_share_q1 = sum(1 for r in hits if id(r) in q1_ids) / max(len(hits), 1)
+    return {
+        "n_docs": n,
+        "n_hits": len(hits),
+        "quartile_size": q,
+        "hit_share_in_low_mu_quartile": round(hit_share_q1, 4),
+        "null_share": round(q / n, 4),
+        "mean_mu_hits": round(sum(r[mu_key] for r in hits) / max(len(hits), 1), 4) if hits else None,
+        "mean_mu_misses": round(sum(r[mu_key] for r in misses) / max(len(misses), 1), 4) if misses else None,
+        "mean_mu_all": round(sum(r[mu_key] for r in rows) / n, 4),
+    }
+
+
+# ---------------------------------------------------------------------------
 # orchestration
 # ---------------------------------------------------------------------------
 
@@ -500,6 +564,10 @@ def main() -> None:
     p.add_argument("--seed", type=int, default=1042)
     p.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     p.add_argument("--report-name", default="", help="report filename under out-dir (default: report[_smoke]_<run>.json)")
+    p.add_argument("--per-item-log", action="store_true",
+                   help="M2 (2026-08-19): additionally record per-item coherence mu_i (max |cos| "
+                   "over the needle's code-covering key rows, worst interferer) and per-item hit@1, "
+                   "with a quartile predicate summary. Default off = historical report schema untouched.")
     args = p.parse_args()
     mode = "smoke" if args.smoke else "full"
     pages = args.pages or (2 if args.smoke else 4)
@@ -572,6 +640,19 @@ def main() -> None:
             for L in levels
         )
         print(f"[K][{row['key_src']}/g1] loss {row['train_loss_first']:.2f}->{row['train_loss_last']:.2f} {brief}", flush=True)
+        if args.per_item_log:
+            pi = {}
+            for L in levels:
+                recs = per_item_records(retr, eval_sets[L], cfg)
+                pi[str(L)] = {"summary": summarize_per_item(recs), "docs": recs}
+                sm_ = pi[str(L)]["summary"]
+                print(
+                    f"[K][per-item D={L}] hits={sm_.get('n_hits')}/{sm_.get('n_docs')} "
+                    f"hit_share@low-mu-Q1={sm_.get('hit_share_in_low_mu_quartile')} (null {sm_.get('null_share')}) "
+                    f"mu hits={sm_.get('mean_mu_hits')} misses={sm_.get('mean_mu_misses')}",
+                    flush=True,
+                )
+            row["per_item"] = pi
         timing["k_side_sec"] = round(time.time() - t0, 1)
 
     # ---- V side: needle code-span decode, direct + SLM-backbone arms ----

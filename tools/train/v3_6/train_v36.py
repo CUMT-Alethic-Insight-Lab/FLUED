@@ -88,6 +88,7 @@ def build_model(args: Namespace) -> FLUEDV36:
             k_block_eval=getattr(args, "k_block_eval", False),
             seed_source=getattr(args, "seed_source", "v"),
             to_k_center=getattr(args, "to_k_center", False),
+            split_trunk=getattr(args, "split_trunk", False),
             xcache_supp=getattr(args, "xcache_supp", 0),
             supp_source=getattr(args, "supp_source", "state"),
             residual_gate_temp=getattr(args, "residual_gate_temp", 1.0),
@@ -334,6 +335,16 @@ def build_parser() -> argparse.ArgumentParser:
         "buffer (persistent=False -- old checkpoints load strict-clean and "
         "stats re-estimate online from zero). Covers both WriteHead instances. "
         "Default off = bit-preserved legacy paths.",
+    )
+    parser.add_argument(
+        "--split-trunk",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="E79 split-trunk (2026-08-18): WriteHead holds two independent "
+        "trunks (trunk_k -> to_k; trunk_v -> to_v/to_beta/to_b/to_w) so "
+        "to_k-side training dynamics (e.g. --to-k-center) cannot deform value "
+        "content through a shared trunk. Default off = shared trunk, "
+        "bit-preserved legacy paths. Composes with --to-k-center.",
     )
     parser.add_argument(
         "--cloze-prob",
