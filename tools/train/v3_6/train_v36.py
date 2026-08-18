@@ -87,6 +87,7 @@ def build_model(args: Namespace) -> FLUEDV36:
             k_pos_inject=getattr(args, "k_pos_inject", False),
             k_block_eval=getattr(args, "k_block_eval", False),
             seed_source=getattr(args, "seed_source", "v"),
+            to_k_center=getattr(args, "to_k_center", False),
             xcache_supp=getattr(args, "xcache_supp", 0),
             supp_source=getattr(args, "supp_source", "state"),
             residual_gate_temp=getattr(args, "residual_gate_temp", 1.0),
@@ -322,6 +323,17 @@ def build_parser() -> argparse.ArgumentParser:
         "the slm backbone hidden state -- v = V/memory row (default, "
         "consensus §1.3); k = index row, forcing content through K/V "
         "retrieval (index channel becomes load-bearing)",
+    )
+    parser.add_argument(
+        "--to-k-center",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="E75 key-decollapse hard constraint (2026-08-18): WriteHead "
+        "subtracts a running center (EMA 0.99, detached, BatchNorm-style cold "
+        "start) from the to_k output pre-normalization; eval uses the frozen "
+        "buffer (persistent=False -- old checkpoints load strict-clean and "
+        "stats re-estimate online from zero). Covers both WriteHead instances. "
+        "Default off = bit-preserved legacy paths.",
     )
     parser.add_argument(
         "--cloze-prob",

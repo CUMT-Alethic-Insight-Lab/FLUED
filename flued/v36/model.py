@@ -184,6 +184,24 @@ class V36Config:
     # the K/V store -- the index channel becomes load-bearing (the K-block
     # probe showed it is decorative under "v").
     seed_source: str = "v"
+    # E75 key-decollapse hard constraint (user-ruled 2026-08-18; evidence line
+    # E73 oracle verdict / E74 key-collapse survey / E75 layerwise
+    # decomposition): the write keys' collapse (mean pairwise |cos| ~0.93,
+    # Tropp threshold => no addressability from N=2) localizes to a SINGLE
+    # shared direction in the to_k output (de-meaning drops mu 0.935 -> 0.307;
+    # bias/saturation/dead-dims/weight-rank all cleared). When on, WriteHead
+    # subtracts a running center from the to_k output (pre-normalization):
+    # training mode keeps an EMA (momentum 0.99, detached) of the batch mean,
+    # cold-starting from the first batch (BatchNorm convention); eval mode uses
+    # the frozen buffer. The buffer is persistent=False BY RULING: old
+    # checkpoints keep loading strict-clean, and the statistic is re-estimated
+    # online from zero whenever training (re)starts. Operational caveat of that
+    # ruling: a FRESH eval process on a to_k_center-trained checkpoint starts
+    # with a zero buffer (centering off until a training-mode forward warms
+    # it) — in-training eval on the live model is unaffected. Default False =
+    # every legacy path bit-preserved. Covers BOTH WriteHead instances (K and V
+    # channels); the a grid has no WriteHead and is unaffected.
+    to_k_center: bool = False
     # v3.7 mode (docs/versions/v3.7/FLUED_V3_7_ARCHITECTURE_CONSENSUS_20260817_CN.md,
     # user-ruled 2026-08-17): backbone_mode="slm" -- fully config-gated; the
     # default stays "attn" and every v36 path is bit-preserved. In slm mode the
@@ -328,6 +346,11 @@ class WriteHead(nn.Module):
         self.trunk = nn.Sequential(nn.LayerNorm(c.d_mem), nn.Linear(c.d_mem, c.write_hidden), nn.SiLU())
         self.to_k = nn.Linear(c.write_hidden, h * hk)
         self.to_v = nn.Linear(c.write_hidden, h * hv)
+        # E75 key-decollapse hard constraint (see V36Config.to_k_center):
+        # subtract the running center from the to_k output, pre-normalization.
+        self.to_k_center = getattr(c, "to_k_center", False)
+        if self.to_k_center:
+            self.register_buffer("k_center", torch.zeros(h * hk), persistent=False)
         tau = torch.exp(
             torch.linspace(0.0, 1.0, h * hk) * (torch.log(torch.tensor(c.kda_tau_max)))
         ).clamp(min=1.0 + 1e-3)
@@ -348,7 +371,21 @@ class WriteHead(nn.Module):
     def forward(self, memory: torch.Tensor) -> dict[str, torch.Tensor]:
         bsz, chunks, _ = memory.shape
         h = self.trunk(memory)
-        k = F.normalize(self.to_k(h).view(bsz, chunks, self.heads, self.hk), dim=-1)
+        k = self.to_k(h)
+        if self.to_k_center:
+            # E75: subtract the running center (EMA momentum 0.99, detached —
+            # the gradient path to to_k stays live; cold start initializes from
+            # the first batch, BatchNorm convention). Eval uses the frozen
+            # buffer (a zero buffer is a no-op — see the config docstring).
+            if self.training:
+                with torch.no_grad():
+                    m = k.detach().float().mean(dim=(0, 1))
+                    if not bool(self.k_center.any()):
+                        self.k_center.copy_(m)
+                    else:
+                        self.k_center.mul_(0.99).add_(m, alpha=0.01)
+            k = k - self.k_center.to(k.dtype)
+        k = F.normalize(k.view(bsz, chunks, self.heads, self.hk), dim=-1)
         v = self.to_v(h).view(bsz, chunks, self.heads, self.hv)
         alpha = torch.sigmoid(self.alpha_logit).view(1, 1, self.heads, self.hk)
         if self.recurrence == "gdn2":
