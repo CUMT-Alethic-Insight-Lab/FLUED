@@ -252,6 +252,7 @@ def _warm_k_center(model, hay_fn, window: int, device: torch.device, passes: int
     if not getattr(model.config, "to_k_center", False):
         return
     heads = [m for m in (getattr(model, "write_head", None), getattr(model, "write_head_k", None)) if m is not None]
+    wh_main = getattr(model, "write_head", None)  # exists only when v=state
     rng = random.Random(777)
     for m in heads:
         m.train()
@@ -260,7 +261,7 @@ def _warm_k_center(model, hay_fn, window: int, device: torch.device, passes: int
         ids = torch.tensor([b + BYTE_OFFSET for b in raw], dtype=torch.long).unsqueeze(0).to(device)
         _chunks, memory, index = _encode_window(model, ids)
         for m in heads:
-            m(memory if m is model.write_head else index)
+            m(memory if (wh_main is not None and m is wh_main) else index)
     for m in heads:
         m.eval()
     print(f"[probe] to_k_center buffers warmed ({passes} passes, heads={len(heads)})", flush=True)
