@@ -62,6 +62,10 @@ checkpoint 只读且全参数 requires_grad_(False)（W_q 是探针私有，唯�
 CE/softmax/normalize 一律 .float() 后计算（fp16 entropy/log 坑）；chunk 位置
 嵌入保持页内（harness 约定）；任一页面截断 chunk 或 needle 数字缺合法
 (chunk, slot) 的 doc 直接重采样。
+E75 口径追加（2026-08-18）：对 to_k_center=True 的 checkpoint，加载后先用
+haystack 窗暖批 k_center EMA buffer（_warm_k_center；persistent=False 的
+buffer 新进程是冷的，不暖则 eval 下静默回到未去均值几何）；旗标关闭的
+checkpoint 该步骤是 no-op。
 
 Usage:
   smoke (CPU, a 格): py -3.14 -X utf8 tools/analysis/v3_6/probe_archive_addressing_v37.py \
@@ -236,6 +240,30 @@ def _stream_channel(sm, gates: dict, width: int, n_real: int, state: torch.Tenso
         package_i, state = sm.stream_step(ph._slice_gates(gates, i, width), state)
         cols.append(package_i[:, 0].mean(dim=1))  # (1, d_pack), nq-mean like the batched path
     return torch.stack(cols, dim=1), state
+
+
+@torch.no_grad()
+def _warm_k_center(model, hay_fn, window: int, device: torch.device, passes: int = 8) -> None:
+    """E75 to_k_center 探针口径：k_center buffer persistent=False，新进程加载
+    是冷的（eval 下减零 = 不去均值的假几何）。对存在的每个 WriteHead
+    （write_head / write_head_k）用 haystack 窗口做暖批（train 模式前向让
+    EMA 升温），随后切回 eval —— 探针测到的是"若 buffer 持久化，部署形态
+    下的去均值键几何"。旗标关闭的 checkpoint 零侵入。"""
+    if not getattr(model.config, "to_k_center", False):
+        return
+    heads = [m for m in (getattr(model, "write_head", None), getattr(model, "write_head_k", None)) if m is not None]
+    rng = random.Random(777)
+    for m in heads:
+        m.train()
+    for _ in range(passes):
+        raw = hay_fn(window, rng)[:window]
+        ids = torch.tensor([b + BYTE_OFFSET for b in raw], dtype=torch.long).unsqueeze(0).to(device)
+        _chunks, memory, index = _encode_window(model, ids)
+        for m in heads:
+            m(memory if m is model.write_head else index)
+    for m in heads:
+        m.eval()
+    print(f"[probe] to_k_center buffers warmed ({passes} passes, heads={len(heads)})", flush=True)
 
 
 @torch.no_grad()
@@ -493,6 +521,7 @@ def main() -> None:
     model, ns, step = load_model(run_dir, device)
     grid = f"k={ns.k_row_source},v={ns.v_row_source},seed={getattr(ns, 'seed_source', 'v')}"
     print(f"[probe] model={run_dir.name} step={step} seq_len={ns.seq_len} grid=({grid})", flush=True)
+    _warm_k_center(model, hay_fn, ns.seq_len, device)  # E75: no-op unless the ckpt carries to_k_center
 
     # ---- encode doc pools (one carried-state archive per doc) ----
     t0 = time.time()
