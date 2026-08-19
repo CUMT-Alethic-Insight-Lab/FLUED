@@ -528,6 +528,25 @@ def summarize_per_item(rows: list[dict], mu_key: str = "mu_i") -> dict:
 # ---------------------------------------------------------------------------
 
 
+def apply_null_state(encs: list, mode: str, seed: int) -> None:
+    """先验盲猜基线（--null-state，2026-08-19 审计前置项测量 3）：把检索器的
+    键输入（enc["memory"] = K 源行的机械别名）替换为置乱/置零版本，训练与
+    评测两侧同时生效（探针私有 W_q 在置空输入上仍充分训练——最强的无内容
+    基线，hit 数里一切超出 rand_k 的残余即"水分"上限）。逐 doc 独立播种的
+    置换（shuffle 保边际分布、毁键↔内容绑定）或全零（zero：scores 恒等，
+    训练恒 log(G) 无梯度，argsort 退化为固定内容无关次序）。V 侧不读
+    enc["memory"]，不受影响。默认 off 时本函数不被调用，历史口径逐位不变。"""
+    for di, enc in enumerate(encs):
+        keys = enc["memory"]
+        if mode == "shuffle":
+            perm = torch.randperm(keys.size(0), generator=torch.Generator().manual_seed(seed * 1_000_003 + di))
+            enc["memory"] = keys[perm.to(keys.device)]
+        elif mode == "zero":
+            enc["memory"] = torch.zeros_like(keys)
+        else:
+            raise ValueError(f"unknown null-state mode {mode!r}")
+
+
 def build_and_encode(model, ns, window, pages, n_distr, hay_fn, device, seed, max_tries=4):
     rng = random.Random(seed)
     for _ in range(max_tries):
@@ -570,6 +589,12 @@ def main() -> None:
                    help="M2 (2026-08-19): additionally record per-item coherence mu_i (max |cos| "
                    "over the needle's code-covering key rows, worst interferer) and per-item hit@1, "
                    "with a quartile predicate summary. Default off = historical report schema untouched.")
+    p.add_argument("--null-state", choices=["off", "shuffle", "zero"], default="off",
+                   help="先验盲猜基线 (2026-08-19 审计前置项测量 3): replace the retriever's KEY inputs "
+                   "(enc['memory'], the K-source-row alias) with per-doc shuffled / all-zero versions, "
+                   "train+eval both nulled — the strongest content-free floor for the hit@k numbers "
+                   "(去水分 for E78 0.17 / E85 line). K-side only; V side untouched. "
+                   "Default off = historical protocol bit-preserved.")
     args = p.parse_args()
     mode = "smoke" if args.smoke else "full"
     pages = args.pages or (2 if args.smoke else 4)
@@ -612,6 +637,12 @@ def main() -> None:
                 eval_sets[L].append(enc)
         print(f"[probe] eval docs D={L}: {len(eval_sets[L])}/{n_eval} ({time.time() - t0:.0f}s)", flush=True)
     all_encs = train_set + [e for docs in eval_sets.values() for e in docs]
+    if args.null_state != "off":
+        # 先验盲猜基线（测量 3）: null the retriever's key inputs on the FULL
+        # pool (train+eval) before prep_k_index; the K side reads keys only via
+        # the enc["memory"] alias, so this single point covers train and eval.
+        apply_null_state(all_encs, args.null_state, args.seed)
+        print(f"[probe] NULL-STATE={args.null_state}: retriever key inputs nulled on {len(all_encs)} docs (train+eval)", flush=True)
     for enc in all_encs:
         base.prep_k_index(enc, granularities, device)
     if args.side in ("both", "k") and (len(train_set) < args.batch_docs or any(not eval_sets[L] for L in levels)):
@@ -694,7 +725,7 @@ def main() -> None:
         "params": {
             "pages": pages, "train_docs": len(train_set), "eval_docs_per_level": {str(L): len(eval_sets[L]) for L in levels},
             "steps": args.steps, "batch_docs": args.batch_docs, "lr": args.lr, "levels": levels,
-            "granularities": granularities, "seed": args.seed,
+            "granularities": granularities, "seed": args.seed, "null_state": args.null_state,
         },
         "protocol": {
             "entry": "Archive entry QX-####: the special magic number is: #######.",
@@ -709,6 +740,8 @@ def main() -> None:
             "state": "state channels carried ACROSS pages for BOTH sides (one archive encoding; v37 ruling — "
             "pages 2+ of state channels are out of the single-window training distribution)",
             "freeze": "checkpoint read-only, all params requires_grad_(False); W_q is probe-private",
+            "null_state": "off = historical protocol; shuffle/zero = retriever key inputs (train+eval) "
+            "replaced by per-doc permuted / all-zero rows (先验盲猜基线, 2026-08-19)",
         },
         "k_side": k_results,
         "v_side": v_results,

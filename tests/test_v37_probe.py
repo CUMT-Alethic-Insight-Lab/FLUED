@@ -227,6 +227,41 @@ def test_decode_logits_depend_on_cond():
     assert not torch.allclose(logits_base, logits_swap, atol=1e-4)
 
 
+# --- null-state blind-guess baseline (--null-state, 2026-08-19) ---------------
+
+
+def test_apply_null_state_shuffle_and_zero():
+    """shuffle must permute rows (marginal distribution preserved, binding
+    destroyed); zero must zero every row; both leave other enc keys untouched."""
+    keys = torch.arange(12, dtype=torch.float32).reshape(4, 3)
+    encs = [{"memory": keys.clone(), "v_rows": keys.clone()} for _ in range(2)]
+    probe.apply_null_state(encs, "shuffle", seed=7)
+    for enc in encs:
+        assert enc["memory"].shape == keys.shape
+        assert torch.equal(enc["memory"].sort(dim=0).values, keys.sort(dim=0).values)  # same rows
+        assert not torch.equal(enc["memory"], keys)  # permuted
+        assert torch.equal(enc["v_rows"], keys)  # V side untouched
+    # same seed -> same permutation (deterministic baseline)
+    encs2 = [{"memory": keys.clone()} for _ in range(2)]
+    probe.apply_null_state(encs2, "shuffle", seed=7)
+    assert all(torch.equal(a["memory"], b["memory"]) for a, b in zip(encs, encs2))
+    probe.apply_null_state(encs2, "zero", seed=7)
+    assert all(float(e["memory"].abs().sum()) == 0.0 for e in encs2)
+    with pytest.raises(ValueError):
+        probe.apply_null_state([{"memory": keys}], "bogus", seed=0)
+
+
+def test_null_state_zero_retriever_is_content_free():
+    """zero keys -> all scores equal for ANY query -> ranking is content-free
+    (the blind-guess property the baseline relies on)."""
+    d = 8
+    retr = base.Retriever(d, d, "full", 0)
+    enc = {"memory": torch.randn(6, d)}
+    probe.apply_null_state([enc], "zero", seed=0)
+    s = retr.scores(torch.randn(d), enc["memory"])
+    assert torch.allclose(s, torch.zeros_like(s))
+
+
 # --- M2 per-item predicate helpers (probe --per-item-log) ---------------------
 
 
