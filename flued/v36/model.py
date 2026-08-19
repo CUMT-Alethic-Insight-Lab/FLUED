@@ -202,6 +202,22 @@ class V36Config:
     # every legacy path bit-preserved. Covers BOTH WriteHead instances (K and V
     # channels); the a grid has no WriteHead and is unaffected.
     to_k_center: bool = False
+    # fork 2 (user-ruled 2026-08-19; spec docs/versions/v3.7/
+    # FLUED_V3_7_FORK2_MULTIVIEW_READOUT_20260819_CN.md): multi-view readout.
+    # readout_views=m>1 expands the backbone STORE side of each state channel
+    # from one readout row per chunk to m measurement rows per chunk, read with
+    # a SEEDED RANDOM ORTHOGONAL FRAME (probe_frame, seed PROBE_FRAME_SEED,
+    # training-free by ruling: learned probes degenerate to decoration, E66)
+    # rotated once per segment index (frame_rotations table). The direct and
+    # predict paths keep the classic single trained readout_query row
+    # (bit-untouched, fork 2 §1.3); only the completion/readout path's store
+    # is widened. Interface form choice (§4 allows widening realign/decoder_in
+    # inputs OR m-way shared weights): SHARED realign/align weights over m
+    # store entries per chunk ("m 路共享") — zero new parameters, so m>1
+    # checkpoints strict-load into m=1 builds and vice versa, and the
+    # backbone/decoder/loss machinery is unchanged (the m expansion lives
+    # entirely in the store's causal mask). Default 1 = bit-preserved.
+    readout_views: int = 1
     # E79 split-trunk (user-ruled 2026-08-18; evidence M3 write-value probe):
     # the WriteHead trunk was shared by to_k/to_v(/to_beta/to_b/to_w), so the
     # to_k_center surgery's training dynamics deformed to_v's value content
@@ -420,6 +436,34 @@ class WriteHead(nn.Module):
         return {"k": k, "v": v, "beta": beta, "alpha": alpha}
 
 
+PROBE_FRAME_SEED = 20260819  # fork 2 measurement frame seed (pinned in the spec)
+PROBE_FRAME_ROTS = 64  # per-segment rotation table size (segment i uses table[i % 64])
+
+
+def probe_frame(m: int, heads: int, hk: int, seed: int = PROBE_FRAME_SEED) -> torch.Tensor:
+    """fork 2 §1.1: seeded random orthogonal probe frame — m orthonormal probe
+    directions per head, (H, m, hk), training-free. Deterministic under the
+    pinned seed (same frame in every process, training and eval alike)."""
+    gen = torch.Generator().manual_seed(seed)
+    frames = []
+    for _h in range(heads):
+        q, _r = torch.linalg.qr(torch.randn(hk, m, generator=gen))  # (hk, m) orthonormal columns
+        frames.append(q.T.contiguous())  # (m, hk) orthonormal rows
+    return torch.stack(frames)
+
+
+def frame_rotations(count: int, hk: int, seed: int = PROBE_FRAME_SEED + 1) -> torch.Tensor:
+    """fork 2 §1.1 "按段索引旋转一次": a seeded table of `count` orthogonal
+    (hk, hk) rotations; segment i reads the state with frame @ table[i % count]
+    so the measurement directions are not shared across segments."""
+    gen = torch.Generator().manual_seed(seed)
+    rots = []
+    for _i in range(count):
+        q, _r = torch.linalg.qr(torch.randn(hk, hk, generator=gen))
+        rots.append(q.contiguous())
+    return torch.stack(rots)
+
+
 class KDAStateMachine(nn.Module):
     def __init__(self, c: V36Config) -> None:
         super().__init__()
@@ -443,6 +487,83 @@ class KDAStateMachine(nn.Module):
         if getattr(c, "xcache_supp", 0) > 0:
             self.supp_q = nn.Linear(c.d_pack, c.kda_heads * c.kda_head_k, bias=False)
             self.supp_out = nn.Linear(c.kda_heads * c.kda_head_v, c.d_pack, bias=False)
+        # fork 2 multi-view readout (see V36Config.readout_views): seeded
+        # orthogonal probe frame + per-segment rotation table. Buffers are
+        # persistent=False BY RULING: no new parameters/state, so every
+        # checkpoint loads strict-clean either way and the frames are rebuilt
+        # from the pinned seed at construction.
+        self.readout_views = getattr(c, "readout_views", 1)
+        if self.readout_views > 1:
+            self.register_buffer(
+                "view_frame", probe_frame(self.readout_views, c.kda_heads, c.kda_head_k), persistent=False
+            )
+            self.register_buffer(
+                "view_rots", frame_rotations(PROBE_FRAME_ROTS, c.kda_head_k), persistent=False
+            )
+
+    def forward_views(self, gates: dict[str, torch.Tensor], chunk_mask: torch.Tensor) -> torch.Tensor:
+        """fork 2 §1.1: per-chunk m measurement rows. Segment i is read with
+        the seeded frame rotated by table[i % P]; each view's read passes the
+        SHARED realign (m 路共享 — no new parameters). Returns (B, C, m,
+        d_pack); padded chunk rows are garbage-but-masked exactly like the
+        main path. Only the kda recurrence is wired (gdn2 raises loudly —
+        out of fork-2 scope)."""
+        if self.gdn2:
+            raise ValueError("forward_views (readout_views>1) supports recurrence='kda' only")
+        m = self.readout_views
+        if m <= 1:
+            raise ValueError("forward_views requires readout_views > 1")
+        k, v, alpha = gates["k"], gates["v"], gates["alpha"]
+        beta = gates["beta"]
+        keep = chunk_mask.unsqueeze(-1).unsqueeze(-1).to(k.dtype)
+        k = k * keep
+        v = v * keep
+        bsz, chunks, heads, dk = k.shape
+        dv = v.size(-1)
+        beta = beta * chunk_mask.unsqueeze(-1).to(beta.dtype)
+        g = torch.log(alpha.clamp_min(1.0e-6)).to(k.dtype) * keep
+        # per-chunk rotated queries: q[c, h, r] = frame[h, r] @ rots[c % P].
+        # NOTE: einsum is autocast-managed and would run bf16 here while the
+        # kernel's other operands are fp32 (normalize/sigmoid promote) — the
+        # bwd kernel demands uniform dtypes, so compute q outside autocast.
+        idx = torch.arange(chunks, device=k.device) % self.view_rots.size(0)
+        with torch.autocast(k.device.type, enabled=False):
+            q_all = torch.einsum(
+                "hro,cok->chrk", self.view_frame.float(), self.view_rots[idx].float()
+            ).to(k.dtype)
+        outs = []
+        if self.c.kda_impl == "fla" and _fla_chunk_kda is not None:
+            for r in range(m):
+                q_r = q_all[:, :, r].unsqueeze(0).expand(bsz, -1, -1, -1).contiguous()  # (B, C, H, hk)
+                o, _ = _fla_chunk_kda(
+                    q=q_r, k=k, v=v,
+                    g=g.expand(bsz, chunks, -1, -1).contiguous(),
+                    beta=beta, scale=1.0, use_qk_l2norm_in_kernel=False,
+                    output_final_state=False,
+                )
+                outs.append(o)  # (B, C, H, hv)
+        else:
+            # torch reference: serial recurrence, per-chunk rotated reads
+            state = k.new_zeros(bsz, heads, dk, dv, dtype=torch.float32)
+            kf, vf = k.float(), v.float()
+            alpha_eff = 1.0 - chunk_mask.float().view(bsz, chunks, 1, 1, 1) + chunk_mask.float().view(
+                bsz, chunks, 1, 1, 1
+            ) * gates["alpha"][0].float().unsqueeze(0).unsqueeze(-1)
+            bf = beta.float()
+            qf = q_all.float()  # (C, H, m, hk)
+            per_chunk = []
+            for i in range(chunks):
+                ki, vi, bi, ai = kf[:, i], vf[:, i], bf[:, i], alpha_eff[:, i]
+                state = ai * state
+                kTs = torch.einsum("bhk,bhkv->bhv", ki, state)
+                state = state - bi.view(bsz, heads, 1, 1) * ki.unsqueeze(-1) * kTs.unsqueeze(-2)
+                state = state + bi.view(bsz, heads, 1, 1) * ki.unsqueeze(-1) * vi.unsqueeze(-2)
+                per_chunk.append(torch.einsum("hrk,bhkv->bhrv", qf[i], state))  # (B, H, m, hv)
+            o = torch.stack(per_chunk, dim=1)  # (B, C, H, m, hv)
+            outs = [o[:, :, :, r] for r in range(m)]  # each (B, C, H, hv)
+        read = torch.stack(outs, dim=2)  # (B, C, m, H, hv)
+        read = read.reshape(bsz, chunks, m, heads * dv).to(k.dtype)
+        return self.realign(read)
 
     def read_residual(
         self,
@@ -1221,8 +1342,13 @@ class SLMBackbone(nn.Module):
     ) -> torch.Tensor:
         """k_rows: (B, C, d_mem|d_pack) K source rows (index or K~);
         v_rows: (B, C, d_mem|d_pack) V source rows (memory or V~);
-        pos: (1, C, d_backbone) chunk position embedding."""
+        pos: (1, C, d_backbone) chunk position embedding. fork 2: a 4-dim
+        (B, C, m, d) k_rows/v_rows routes to the multi-view store path."""
         bsz, n = chunk_mask.shape
+        kv = k_rows.size(2) if k_rows.dim() == 4 else 1
+        vv = v_rows.size(2) if v_rows.dim() == 4 else 1
+        if max(kv, vv) > 1:
+            return self._forward_views(k_rows, v_rows, chunk_mask, pos, chunk_byte_off, max(kv, vv))
         nh = self.nhead
         hd = pos.size(-1) // nh
         store_v = self.align_v(v_rows)  # (B, C, d) -- shared: store V side AND seeds
@@ -1265,6 +1391,72 @@ class SLMBackbone(nn.Module):
             kk = blk["k"](hn).view(bsz, n, nh, hd).transpose(1, 2)
             vv = blk["v"](hn).view(bsz, n, nh, hd).transpose(1, 2)
             o = F.scaled_dot_product_attention(q, kk, vv, attn_mask=allowed)
+            h = h + blk["o"](o.transpose(1, 2).reshape(bsz, n, nh * hd))
+            h = h + blk["ffn"](blk["ln_f"](h))
+        return self.norm(h)
+
+    def _forward_views(
+        self,
+        k_rows: torch.Tensor,
+        v_rows: torch.Tensor,
+        chunk_mask: torch.Tensor,
+        pos: torch.Tensor,
+        chunk_byte_off: torch.Tensor | None,
+        views: int,
+    ) -> torch.Tensor:
+        """fork 2 multi-view store path (spec §1.1/§1.3): each chunk
+        contributes `views` store entries — its m measurement rows from the
+        seeded orthogonal frame; a direct/single-view side repeats its row.
+        Query positions stay per-chunk; position i sees all views of chunks
+        0..i. align_k/align_v/realign are SHARED across views (m 路共享,
+        zero new parameters). Seed = per-chunk canonical row (view 0 for K,
+        the view mean for V)."""
+        bsz, n = chunk_mask.shape
+        nh = self.nhead
+        hd = pos.size(-1) // nh
+        if k_rows.dim() == 3:
+            k_rows = k_rows.unsqueeze(2).expand(bsz, n, views, k_rows.size(-1))
+        if v_rows.dim() == 3:
+            v_rows = v_rows.unsqueeze(2).expand(bsz, n, views, v_rows.size(-1))
+        store_v = self.align_v(v_rows.reshape(bsz, n * views, -1))
+        k_flat = self.align_k(k_rows.reshape(bsz, n * views, -1))
+        # seed from the per-chunk canonical rows (view 0 K / view-mean V)
+        seed = self.align_k(k_rows[:, :, 0]) if self.seed_source == "k" else self.align_v(v_rows.mean(dim=2))
+        h = seed + pos.to(seed.dtype)
+        if self.k_pos_inject:
+            if chunk_byte_off is None:
+                raise ValueError("k_pos_inject requires chunk_byte_off (window-relative per-chunk start byte offsets)")
+            seg_idx = torch.arange(n, device=k_rows.device).repeat_interleave(views).unsqueeze(0).expand(bsz, -1)
+            k_flat = k_flat + self.pos_gate * self.pos_proj(
+                _pos_features(seg_idx, chunk_byte_off.repeat_interleave(views, dim=1))
+            )
+        if self.k_block_eval:
+            k_flat = torch.zeros_like(k_flat)
+        k = k_flat.view(bsz, n * views, nh, hd).transpose(1, 2)
+        v = store_v.view(bsz, n * views, nh, hd).transpose(1, 2)
+        # store mask: query chunk j sees entries of chunks 0..j (all views);
+        # diagonal-keep guard on padded rows (same NaN-poison rule as legacy)
+        store_chunk = torch.arange(n, device=k_rows.device).repeat_interleave(views)
+        qidx = torch.arange(n, device=k_rows.device)
+        causal = store_chunk.view(1, -1) <= qidx.view(-1, 1)  # (n, n*views)
+        allowed = causal.view(1, 1, n, n * views) & chunk_mask[:, store_chunk].view(bsz, 1, 1, n * views)
+        first_view = (torch.arange(n * views, device=k_rows.device) % views == 0).view(1, -1)
+        diag = (store_chunk.view(1, -1) == qidx.view(-1, 1)) & first_view
+        allowed = allowed | diag.view(1, 1, n, n * views)
+        q = self.q_proj(h).view(bsz, n, nh, hd).transpose(1, 2)
+        o = F.scaled_dot_product_attention(q, k, v, attn_mask=allowed)
+        h = h + self.o_proj(o.transpose(1, 2).reshape(bsz, n, nh * hd))
+        h = h + self.ffn1(self.ln_ffn1(h))
+        # blocks 2..L: per-chunk causal self-attention (legacy mask)
+        future = torch.triu(torch.ones(n, n, dtype=torch.bool, device=k_rows.device), diagonal=1)
+        allowed_self = (~future).view(1, 1, n, n) & chunk_mask.view(bsz, 1, 1, n)
+        allowed_self = allowed_self | torch.eye(n, dtype=torch.bool, device=k_rows.device).view(1, 1, n, n)
+        for blk in self.self_blocks:
+            hn = blk["ln_s"](h)
+            q = blk["q"](hn).view(bsz, n, nh, hd).transpose(1, 2)
+            kk = blk["k"](hn).view(bsz, n, nh, hd).transpose(1, 2)
+            vv = blk["v"](hn).view(bsz, n, nh, hd).transpose(1, 2)
+            o = F.scaled_dot_product_attention(q, kk, vv, attn_mask=allowed_self)
             h = h + blk["o"](o.transpose(1, 2).reshape(bsz, n, nh * hd))
             h = h + blk["ffn"](blk["ln_f"](h))
         return self.norm(h)
@@ -1749,7 +1941,7 @@ class FLUEDV36(nn.Module):
         )
         return executable, utf8_cont, overflow
 
-    def _slm_store_rows(self, chunks: ChunkBatch) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _slm_store_rows(self, chunks: ChunkBatch, with_views: bool = False):
         """v3.7 encoder after the segmentor (consensus §1): the summarizer
         directly produces (memory = the V rows, index = the K rows); each
         channel then either passes through DIRECTLY (fine granularity) or via
@@ -1757,18 +1949,32 @@ class FLUEDV36(nn.Module):
         (k_rows, v_rows, state_norm, memory, index) -- k_rows/v_rows are the
         backbone store source rows; state_norm averages the engaged channels'
         norms, with a 0 placeholder when no state machine exists (the a grid,
-        per the ruling)."""
+        per the ruling).
+
+        fork 2: with_views=True returns TWO extra elements (k_store, v_store):
+        the multi-view store rows (B, C, m, d_pack) for each ENGAGED state
+        channel, None for direct channels and when readout_views == 1. The
+        classic 5-tuple elements are bit-identical either way (direct/predict
+        keep the single trained-readout row, fork 2 §1.3)."""
         memory, index = self.summarizer.forward_with_index(chunks.span_embeddings, chunks.token_mask)
+        views = getattr(self.config, "readout_views", 1)
+        k_store = v_store = None
         norms = []
         if self.config.k_row_source == "state":
-            package_k, sn_k = self.state_machine_k(self.write_head_k(index), chunks.chunk_mask)
+            gates_k = self.write_head_k(index)
+            package_k, sn_k = self.state_machine_k(gates_k, chunks.chunk_mask)
             k_rows = package_k.mean(dim=2)  # K~ per chunk (B, C, d_pack)
+            if with_views and views > 1:
+                k_store = self.state_machine_k.forward_views(gates_k, chunks.chunk_mask)
             norms.append(sn_k)
         else:
             k_rows = index
         if self.config.v_row_source == "state":
-            package_v, sn_v = self.state_machine(self.write_head(memory), chunks.chunk_mask)
+            gates_v = self.write_head(memory)
+            package_v, sn_v = self.state_machine(gates_v, chunks.chunk_mask)
             v_rows = package_v.mean(dim=2)  # V~ per chunk (B, C, d_pack)
+            if with_views and views > 1:
+                v_store = self.state_machine.forward_views(gates_v, chunks.chunk_mask)
             norms.append(sn_v)
         else:
             v_rows = memory
@@ -1776,6 +1982,8 @@ class FLUEDV36(nn.Module):
             state_norm = torch.stack([n.float() for n in norms]).mean()
         else:
             state_norm = memory.new_zeros((), dtype=torch.float32)
+        if with_views:
+            return k_rows, v_rows, state_norm, memory, index, k_store, v_store
         return k_rows, v_rows, state_norm, memory, index
 
     def _forward_slm(self, chunks: ChunkBatch, confidence: torch.Tensor, valid: torch.Tensor, hard_cut: torch.Tensor, cut_overflow: torch.Tensor) -> V36Output:
@@ -1783,13 +1991,18 @@ class FLUEDV36(nn.Module):
         summarizer-owned store; the decoder conditions on the SAME V source
         rows as the backbone store (direct), and completion reads the
         backbone's output matrix -- three tasks, one V (§1.4)."""
-        k_rows, v_rows, state_norm, memory, _index = self._slm_store_rows(chunks)
+        k_rows, v_rows, state_norm, memory, _index, k_store, v_store = self._slm_store_rows(chunks, with_views=True)
         n_chunks = chunks.chunk_mask.size(1)
         pos = self.chunk_pos.weight.unsqueeze(0)[:, :n_chunks]
         chunk_byte_off = (
             chunk_byte_offsets(chunks.token_mask) if getattr(self.config, "k_pos_inject", False) else None
         )
-        backbone_out = self.backbone(k_rows, v_rows, chunks.chunk_mask, pos, chunk_byte_off=chunk_byte_off)
+        # fork 2: the store carries the multi-view rows when readout_views > 1
+        backbone_out = self.backbone(
+            k_store if k_store is not None else k_rows,
+            v_store if v_store is not None else v_rows,
+            chunks.chunk_mask, pos, chunk_byte_off=chunk_byte_off,
+        )
         cond_backbone = backbone_out + pos
         dec_in = self.decoder_in if self.config.v_row_source == "state" else self.decoder_in_mem
         cond_direct = dec_in(v_rows) + pos

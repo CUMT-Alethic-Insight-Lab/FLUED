@@ -89,6 +89,7 @@ def build_model(args: Namespace) -> FLUEDV36:
             seed_source=getattr(args, "seed_source", "v"),
             to_k_center=getattr(args, "to_k_center", False),
             split_trunk=getattr(args, "split_trunk", False),
+            readout_views=getattr(args, "readout_views", 1),
             xcache_supp=getattr(args, "xcache_supp", 0),
             supp_source=getattr(args, "supp_source", "state"),
             residual_gate_temp=getattr(args, "residual_gate_temp", 1.0),
@@ -186,12 +187,20 @@ def evaluate(model, eval_loader, args, device):
             break
         _, metrics = step_model(model, batch, args, device, train=False)
         rows.append(metrics)
+    verify_rows = {}
+    if getattr(args, "verify_topl", 0) > 0:
+        # fork 2 forward-verification pass (default off; re-iterates the eval
+        # loader with the same reseed so the byte masks are identical)
+        from tools.eval.forward_verifier import verify_completion_eval
+
+        verify_rows = verify_completion_eval(model, eval_loader, args, device)
     model.train()
     merged = {}
     for key in rows[0]:
         merged[f"eval_{key}"] = sum(r[key] for r in rows) / len(rows)
     merged["eval_backbone_ppl"] = float(math.exp(min(merged["eval_backbone_loss"], 20.0)))
     merged["eval_direct_ppl"] = float(math.exp(min(merged["eval_direct_loss"], 20.0)))
+    merged.update(verify_rows)
     return merged
 
 
@@ -345,6 +354,29 @@ def build_parser() -> argparse.ArgumentParser:
         "to_k-side training dynamics (e.g. --to-k-center) cannot deform value "
         "content through a shared trunk. Default off = shared trunk, "
         "bit-preserved legacy paths. Composes with --to-k-center.",
+    )
+    parser.add_argument(
+        "--readout-views",
+        type=int,
+        default=1,
+        help="fork 2 multi-view readout (2026-08-19): m>1 expands each state "
+        "channel's backbone-store rows to m measurement rows per chunk read "
+        "with a seeded orthogonal frame (training-free, seed pinned in "
+        "flued/v36/model.py); direct/predict paths bit-untouched. Default 1 = "
+        "bit-preserved legacy behavior.",
+    )
+    parser.add_argument(
+        "--verify-topl",
+        type=int,
+        default=0,
+        help="fork 2 forward verification (2026-08-19, spec §1.2): at eval, "
+        "take the completion decoder's exact top-L per-chunk segment "
+        "candidates, replay each through the frozen write operator (original "
+        "timetable), and pick the nearest to the chunk's trained state "
+        "readout in a seeded-frame measurement space; reports "
+        "eval_verify_hit1_before/after, eval_verify_hitl and the false-peak "
+        "rate. 0 = off (default, bit-preserved legacy eval). Wired in "
+        "train_v36.py evaluate() only; slm + --v-row-source state grids.",
     )
     parser.add_argument(
         "--cloze-prob",

@@ -753,14 +753,19 @@ def _slm_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None) 
     hard_cut, utf8_cont, cut_overflow = model._cuts(source, confidence, valid)
     chunks = model.chunk_builder(byte_states, valid, hard_cut, confidence)
     chunks = model.bridge(chunks, byte_states, confidence, valid, utf8_cont)
-    k_rows, v_rows, state_norm, memory, index = model._slm_store_rows(chunks)
+    k_rows, v_rows, state_norm, memory, index, k_store, v_store = model._slm_store_rows(chunks, with_views=True)
     n_chunks = chunks.chunk_mask.size(1)
     pos = model.chunk_pos.weight.unsqueeze(0)[:, :n_chunks]
     # a+pos arm: window-relative per-chunk start byte offsets (None = off)
     chunk_byte_off = (
         chunk_byte_offsets(chunks.token_mask) if getattr(model.config, "k_pos_inject", False) else None
     )
-    backbone_out = model.backbone(k_rows, v_rows, chunks.chunk_mask, pos, chunk_byte_off=chunk_byte_off)
+    # fork 2: multi-view store rows when readout_views > 1 (classic rows otherwise)
+    backbone_out = model.backbone(
+        k_store if k_store is not None else k_rows,
+        v_store if v_store is not None else v_rows,
+        chunks.chunk_mask, pos, chunk_byte_off=chunk_byte_off,
+    )
     cond_backbone = backbone_out + pos
     dec_in = model.decoder_in if model.config.v_row_source == "state" else model.decoder_in_mem
     cond_direct = dec_in(v_rows) + pos

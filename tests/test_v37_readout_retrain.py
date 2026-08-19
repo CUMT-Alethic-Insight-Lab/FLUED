@@ -14,6 +14,7 @@ import torch.nn.functional as F
 
 import tools.train.v3_6.retrain_readout_chain as rr
 import tools.analysis.v3_6.measure_readout_lockin_curve as lc
+import tools.train.v3_6.train_v36_s1 as s1
 from tests.test_v37_oracle_probe import _tiny_c_config
 from flued.v36 import FLUEDV36
 
@@ -36,10 +37,12 @@ def test_freeze_surface_correctness():
     model = _tiny_model()
     names = rr.unfreeze_readout_chain(model)
     trainable = {n for n, p in model.named_parameters() if p.requires_grad}
+    # fork 1 default: readout chain + the WHOLE backbone
     expected = {
         n
         for n, _ in model.named_parameters()
-        if n.startswith(rr.TRAINABLE_PREFIXES) and not n.startswith("decoder.byte_lookup.")
+        if (n.startswith(rr.TRAINABLE_PREFIXES) and not n.startswith("decoder.byte_lookup."))
+        or n.startswith("backbone.")
     }
     assert trainable == expected
     assert set(names) == expected
@@ -49,7 +52,7 @@ def test_freeze_surface_correctness():
     # producers stay frozen
     assert not model.write_head.to_k.weight.requires_grad
     assert not model.state_machine.readout_query.requires_grad
-    assert not model.backbone.q_proj.weight.requires_grad
+    assert model.backbone.q_proj.weight.requires_grad  # fork 1: backbone in the chain
 
 
 def test_unfreeze_backbone_last_n():
@@ -62,6 +65,18 @@ def test_unfreeze_backbone_last_n():
     last_params = {id(p) for p in last.parameters()}
     backbone_trainable = [p for n, p in model.named_parameters() if n.startswith("backbone.") and p.requires_grad]
     assert all(id(p) in last_params for p in backbone_trainable)
+
+
+def test_freeze_backbone_flag():
+    model = _tiny_model()
+    rr.unfreeze_readout_chain(model, freeze_backbone=True)
+    trainable = {n for n, p in model.named_parameters() if p.requires_grad}
+    assert not any(n.startswith("backbone.") for n in trainable)
+    assert any(n.startswith("state_machine.realign.") for n in trainable)
+    import pytest
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        rr.unfreeze_readout_chain(_tiny_model(), backbone_last_n=1, freeze_backbone=True)
 
 
 # --- oracle-frac schedule + mixing --------------------------------------------
@@ -91,23 +106,77 @@ def test_train_step_finite_and_scoped_grads():
     r2 = rr.train_step(model, ns, clean, byte_mask, 0.0, opt, rng, 1.0)  # forced natural
     assert r2["use_oracle"] is False and math.isfinite(r2["loss"])
     for n, p in model.named_parameters():
-        if p.requires_grad:
-            # noise_cond sees an identically-zero input by design (DiT noise=0)
-            # => its grad is structurally zero; existence is what matters there
-            assert p.grad is not None, f"no grad on trainable {n}"
-            if "noise_cond" not in n:
-                assert p.grad.abs().sum() > 0, f"zero grad on trainable {n}"
-        else:
+        if not p.requires_grad:
             assert p.grad is None, f"grad leaked to frozen {n}"
+            continue
+        assert p.grad is not None, f"no grad on trainable {n}"
+        if "noise_cond" in n:
+            continue  # zero-noise input by design => structurally zero grad
+        if n.startswith("decoder_in."):
+            continue  # fork 1: completion form does not route through decoder_in
+        assert p.grad.abs().sum() > 0, f"zero grad on trainable {n}"
+    # fork 1: the backbone must actually receive the completion gradient
+    assert model.backbone.q_proj.weight.grad.abs().sum() > 0
+    assert model.backbone.self_blocks[-1]["q"].weight.grad.abs().sum() > 0
+
+
+def test_completion_form_uses_clean_cumulative_grid():
+    """The fork-1 loss targets CLEAN bytes at masked slots (completion form),
+    not MASK_ID (the old as-encoded/direct grid)."""
+    model = _tiny_model().eval()
+    ns = _ns()
+    clean = torch.randint(1, 258, (1, 256))
+    byte_mask = torch.zeros_like(clean, dtype=torch.bool)
+    byte_mask[0, 10:14] = True
+    source = clean.masked_fill(byte_mask, 257)
+    chunks, n_real, S, k_rows = rr._states_for(model, source, use_oracle=False)
+    logits = rr._chain_logits(model, chunks, n_real, S, k_rows)
+    import torch.nn.functional as F
+
+    with torch.no_grad():
+        logits_manual = logits.clone()
+    # reference: manual clean-grid CE at the masked byte's (chunk, slot)
+    j = int(chunks.chunk_ids[0, 10])
+    s = int(chunks.offsets[0, 10])
+    tgt_clean = s1.make_cumulative_retention_targets(clean, byte_mask, chunks.chunk_ids, chunks.offsets, ns.max_chunks, ns.max_span)[0]
+    assert int(tgt_clean[0, j, s]) == int(clean[0, 10])  # clean byte, not MASK_ID=257
+    loss = rr._direct_loss(model, ns, chunks, n_real, clean, byte_mask, logits_manual.requires_grad_(True))
+    ref = F.cross_entropy(logits_manual[0, j, s].float().unsqueeze(0), torch.tensor([int(clean[0, 10])]))
+    # the masked byte is one of the scored slots; the scalar loss won't equal
+    # the single-slot CE, but the grid must hold the clean id at that slot
+    assert math.isfinite(float(loss)) and float(ref) > 0
 
 
 def test_oracle_vs_natural_states_differ():
     model = _tiny_model().eval()
     clean = torch.randint(1, 258, (1, 256))
-    chunks, n_real, S_or = rr._states_for(model, clean, use_oracle=True)
-    _, _, S_tr = rr._states_for(model, clean, use_oracle=False)
+    chunks, n_real, S_or, k_rows = rr._states_for(model, clean, use_oracle=True)
+    _, _, S_tr, k_rows2 = rr._states_for(model, clean, use_oracle=False)
     assert S_or.shape == S_tr.shape
+    assert torch.allclose(k_rows, k_rows2)  # K store source is state-choice independent
     assert not torch.allclose(S_or, S_tr)  # the two state kinds are genuinely different
+
+
+def test_state_only_ablation_removes_k_rows_from_attention():
+    """护栏一 (b): with k_block_eval on, changing the K store rows must NOT
+    change the backbone output (the direct-source rows no longer participate)."""
+    model = _tiny_model().eval()
+    clean = torch.randint(1, 258, (1, 256))
+    chunks, n_real, S, k_rows = rr._states_for(model, clean, use_oracle=False)
+    bb = model.backbone
+    pos = model.chunk_pos.weight.unsqueeze(0)[:, :n_real]
+    v_rows = torch.randn(1, n_real, model.config.d_pack)
+    mask = chunks.chunk_mask[:, :n_real]
+    with torch.no_grad():
+        out_full = bb(k_rows, v_rows, mask, pos)
+        out_perm = bb(k_rows[:, torch.randperm(n_real)], v_rows, mask, pos)
+        bb.k_block_eval = True
+        out_a = bb(k_rows, v_rows, mask, pos)
+        out_b = bb(k_rows[:, torch.randperm(n_real)], v_rows, mask, pos)
+        bb.k_block_eval = False
+    assert not torch.allclose(out_full, out_perm, atol=1e-4)  # K rows matter when un-ablated
+    assert torch.allclose(out_a, out_b, atol=1e-5)  # ablated: K rows fully inert
+    assert not torch.allclose(out_full, out_a, atol=1e-4)  # the ablation itself has effect
 
 
 # --- eval determinism ---------------------------------------------------------

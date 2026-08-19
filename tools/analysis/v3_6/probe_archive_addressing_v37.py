@@ -303,7 +303,7 @@ def encode_document(model, ns, doc: bytes, entries: list, window: int, device: t
     v_state = cfg.v_row_source == "state"
     state_k = model.state_machine_k.init_stream_state(1, device) if k_state else None
     state_v = model.state_machine.init_stream_state(1, device) if v_state else None
-    k_cols, v_cols, bb_cols, metas = [], [], [], {}
+    k_cols, v_cols, bb_cols, idx_cols, metas = [], [], [], [], {}
     chunk_offset = 0
     for w in range(n_pages):
         raw = doc[w * window : (w + 1) * window]
@@ -347,6 +347,7 @@ def encode_document(model, ns, doc: bytes, entries: list, window: int, device: t
         k_cols.append(k_rows_w[0].to(torch.bfloat16))  # (n_real, d_mem|d_pack)
         v_cols.append(v_rows_w[0].to(torch.bfloat16))
         bb_cols.append(bb_w[0].to(torch.bfloat16))  # (n_real, d_backbone)
+        idx_cols.append(index[0, :n_real].to(torch.bfloat16))  # per-chunk index rows (M2/verifier write-replay)
         if touched:
             metas[w] = {
                 "offset": chunk_offset,
@@ -387,6 +388,7 @@ def encode_document(model, ns, doc: bytes, entries: list, window: int, device: t
         "k_rows": k_rows,
         "v_rows": torch.cat(v_cols, dim=0),  # (G, d_v) bf16
         "backbone": torch.cat(bb_cols, dim=0),  # (G, d_backbone) bf16
+        "index_rows": torch.cat(idx_cols, dim=0),  # (G, d_mem) bf16 — write-replay source (verifier)
         # ALIAS: the frozen probe's train/eval loops read per-chunk keys via
         # extract_keys(key_src="memrow") -> enc["memory"]; pointing it at the K
         # source rows reuses those loops verbatim. For k=state cells these rows
