@@ -28,6 +28,14 @@ cond = backbone_out + pos（s1 completion 形态），累积保持 CLEAN 目标�
 均匀抽档）；eval = 训练终评同口径 16 窗（eval seed 1042）。fp32、无
 autocast。
 
+2026-08-19 训练稳定性加固（E83 对象 1 在 12.4K 步 loss 4.69→NaN 发散归零
+的教训，用户裁定四项）：① 梯度裁剪 --grad-clip 1.0（日志带 pre-clip
+grad_norm）；② NaN 保护——非有限 loss/grad 跳过该步且不计指标，连续
+--nan-abort-after（默认 10）次则响亮退出；③ warmup+余弦 LR——
+--warmup-steps（默认 200）线性升至 --lr 后余弦衰减到 0；④ latest 式断点
+续训 --resume（保存/恢复 modules+optimizer+step+全部 RNG 流，数据流按
+step 快进）。
+
 Usage:
   CPU 冒烟: python tools/train/v3_6/retrain_readout_chain.py --steps 20 --seq-len 512 \
       --eval-windows 2 --eval-every 10 --log-every 5 --device cpu \
@@ -66,6 +74,107 @@ from tools.analysis.v3_6.measure_readout_lockin_curve import mix_keys  # noqa: E
 
 LINEAR_PROBE_FLOOR = 0.6185  # E73-A6: write-value linear byte probe, slot0 acc
 TRAINABLE_PREFIXES = ("state_machine.realign.", "decoder_in.", "decoder.")
+
+
+def lr_at(step: int, base_lr: float, total_steps: int, warmup_steps: int) -> float:
+    """Warmup + cosine schedule (2026-08-19 hardening, E83 constant-lr divergence
+    lesson): linear 0 -> base_lr over warmup_steps, then cosine base_lr -> 0 over
+    the remaining steps (lr=0 exactly at step=total_steps). Stateless in `step`,
+    so a resumed run lands on the identical lr trajectory."""
+    if warmup_steps > 0 and step <= warmup_steps:
+        return base_lr * step / warmup_steps
+    span = max(total_steps - warmup_steps, 1)
+    t = min((step - warmup_steps) / span, 1.0)
+    return 0.5 * base_lr * (1.0 + math.cos(math.pi * t))
+
+
+class NanSkipTracker:
+    """Consecutive NaN/Inf skip counter (2026-08-19 hardening): a skipped step
+    never advances metrics (AGENTS.md pitfall 3); `limit` CONSECUTIVE skips mean
+    the run is diverging (E83: the unsurgered cell's loss-NaN collapse) and the
+    run must exit loudly instead of burning budget. A successful step resets the
+    consecutive count; the total is kept for the log."""
+
+    def __init__(self, limit: int = 10) -> None:
+        self.limit = limit
+        self.total = 0
+        self.consecutive = 0
+
+    def record(self, skipped: bool) -> None:
+        if skipped:
+            self.total += 1
+            self.consecutive += 1
+        else:
+            self.consecutive = 0
+
+    def should_abort(self) -> bool:
+        return self.consecutive >= self.limit
+
+
+def _trainable_modules_sd(model, freeze_backbone: bool) -> dict:
+    """The retrained-module state dict (byte_lookup rows stripped) — shared by
+    the final artifact and the resume state; the source checkpoint is never
+    written back (护栏四)."""
+    sd = {
+        "realign": model.state_machine.realign.state_dict(),
+        "decoder_in": model.decoder_in.state_dict(),
+        "decoder": {k: v for k, v in model.decoder.state_dict().items() if not k.startswith("byte_lookup.")},
+    }
+    if not freeze_backbone:
+        sd["backbone"] = model.backbone.state_dict()
+    return sd
+
+
+def save_retrain_state(path: Path, model, opt, step: int, mix_rng, tracker: NanSkipTracker, eval_history: list, args) -> None:
+    """Latest-style resume state: modules + optimizer + step + every RNG stream.
+    The deterministic data stream itself is rebuilt and fast-forwarded on
+    resume, so it needs no state."""
+    torch.save(
+        {
+            "step": step,
+            "modules": _trainable_modules_sd(model, args.freeze_backbone),
+            "optimizer": opt.state_dict(),
+            "mix_rng_state": mix_rng.getstate(),
+            "torch_rng_state": torch.get_rng_state(),
+            "cuda_rng_state": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+            "mask_gen_state": s1._MASK_GENERATOR.get_state(),
+            "nan_total": tracker.total,
+            "nan_consecutive": tracker.consecutive,
+            "eval_natural_history": list(eval_history),
+            "args": vars(args),
+        },
+        path,
+    )
+
+
+def load_retrain_state(path: Path, model, opt, mix_rng, tracker: NanSkipTracker, eval_history: list, args) -> int:
+    """Restore a resume state into the already-unfrozen model + optimizer and
+    return the step to continue FROM. The freeze surface is part of the saved
+    state — resuming with different freeze flags is a loud error, not a silent
+    partial load."""
+    state = torch.load(path, map_location="cpu", weights_only=False)
+    modules = state["modules"]
+    saved_has_backbone = "backbone" in modules
+    if saved_has_backbone == args.freeze_backbone:
+        raise ValueError(
+            f"resume surface mismatch: the saved state {'includes' if saved_has_backbone else 'excludes'} the backbone "
+            f"but --freeze-backbone={args.freeze_backbone} — resume with the same freeze flags as the original run"
+        )
+    model.state_machine.realign.load_state_dict(modules["realign"])
+    model.decoder_in.load_state_dict(modules["decoder_in"])
+    model.decoder.load_state_dict(modules["decoder"], strict=False)  # byte_lookup rows stripped by construction
+    if saved_has_backbone:
+        model.backbone.load_state_dict(modules["backbone"])
+    opt.load_state_dict(state["optimizer"])
+    mix_rng.setstate(state["mix_rng_state"])
+    torch.set_rng_state(state["torch_rng_state"])
+    if state.get("cuda_rng_state") is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(state["cuda_rng_state"])
+    s1._MASK_GENERATOR.set_state(state["mask_gen_state"])
+    tracker.total = state.get("nan_total", 0)
+    tracker.consecutive = state.get("nan_consecutive", 0)
+    eval_history.extend(state.get("eval_natural_history", []))
+    return int(state["step"])
 
 
 def unfreeze_readout_chain(model, backbone_last_n: int = 0, freeze_backbone: bool = False) -> list[str]:
@@ -166,16 +275,22 @@ def train_step(model, ns, clean: torch.Tensor, byte_mask: torch.Tensor, frac: fl
     logits = _chain_logits(model, chunks, n_real, S, k_rows)
     loss = _direct_loss(model, ns, chunks, n_real, clean, byte_mask, logits)
     opt.zero_grad(set_to_none=True)
+    base = {"use_oracle": use_oracle, "frac": frac, "n_real": n_real, "mu_lambda": lam}
     if not torch.isfinite(loss):
         # NaN/Inf guard (2026-08-19, run-1 divergence lesson): skip the step —
         # metrics must not advance as if an optimizer step succeeded (AGENTS.md
         # pitfall 3). Extreme oracle-state norms (collapsed-key cumsum, |S|~1e3)
         # can push the now-trainable backbone into fp32 divergence.
-        return {"loss": None, "skipped": True, "use_oracle": use_oracle, "frac": frac, "n_real": n_real, "mu_lambda": lam}
+        return {"loss": None, "skipped": True, "skip_reason": "loss_nan", "grad_norm": None, **base}
     loss.backward()
-    torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], grad_clip)
+    grad_norm = torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], grad_clip)
+    if not torch.isfinite(grad_norm):
+        # grad-NaN guard: a finite loss can still produce non-finite gradients
+        # (fp32 overflow deeper in the chain) — never let them touch the params.
+        opt.zero_grad(set_to_none=True)
+        return {"loss": None, "skipped": True, "skip_reason": "grad_nan", "grad_norm": None, **base}
     opt.step()
-    return {"loss": float(loss.detach()), "skipped": False, "use_oracle": use_oracle, "frac": frac, "n_real": n_real, "mu_lambda": lam}
+    return {"loss": float(loss.detach()), "skipped": False, "skip_reason": None, "grad_norm": float(grad_norm), **base}
 
 
 @torch.no_grad()
@@ -240,6 +355,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--seq-len", type=int, default=0, help="0 = the checkpoint's (4096); smaller for CPU smoke")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--grad-clip", type=float, default=1.0)
+    p.add_argument("--warmup-steps", type=int, default=200,
+                   help="linear 0->lr warmup, then cosine decay to 0 at --steps (stateless in step; resume-safe)")
+    p.add_argument("--nan-abort-after", type=int, default=10,
+                   help="abort loudly after this many CONSECUTIVE NaN/Inf-skipped steps (a successful step resets the streak)")
+    p.add_argument("--save-every", type=int, default=1000,
+                   help="resume-state cadence: <out-dir>/retrain_state_latest.pt (modules+optimizer+step+RNGs)")
+    p.add_argument("--resume", action="store_true",
+                   help="continue from the latest retrain state up to --steps (same freeze flags required)")
+    p.add_argument("--resume-path", default="", help="empty = <out-dir>/retrain_state_latest.pt")
     p.add_argument("--unfreeze-backbone-last-n", type=int, default=0,
                    help="0 = fork 1 default: backbone FULLY in the chain; >0 = only the last n self-attention blocks")
     p.add_argument("--freeze-backbone", action="store_true",
@@ -275,22 +399,34 @@ def main() -> None:
     opt = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=args.lr)
     mix_rng = random.Random(args.seed + 7)
     s1._MASK_GENERATOR.manual_seed(args.seed)
+    tracker = NanSkipTracker(args.nan_abort_after)
+    eval_natural_history: list[float] = []
+    start_step = 0
+    if args.resume:
+        resume_path = Path(args.resume_path) if args.resume_path else out_dir / "retrain_state_latest.pt"
+        if not resume_path.exists():
+            raise FileNotFoundError(f"--resume given but no retrain state at {resume_path}")
+        start_step = load_retrain_state(resume_path, model, opt, mix_rng, tracker, eval_natural_history, args)
+        if start_step >= args.steps:
+            raise ValueError(f"resume state is already at step {start_step} >= --steps {args.steps} — nothing to do")
+        print(f"[retrain] RESUMED from {resume_path} at step {start_step} "
+              f"(nan_total={tracker.total}, evals={len(eval_natural_history)})", flush=True)
 
     train_ds = StreamingReconstructionDataset(
         file_path=ns.data_path, seq_len=ns.seq_len,
         samples_per_worker=max(args.steps * 2, 2000), seed=args.seed,
     )
     train_iter = iter(torch.utils.data.DataLoader(train_ds, batch_size=1, shuffle=False, num_workers=0))
+    for _ in range(start_step):  # fast-forward the deterministic stream to the resume point
+        next(train_iter)
     eval_windows = build_eval_windows(ns, args.eval_windows)
     eval_masks = build_masks(eval_windows, ns)
 
     log_path = out_dir / "train_log.jsonl"
     mu_grid = [float(x) for x in args.mu_lambda_grid.split(",") if x.strip()]
-    eval_natural_history: list[float] = []
-    nan_skips = 0
     with log_path.open("a", encoding="utf-8") as log_fh:
         losses = []
-        for step in range(1, args.steps + 1):
+        for step in range(start_step + 1, args.steps + 1):
             clean = next(train_iter)[0].to(device)
             byte_mask = s1.make_mixed_mask(
                 clean.cpu(), ns.mask_prob,
@@ -298,16 +434,28 @@ def main() -> None:
                 char_span_max=getattr(ns, "mask_char_span_max", 3),
                 tokenizer=s1._BPE_TOKENIZER, generator=s1._MASK_GENERATOR,
             ).to(device)
+            lr = lr_at(step, args.lr, args.steps, args.warmup_steps)
+            for g in opt.param_groups:
+                g["lr"] = lr
             frac = oracle_frac_at(step, args.steps, args.oracle_frac_start, args.oracle_frac_end, args.oracle_anneal_steps)
             r = train_step(model, ns, clean, byte_mask, frac, opt, mix_rng, args.grad_clip, mu_lambda_grid=mu_grid)
-            if r["skipped"]:
-                nan_skips += 1  # NaN/Inf step skipped: metrics do not advance
-            else:
+            tracker.record(r["skipped"])  # a skipped step never advances metrics
+            if not r["skipped"]:
                 losses.append(r["loss"])
-            if step % args.log_every == 0 or step == 1:
+            if tracker.should_abort():
+                row = {"step": step, "abort": f"{tracker.consecutive} consecutive NaN/Inf-skipped steps "
+                       f"(limit {tracker.limit}, total {tracker.total}) — the run is diverging; "
+                       "last resume state NOT overwritten by this abort"}
+                print(f"[retrain][ABORT] {row}", flush=True)
+                log_fh.write(json.dumps({"abort": row}) + "\n")
+                log_fh.flush()
+                raise SystemExit(1)
+            if step % args.log_every == 0 or step == start_step + 1:
                 row = {"step": step, "loss": round(sum(losses) / len(losses), 4) if losses else None,
+                       "lr": lr, "grad_norm": round(r["grad_norm"], 4) if r["grad_norm"] is not None else None,
                        "oracle_frac": round(frac, 4), "use_oracle_last": r["use_oracle"],
-                       "mu_lambda_last": r["mu_lambda"], "nan_skips": nan_skips}
+                       "mu_lambda_last": r["mu_lambda"], "nan_skips": tracker.total,
+                       "nan_consecutive": tracker.consecutive}
                 print(f"[retrain] {row}", flush=True)
                 log_fh.write(json.dumps({"losses_window": len(losses), **row}) + "\n")
                 log_fh.flush()
@@ -325,22 +473,18 @@ def main() -> None:
                 print(f"[retrain][eval] {row}", flush=True)
                 log_fh.write(json.dumps({"eval": row}) + "\n")
                 log_fh.flush()
+            if step % args.save_every == 0 or step == args.steps:
+                save_retrain_state(out_dir / "retrain_state_latest.pt", model, opt, step, mix_rng, tracker, eval_natural_history, args)
 
     # save ONLY the retrained modules (byte_lookup rows stripped) — the source
     # checkpoint is never written back. fork 1: the backbone is in the chain by
     # default, so it is persisted too (skipped when --freeze-backbone).
-    sd = {
-        "realign": model.state_machine.realign.state_dict(),
-        "decoder_in": model.decoder_in.state_dict(),
-        "decoder": {k: v for k, v in model.decoder.state_dict().items() if not k.startswith("byte_lookup.")},
-    }
-    if not args.freeze_backbone:
-        sd["backbone"] = model.backbone.state_dict()
+    sd = _trainable_modules_sd(model, args.freeze_backbone)
     torch.save(
         {"step": args.steps, "modules": sd, "source_run": Path(args.run_dir).name, "args": vars(args)},
         out_dir / "retrained_readout.pt",
     )
-    print(f"[retrain] done -> {out_dir / 'retrained_readout.pt'} ({time.time() - t0:.0f}s, nan_skips={nan_skips})", flush=True)
+    print(f"[retrain] done -> {out_dir / 'retrained_readout.pt'} ({time.time() - t0:.0f}s, nan_skips={tracker.total})", flush=True)
 
 
 if __name__ == "__main__":

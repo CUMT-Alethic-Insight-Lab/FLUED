@@ -249,6 +249,12 @@ def test_retrainer_defaults_updated():
     assert abs(args.oracle_frac_end - 0.3) < 1e-9  # 修正一 endpoint 0.1 -> 0.3
     assert args.oracle_frac_start == 0.8
     assert args.unfreeze_backbone_last_n == 0
+    # 2026-08-19 hardening defaults (E83 divergence lesson)
+    assert args.grad_clip == 1.0
+    assert args.warmup_steps == 200
+    assert args.nan_abort_after == 10
+    assert args.save_every == 1000
+    assert args.resume is False and args.resume_path == ""
 
 
 def test_train_step_with_mu_curriculum():
@@ -273,3 +279,156 @@ def test_train_step_with_mu_curriculum():
     # grid=None keeps the pre-curriculum plain-oracle form working
     r = rr.train_step(model, ns, clean, byte_mask, 1.0, opt, rng, 1.0, mu_lambda_grid=None)
     assert r["mu_lambda"] is None and math.isfinite(r["loss"])
+
+
+# --- 2026-08-19 hardening: grad clip / NaN guards / lr schedule / resume ------
+
+
+def test_grad_clip_bounds_post_clip_norm():
+    """After a clipped step the total grad norm over trainable params must be
+    within the threshold (and the reported pre-clip norm must have exceeded it,
+    so the clip actually did work)."""
+    model = _tiny_model()
+    rr.unfreeze_readout_chain(model)
+    ns = _ns()
+    opt = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=1e-3)
+    clean = torch.randint(1, 258, (1, 256))
+    byte_mask = torch.zeros_like(clean, dtype=torch.bool)
+    import random
+
+    clip = 1e-3
+    r = rr.train_step(model, ns, clean, byte_mask, 1.0, opt, random.Random(0), clip)
+    assert r["grad_norm"] is not None and r["grad_norm"] > clip  # pre-clip norm: clip had work to do
+    sq = 0.0
+    for p in model.parameters():
+        if p.requires_grad:
+            assert p.grad is not None
+            sq += float(p.grad.square().sum())
+    assert math.sqrt(sq) <= clip * (1 + 1e-4)  # post-clip total norm within threshold
+
+
+def test_nan_loss_step_skips_without_advancing():
+    """Non-finite loss -> step skipped: params untouched, no stray grads, and
+    the tracker aborts only on CONSECUTIVE skips (a success resets the streak)."""
+    from unittest import mock
+
+    model = _tiny_model()
+    rr.unfreeze_readout_chain(model)
+    ns = _ns()
+    opt = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=1e-3)
+    clean = torch.randint(1, 258, (1, 256))
+    byte_mask = torch.zeros_like(clean, dtype=torch.bool)
+    import random
+
+    before = [p.detach().clone() for p in model.parameters() if p.requires_grad]
+    nan_loss = torch.tensor(float("nan"), requires_grad=True)
+    with mock.patch.object(rr, "_direct_loss", return_value=nan_loss):
+        r = rr.train_step(model, ns, clean, byte_mask, 0.0, opt, random.Random(0), 1.0)
+    assert r["skipped"] is True and r["loss"] is None and r["skip_reason"] == "loss_nan"
+    after = list(model.parameters())
+    assert all(torch.equal(b, p.detach()) for b, p in zip(before, (p for p in after if p.requires_grad)))
+    assert all(p.grad is None for p in model.parameters() if p.requires_grad)
+
+    tr = rr.NanSkipTracker(limit=3)
+    tr.record(True)
+    tr.record(True)
+    assert not tr.should_abort()
+    tr.record(False)  # a successful step resets the consecutive streak
+    assert tr.consecutive == 0 and tr.total == 2
+    tr.record(True)
+    tr.record(True)
+    tr.record(True)
+    assert tr.should_abort() and tr.total == 5
+
+
+def test_grad_nan_step_skips_without_advancing():
+    """A FINITE loss can still yield non-finite gradients (sqrt(0) derivative):
+    the grad guard must skip the step before the optimizer touches params."""
+    from unittest import mock
+
+    model = _tiny_model()
+    rr.unfreeze_readout_chain(model)
+    ns = _ns()
+    opt = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=1e-3)
+    clean = torch.randint(1, 258, (1, 256))
+    byte_mask = torch.zeros_like(clean, dtype=torch.bool)
+    import random
+
+    def zero_sqrt_loss(model, ns, chunks, n_real, clean, byte_mask, logits):
+        return torch.sqrt((logits * 0).sum())  # finite 0 loss; d/dx sqrt at 0 -> inf -> 0*inf = nan grads
+
+    before = [p.detach().clone() for p in model.parameters() if p.requires_grad]
+    with mock.patch.object(rr, "_direct_loss", side_effect=zero_sqrt_loss):
+        r = rr.train_step(model, ns, clean, byte_mask, 0.0, opt, random.Random(0), 1.0)
+    assert r["skipped"] is True and r["skip_reason"] == "grad_nan" and r["grad_norm"] is None
+    assert all(torch.equal(b, p.detach()) for b, p in zip(before, (p for p in model.parameters() if p.requires_grad)))
+    assert all(p.grad is None for p in model.parameters() if p.requires_grad)  # cleared after the guard
+
+
+def test_lr_schedule_warmup_cosine():
+    f = rr.lr_at
+    assert abs(f(1, 1e-3, 1000, 200) - 5e-6) < 1e-12  # linear warmup start
+    assert abs(f(200, 1e-3, 1000, 200) - 1e-3) < 1e-12  # peak exactly at warmup end
+    assert abs(f(600, 1e-3, 1000, 200) - 0.5e-3) < 1e-12  # cosine midpoint
+    assert f(1000, 1e-3, 1000, 200) == 0.0  # decays to exactly 0 at total steps
+    post = [f(s, 1e-3, 1000, 200) for s in (201, 400, 800, 999)]
+    assert all(a > b for a, b in zip(post, post[1:]))  # strictly decreasing after warmup
+    assert abs(f(1, 1e-3, 1000, 0) - 1e-3) < 1e-6  # warmup_steps=0: pure cosine from base
+
+
+def test_resume_roundtrip_continues_identical_trajectory(tmp_path):
+    """Save at step 3, load into a fresh identically-seeded model, continue:
+    the loss trajectory must be bitwise-identical to the uninterrupted run."""
+    import random
+
+    ns = _ns()
+    clean = torch.randint(1, 258, (1, 256))
+    byte_mask = torch.zeros_like(clean, dtype=torch.bool)
+    args = rr.build_parser().parse_args([])
+
+    def fresh():
+        model = _tiny_model(seed=0)
+        rr.unfreeze_readout_chain(model)
+        opt = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=1e-2)
+        return model, opt
+
+    model_a, opt_a = fresh()
+    rng_a = random.Random(7)
+    tracker_a, hist_a = rr.NanSkipTracker(), []
+    losses_a = [rr.train_step(model_a, ns, clean, byte_mask, 0.0, opt_a, rng_a, 1.0)["loss"] for _ in range(3)]
+    assert all(math.isfinite(x) for x in losses_a)
+    state_path = tmp_path / "retrain_state_latest.pt"
+    rr.save_retrain_state(state_path, model_a, opt_a, 3, rng_a, tracker_a, hist_a, args)
+
+    model_b, opt_b = fresh()
+    rng_b = random.Random(7)
+    tracker_b, hist_b = rr.NanSkipTracker(), []
+    start = rr.load_retrain_state(state_path, model_b, opt_b, rng_b, tracker_b, hist_b, args)
+    assert start == 3
+    for _ in range(3):  # identical continuation, bitwise
+        la = rr.train_step(model_a, ns, clean, byte_mask, 0.0, opt_a, rng_a, 1.0)["loss"]
+        lb = rr.train_step(model_b, ns, clean, byte_mask, 0.0, opt_b, rng_b, 1.0)["loss"]
+        assert la == lb
+
+
+def test_resume_surface_mismatch_is_loud(tmp_path):
+    """Resuming a backbone-in-chain state with --freeze-backbone (or vice
+    versa) must raise, never silently half-load."""
+    import argparse
+    import random
+
+    model = _tiny_model()
+    rr.unfreeze_readout_chain(model)
+    opt = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=1e-3)
+    args = rr.build_parser().parse_args([])
+    state_path = tmp_path / "retrain_state_latest.pt"
+    rr.save_retrain_state(state_path, model, opt, 1, random.Random(0), rr.NanSkipTracker(), [], args)
+
+    model2 = _tiny_model()
+    rr.unfreeze_readout_chain(model2, freeze_backbone=True)
+    opt2 = torch.optim.Adam([p for p in model2.parameters() if p.requires_grad], lr=1e-3)
+    bad_args = argparse.Namespace(**{**vars(args), "freeze_backbone": True})
+    import pytest
+
+    with pytest.raises(ValueError, match="surface mismatch"):
+        rr.load_retrain_state(state_path, model2, opt2, random.Random(0), rr.NanSkipTracker(), [], bad_args)
