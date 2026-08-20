@@ -202,6 +202,22 @@ class V36Config:
     # every legacy path bit-preserved. Covers BOTH WriteHead instances (K and V
     # channels); the a grid has no WriteHead and is unaffected.
     to_k_center: bool = False
+    # Hard-constraint gate arm (Q10, user-ruled 2026-08-20; E79 mu-trajectory
+    # showed the de-mean-only surgery's residual coherence slowly re-collapses
+    # 0.690 -> 0.811 under training — soft repair re-collapses, so the gate
+    # upgrades centering to full whitening): WriteHead applies
+    # k <- (k - EMA_mean) @ W_pre with W_pre = (EMA_cov + eps*I)^{-1/2}
+    # (eigh, fp32, recomputed every training step; 512x512 is sub-ms), pushing
+    # the pre-normalization key covariance to identity — pairwise |cos| is
+    # crushed toward ~0 by construction instead of being negotiated with the
+    # loss. Same buffer discipline as to_k_center (EMA 0.99, detached,
+    # BatchNorm-style cold start, persistent=False; eval uses the frozen
+    # buffers, so a FRESH eval process starts with identity whitening until a
+    # training-mode forward warms the buffers — measurement protocols must
+    # warm up first). Superset of to_k_center: when on, the centering branch
+    # is subsumed (whitening includes de-meaning); do not stack the flags.
+    # Default False = every legacy path bit-preserved.
+    to_k_whiten: bool = False
     # fork 2 (user-ruled 2026-08-19; spec docs/versions/v3.7/
     # FLUED_V3_7_FORK2_MULTIVIEW_READOUT_20260819_CN.md): multi-view readout.
     # readout_views=m>1 expands the backbone STORE side of each state channel
@@ -385,8 +401,15 @@ class WriteHead(nn.Module):
         # E75 key-decollapse hard constraint (see V36Config.to_k_center):
         # subtract the running center from the to_k output, pre-normalization.
         self.to_k_center = getattr(c, "to_k_center", False)
-        if self.to_k_center:
+        self.to_k_whiten = getattr(c, "to_k_whiten", False)
+        if self.to_k_center or self.to_k_whiten:
             self.register_buffer("k_center", torch.zeros(h * hk), persistent=False)
+        if self.to_k_whiten:
+            # Q10 gate (see V36Config.to_k_whiten): full whitening superset of
+            # centering. k_cov = EMA of the pre-normalization key covariance;
+            # k_white = (k_cov + eps I)^{-1/2} refreshed every training step.
+            self.register_buffer("k_cov", torch.zeros(h * hk, h * hk), persistent=False)
+            self.register_buffer("k_white", torch.eye(h * hk), persistent=False)
         tau = torch.exp(
             torch.linspace(0.0, 1.0, h * hk) * (torch.log(torch.tensor(c.kda_tau_max)))
         ).clamp(min=1.0 + 1e-3)
@@ -412,7 +435,34 @@ class WriteHead(nn.Module):
         else:
             h_k = h_v = self.trunk(memory)
         k = self.to_k(h_k)
-        if self.to_k_center:
+        if self.to_k_whiten:
+            # Q10 gate: whiten = de-mean + decorrelate + equalize variance
+            # (superset of the centering branch). EMA momentum 0.99, detached —
+            # the gradient path to to_k stays live. Eval uses the frozen
+            # buffers (zero center + identity white = no-op until warmed, same
+            # caveat as to_k_center).
+            if self.training:
+                with torch.no_grad():
+                    kd = k.detach().float()
+                    m = kd.mean(dim=(0, 1))
+                    xc = kd.reshape(-1, kd.size(-1)) - m
+                    cov = (xc.T @ xc) / max(xc.size(0), 1)
+                    if not bool(self.k_center.any()):
+                        self.k_center.copy_(m)
+                        self.k_cov.copy_(cov)
+                    else:
+                        self.k_center.mul_(0.99).add_(m, alpha=0.01)
+                        self.k_cov.mul_(0.99).add_(cov, alpha=0.01)
+                    d = kd.size(-1)
+                    eps = (self.k_cov.diagonal().mean() * 1e-3).clamp_min(1e-8)
+                    evals, evecs = torch.linalg.eigh(
+                        self.k_cov + eps * torch.eye(d, device=self.k_cov.device, dtype=self.k_cov.dtype)
+                    )
+                    self.k_white.copy_(
+                        (evecs * evals.clamp_min(1e-12).rsqrt()) @ evecs.T
+                    )
+            k = ((k.float() - self.k_center) @ self.k_white).to(k.dtype)
+        elif self.to_k_center:
             # E75: subtract the running center (EMA momentum 0.99, detached —
             # the gradient path to to_k stays live; cold start initializes from
             # the first batch, BatchNorm convention). Eval uses the frozen

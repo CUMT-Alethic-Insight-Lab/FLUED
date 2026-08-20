@@ -88,6 +88,7 @@ def build_model(args: Namespace) -> FLUEDV36:
             k_block_eval=getattr(args, "k_block_eval", False),
             seed_source=getattr(args, "seed_source", "v"),
             to_k_center=getattr(args, "to_k_center", False),
+            to_k_whiten=getattr(args, "to_k_whiten", False),
             split_trunk=getattr(args, "split_trunk", False),
             readout_views=getattr(args, "readout_views", 1),
             xcache_supp=getattr(args, "xcache_supp", 0),
@@ -344,6 +345,21 @@ def build_parser() -> argparse.ArgumentParser:
         "buffer (persistent=False -- old checkpoints load strict-clean and "
         "stats re-estimate online from zero). Covers both WriteHead instances. "
         "Default off = bit-preserved legacy paths.",
+    )
+    parser.add_argument(
+        "--to-k-whiten",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Q10 hard-constraint gate (user-ruled 2026-08-20): WriteHead "
+        "whitens the to_k output pre-normalization — k <- (k - EMA_mean) @ "
+        "(EMA_cov + eps I)^{-1/2} (eigh, fp32, refreshed every training "
+        "step). Superset of --to-k-center (includes de-meaning; do not stack "
+        "the two flags). E79 showed de-mean-only surgery slowly re-collapses "
+        "(mu 0.690 -> 0.811); whitening crushes pairwise |cos| toward ~0 by "
+        "construction. Same buffer discipline as --to-k-center (persistent="
+        "False; fresh eval processes start with identity whitening until a "
+        "training-mode forward warms the buffers). Default off = bit-"
+        "preserved legacy paths.",
     )
     parser.add_argument(
         "--split-trunk",
