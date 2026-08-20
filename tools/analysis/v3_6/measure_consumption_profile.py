@@ -272,6 +272,26 @@ def main() -> None:
     model, ns, step = load_model(Path(args.run_dir), device)
     windows = build_eval_windows(ns, args.max_windows)
     masks = build_masks(windows, ns)
+    # Q10 口径追加（2026-08-20）：to_k_center/to_k_whiten 格的 buffer 是
+    # persistent=False，新进程冷启动（零中心/恒等白化=部署形态的假几何）。
+    # 测量前先用本批 eval 窗暖批（train 模式前向升 EMA，再切回 eval）——
+    # 与档案馆探针 _warm_k_center 同纪律；旗标全关的 checkpoint 是 no-op。
+    # 注：E86 的 b 格消费剖面是在冷 buffer（raw 几何）下测的，两臂同冷、
+    # Δ 仍有效，但绝对档级与暖 buffer 口径不可直接比。
+    _heads = [m for m in (getattr(model, "write_head", None), getattr(model, "write_head_k", None)) if m is not None]
+    if (getattr(model.config, "to_k_center", False) or getattr(model.config, "to_k_whiten", False)) and _heads:
+        from tools.analysis.v3_6.probe_oracle_write_verdict import _front_end as _fe
+        for m in _heads:
+            m.train()
+        for _ in range(3):
+            for clean, bm in zip(windows, masks):
+                source = clean.masked_fill(bm.to(clean.device), MASK_ID).to(device)
+                _c, _mem, _idx = _fe(model, source)
+                for m in _heads:
+                    m(_mem if m is getattr(model, "write_head", None) else _idx)
+        for m in _heads:
+            m.eval()
+        print(f"[prof] to_k_center/whiten buffers warmed (3 passes, heads={len(_heads)})", flush=True)
     sites = (
         ["k_rows", "v_rows", "bb_cross1"]
         + [f"bb_self{i}" for i in range(len(model.backbone.self_blocks))]

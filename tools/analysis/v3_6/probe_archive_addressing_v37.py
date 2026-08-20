@@ -250,7 +250,7 @@ def _warm_k_center(model, hay_fn, window: int, device: torch.device, passes: int
     （write_head / write_head_k）用 haystack 窗口做暖批（train 模式前向让
     EMA 升温），随后切回 eval —— 探针测到的是"若 buffer 持久化，部署形态
     下的去均值键几何"。旗标关闭的 checkpoint 零侵入。"""
-    if not getattr(model.config, "to_k_center", False):
+    if not (getattr(model.config, "to_k_center", False) or getattr(model.config, "to_k_whiten", False)):
         return
     heads = [m for m in (getattr(model, "write_head", None), getattr(model, "write_head_k", None)) if m is not None]
     wh_main = getattr(model, "write_head", None)  # exists only when v=state
@@ -265,7 +265,7 @@ def _warm_k_center(model, hay_fn, window: int, device: torch.device, passes: int
             m(memory if (wh_main is not None and m is wh_main) else index)
     for m in heads:
         m.eval()
-    print(f"[probe] to_k_center buffers warmed ({passes} passes, heads={len(heads)})", flush=True)
+    print(f"[probe] to_k_center/whiten buffers warmed ({passes} passes, heads={len(heads)})", flush=True)
 
 
 @torch.no_grad()

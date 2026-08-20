@@ -56,6 +56,9 @@ def measure_milestone(model, wh, rows_name, windows, masks, device) -> dict:
         rows = (memory if rows_name == "memory" else index)[0, : int(_chunks.chunk_mask[0].sum())]
         rows_per_window.append(rows)
     wh.k_center.zero_()  # 里程碑间统计不同步：统一从零冷启动再暖批
+    if getattr(wh, "to_k_whiten", False):
+        wh.k_cov.zero_()  # 白化格：协方差/白化阵同步归零（k_center 零值即触发冷启动全量重估）
+        wh.k_white.copy_(torch.eye(wh.k_white.size(0), device=wh.k_white.device, dtype=wh.k_white.dtype))
     wh.train()
     for _ in range(N_WARM_PASSES):
         for rows in rows_per_window:
@@ -71,21 +74,28 @@ def main() -> None:
     p.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     p.add_argument("--max-windows", type=int, default=16)
     p.add_argument("--out-dir", default="outputs/key_collapse_survey_20260818")
+    p.add_argument("--grids", default="", help="comma-separated label=run_dir overrides "
+                   "(default: the two tokcenter grids above; e.g. 'b-tokwhiten=checkpoints/...')")
     args = p.parse_args()
     device = torch.device("cuda" if (args.device == "auto" and torch.cuda.is_available()) or args.device == "cuda" else "cpu")
     out_dir = Path(args.out_dir)
     t0 = time.time()
 
     trajectories = []
-    for label, run in GRIDS:
+    grids = GRIDS
+    if args.grids:
+        grids = [tuple(item.split("=", 1)) for item in args.grids.split(",")]
+    for label, run in grids:
         run_dir = Path(run)
         model, ns, _step = load_model(run_dir, device)  # latest.pt just for build+windows
         channel, wh, rows_name = _resolve_channel(model)
-        assert getattr(model.config, "to_k_center", False), f"{label}: expected to_k_center=True"
+        assert (getattr(model.config, "to_k_center", False) or getattr(model.config, "to_k_whiten", False)), \
+            f"{label}: expected to_k_center or to_k_whiten=True"
         windows = build_eval_windows(ns, args.max_windows)
         masks = build_masks(windows, ns)
         points = []
         files = [run_dir / f"step_{s:06d}.pt" for s in MILESTONE_STEPS] + [run_dir / "latest.pt"]
+        files = [f for f in files if f.exists()]  # 在跑 run 的途中测量：跳过未到的里程碑
         for f in files:
             payload = torch.load(f, map_location=device, weights_only=False)
             model.load_state_dict(payload["model"], strict=True)

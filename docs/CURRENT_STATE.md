@@ -1075,3 +1075,9 @@ overflow 真凶是 URL 编码/base64 类**无语言边界的高熵字节流**（
   位次打乱+per-item 旗标必开）。⑤ 三选一裁定：硬约束闸门先点火（Q10 赛前冻结双前提/验收线/
   三档判决），fork 3 立项书同窗起草但补非线性段尾探针前置（解得出→靶子=读出接口；解不出→
   靶子=summarizer 编码目标/容量），终考现在执行否决（修订 2 后随闸门读数排期）。
+- 2026-08-20：（十九）**fork 3 撞车侦察收官（subagent 并行）**——三臂均无撞车：F2 引
+  Compressive Transformer/ICAE 为祖先与正面先例、SAC（2510.08907）为警示；F3 机制件全标准件
+  （新颖性挂考场与判据）、内险=slot collapse（2605.02323）须内置位置锚+SGPT 零参数对照臂；
+  F1 降级为配套消融轴（IB/posterior collapse 族：容量充足≠会被使用）。判读金规入立项书：
+  fork 3 的生死只看 E89 探针剖面，训练损失读数一律不作数。报告：docs/research/
+  COLLISION_SCOUT_FORK3_SUMMARIZER_FIDELITY_20260820_CN.md（存疑清单 9 项见 §8）。
