@@ -107,7 +107,11 @@ def test_splice_deterministic_same_seed():
         assert 0 <= slo < shi <= 384
         assert slo <= alo < ahi <= shi
         assert row[alo:ahi] == answer
-        assert answer.isalpha() and answer.isascii() and 3 <= len(answer) <= 10
+        # v2 cjk main arm (default): 2–4 char non-boundary segment (edges
+        # clean, no boundary char inside)
+        ans = answer.decode("utf-8")
+        assert 2 <= len(ans) <= 4
+        assert not any(ch in s1._BOUNDARY_CHARS for ch in ans)
         # tail layout: \n前文'<F with W -> ___>'空格处是什么？\n答案是：<W>
         tail = row[m["query_start"] :]
         assert tail.startswith("\n前文'".encode("utf-8"))
@@ -142,9 +146,15 @@ def test_splice_prob_zero_and_partial():
 def test_splice_inactive_without_ascii_word():
     raw = "中文窗口没有任何可抽取的英文单词，整段都是汉字标点。".encode("utf-8") * 6
     clean = _clean([raw], 300)
-    out, metas = s1._splice_retrieval(clean, 1.0, torch.Generator().manual_seed(5))
-    assert metas == [None]  # no [A-Za-z]{3,10} run anywhere -> inactive
+    # ascii control arm: no [A-Za-z]{3,10} run anywhere -> inactive even after N=8 retries
+    out, metas = s1._splice_retrieval(clean, 1.0, torch.Generator().manual_seed(5), "ascii")
+    assert metas == [None]
     assert torch.equal(out, clean)
+    # cjk main arm on the same window: activates (2–4 char non-boundary segments everywhere)
+    out2, metas2 = s1._splice_retrieval(clean, 1.0, torch.Generator().manual_seed(5), "cjk")
+    assert metas2[0] is not None
+    ans = metas2[0]["answer_b"].decode("utf-8")
+    assert 2 <= len(ans) <= 4
 
 
 def test_splice_inactive_short_window():

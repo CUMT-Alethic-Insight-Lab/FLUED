@@ -325,6 +325,46 @@ _RETRIEVAL_QUERY_PRE = "\n前文'".encode("utf-8")
 _RETRIEVAL_QUERY_POST = "'空格处是什么？".encode("utf-8")
 _RETRIEVAL_ECHO_PROMPT = "\n答案是：".encode("utf-8")
 _ASCII_WORD_RE = re.compile(rb"[A-Za-z]+")
+# Q11 v2 (user-ruled 2026-08-21): CJK small-segment main arm. Frozen values
+# from the prereg amendment: retry cap N=8 and the punctuation boundary set
+# (appendix A of FLUED_V3_7_RECRUITMENT_ARM_NATURAL_RETRIEVAL_20260821_CN.md).
+_RETRIEVAL_MAX_RETRY = 8
+_BOUNDARY_CHARS = frozenset(
+    "。，、；：？！“”‘’（）《》〈〉【】〔〕「」『』…—～・｜＂＇"
+    ".,;:?!\"'()[]{}<>/\\|@#$%^&*_+=~`-"
+    " \t\n\r\u3000\u00a0"
+)
+
+
+def _cjk_candidates(frag: bytes) -> list[tuple[int, int]]:
+    """Byte-offset (start, end) pairs of qualifying CJK small segments: every
+    2–4 char substring of a maximal non-boundary-char run (v2 §1: edges never
+    punctuation/whitespace, never crossing a boundary char; digits/letters
+    allowed inside). Decode-for-selection only; splicing stays byte-level."""
+    try:
+        s = frag.decode("utf-8")
+    except UnicodeDecodeError:
+        return []
+    offs = [0]
+    for ch in s:
+        offs.append(offs[-1] + len(ch.encode("utf-8")))
+    runs: list[tuple[int, int]] = []
+    start = None
+    for i, ch in enumerate(s):
+        if ch in _BOUNDARY_CHARS:
+            if start is not None:
+                runs.append((start, i))
+                start = None
+        elif start is None:
+            start = i
+    if start is not None:
+        runs.append((start, len(s)))
+    cands = []
+    for lo, hi in runs:
+        for L in (2, 3, 4):
+            for j in range(lo, hi - L + 1):
+                cands.append((offs[j], offs[j + L]))
+    return cands
 
 
 def _retrieval_enabled(args) -> bool:
@@ -355,27 +395,27 @@ def _check_retrieval_args(args) -> None:
         )
 
 
-def _splice_retrieval(clean: torch.Tensor, prob: float, generator: torch.Generator):
+def _splice_retrieval(clean: torch.Tensor, prob: float, generator: torch.Generator, answer_mode: str = "cjk"):
     """Splice one natural-retrieval instance into each selected window (CPU,
     pre-encode). Same splicing discipline as ``_splice_cloze``.
 
     Per row, in a fixed draw order on ``generator`` (selection uniform, then
-    fragment length, then fragment start, then answer-word index): with
-    probability ``prob`` pick a 32-64B contiguous in-window fragment F as the
-    source span (start uniform, snapped FORWARD to a UTF-8 char boundary, end
-    snapped BACKWARD -- byte-level splicing never decodes, so the question
-    segment stays valid UTF-8), pick one maximal ASCII run W ([A-Za-z]{3,10})
-    inside F uniformly as the answer word, and append at the window tail
-    ``\\n前文'`` + F with W replaced by ``___`` + ``'空格处是什么？`` +
-    ``\\n答案是：`` + W. The batch tensor WIDENS past seq_len to hold the
-    splice (same legality argument as cloze); the task counts only when the
-    echo survives packing whole (``_cloze_slot_grid`` skip rule, reused).
+    per-attempt: fragment length, fragment start, candidate index): with
+    probability ``prob`` try up to ``_RETRIEVAL_MAX_RETRY`` (N=8, v2 frozen)
+    fragment draws -- pick a 32-64B contiguous in-window fragment F (start
+    uniform, snapped FORWARD to a UTF-8 char boundary, end snapped BACKWARD),
+    then pick the answer segment inside F uniformly among the mode's
+    candidates: ``cjk`` (v2 main arm) = 2–4 char substrings of maximal
+    non-boundary runs (_cjk_candidates); ``ascii`` (v2 control arm) = maximal
+    [A-Za-z]{3,10} runs. Append at the window tail ``\\n前文'`` + F with the
+    answer replaced by ``___`` + ``'空格处是什么？`` + ``\\n答案是：`` +
+    answer. The batch tensor WIDENS past seq_len (same legality as cloze).
 
-    Rows without a qualifying fragment/word (short window, no ASCII run) stay
-    byte-identical and inactive (prob drawn, splice skipped). Returns
-    (new_clean, metas); metas[b] is None or {"source_span": (lo, hi),
-    "source_answer_span": (lo, hi), "query_start": int, "echo_span": (lo, hi),
-    "answer_b": bytes}.
+    Rows still without a candidate after N retries stay byte-identical and
+    inactive (draws consumed, splice skipped; counted in the activation
+    rate). Returns (new_clean, metas); metas[b] is None or
+    {"source_span": (lo, hi), "source_answer_span": (lo, hi),
+    "query_start": int, "echo_span": (lo, hi), "answer_b": bytes}.
     """
     bsz, width = clean.shape
     metas: list[dict | None] = [None] * bsz
@@ -390,26 +430,35 @@ def _splice_retrieval(clean: torch.Tensor, prob: float, generator: torch.Generat
         if u >= prob or n < 32 or not bool(valid[:n].all()) or bool(valid[n:].any()):
             continue
         raw = bytes(int(i) - BYTE_OFFSET for i in ids[:n].tolist())
-        frag_len = int(torch.randint(32, min(64, n) + 1, (1,), generator=generator))
-        start = int(torch.randint(0, n - frag_len + 1, (1,), generator=generator))
-        # UTF-8 snap: start forward to a char boundary, end backward (never
-        # split a multi-byte char at the fragment edges).
-        while start < n and (raw[start] & 0xC0) == 0x80:
-            start += 1
-        end = min(start + frag_len, n)
-        while end > start and end < n and (raw[end] & 0xC0) == 0x80:
-            end -= 1
-        frag = raw[start:end]
-        words = [m for m in _ASCII_WORD_RE.finditer(frag) if 3 <= m.end() - m.start() <= 10]
-        if not words:
-            continue  # no qualifying ASCII word in the fragment: inactive
-        w = words[int(torch.randint(len(words), (1,), generator=generator))]
-        answer = frag[w.start() : w.end()]
+        picked = None
+        for _attempt in range(_RETRIEVAL_MAX_RETRY):
+            frag_len = int(torch.randint(32, min(64, n) + 1, (1,), generator=generator))
+            start = int(torch.randint(0, n - frag_len + 1, (1,), generator=generator))
+            # UTF-8 snap: start forward to a char boundary, end backward
+            while start < n and (raw[start] & 0xC0) == 0x80:
+                start += 1
+            end = min(start + frag_len, n)
+            while end > start and end < n and (raw[end] & 0xC0) == 0x80:
+                end -= 1
+            frag = raw[start:end]
+            if answer_mode == "cjk":
+                cands = _cjk_candidates(frag)
+            else:
+                cands = [(m.start(), m.end()) for m in _ASCII_WORD_RE.finditer(frag) if 3 <= m.end() - m.start() <= 10]
+            if not cands:
+                continue
+            ci = int(torch.randint(len(cands), (1,), generator=generator))
+            picked = (start, end, frag, cands[ci])
+            break
+        if picked is None:
+            continue  # N retries exhausted: inactive (counted in activation rate)
+        start, end, frag, (a_lo, a_hi) = picked
+        answer = frag[a_lo:a_hi]
         tail = (
             _RETRIEVAL_QUERY_PRE
-            + frag[: w.start()]
+            + frag[:a_lo]
             + b"___"
-            + frag[w.end() :]
+            + frag[a_hi:]
             + _RETRIEVAL_QUERY_POST
             + _RETRIEVAL_ECHO_PROMPT
             + answer
@@ -418,7 +467,7 @@ def _splice_retrieval(clean: torch.Tensor, prob: float, generator: torch.Generat
         echo_lo = len(new) - len(answer)
         metas[b] = {
             "source_span": (start, end),
-            "source_answer_span": (start + w.start(), start + w.end()),
+            "source_answer_span": (start + a_lo, start + a_hi),
             "query_start": n,  # the tail starts at the original window end
             "echo_span": (echo_lo, len(new)),
             "answer_b": answer,
@@ -1151,7 +1200,10 @@ def step_model(model, batch, args, device, train: bool):
                 "retrieval (--retrieval-prob>0) and cloze (--cloze-prob>0) are mutually "
                 "exclusive (同窗只允许一种检索任务)"
             )
-        clean, retrieval_metas = _splice_retrieval(clean, float(args.retrieval_prob), _RETRIEVAL_GENERATOR)
+        clean, retrieval_metas = _splice_retrieval(
+            clean, float(args.retrieval_prob), _RETRIEVAL_GENERATOR,
+            getattr(args, "retrieval_answer_mode", "cjk"),
+        )
     clean = clean.to(device)
     valid = clean.ne(PAD_ID)
     if getattr(args, "mask_mode", "byte_span") == "mixed":

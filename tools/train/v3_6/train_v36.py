@@ -475,6 +475,15 @@ def build_parser() -> argparse.ArgumentParser:
         "preregistered ramp {0 -> 0.5 -> 1.0}.",
     )
     parser.add_argument(
+        "--retrieval-answer-mode",
+        choices=["cjk", "ascii"],
+        default="cjk",
+        help="Q11 v2 (user-ruled 2026-08-21): answer granularity — cjk = "
+        "2–4 char small segment from non-boundary runs (main arm, activation "
+        "~1.0); ascii = maximal [A-Za-z]{3,10} word (control/replication arm). "
+        "Both retry fragment draws up to N=8 before marking the row inactive.",
+    )
+    parser.add_argument(
         "--xcache-supp",
         type=int,
         default=0,
