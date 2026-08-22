@@ -89,6 +89,7 @@ def build_model(args: Namespace) -> FLUEDV36:
             seed_source=getattr(args, "seed_source", "v"),
             to_k_center=getattr(args, "to_k_center", False),
             to_k_whiten=getattr(args, "to_k_whiten", False),
+            pos_prior_keys=getattr(args, "pos_prior_keys", False),
             summarizer_pool=getattr(args, "summarizer_pool", "mean"),
             summarizer_aux_recon=getattr(args, "summarizer_aux_recon", False),
             summarizer_aux_weight=getattr(args, "summarizer_aux_weight", 0.1),
@@ -363,6 +364,17 @@ def build_parser() -> argparse.ArgumentParser:
         "False; fresh eval processes start with identity whitening until a "
         "training-mode forward warms the buffers). Default off = bit-"
         "preserved legacy paths.",
+    )
+    parser.add_argument(
+        "--pos-prior-keys",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="recruitment-arm B (user-ruled 2026-08-22, prereg §2): write "
+        "keys = FIXED random vectors per absolute chunk position (seeded "
+        "table, content-independent strong prior) — the diagnostic arm "
+        "answering 'is position the true index?'. Values/beta stay "
+        "content-driven; only the key path is replaced. Default off = "
+        "bit-preserved legacy paths.",
     )
     parser.add_argument(
         "--summarizer-pool",

@@ -238,6 +238,15 @@ class V36Config:
     # checkpoints do NOT load into mean-pool builds — loud by design).
     # "poswmean" = F3z zero-param control: position-weighted mean
     # (w_t ∝ t+1, SGPT family), no new parameters.
+    # Recruitment-arm B (user-ruled 2026-08-22; prereg
+    # FLUED_V3_7_RECRUITMENT_ARM_NATURAL_RETRIEVAL_20260821_CN.md §2):
+    # positional-prior keys — the write key is a FIXED random vector per
+    # absolute chunk position (seeded table, content-independent), the
+    # strong-prior diagnostic arm answering "is position the true index?".
+    # Values/beta/alpha stay content-driven; only the key path is replaced.
+    # Default False = bit-preserved legacy paths. Applies to whichever
+    # WriteHead instances exist (same convention as to_k_center).
+    pos_prior_keys: bool = False
     summarizer_pool: str = "mean"
     summarizer_aux_recon: bool = False
     summarizer_aux_weight: float = 0.1
@@ -459,6 +468,15 @@ class WriteHead(nn.Module):
         # subtract the running center from the to_k output, pre-normalization.
         self.to_k_center = getattr(c, "to_k_center", False)
         self.to_k_whiten = getattr(c, "to_k_whiten", False)
+        # Recruitment-arm B (see V36Config.pos_prior_keys): fixed random key
+        # per absolute chunk position, content-independent. Seeded table,
+        # persistent=False (rebuilt from the pinned seed at construction —
+        # every checkpoint loads strict-clean either way).
+        self.pos_prior_keys = getattr(c, "pos_prior_keys", False)
+        if self.pos_prior_keys:
+            gen = torch.Generator().manual_seed(20260822)
+            table = torch.randn(c.max_chunks, h * hk, generator=gen)
+            self.register_buffer("pos_key_table", table, persistent=False)
         if self.to_k_center or self.to_k_whiten:
             self.register_buffer("k_center", torch.zeros(h * hk), persistent=False)
         if self.to_k_whiten:
@@ -491,6 +509,12 @@ class WriteHead(nn.Module):
             h_v = self.trunk_v(memory)
         else:
             h_k = h_v = self.trunk(memory)
+        if self.pos_prior_keys:
+            # Recruitment-arm B: key = fixed random vector per absolute chunk
+            # position (content-independent strong prior); the content path
+            # below (to_k/center/whiten) is bypassed for the key only.
+            k = self.pos_key_table[:chunks].to(memory.dtype).unsqueeze(0).expand(bsz, -1, -1)
+            return self._gates_from_k(k, h_v, bsz, chunks)
         k = self.to_k(h_k)
         if self.to_k_whiten:
             # Q10 gate: whiten = de-mean + decorrelate + equalize variance
@@ -532,7 +556,11 @@ class WriteHead(nn.Module):
                     else:
                         self.k_center.mul_(0.99).add_(m, alpha=0.01)
             k = k - self.k_center.to(k.dtype)
-        k = F.normalize(k.view(bsz, chunks, self.heads, self.hk), dim=-1)
+        return self._gates_from_k(k, h_v, bsz, chunks)
+
+    def _gates_from_k(self, k: torch.Tensor, h_v: torch.Tensor, bsz: int, chunks: int) -> dict[str, torch.Tensor]:
+        """Shared post-key path (normalize k, produce v/alpha/beta|b,w)."""
+        k = F.normalize(k.reshape(bsz, chunks, self.heads, self.hk), dim=-1)
         v = self.to_v(h_v).view(bsz, chunks, self.heads, self.hv)
         alpha = torch.sigmoid(self.alpha_logit).view(1, 1, self.heads, self.hk)
         if self.recurrence == "gdn2":
