@@ -1103,6 +1103,17 @@ def step_model(model, batch, args, device, train: bool):
         + args.predict_weight * predict_loss
         + getattr(args, "cloze_weight", 0.3) * cloze_loss
     )
+    # fork 3 F2 (user-ruled 2026-08-21): auxiliary per-slot byte-reconstruction
+    # loss on the summarizer's memory rows — the pressure path that tells the
+    # summarizer the tail bytes must be IN the memory row. Train-time only:
+    # never computed in eval, so eval_loss stays form-identical to historical
+    # runs (comparability); the aux head never enters inference.
+    aux_recon_loss = torch.zeros((), device=device)
+    if train and getattr(args, "summarizer_aux_recon", False) and out.get("memory") is not None:
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=args.amp and device.type == "cuda"):
+            aux_logits = model.aux_recon_logits(out["memory"])
+        aux_recon_loss = _ce(aux_logits, targets, slot_mask)
+        loss = loss + args.summarizer_aux_weight * aux_recon_loss
     # Metrics stay on device (detached scalars); the training loop accumulates
     # them and only syncs to host at log time -- per-step .item() calls on
     # ~19 metrics were serializing the pipeline.
@@ -1120,6 +1131,7 @@ def step_model(model, batch, args, device, train: bool):
         "retention_truncated_slots": retention_trunc.detach().float(),
         "predict_cos": predict_cos.detach(),
         "cloze_loss": cloze_loss.detach(),
+        "aux_recon_loss": aux_recon_loss.detach(),
         "cloze_byte_acc": cloze_metrics["cloze_byte_acc"],
         "cloze_exact": cloze_metrics["cloze_exact"],
         "cloze_count": cloze_metrics["cloze_count"],

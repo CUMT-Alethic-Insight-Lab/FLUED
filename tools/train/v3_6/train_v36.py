@@ -89,6 +89,8 @@ def build_model(args: Namespace) -> FLUEDV36:
             seed_source=getattr(args, "seed_source", "v"),
             to_k_center=getattr(args, "to_k_center", False),
             to_k_whiten=getattr(args, "to_k_whiten", False),
+            summarizer_aux_recon=getattr(args, "summarizer_aux_recon", False),
+            summarizer_aux_weight=getattr(args, "summarizer_aux_weight", 0.1),
             split_trunk=getattr(args, "split_trunk", False),
             readout_views=getattr(args, "readout_views", 1),
             xcache_supp=getattr(args, "xcache_supp", 0),
@@ -360,6 +362,25 @@ def build_parser() -> argparse.ArgumentParser:
         "False; fresh eval processes start with identity whitening until a "
         "training-mode forward warms the buffers). Default off = bit-"
         "preserved legacy paths.",
+    )
+    parser.add_argument(
+        "--summarizer-aux-recon",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="fork 3 F2 (user-ruled 2026-08-21): train-time-only auxiliary "
+        "per-slot byte-reconstruction head on the summarizer's memory rows "
+        "(the H-obj arm: the tail bytes never enter the memory row, E89/E95). "
+        "Small head (2-layer MLP + slot table, ~1.9M params — scout capacity "
+        "cap against decoder explain-away); removed at inference. Verdict "
+        "lines are the probe profiles, never the aux loss. Default off = "
+        "bit-preserved legacy paths.",
+    )
+    parser.add_argument(
+        "--summarizer-aux-weight",
+        type=float,
+        default=0.1,
+        help="fork 3 F2: weight of the auxiliary reconstruction loss on top "
+        "of the main tasks (pre-registered 0.1).",
     )
     parser.add_argument(
         "--split-trunk",

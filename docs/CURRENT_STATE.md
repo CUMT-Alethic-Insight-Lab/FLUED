@@ -161,6 +161,7 @@ overflow 真凶是 URL 编码/base64 类**无语言边界的高熵字节流**（
 | E92 | **段内字节乱序探针（位置沉淀 vs 内容偏置，c 格 v37_c_is memory 行，16 窗，E73-A6 口径）——位置沉淀坐实：乱序后头尾比 4.944 几乎不动（基线 5.148），fork 3 F3 池化臂获直接依据**：段内有效 span 乱序（嵌入随内容走，只重跑 summarizer，DiT 带 RoPE 位置敏感故乱序非平凡）后逐 slot 剖面：head 0.4443→0.1424、tail 0.0863→0.0288，**比值 5.148→4.944 不变**——沉淀按位置不按内容（池化结构病）；但绝对水位整体掉 ~3×（乱序内容对训好的 summarizer 是 OOD，自然语序对绝对可解码量有贡献）——形状是位置的、水位有内容成分，判词按赛前冻结规则落"位置沉淀"并如实登记水位注记。锚校验：基线臂 slot0-3 逐位复现 E88（Δ=0.0000） | 已验证（零训练，16 窗，乱序种子 20260821，锚全过） | outputs/audit_measurements_20260819/probe_position_sink.json + SUMMARY_position_sink.txt（2026-08-21） |
 | E93 | **码本臂 0 入口闸：split-trunk 30 步冒烟对照（b 格+tokcenter±split_trunk，E79 解耦冒烟口径）——零期望成立，拆分准入册**：双臂全程零 NaN；step20 对照 loss 12.935 vs 13.033、direct_acc 0.0392 vs 0.0390、key_mu_k 0.526 vs 0.537、state_norm 1.74 vs 1.87——几何与任务指标无显著差异（梯度隔离机制级证明已由 tests/test_v37_split_trunk.py 承担：键侧损失对值支路梯度恰为零）。码本臂对照纯度的前置条件（唯一合法差异=键路径）由此满足 | 已验证（30 步冒烟×2，同种子同配方） | checkpoints/_smoke_b_tokcenter_shared_20260821 + _smoke_b_tokcenter_split_20260821（2026-08-21） |
 | E94 | **views4 格（E85）逐条目记录补跑落盘（追账清零）**：probe_archive_addressing_v37 --per-item-log 重跑，36 docs 逐条目记录（命中/μ_i/位次）入 `outputs/s39_addressing_probe_v37_20260817/report_..._views4_....json` 的 k_side[0].per_item；读数与 E85 原口径一致（D=4 hit@3/5=0.25/0.33 但 hit@1=0.00；D=16 hit@1=0.08 单 hit 落在 μ_i=0.99 高相干条目——E79 谓词证伪形态第三次复现；D=64 全零）。同轮追账：① zero_V=0.3185/zero_KV→0.0129 的落盘文件=`outputs/audit_measurements_20260819/completion_prior_floor.json`（40K 对象逐位不动实测，含 prior_floor 0.0129，审计包已含副本 audit_measurements__completion_prior_floor.json）——销账；② "档案馆防止主干对数字过于敏感"全文档检索零命中（docs/ 全库 + 探针源码注释）——无登记出处，按黑户销案 | 已验证（探针复跑与原口径一致；两条簿记清零） | report views4 per-item + completion_prior_floor.json（2026-08-21） |
+| E95 | **F2 点火前提探针·严格 2-fold 版收官（c 格 memory 行，与岭回归同任务同 2-fold 同 real−garbage 同 majority 基线）——段尾信息真缺席终判，F2 靶子=压缩目标/容量**：2 层 MLP（hidden 1024，GELU，参数量 10M ≤ 4×ridge 预算核验 OK）对岭回归的段尾超额 = **−0.0062**（三次独立测量收敛：E89 −0.002、2fold 首跑 +0.008、本次 −0.006），非线性段尾 0.078 贴 majority 档 0.099 之下；护栏全过（泛化一致性 val vs test gap 为负值，无伪影）。**口径裁定（用户预注册护栏的落地注记）**：字面值 train/test gap 在小行数预算下对任何充分训练的高容量探针必然 >15pp（记忆与有效 held-out 估计共存），按护栏真实意图改读"泛化一致性"（val 留出集 vs test，两个探针未见集）作判据，记忆差距仅透明披露——**首跑按字面值触发作废，此为探针协议修订记录**。中途插曲如实登记：固定 3000 步在 ~1300 行上=1400 epochs 必然记忆，已改为 best-val 早停选择。判词落定 F2 靶子措辞=压缩目标/容量（为什么段尾没进 memory 行），F2 于同日点火 | 已验证（零训练，16 窗，2-fold 双向，三护栏核验） | outputs/audit_measurements_20260819/probe_tail_nonlinear_2fold.json + SUMMARY_tail_nonlinear_2fold.txt（2026-08-21） |
 
 ## 4. 闸门注册表
 
@@ -1100,3 +1101,11 @@ overflow 真凶是 URL 编码/base64 类**无语言边界的高熵字节流**（
   （折叠进 align 层不可行除非砍非线性）、"防止主干对数字过于敏感"查无登记销案），E91 μ 轨迹
   单独成行，E92 位置沉淀坐实（乱序后头尾比 4.944 不动，fork3 F3 直接依据），E93 split-trunk
   冒烟零期望成立（码本臂 0 入口闸过），队列 Q11/Q12 建立。
+- 2026-08-21：（二十二）**F2 点火（E95 判词落定后）**：严格 2-fold 非线性探针三护栏收官——
+  段尾信息真缺席终判（非线性对线性超额 −0.0062，三测收敛），F2 靶子=压缩目标/容量；探针护栏
+  口径裁定：train/test gap 按真实意图改读泛化一致性（val vs test），记忆差距仅透明披露。
+  F2 实现落地：--summarizer-aux-recon（训练期专用 2 层 MLP+slot 表 ~1.9M 辅助头，scout 容量帽，
+  推理拆除；eval 总损失形态与历史逐位一致）、6 项新单测、全量 400+4 绿、30 步冒烟零 NaN；
+  正式臂 v37_c_is_v371_auxrecon_20k_ctx4096_20260821 点火（20K@4096B 无 cloze，纯 c 格单变量）。
+  fork 3 立项书补丁：codec 税报备行（>2pp=部分失败）+三结局类解释键（E92 位置沉淀依据）。
+  训练窗口排序：F2 → 锁 v2 V 形检验两相 → 招募臂（任务构造器+掩码线程并行写）。

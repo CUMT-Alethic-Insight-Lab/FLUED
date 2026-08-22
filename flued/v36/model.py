@@ -218,6 +218,18 @@ class V36Config:
     # is subsumed (whitening includes de-meaning); do not stack the flags.
     # Default False = every legacy path bit-preserved.
     to_k_whiten: bool = False
+    # fork 3 F2 (user-ruled 2026-08-21; spec docs/versions/v3.7/
+    # FLUED_V3_7_FORK3_SUMMARIZER_FIDELITY_20260820_CN.md): train-time-only
+    # auxiliary per-slot byte-reconstruction loss on the summarizer's memory
+    # rows (the H-obj arm — "pressure insufficiency": the tail bytes never
+    # enter the memory row, E89/E95). The aux head is small (2-layer MLP +
+    # slot table, ~1.9M params — scout capacity cap against decoder
+    # explain-away) and is REMOVED at inference (conditional creation; the
+    # deployment form is unchanged). Verdict lines are the probe profiles
+    # (E89/E92 protocol), never the aux loss itself. Default False = every
+    # legacy path bit-preserved.
+    summarizer_aux_recon: bool = False
+    summarizer_aux_weight: float = 0.1
     # fork 2 (user-ruled 2026-08-19; spec docs/versions/v3.7/
     # FLUED_V3_7_FORK2_MULTIVIEW_READOUT_20260819_CN.md): multi-view readout.
     # readout_views=m>1 expands the backbone STORE side of each state channel
@@ -1946,6 +1958,34 @@ class FLUEDV36(nn.Module):
         self.decoder = GlobalSpanDecoder(c, self.byte_lookup)
         self.chunk_pos = nn.Embedding(c.max_chunks, c.d_backbone)
         nn.init.trunc_normal_(self.chunk_pos.weight, std=0.02)
+        # fork 3 F2 (user-ruled 2026-08-21; spec docs/versions/v3.7/
+        # FLUED_V3_7_FORK3_SUMMARIZER_FIDELITY_20260820_CN.md): train-time-only
+        # auxiliary byte-reconstruction head on the summarizer's memory rows —
+        # the pressure path that tells the summarizer "the tail bytes must be
+        # IN the memory row" (E89/E95: the tail is absent, not unreachable).
+        # Scout capacity cap: 2 layers / ~1.9M params (防 decoder explain-away
+        # — the aux head must stay in the E89 probe class, not out-decode it).
+        # Conditional creation: default off = every legacy path bit-preserved
+        # (old checkpoints load strict-clean; an aux-trained checkpoint does
+        # NOT strict-load into a flag-off model — by design, loud).
+        if getattr(c, "summarizer_aux_recon", False):
+            h_dim = 1024
+            self.aux_slot = nn.Parameter(torch.empty(c.max_span, h_dim))
+            nn.init.trunc_normal_(self.aux_slot, std=0.02)
+            self.aux_recon = nn.Sequential(
+                nn.Linear(c.d_mem, h_dim),
+                nn.GELU(),
+                nn.Linear(h_dim, h_dim),
+                nn.GELU(),
+            )
+            self.aux_out = nn.Linear(h_dim, 258)
+
+    def aux_recon_logits(self, memory: torch.Tensor) -> torch.Tensor:
+        """(B, C, d_mem) memory rows -> (B, C, max_span, 258) per-slot byte
+        logits (train-time-only F2 aux head; never used in eval/inference)."""
+        h = self.aux_recon(memory)  # (B, C, H)
+        h = h.unsqueeze(2) + self.aux_slot.view(1, 1, *self.aux_slot.shape)
+        return self.aux_out(h)
 
     def _front_end_frozen(self) -> bool:
         mods = (self.byte_lookup, *self.encoder_blocks, *self.segmentor_blocks, self.segmentor_head)
