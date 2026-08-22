@@ -1401,16 +1401,22 @@ class SLMBackbone(nn.Module):
         chunk_mask: torch.Tensor,
         pos: torch.Tensor,
         chunk_byte_off: torch.Tensor | None = None,
+        store_block: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """k_rows: (B, C, d_mem|d_pack) K source rows (index or K~);
         v_rows: (B, C, d_mem|d_pack) V source rows (memory or V~);
         pos: (1, C, d_backbone) chunk position embedding. fork 2: a 4-dim
-        (B, C, m, d) k_rows/v_rows routes to the multi-view store path."""
+        (B, C, m, d) k_rows/v_rows routes to the multi-view store path.
+        store_block: optional (B, n_q, n_kv_chunk) bool — True = the store
+        row is EXCISED for that query (recruitment arm 档 a mask-level
+        excision, user-ruled 2026-08-21: the only bypass needing removal —
+        direct path is per-chunk leak-free by construction). Applied before
+        the diagonal-keep so no query row ever goes fully masked."""
         bsz, n = chunk_mask.shape
         kv = k_rows.size(2) if k_rows.dim() == 4 else 1
         vv = v_rows.size(2) if v_rows.dim() == 4 else 1
         if max(kv, vv) > 1:
-            return self._forward_views(k_rows, v_rows, chunk_mask, pos, chunk_byte_off, max(kv, vv))
+            return self._forward_views(k_rows, v_rows, chunk_mask, pos, chunk_byte_off, max(kv, vv), store_block)
         nh = self.nhead
         hd = pos.size(-1) // nh
         store_v = self.align_v(v_rows)  # (B, C, d) -- shared: store V side AND seeds
@@ -1440,6 +1446,8 @@ class SLMBackbone(nn.Module):
         # fully-masked SDPA row yields NaN, and 0*NaN poisons downstream)
         future = torch.triu(torch.ones(n, n, dtype=torch.bool, device=k_rows.device), diagonal=1)
         allowed = (~future).view(1, 1, n, n) & chunk_mask.view(bsz, 1, 1, n)
+        if store_block is not None:
+            allowed = allowed & ~store_block.view(bsz, 1, n, n)
         allowed = allowed | torch.eye(n, dtype=torch.bool, device=k_rows.device).view(1, 1, n, n)
         # block 1: cross-read; Q self-produced from the hidden state
         q = self.q_proj(h).view(bsz, n, nh, hd).transpose(1, 2)
@@ -1465,6 +1473,7 @@ class SLMBackbone(nn.Module):
         pos: torch.Tensor,
         chunk_byte_off: torch.Tensor | None,
         views: int,
+        store_block: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """fork 2 multi-view store path (spec §1.1/§1.3): each chunk
         contributes `views` store entries — its m measurement rows from the
@@ -1502,6 +1511,9 @@ class SLMBackbone(nn.Module):
         qidx = torch.arange(n, device=k_rows.device)
         causal = store_chunk.view(1, -1) <= qidx.view(-1, 1)  # (n, n*views)
         allowed = causal.view(1, 1, n, n * views) & chunk_mask[:, store_chunk].view(bsz, 1, 1, n * views)
+        if store_block is not None:
+            # chunk-space excision replicated across each chunk's views
+            allowed = allowed & ~store_block.repeat_interleave(views, dim=2).view(bsz, 1, n, n * views)
         first_view = (torch.arange(n * views, device=k_rows.device) % views == 0).view(1, -1)
         diag = (store_chunk.view(1, -1) == qidx.view(-1, 1)) & first_view
         allowed = allowed | diag.view(1, 1, n, n * views)
@@ -2076,7 +2088,7 @@ class FLUEDV36(nn.Module):
             return k_rows, v_rows, state_norm, memory, index, k_store, v_store
         return k_rows, v_rows, state_norm, memory, index
 
-    def _forward_slm(self, chunks: ChunkBatch, confidence: torch.Tensor, valid: torch.Tensor, hard_cut: torch.Tensor, cut_overflow: torch.Tensor) -> V36Output:
+    def _forward_slm(self, chunks: ChunkBatch, confidence: torch.Tensor, valid: torch.Tensor, hard_cut: torch.Tensor, cut_overflow: torch.Tensor, store_block: torch.Tensor | None = None) -> V36Output:
         """v3.7 slm forward (consensus §1-2): the SLM backbone reads the
         summarizer-owned store; the decoder conditions on the SAME V source
         rows as the backbone store (direct), and completion reads the
@@ -2092,6 +2104,7 @@ class FLUEDV36(nn.Module):
             k_store if k_store is not None else k_rows,
             v_store if v_store is not None else v_rows,
             chunks.chunk_mask, pos, chunk_byte_off=chunk_byte_off,
+            store_block=store_block,
         )
         cond_backbone = backbone_out + pos
         dec_in = self.decoder_in if self.config.v_row_source == "state" else self.decoder_in_mem
@@ -2119,7 +2132,7 @@ class FLUEDV36(nn.Module):
             prefix=None,
         )
 
-    def forward(self, token_ids: torch.Tensor) -> V36Output:
+    def forward(self, token_ids: torch.Tensor, store_block: torch.Tensor | None = None) -> V36Output:
         byte_states, confidence, valid, _logits = self._encode(token_ids)
         hard_cut, utf8_cont, cut_overflow = self._cuts(token_ids, confidence, valid)
         chunks = self.chunk_builder(byte_states, valid, hard_cut, confidence)
@@ -2128,7 +2141,7 @@ class FLUEDV36(nn.Module):
             # v3.7 slm mode: dedicated path (summarizer-owned K/V + SLM
             # backbone + decoder on the same V); the legacy content channel
             # below is bypassed entirely.
-            return self._forward_slm(chunks, confidence, valid, hard_cut, cut_overflow)
+            return self._forward_slm(chunks, confidence, valid, hard_cut, cut_overflow, store_block=store_block)
         memory = self.summarizer(chunks.span_embeddings, chunks.token_mask)
         gates = self.write_head(memory)
         package, state_norm = self.state_machine(gates, chunks.chunk_mask)
