@@ -1631,9 +1631,13 @@ def step_model(model, batch, args, device, train: bool):
         retrieval_slot, retrieval_active = _cloze_slot_grid(
             retrieval_metas, chunks.chunk_ids, chunks.offsets, args.max_chunks, args.max_span
         )
-        retrieval_loss, retrieval_metrics = _retrieval_loss_and_metrics(
+        retrieval_loss, _retrieval_rm = _retrieval_loss_and_metrics(
             out["logits_backbone"], comp_targets, retrieval_slot, retrieval_active
         )
+        # keep the pre-initialized Q12 budget gauges (setdefault zeros) — the
+        # loss helper returns only the base keys, and splice-free batches
+        # would otherwise KeyError downstream
+        retrieval_metrics.update(_retrieval_rm)
         retrieval_metrics["retrieval_block_rate"] = torch.tensor(
             out.get("retrieval_block_rate", 0.0), device=device
         )
