@@ -484,6 +484,14 @@ def build_parser() -> argparse.ArgumentParser:
         "Both retry fragment draws up to N=8 before marking the row inactive.",
     )
     parser.add_argument(
+        "--retrieval-block-ramp",
+        type=str,
+        default="",
+        help="Q11 r 爬坡 (prereg §4): 'r:step,r:step,...' schedule, e.g. "
+        "'0:0,0.5:5000,1.0:10000' — r applies from its step onward (each tier "
+        ">=5K steps per prereg). Empty = fixed --retrieval-block-prob.",
+    )
+    parser.add_argument(
         "--xcache-supp",
         type=int,
         default=0,

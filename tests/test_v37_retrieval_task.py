@@ -401,3 +401,26 @@ def test_parser_defaults_retrieval_off():
     assert args.retrieval_prob == 0.0  # default off = zero intrusion
     assert args.retrieval_weight == 1.0
     assert args.retrieval_block_prob == 0.0
+
+
+# --- 8. r 爬坡调度器（Q11 prereg §4） ------------------------------------------
+
+
+def test_block_ramp_parse_and_lookup():
+    ramp = s1._parse_block_ramp("0:0,0.5:5000,1.0:10000")
+    assert ramp == [(0, 0.0), (5000, 0.5), (10000, 1.0)]
+    assert s1._ramp_lookup(ramp, 0) == 0.0
+    assert s1._ramp_lookup(ramp, 4999) == 0.0
+    assert s1._ramp_lookup(ramp, 5000) == 0.5
+    assert s1._ramp_lookup(ramp, 9999) == 0.5
+    assert s1._ramp_lookup(ramp, 10000) == 1.0
+    assert s1._ramp_lookup(ramp, 20000) == 1.0
+
+
+def test_block_ramp_unsorted_and_out_of_range():
+    ramp = s1._parse_block_ramp("1.0:10000,0:0,0.5:5000")
+    assert ramp[0] == (0, 0.0)
+    import pytest
+
+    with pytest.raises(SystemExit):
+        s1._parse_block_ramp("1.5:5000")

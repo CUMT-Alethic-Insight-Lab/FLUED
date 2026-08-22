@@ -321,6 +321,33 @@ def _cloze_loss_and_metrics(logits_backbone: torch.Tensor, comp_targets: torch.T
 # the mask and cloze streams (same seed family, different stream).
 _RETRIEVAL_GENERATOR = torch.Generator()
 _RETRIEVAL_SEED_OFFSET = 101_009
+# Q11 r 爬坡（prereg §4: {0 → 0.5 → 1.0}，每档 ≥5K 步）：main() 从
+# --retrieval-block-ramp 解析填充，训练循环每步查表覆写 args 上的 r。
+_RETRIEVAL_RAMP: list[tuple[int, float]] | None = None
+
+
+def _parse_block_ramp(spec: str) -> list[tuple[int, float]]:
+    """'0:0,0.5:5000,1.0:10000' -> [(0, 0.0), (5000, 0.5), (10000, 1.0)]
+    (step, r) sorted by step; r applies from its step onward."""
+    ramp = []
+    for item in spec.split(","):
+        r_s, step_s = item.split(":")
+        ramp.append((int(step_s), float(r_s)))
+    ramp.sort()
+    for _s, r in ramp:
+        if not 0.0 <= r <= 1.0:
+            raise SystemExit(f"--retrieval-block-ramp r out of [0, 1]: {r}")
+    return ramp
+
+
+def _ramp_lookup(ramp: list[tuple[int, float]], step: int) -> float:
+    r = ramp[0][1]
+    for s, rr in ramp:
+        if step >= s:
+            r = rr
+        else:
+            break
+    return r
 _RETRIEVAL_QUERY_PRE = "\n前文'".encode("utf-8")
 _RETRIEVAL_QUERY_POST = "'空格处是什么？".encode("utf-8")
 _RETRIEVAL_ECHO_PROMPT = "\n答案是：".encode("utf-8")
@@ -1663,6 +1690,10 @@ def main() -> None:
             f"weight={args.retrieval_weight} block_prob(r)={args.retrieval_block_prob}",
             flush=True,
         )
+    if getattr(args, "retrieval_block_ramp", ""):
+        global _RETRIEVAL_RAMP
+        _RETRIEVAL_RAMP = _parse_block_ramp(args.retrieval_block_ramp)
+        print(f"[s1] retrieval r 爬坡 (prereg §4): {_RETRIEVAL_RAMP}", flush=True)
     if args.codec_final_state:
         if not getattr(args, "state_channel", True):
             raise SystemExit("--codec-final-state requires --state-channel (this arm trains the state channel itself)")
@@ -1758,6 +1789,8 @@ def main() -> None:
         for batch in train_loader:
             if step >= args.max_steps:
                 break
+            if _RETRIEVAL_RAMP is not None:
+                args.retrieval_block_prob = _ramp_lookup(_RETRIEVAL_RAMP, step)
             loss, metrics = step_model(model, batch, args, device, train=True)
             if not bool(torch.isfinite(loss)):
                 nan_skips += 1
