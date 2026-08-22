@@ -584,6 +584,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--optimizer", default="fused_adamw")
     parser.add_argument("--warmup-steps", type=int, default=200)
+    parser.add_argument(
+        "--lr-const-after-resume",
+        type=float,
+        default=0.0,
+        help="Q12 40K 延长臂（用户冻结 2026-08-22）：resume 后不复用旧 cosine "
+        "尾段——重置 base lr 后 re-warmup --lr-rewarmup 步、随后恒定本值至 "
+        "max-steps。0 = 常规 cosine 调度。",
+    )
+    parser.add_argument(
+        "--lr-rewarmup",
+        type=int,
+        default=200,
+        help="--lr-const-after-resume 的 re-warmup 步数（冻结 200）。",
+    )
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--log-every", type=int, default=20)
     parser.add_argument("--ckpt-every", type=int, default=1000)

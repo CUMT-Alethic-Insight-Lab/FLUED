@@ -1974,6 +1974,26 @@ def main() -> None:
         start_step = int(payload.get("step", 0))
         if start_step > 0:
             sched.step(start_step)
+    if float(getattr(args, "lr_const_after_resume", 0.0)) > 0 and start_step > 0:
+        # Q12 40K 延长臂（用户冻结 2026-08-22）：不复用旧 cosine 尾段——
+        # 重置 base lr 后 re-warmup lr_rewarmup 步、随后恒定 lr_const_after_resume
+        for g in opt.param_groups:
+            g["lr"] = args.lr
+        _target = float(args.lr_const_after_resume) / args.lr
+        _rew = int(getattr(args, "lr_rewarmup", 200))
+
+        def _const_lambda(s, _t=_target, _r=_rew, _s0=start_step):
+            rel = s - _s0
+            if rel < _r:
+                return _t * (rel + 1) / _r
+            return _t
+
+        sched = torch.optim.lr_scheduler.LambdaLR(opt, _const_lambda)
+        sched.step(start_step)
+        print(
+            f"[s1] LR 覆写（用户冻结 40K 延长）：re-warmup {_rew} 步 → 恒定 {args.lr_const_after_resume}（不复用 cosine 尾段）",
+            flush=True,
+        )
         print(f"[s1] resumed from step {start_step}", flush=True)
 
     log_path = out_dir / "train_log.jsonl"

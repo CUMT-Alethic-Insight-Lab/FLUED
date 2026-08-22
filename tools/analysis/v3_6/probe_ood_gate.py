@@ -120,6 +120,8 @@ def score_doc(model, doc: bytes, echo_lo: int, answer: bytes, device):
         "byte_acc": float(hits.float().mean()),
         "exact": bool(hits.all()),
         "format_ok": tgt_utf8_ok and not degenerate,
+        "echo_lo": echo_lo,
+        "doc_len": len(doc),
     }
 
 
@@ -205,6 +207,7 @@ def main() -> None:
         "device": device.type,
         "checkpoint": {"run": Path(args.run_dir).name, "step": step},
         "levels": summary,
+        "per_item": {str(k): v for k, v in results.items()},
         "blind_prior_byte_acc": prior_acc,
         "gate": {"margin": MARGIN, "format_line": 0.90, "ok": gate_ok},
         "verdict": verdict,
