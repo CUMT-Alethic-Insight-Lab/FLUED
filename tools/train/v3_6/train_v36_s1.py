@@ -1300,10 +1300,16 @@ def _key_geometry_metrics(model, out: dict, device) -> dict:
             kh = kr[:, h]
             G = kh @ kh.T
             off = G.abs()[~torch.eye(kh.size(0), dtype=torch.bool, device=kh.device)]
-            eig = torch.linalg.eigvalsh(G).clamp(min=0.0)
             mus.append(off.mean())
             mx.append(off.max())
-            prs.append(eig.sum() ** 2 / eig.square().sum().clamp(min=1e-12) / kh.size(0))
+            try:
+                eig = torch.linalg.eigvalsh(G).clamp(min=0.0)
+                prs.append(eig.sum() ** 2 / eig.square().sum().clamp(min=1e-12) / kh.size(0))
+            except torch._C._LinAlgError:
+                # dashboard must never kill training: degenerate states (e.g.
+                # runaway state_norm at hot LR) make eigh fail to converge —
+                # report a placeholder, not a crash (2026-08-22 40K 延长臂教训)
+                prs.append(torch.zeros((), device=kh.device))
         return torch.stack(mus).mean().detach(), torch.stack(mx).max().detach(), torch.stack(prs).mean().detach()
 
     cfg = model.config
