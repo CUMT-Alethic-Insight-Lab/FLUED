@@ -50,6 +50,18 @@ Tasks (spec section 20, user-designed):
    question's first chunk, so the answer reaches the question only through
    K->state->readout. Mutually exclusive with --cloze-prob>0 (同窗只允许一种
    检索任务). Default off (``--retrieval-prob 0.0`` = zero intrusion).
+   Q12 示例密集形态 (修订案 v3, 2026-08-22 冻结): ``--retrieval-examples``
+   2–4 prepends that many COMPLETE examples (same 前文/答案是 format, answer
+   visible and force-UNMASKED) before the query; query last (nothing is ever
+   inserted after it). Anti-shortcut clauses are per-sample mechanical
+   asserts (query answer never a byte-substring of any example; example
+   source spans/contents distinct from the query's -- violations redraw up
+   to N=8, then the sample stays inactive). Window budget (appendix A2②):
+   source and query segments are never truncated; on overflow the EARLIEST
+   examples are dropped first (drop rate recorded); a query pushed off the
+   chunk grid is a construction defect (sample discarded, counted). Per-batch
+   metrics: retrieval_budget_ratio / retrieval_examples / retrieval_drop_rate
+   / retrieval_defect. Default 0 = the example-free form, bitwise-identical.
 
 Metric redefinition (S1.0+): direct fidelity excludes nothing but MASK_ID
 positions are reported separately (trivially correct); masked acc is backbone
@@ -351,6 +363,22 @@ def _ramp_lookup(ramp: list[tuple[int, float]], step: int) -> float:
 _RETRIEVAL_QUERY_PRE = "\n前文'".encode("utf-8")
 _RETRIEVAL_QUERY_POST = "'空格处是什么？".encode("utf-8")
 _RETRIEVAL_ECHO_PROMPT = "\n答案是：".encode("utf-8")
+
+
+def _retrieval_qa_block(frag: bytes, a_lo: int, a_hi: int, answer: bytes) -> bytes:
+    """One 前文/答案是 block (Q12.1 format, identical for examples and the
+    query): ``\\n前文'`` + frag with the answer span blanked to ``___`` +
+    ``'空格处是什么？`` + ``\\n答案是：`` + answer. Examples keep the answer
+    visible; the query's echo is force-MASKED downstream (mask overrides)."""
+    return (
+        _RETRIEVAL_QUERY_PRE
+        + frag[:a_lo]
+        + b"___"
+        + frag[a_hi:]
+        + _RETRIEVAL_QUERY_POST
+        + _RETRIEVAL_ECHO_PROMPT
+        + answer
+    )
 _ASCII_WORD_RE = re.compile(rb"[A-Za-z]+")
 # Q11 v2 (user-ruled 2026-08-21): CJK small-segment main arm. Frozen values
 # from the prereg amendment: retry cap N=8 and the punctuation boundary set
@@ -401,12 +429,22 @@ def _retrieval_enabled(args) -> bool:
 def _check_retrieval_args(args) -> None:
     """Loud CLI validation for the natural retrieval task (recruitment arm):
     r out of [0, 1] is always an error; a live task is slm-only and mutually
-    exclusive with cloze (同窗只允许一种检索任务)."""
+    exclusive with cloze (同窗只允许一种检索任务). Q12 示例密集形态
+    (修订案 v3): --retrieval-examples is 0 (example-free form) or 2–4, and
+    requires a live retrieval task."""
     r = float(getattr(args, "retrieval_block_prob", 0.0))
     if not 0.0 <= r <= 1.0:
         raise SystemExit(
             f"--retrieval-block-prob must lie in [0, 1] (档 a 掩码剔除比例 r, got {r})"
         )
+    n_ex = int(getattr(args, "retrieval_examples", 0))
+    if n_ex != 0 and not 2 <= n_ex <= 4:
+        raise SystemExit(
+            f"--retrieval-examples must be 0 (无示例形态) or 2–4 (Q12 示例密集形态, "
+            f"修订案 v3 Q12.1), got {n_ex}"
+        )
+    if n_ex > 0 and not _retrieval_enabled(args):
+        raise SystemExit("--retrieval-examples>0 requires --retrieval-prob>0 (Q12 示例密集形态)")
     if not _retrieval_enabled(args):
         return
     if getattr(args, "backbone_mode", "") != "slm":
@@ -422,7 +460,122 @@ def _check_retrieval_args(args) -> None:
         )
 
 
-def _splice_retrieval(clean: torch.Tensor, prob: float, generator: torch.Generator, answer_mode: str = "cjk"):
+def _draw_retrieval_fragment(raw: bytes, n: int, answer_mode: str, generator: torch.Generator):
+    """One fragment+answer draw (shared by the example-free and Q12 forms):
+    32-64B contiguous in-window fragment (start uniform, snapped FORWARD to a
+    UTF-8 char boundary, end snapped BACKWARD), then the answer segment inside
+    it uniformly among the mode's candidates. Fixed draw order: frag_len,
+    start, candidate index. Returns (start, end, frag, (a_lo, a_hi)) or None
+    (no qualifying candidate; the candidate-index draw is then not consumed,
+    same discipline as the legacy retry loop)."""
+    frag_len = int(torch.randint(32, min(64, n) + 1, (1,), generator=generator))
+    start = int(torch.randint(0, n - frag_len + 1, (1,), generator=generator))
+    # UTF-8 snap: start forward to a char boundary, end backward
+    while start < n and (raw[start] & 0xC0) == 0x80:
+        start += 1
+    end = min(start + frag_len, n)
+    while end > start and end < n and (raw[end] & 0xC0) == 0x80:
+        end -= 1
+    frag = raw[start:end]
+    if answer_mode == "cjk":
+        cands = _cjk_candidates(frag)
+    else:
+        cands = [(m.start(), m.end()) for m in _ASCII_WORD_RE.finditer(frag) if 3 <= m.end() - m.start() <= 10]
+    if not cands:
+        return None
+    ci = int(torch.randint(len(cands), (1,), generator=generator))
+    return start, end, frag, cands[ci]
+
+
+def _draw_retrieval_examples(raw: bytes, n: int, n_examples: int, answer_mode: str, generator: torch.Generator, capacity: int | None):
+    """Q12 示例密集形态 (修订案 v3, 2026-08-22 冻结): one attempt = n_examples+1
+    independent fragment+answer draws, then ONE role draw deciding which item
+    is the query (示例/查询角色随机化; the rest are examples in drawn order).
+    Anti-shortcut clauses (Q12.2, mechanical per-sample asserts): all K+1
+    source spans pairwise distinct (span AND content -- so 示例来源段 ≠ 查询
+    来源段 holds under any role assignment) and the query answer string never
+    a byte-level substring of any example block; violations redraw up to
+    _RETRIEVAL_MAX_RETRY (N=8), then the sample stays inactive.
+
+    Window budget (appendix A2②): source and query segments are NEVER
+    truncated; if the total (window + example blocks + query block) exceeds
+    ``capacity`` bytes (the 4096B 窗 = chunk-grid byte capacity) the EARLIEST
+    examples are dropped first (n_dropped recorded). The query block always
+    goes last -- nothing is ever inserted after it; a query pushed off the
+    chunk grid is a construction defect, caught downstream by the echo slot
+    grid (sample discarded, counted in retrieval_defect).
+
+    Returns (meta, new_row_bytes) or None."""
+    for _attempt in range(_RETRIEVAL_MAX_RETRY):
+        items = []
+        for _ in range(n_examples + 1):
+            item = _draw_retrieval_fragment(raw, n, answer_mode, generator)
+            if item is None:
+                break
+            items.append(item)
+        if len(items) < n_examples + 1:
+            continue
+        # role draw is consumed for EVERY candidate-complete attempt, before
+        # the constraint checks (draw stream fixed in shape per attempt).
+        qi = int(torch.randint(len(items), (1,), generator=generator))
+        spans = [(s, e) for s, e, _, _ in items]
+        if len(set(spans)) != len(spans):
+            continue  # 示例来源段 ≠ 查询来源段 (span level)
+        frags = [f for _, _, f, _ in items]
+        if len(set(frags)) != len(frags):
+            continue  # 示例与查询内容独立 (content level)
+        q_start, q_end, q_frag, (qa_lo, qa_hi) = items[qi]
+        q_answer = q_frag[qa_lo:qa_hi]
+        ex_items = items[:qi] + items[qi + 1 :]
+        ex_blocks = [
+            _retrieval_qa_block(f, alo, ahi, f[alo:ahi]) for _, _, f, (alo, ahi) in ex_items
+        ]
+        if any(q_answer in blk for blk in ex_blocks):
+            continue  # 查询答案字符串不得出现在任何示例中 (byte substring)
+        # 窗口预算 (A2②): 溢出按最早示例先丢; 来源段与查询段永不截断
+        n_dropped = 0
+        if capacity:
+            total = n + sum(len(blk) for blk in ex_blocks) + len(
+                _retrieval_qa_block(q_frag, qa_lo, qa_hi, q_answer)
+            )
+            while ex_blocks and total > capacity:
+                total -= len(ex_blocks[0])
+                ex_blocks = ex_blocks[1:]
+                ex_items = ex_items[1:]
+                n_dropped += 1
+        parts = []
+        ex_metas = []
+        cur = n
+        for (s, e, f, (alo, ahi)), blk in zip(ex_items, ex_blocks):
+            ans = f[alo:ahi]
+            ex_metas.append(
+                {
+                    "source_span": (s, e),
+                    "source_answer_span": (s + alo, s + ahi),
+                    "echo_span": (cur + len(blk) - len(ans), cur + len(blk)),
+                    "answer_b": ans,
+                }
+            )
+            parts.append(blk)
+            cur += len(blk)
+        query_start = cur
+        new = raw + b"".join(parts) + _retrieval_qa_block(q_frag, qa_lo, qa_hi, q_answer)
+        meta = {
+            "source_span": (q_start, q_end),
+            "source_answer_span": (q_start + qa_lo, q_start + qa_hi),
+            "query_start": query_start,
+            "echo_span": (len(new) - len(q_answer), len(new)),
+            "answer_b": q_answer,
+            "examples": ex_metas,
+            "n_examples": len(ex_metas),
+            "n_dropped": n_dropped,
+            "budget_ratio": len(new) / capacity if capacity else 0.0,
+        }
+        return meta, new
+    return None
+
+
+def _splice_retrieval(clean: torch.Tensor, prob: float, generator: torch.Generator, answer_mode: str = "cjk", n_examples: int = 0, capacity: int | None = None):
     """Splice one natural-retrieval instance into each selected window (CPU,
     pre-encode). Same splicing discipline as ``_splice_cloze``.
 
@@ -438,11 +591,19 @@ def _splice_retrieval(clean: torch.Tensor, prob: float, generator: torch.Generat
     answer replaced by ``___`` + ``'空格处是什么？`` + ``\\n答案是：`` +
     answer. The batch tensor WIDENS past seq_len (same legality as cloze).
 
+    ``n_examples`` (Q12 示例密集形态, 修订案 v3): 0 = the example-free form
+    above (bitwise-identical); 2–4 = prepend that many complete examples
+    (answer visible) before the query (see _draw_retrieval_examples for the
+    anti-shortcut clauses and the window-budget drop rule). ``capacity`` is
+    the window budget in bytes (chunk-grid byte capacity, the A2② 4096B 窗).
+
     Rows still without a candidate after N retries stay byte-identical and
     inactive (draws consumed, splice skipped; counted in the activation
     rate). Returns (new_clean, metas); metas[b] is None or
     {"source_span": (lo, hi), "source_answer_span": (lo, hi),
-    "query_start": int, "echo_span": (lo, hi), "answer_b": bytes}.
+    "query_start": int, "echo_span": (lo, hi), "answer_b": bytes} -- the Q12
+    form adds "examples" (per-example same-shape dicts), "n_examples",
+    "n_dropped", "budget_ratio".
     """
     bsz, width = clean.shape
     metas: list[dict | None] = [None] * bsz
@@ -457,39 +618,22 @@ def _splice_retrieval(clean: torch.Tensor, prob: float, generator: torch.Generat
         if u >= prob or n < 32 or not bool(valid[:n].all()) or bool(valid[n:].any()):
             continue
         raw = bytes(int(i) - BYTE_OFFSET for i in ids[:n].tolist())
+        if n_examples > 0:
+            picked_ex = _draw_retrieval_examples(raw, n, n_examples, answer_mode, generator, capacity)
+            if picked_ex is None:
+                continue  # N retries exhausted: inactive (counted in activation rate)
+            metas[b], spliced[b] = picked_ex
+            continue
         picked = None
         for _attempt in range(_RETRIEVAL_MAX_RETRY):
-            frag_len = int(torch.randint(32, min(64, n) + 1, (1,), generator=generator))
-            start = int(torch.randint(0, n - frag_len + 1, (1,), generator=generator))
-            # UTF-8 snap: start forward to a char boundary, end backward
-            while start < n and (raw[start] & 0xC0) == 0x80:
-                start += 1
-            end = min(start + frag_len, n)
-            while end > start and end < n and (raw[end] & 0xC0) == 0x80:
-                end -= 1
-            frag = raw[start:end]
-            if answer_mode == "cjk":
-                cands = _cjk_candidates(frag)
-            else:
-                cands = [(m.start(), m.end()) for m in _ASCII_WORD_RE.finditer(frag) if 3 <= m.end() - m.start() <= 10]
-            if not cands:
-                continue
-            ci = int(torch.randint(len(cands), (1,), generator=generator))
-            picked = (start, end, frag, cands[ci])
-            break
+            picked = _draw_retrieval_fragment(raw, n, answer_mode, generator)
+            if picked is not None:
+                break
         if picked is None:
             continue  # N retries exhausted: inactive (counted in activation rate)
         start, end, frag, (a_lo, a_hi) = picked
         answer = frag[a_lo:a_hi]
-        tail = (
-            _RETRIEVAL_QUERY_PRE
-            + frag[:a_lo]
-            + b"___"
-            + frag[a_hi:]
-            + _RETRIEVAL_QUERY_POST
-            + _RETRIEVAL_ECHO_PROMPT
-            + answer
-        )
+        tail = _retrieval_qa_block(frag, a_lo, a_hi, answer)
         new = raw + tail
         echo_lo = len(new) - len(answer)
         metas[b] = {
@@ -517,7 +661,11 @@ def _retrieval_mask_overrides(byte_mask: torch.Tensor, metas: list) -> torch.Ten
     window tail); the source fragment's answer word W is force-UNMASKED --
     W must be encoded into the state, it is the retrieval pressure's whole
     point. Everything else (the rest of the source fragment included) keeps
-    the regular mask."""
+    the regular mask. Q12 示例密集形态 (修订案 v3): the overrides key off the
+    QUERY spans (examples' source spans keep the regular mask -- their store
+    rows are never excised either, 示例是脚手架，必须可读), and each example's
+    echo answer is force-UNMASKED (示例的答案可见 -- a scaffold with a masked
+    answer is not a complete demonstration)."""
     for b, m in enumerate(metas):
         if m is None:
             continue
@@ -525,6 +673,9 @@ def _retrieval_mask_overrides(byte_mask: torch.Tensor, metas: list) -> torch.Ten
         byte_mask[b, lo:hi] = False
         lo, hi = m["echo_span"]
         byte_mask[b, lo:hi] = True
+        for ex in m.get("examples") or ():
+            lo, hi = ex["echo_span"]
+            byte_mask[b, lo:hi] = False
     return byte_mask
 
 
@@ -541,6 +692,10 @@ def _retrieval_store_block(metas: list, chunks, block_prob: float, generator: to
     both spliced and drawn (zero-cost legacy path). The r draw is consumed
     for EVERY spliced row in fixed order, so the draw stream is independent
     of the r value itself.
+
+    Q12 示例密集形态 (修订案 v3): the metas' source_span/query_start are the
+    QUERY's, so only the query's source chunks are excised; the examples'
+    store rows are never excised (示例是脚手架，必须可读).
     """
     chunk_ids = chunks.chunk_ids
     n_chunks = chunks.chunk_mask.size(1)
@@ -1230,6 +1385,9 @@ def step_model(model, batch, args, device, train: bool):
         clean, retrieval_metas = _splice_retrieval(
             clean, float(args.retrieval_prob), _RETRIEVAL_GENERATOR,
             getattr(args, "retrieval_answer_mode", "cjk"),
+            int(getattr(args, "retrieval_examples", 0)),
+            # A2② 窗 = chunk-grid byte capacity (canonical 64x64 = 4096B)
+            int(args.max_chunks) * int(args.max_span),
         )
     clean = clean.to(device)
     valid = clean.ne(PAD_ID)
@@ -1461,6 +1619,13 @@ def step_model(model, batch, args, device, train: bool):
         "retrieval_exact": torch.zeros((), device=device),
         "retrieval_count": torch.zeros((), device=device),
         "retrieval_block_rate": torch.zeros((), device=device),
+        # Q12 示例密集形态 (修订案 v3 / 附录 A2②): window-budget and
+        # construction-defect gauges; all-zero in the example-free form
+        # (metas carry no budget fields there).
+        "retrieval_budget_ratio": torch.zeros((), device=device),
+        "retrieval_examples": torch.zeros((), device=device),
+        "retrieval_drop_rate": torch.zeros((), device=device),
+        "retrieval_defect": torch.zeros((), device=device),
     }
     if retrieval_metas is not None:
         retrieval_slot, retrieval_active = _cloze_slot_grid(
@@ -1472,6 +1637,26 @@ def step_model(model, batch, args, device, train: bool):
         retrieval_metrics["retrieval_block_rate"] = torch.tensor(
             out.get("retrieval_block_rate", 0.0), device=device
         )
+        # Q12 budget gauges (A2②): means over the spliced samples; the
+        # defect count is the 查询段被挤到窗沿 弃用计数 -- spliced but the
+        # query echo never fully landed on the chunk grid (the per-sample
+        # causal-visibility assert lives in the slot grid itself).
+        spliced = [(b, m) for b, m in enumerate(retrieval_metas) if m is not None]
+        if spliced:
+            n_sp = float(len(spliced))
+            n_ex = sum(int(m.get("n_examples", 0)) for _, m in spliced)
+            n_dr = sum(int(m.get("n_dropped", 0)) for _, m in spliced)
+            retrieval_metrics["retrieval_budget_ratio"] = torch.tensor(
+                sum(float(m.get("budget_ratio", 0.0)) for _, m in spliced) / n_sp, device=device
+            )
+            retrieval_metrics["retrieval_examples"] = torch.tensor(n_ex / n_sp, device=device)
+            retrieval_metrics["retrieval_drop_rate"] = torch.tensor(
+                n_dr / (n_ex + n_dr) if (n_ex + n_dr) else 0.0, device=device
+            )
+            retrieval_metrics["retrieval_defect"] = torch.tensor(
+                sum(0.0 if bool(retrieval_active[b]) else 1.0 for b, _ in spliced) / n_sp,
+                device=device,
+            )
 
     loss = (
         args.task1_loss_weight * direct_loss
@@ -1517,6 +1702,10 @@ def step_model(model, batch, args, device, train: bool):
         "retrieval_exact": retrieval_metrics["retrieval_exact"],
         "retrieval_count": retrieval_metrics["retrieval_count"],
         "retrieval_block_rate": retrieval_metrics["retrieval_block_rate"],
+        "retrieval_budget_ratio": retrieval_metrics["retrieval_budget_ratio"],
+        "retrieval_examples": retrieval_metrics["retrieval_examples"],
+        "retrieval_drop_rate": retrieval_metrics["retrieval_drop_rate"],
+        "retrieval_defect": retrieval_metrics["retrieval_defect"],
         "mask_rate": (byte_mask.float().sum() / valid.float().sum().clamp(min=1.0)).detach(),
         "truncated_tokens": chunks.pack_info["truncated_tokens"].float().sum().detach(),
         "cut_capacity_overflow": out["cut_overflow"].float().sum().detach(),
@@ -1687,7 +1876,12 @@ def main() -> None:
     if _retrieval_enabled(args):
         print(
             f"[s1] 自然检索任务 (招募臂): prob={args.retrieval_prob} "
-            f"weight={args.retrieval_weight} block_prob(r)={args.retrieval_block_prob}",
+            f"weight={args.retrieval_weight} block_prob(r)={args.retrieval_block_prob}"
+            + (
+                f" examples={int(args.retrieval_examples)} (Q12 示例密集形态, 修订案 v3)"
+                if int(getattr(args, "retrieval_examples", 0)) > 0
+                else ""
+            ),
             flush=True,
         )
     if getattr(args, "retrieval_block_ramp", ""):

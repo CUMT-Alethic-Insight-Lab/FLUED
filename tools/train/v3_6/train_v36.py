@@ -503,6 +503,23 @@ def build_parser() -> argparse.ArgumentParser:
         ">=5K steps per prereg). Empty = fixed --retrieval-block-prob.",
     )
     parser.add_argument(
+        "--retrieval-examples",
+        type=int,
+        default=0,
+        help="Q12 示例密集型招募臂 (修订案 v3, 2026-08-22 冻结): 2–4 = per "
+        "sample prepend that many COMPLETE examples (same 前文/答案是 format, "
+        "answer visible + force-unmasked) before the one masked-answer query; "
+        "example/query roles randomized, query answer never a byte-substring "
+        "of any example, example source spans/contents distinct from the "
+        "query's (violations redraw up to N=8, then inactive); window budget "
+        "(A2②): source/query never truncated, overflow drops the earliest "
+        "examples first (retrieval_drop_rate), query pushed off the chunk "
+        "grid = construction defect (retrieval_defect); per-batch occupancy "
+        "logged as retrieval_budget_ratio. 0 = the example-free form, "
+        "bitwise-identical. Requires --retrieval-prob>0; same slm-only and "
+        "cloze-mutex rules.",
+    )
+    parser.add_argument(
         "--xcache-supp",
         type=int,
         default=0,
