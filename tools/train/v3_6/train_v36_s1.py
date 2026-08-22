@@ -36,6 +36,20 @@ Tasks (spec section 20, user-designed):
    intrusion: the legacy path stays bitwise-identical). Motivation: E64/E66
    showed the three tasks put zero retrieval load on the K channel inside a
    4096B window; cloze makes "retrieve or lose points" part of the gradient.
+5. natural retrieval (v3.7 slm only, recruitment arm prereg
+   docs/versions/v3.7/FLUED_V3_7_RECRUITMENT_ARM_NATURAL_RETRIEVAL_20260821_CN.md):
+   with probability ``--retrieval-prob`` one 32-64B in-window fragment is
+   picked as the source span, one ASCII word W ([A-Za-z]{3,10}) inside it is
+   blanked in a tail question (前文'...___...'空格处是什么？), and 答案是：W
+   is appended as the echo. The source W is force-UNMASKED (it must enter
+   the state -- that is the retrieval pressure), the echo is force-MASKED,
+   byte CE on the echo slots rides the SAME completion conditioning, weighted
+   by ``--retrieval-weight``. ``--retrieval-block-prob`` is the preregistered
+   r (档 a 掩码级剔除): per spliced sample, the source fragment's store rows
+   are excised (store_block) from every query position at/after the
+   question's first chunk, so the answer reaches the question only through
+   K->state->readout. Mutually exclusive with --cloze-prob>0 (同窗只允许一种
+   检索任务). Default off (``--retrieval-prob 0.0`` = zero intrusion).
 
 Metric redefinition (S1.0+): direct fidelity excludes nothing but MASK_ID
 positions are reported separately (trivially correct); masked acc is backbone
@@ -73,6 +87,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import sys
 import time
 from argparse import Namespace
@@ -294,6 +309,224 @@ def _cloze_loss_and_metrics(logits_backbone: torch.Tensor, comp_targets: torch.T
     }
 
 
+# ---------------------------------------------------------------------------
+# 自然检索任务 (v3.7 slm-only 5th task, recruitment arm prereg 2026-08-21:
+# docs/versions/v3.7/FLUED_V3_7_RECRUITMENT_ARM_NATURAL_RETRIEVAL_20260821_CN.md)
+# ---------------------------------------------------------------------------
+
+# Dedicated CPU generator (same discipline as _CLOZE_GENERATOR): main() seeds
+# it from args.seed, evaluate() re-seeds it from args.eval_mask_seed, so eval
+# splices/block draws are deterministic regardless of dataset/mask RNG
+# consumption order. The offset decorrelates the retrieval draw stream from
+# the mask and cloze streams (same seed family, different stream).
+_RETRIEVAL_GENERATOR = torch.Generator()
+_RETRIEVAL_SEED_OFFSET = 101_009
+_RETRIEVAL_QUERY_PRE = "\n前文'".encode("utf-8")
+_RETRIEVAL_QUERY_POST = "'空格处是什么？".encode("utf-8")
+_RETRIEVAL_ECHO_PROMPT = "\n答案是：".encode("utf-8")
+_ASCII_WORD_RE = re.compile(rb"[A-Za-z]+")
+
+
+def _retrieval_enabled(args) -> bool:
+    return float(getattr(args, "retrieval_prob", 0.0)) > 0.0
+
+
+def _check_retrieval_args(args) -> None:
+    """Loud CLI validation for the natural retrieval task (recruitment arm):
+    r out of [0, 1] is always an error; a live task is slm-only and mutually
+    exclusive with cloze (同窗只允许一种检索任务)."""
+    r = float(getattr(args, "retrieval_block_prob", 0.0))
+    if not 0.0 <= r <= 1.0:
+        raise SystemExit(
+            f"--retrieval-block-prob must lie in [0, 1] (档 a 掩码剔除比例 r, got {r})"
+        )
+    if not _retrieval_enabled(args):
+        return
+    if getattr(args, "backbone_mode", "") != "slm":
+        raise SystemExit(
+            "--retrieval-prob>0 requires --backbone-mode slm (v3.7 自然检索任务, 招募臂 "
+            "prereg 2026-08-21); xattn/paged/draft/attn paths and "
+            "codec_final/paged/draft/prefix_task combinations are N/A"
+        )
+    if float(getattr(args, "cloze_prob", 0.0)) > 0:
+        raise SystemExit(
+            "--retrieval-prob>0 and --cloze-prob>0 are mutually exclusive "
+            "(同窗只允许一种检索任务)"
+        )
+
+
+def _splice_retrieval(clean: torch.Tensor, prob: float, generator: torch.Generator):
+    """Splice one natural-retrieval instance into each selected window (CPU,
+    pre-encode). Same splicing discipline as ``_splice_cloze``.
+
+    Per row, in a fixed draw order on ``generator`` (selection uniform, then
+    fragment length, then fragment start, then answer-word index): with
+    probability ``prob`` pick a 32-64B contiguous in-window fragment F as the
+    source span (start uniform, snapped FORWARD to a UTF-8 char boundary, end
+    snapped BACKWARD -- byte-level splicing never decodes, so the question
+    segment stays valid UTF-8), pick one maximal ASCII run W ([A-Za-z]{3,10})
+    inside F uniformly as the answer word, and append at the window tail
+    ``\\n前文'`` + F with W replaced by ``___`` + ``'空格处是什么？`` +
+    ``\\n答案是：`` + W. The batch tensor WIDENS past seq_len to hold the
+    splice (same legality argument as cloze); the task counts only when the
+    echo survives packing whole (``_cloze_slot_grid`` skip rule, reused).
+
+    Rows without a qualifying fragment/word (short window, no ASCII run) stay
+    byte-identical and inactive (prob drawn, splice skipped). Returns
+    (new_clean, metas); metas[b] is None or {"source_span": (lo, hi),
+    "source_answer_span": (lo, hi), "query_start": int, "echo_span": (lo, hi),
+    "answer_b": bytes}.
+    """
+    bsz, width = clean.shape
+    metas: list[dict | None] = [None] * bsz
+    spliced: dict[int, bytes] = {}
+    for b in range(bsz):
+        ids = clean[b]
+        valid = ids.ne(PAD_ID)
+        n = int(valid.sum())
+        u = float(torch.rand((), generator=generator))
+        # defense: only prefix-valid rows are eligible (same as cloze);
+        # ineligible rows keep their content byte-identical.
+        if u >= prob or n < 32 or not bool(valid[:n].all()) or bool(valid[n:].any()):
+            continue
+        raw = bytes(int(i) - BYTE_OFFSET for i in ids[:n].tolist())
+        frag_len = int(torch.randint(32, min(64, n) + 1, (1,), generator=generator))
+        start = int(torch.randint(0, n - frag_len + 1, (1,), generator=generator))
+        # UTF-8 snap: start forward to a char boundary, end backward (never
+        # split a multi-byte char at the fragment edges).
+        while start < n and (raw[start] & 0xC0) == 0x80:
+            start += 1
+        end = min(start + frag_len, n)
+        while end > start and end < n and (raw[end] & 0xC0) == 0x80:
+            end -= 1
+        frag = raw[start:end]
+        words = [m for m in _ASCII_WORD_RE.finditer(frag) if 3 <= m.end() - m.start() <= 10]
+        if not words:
+            continue  # no qualifying ASCII word in the fragment: inactive
+        w = words[int(torch.randint(len(words), (1,), generator=generator))]
+        answer = frag[w.start() : w.end()]
+        tail = (
+            _RETRIEVAL_QUERY_PRE
+            + frag[: w.start()]
+            + b"___"
+            + frag[w.end() :]
+            + _RETRIEVAL_QUERY_POST
+            + _RETRIEVAL_ECHO_PROMPT
+            + answer
+        )
+        new = raw + tail
+        echo_lo = len(new) - len(answer)
+        metas[b] = {
+            "source_span": (start, end),
+            "source_answer_span": (start + w.start(), start + w.end()),
+            "query_start": n,  # the tail starts at the original window end
+            "echo_span": (echo_lo, len(new)),
+            "answer_b": answer,
+        }
+        spliced[b] = new
+    out = clean
+    if spliced:
+        new_width = max([width] + [len(r) for r in spliced.values()])
+        out = clean.new_full((bsz, new_width), PAD_ID)
+        out[:, :width] = clean
+        for b, r in spliced.items():
+            out[b] = PAD_ID
+            out[b, : len(r)] = torch.tensor([x + BYTE_OFFSET for x in r], dtype=clean.dtype)
+    return out, metas
+
+
+def _retrieval_mask_overrides(byte_mask: torch.Tensor, metas: list) -> torch.Tensor:
+    """E23 discipline, applied AFTER the regular mask (same form as cloze):
+    the tail echo answer is force-MASKED (no copying the answer from the
+    window tail); the source fragment's answer word W is force-UNMASKED --
+    W must be encoded into the state, it is the retrieval pressure's whole
+    point. Everything else (the rest of the source fragment included) keeps
+    the regular mask."""
+    for b, m in enumerate(metas):
+        if m is None:
+            continue
+        lo, hi = m["source_answer_span"]
+        byte_mask[b, lo:hi] = False
+        lo, hi = m["echo_span"]
+        byte_mask[b, lo:hi] = True
+    return byte_mask
+
+
+def _retrieval_store_block(metas: list, chunks, block_prob: float, generator: torch.Generator):
+    """档 a 掩码级剔除 (prereg §1/§4): per spliced sample drawn by
+    ``block_prob`` (the preregistered r), excise the store rows covering the
+    source fragment from every query position at/after the question's first
+    chunk -- the answer then reaches the question only through
+    K->state->readout (the direct path is per-chunk leak-free by
+    construction, so the SLM block1 store rows are the only bypass).
+
+    Byte->chunk mapping reuses the packing grid (chunk_ids, make_targets
+    style). Returns (store_block_or_None, block_rate); None when no sample is
+    both spliced and drawn (zero-cost legacy path). The r draw is consumed
+    for EVERY spliced row in fixed order, so the draw stream is independent
+    of the r value itself.
+    """
+    chunk_ids = chunks.chunk_ids
+    n_chunks = chunks.chunk_mask.size(1)
+    block = None
+    n_spliced = 0
+    n_blocked = 0
+    for b, m in enumerate(metas):
+        if m is None:
+            continue
+        n_spliced += 1
+        u = float(torch.rand((), generator=generator))
+        if u >= block_prob:
+            continue
+        lo, hi = m["source_span"]
+        src_chunks = torch.unique(chunk_ids[b, lo:hi])
+        src_chunks = src_chunks[src_chunks.ge(0)]
+        if src_chunks.numel() == 0:
+            continue  # fragment never packed (capacity) -- nothing to excise
+        tail = chunk_ids[b, m["query_start"] :]
+        q_chunks = tail[tail.ge(0)]
+        if q_chunks.numel() == 0:
+            continue  # question truncated out of the grid -- no query to block
+        qc = int(q_chunks[0])  # chunks are byte-ordered: first valid = question head
+        if block is None:
+            block = torch.zeros(
+                chunk_ids.size(0), n_chunks, n_chunks, dtype=torch.bool, device=chunk_ids.device
+            )
+        block[b, qc:, src_chunks] = True
+        n_blocked += 1
+    block_rate = n_blocked / n_spliced if n_spliced else 0.0
+    return block, block_rate
+
+
+def _ascii_casefold(ids: torch.Tensor) -> torch.Tensor:
+    """ASCII case-fold on PAD-offset byte ids (A-Z -> a-z; everything else,
+    PAD/MASK/multibyte included, untouched)."""
+    b = ids - BYTE_OFFSET
+    return torch.where((b >= 65) & (b <= 90), b + 32, b)
+
+
+def _retrieval_loss_and_metrics(logits_backbone: torch.Tensor, comp_targets: torch.Tensor, retrieval_slot: torch.Tensor, active: torch.Tensor):
+    """Byte CE over the echo slots on the SAME completion conditioning as the
+    masked completion task (same form as ``_cloze_loss_and_metrics``; the
+    slot grid itself is ``_cloze_slot_grid``, the meta contract is
+    compatible). exact = normalized exact match (prereg §3 答案计分口径:
+    大小写/空白归一、全词命中) -- the echo span holds exactly the answer
+    word's bytes ([A-Za-z]{3,10}, no whitespace by construction), so ASCII
+    case-folding is the whole normalization. count = batch hit rate."""
+    retrieval_loss = _ce(logits_backbone, comp_targets, retrieval_slot)
+    pred = logits_backbone.argmax(dim=-1)
+    hit = pred.eq(comp_targets) & retrieval_slot
+    byte_acc = hit.float().sum() / retrieval_slot.float().sum().clamp(min=1.0)
+    hit_norm = _ascii_casefold(pred).eq(_ascii_casefold(comp_targets)) & retrieval_slot
+    exact_per = (hit_norm | ~retrieval_slot).flatten(1).all(dim=1) & active
+    exact = exact_per.float().sum() / active.float().sum().clamp(min=1.0)
+    return retrieval_loss, {
+        "retrieval_byte_acc": byte_acc.detach(),
+        "retrieval_exact": exact.detach(),
+        "retrieval_count": active.float().mean().detach(),
+    }
+
+
 def _load_bpe_tokenizer(path: str) -> None:
     global _BPE_TOKENIZER
     from tokenizers import Tokenizer
@@ -503,7 +736,7 @@ def _completion_target_grids(
     return targets, slot_mask, masked_slot, torch.zeros((), device=clean.device)
 
 
-def s1_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None) -> dict:
+def s1_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None, retrieval_metas=None) -> dict:
     codec_final = getattr(args, "codec_final_state", False)
     if getattr(model.config, "backbone_mode", "") == "slm":
         # v3.7 (consensus §1-2): dedicated branch. codec_final / paged / draft
@@ -516,7 +749,14 @@ def s1_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None) ->
                 "machine is an optional per-channel interpreter, not the pipeline "
                 "keystone this arm welds shut)"
             )
-        return _slm_forward(model, source, args, clean=clean, byte_mask=byte_mask)
+        return _slm_forward(
+            model, source, args, clean=clean, byte_mask=byte_mask, retrieval_metas=retrieval_metas
+        )
+    if retrieval_metas is not None:
+        raise ValueError(
+            "retrieval (--retrieval-prob>0) requires backbone_mode='slm' (v3.7 自然检索任务); "
+            "legacy xattn/paged/draft/attn paths are N/A"
+        )
     byte_states, confidence, valid, _ = model._encode(source)
     hard_cut, utf8_cont, cut_overflow = model._cuts(source, confidence, valid)
     chunks = model.chunk_builder(byte_states, valid, hard_cut, confidence)
@@ -737,7 +977,7 @@ def s1_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None) ->
     }
 
 
-def _slm_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None) -> dict:
+def _slm_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None, retrieval_metas=None) -> dict:
     """v3.7 slm branch (docs/versions/v3.7/FLUED_V3_7_ARCHITECTURE_CONSENSUS_20260817_CN.md).
 
     Codec full-coverage law (consensus §2): any content task's loss covers the
@@ -748,6 +988,11 @@ def _slm_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None) 
     decoder-aligned V source rows (fine: decoder_in_mem(memory); coarse:
     decoder_in(V~)), completion eats the backbone's output matrix (V^), and
     predict anchors the NEXT chunk's V source row (step_model).
+
+    ``retrieval_metas`` (自然检索任务, recruitment arm): when given, the
+    档 a store_block mask is built from the metas + chunk grid
+    (``_retrieval_store_block``) and threaded into the backbone; the block
+    rate rides out to step_model's metrics. None = bit-identical legacy.
     """
     byte_states, confidence, valid, _ = model._encode(source)
     hard_cut, utf8_cont, cut_overflow = model._cuts(source, confidence, valid)
@@ -760,11 +1005,18 @@ def _slm_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None) 
     chunk_byte_off = (
         chunk_byte_offsets(chunks.token_mask) if getattr(model.config, "k_pos_inject", False) else None
     )
+    store_block = None
+    retrieval_block_rate = 0.0
+    if retrieval_metas is not None:
+        store_block, retrieval_block_rate = _retrieval_store_block(
+            retrieval_metas, chunks, float(getattr(args, "retrieval_block_prob", 0.0)), _RETRIEVAL_GENERATOR
+        )
     # fork 2: multi-view store rows when readout_views > 1 (classic rows otherwise)
     backbone_out = model.backbone(
         k_store if k_store is not None else k_rows,
         v_store if v_store is not None else v_rows,
         chunks.chunk_mask, pos, chunk_byte_off=chunk_byte_off,
+        store_block=store_block,
     )
     cond_backbone = backbone_out + pos
     dec_in = model.decoder_in if model.config.v_row_source == "state" else model.decoder_in_mem
@@ -780,6 +1032,7 @@ def _slm_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None) 
         "v_rows": v_rows,  # decoder-side V source rows (the predict anchor, §1.4)
         "memory": memory,
         "index": index,  # summarizer K rows (resident key-geometry metrics, E80 补充 2)
+        "retrieval_block_rate": retrieval_block_rate,  # 档 a excision hit rate (0.0 when off)
         "think_steps": 0.0,
         "chunks": chunks,
         "cut_overflow": cut_overflow,
@@ -883,6 +1136,22 @@ def step_model(model, batch, args, device, train: bool):
                 "_load_cloze_bank before training/eval"
             )
         clean, cloze_metas = _splice_cloze(clean, _CLOZE_BANK, float(args.cloze_prob), _CLOZE_GENERATOR)
+    retrieval_metas = None
+    if _retrieval_enabled(args):
+        # v3.7 自然检索任务 (recruitment arm prereg 2026-08-21): slm-only; the
+        # legacy xattn/paged/draft/attn paths and a simultaneously live cloze
+        # task are N/A and must fail loudly, not silently.
+        if getattr(model.config, "backbone_mode", "") != "slm":
+            raise ValueError(
+                "retrieval (--retrieval-prob>0) requires backbone_mode='slm' (v3.7 自然检索任务); "
+                "legacy xattn/paged/draft/attn paths are N/A"
+            )
+        if cloze_metas is not None:
+            raise ValueError(
+                "retrieval (--retrieval-prob>0) and cloze (--cloze-prob>0) are mutually "
+                "exclusive (同窗只允许一种检索任务)"
+            )
+        clean, retrieval_metas = _splice_retrieval(clean, float(args.retrieval_prob), _RETRIEVAL_GENERATOR)
     clean = clean.to(device)
     valid = clean.ne(PAD_ID)
     if getattr(args, "mask_mode", "byte_span") == "mixed":
@@ -900,9 +1169,13 @@ def step_model(model, batch, args, device, train: bool):
         # E23 overrides AFTER the regular mask: passage answer force-unmasked,
         # tail echo force-masked (see _cloze_mask_overrides).
         byte_mask = _cloze_mask_overrides(byte_mask, cloze_metas)
+    if retrieval_metas is not None:
+        # same E23 form (see _retrieval_mask_overrides): source answer word
+        # force-unmasked, tail echo force-masked.
+        byte_mask = _retrieval_mask_overrides(byte_mask, retrieval_metas)
     source = clean.masked_fill(byte_mask, MASK_ID)
     with torch.autocast("cuda", dtype=torch.bfloat16, enabled=args.amp and device.type == "cuda"):
-        out = s1_forward(model, source, args, clean=clean, byte_mask=byte_mask)
+        out = s1_forward(model, source, args, clean=clean, byte_mask=byte_mask, retrieval_metas=retrieval_metas)
     chunks = out["chunks"]
     # Per-chunk base grids: direct (encoded) and predict views keep these.
     targets, slot_mask, masked_slot = make_targets(
@@ -1097,11 +1370,36 @@ def step_model(model, batch, args, device, train: bool):
             out["logits_backbone"], comp_targets, cloze_slot, cloze_active
         )
 
+    # 自然检索任务 (v3.7 slm, recruitment arm prereg 2026-08-21): byte CE over
+    # the echo slots on the SAME final completion logits as the masked
+    # completion task (post-Markov-head, same form as cloze); the weight sits
+    # ON TOP of the three main tasks (their weights are untouched). Zero
+    # placeholders keep the log schema aligned when the task is off or no
+    # sample is active.
+    retrieval_loss = torch.zeros((), device=device)
+    retrieval_metrics = {
+        "retrieval_byte_acc": torch.zeros((), device=device),
+        "retrieval_exact": torch.zeros((), device=device),
+        "retrieval_count": torch.zeros((), device=device),
+        "retrieval_block_rate": torch.zeros((), device=device),
+    }
+    if retrieval_metas is not None:
+        retrieval_slot, retrieval_active = _cloze_slot_grid(
+            retrieval_metas, chunks.chunk_ids, chunks.offsets, args.max_chunks, args.max_span
+        )
+        retrieval_loss, retrieval_metrics = _retrieval_loss_and_metrics(
+            out["logits_backbone"], comp_targets, retrieval_slot, retrieval_active
+        )
+        retrieval_metrics["retrieval_block_rate"] = torch.tensor(
+            out.get("retrieval_block_rate", 0.0), device=device
+        )
+
     loss = (
         args.task1_loss_weight * direct_loss
         + args.task2_loss_weight * completion_loss
         + args.predict_weight * predict_loss
         + getattr(args, "cloze_weight", 0.3) * cloze_loss
+        + getattr(args, "retrieval_weight", 1.0) * retrieval_loss
     )
     # fork 3 F2 (user-ruled 2026-08-21): auxiliary per-slot byte-reconstruction
     # loss on the summarizer's memory rows — the pressure path that tells the
@@ -1135,6 +1433,11 @@ def step_model(model, batch, args, device, train: bool):
         "cloze_byte_acc": cloze_metrics["cloze_byte_acc"],
         "cloze_exact": cloze_metrics["cloze_exact"],
         "cloze_count": cloze_metrics["cloze_count"],
+        "retrieval_loss": retrieval_loss.detach(),
+        "retrieval_byte_acc": retrieval_metrics["retrieval_byte_acc"],
+        "retrieval_exact": retrieval_metrics["retrieval_exact"],
+        "retrieval_count": retrieval_metrics["retrieval_count"],
+        "retrieval_block_rate": retrieval_metrics["retrieval_block_rate"],
         "mask_rate": (byte_mask.float().sum() / valid.float().sum().clamp(min=1.0)).detach(),
         "truncated_tokens": chunks.pack_info["truncated_tokens"].float().sum().detach(),
         "cut_capacity_overflow": out["cut_overflow"].float().sum().detach(),
@@ -1185,6 +1488,8 @@ def evaluate(model, eval_loader, args, device):
     # cloze eval determinism (same seed family as the eval mask): fixed
     # splices per eval batch regardless of the training-time draw count.
     _CLOZE_GENERATOR.manual_seed(args.eval_mask_seed + _CLOZE_SEED_OFFSET)
+    # retrieval eval determinism: same discipline, its own stream offset.
+    _RETRIEVAL_GENERATOR.manual_seed(args.eval_mask_seed + _RETRIEVAL_SEED_OFFSET)
     rows = []
     for i, batch in enumerate(eval_loader):
         if i >= args.max_eval_batches:
@@ -1299,6 +1604,13 @@ def main() -> None:
             f"prob={args.cloze_prob} weight={args.cloze_weight}",
             flush=True,
         )
+    _check_retrieval_args(args)
+    if _retrieval_enabled(args):
+        print(
+            f"[s1] 自然检索任务 (招募臂): prob={args.retrieval_prob} "
+            f"weight={args.retrieval_weight} block_prob(r)={args.retrieval_block_prob}",
+            flush=True,
+        )
     if args.codec_final_state:
         if not getattr(args, "state_channel", True):
             raise SystemExit("--codec-final-state requires --state-channel (this arm trains the state channel itself)")
@@ -1317,6 +1629,7 @@ def main() -> None:
         _load_bpe_tokenizer(args.bpe_tokenizer_path)
     _MASK_GENERATOR.manual_seed(args.seed)
     _CLOZE_GENERATOR.manual_seed(args.seed + _CLOZE_SEED_OFFSET)
+    _RETRIEVAL_GENERATOR.manual_seed(args.seed + _RETRIEVAL_SEED_OFFSET)
 
     device = torch.device(args.device if args.device == "cpu" or torch.cuda.is_available() else "cpu")
     torch.manual_seed(args.seed)

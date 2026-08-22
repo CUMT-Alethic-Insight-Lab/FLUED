@@ -443,6 +443,38 @@ def build_parser() -> argparse.ArgumentParser:
         "tools/data/mine_cloze_bank.py contract); required when --cloze-prob>0",
     )
     parser.add_argument(
+        "--retrieval-prob",
+        type=float,
+        default=0.0,
+        help="v3.7 自然检索任务 (招募臂, prereg "
+        "docs/versions/v3.7/FLUED_V3_7_RECRUITMENT_ARM_NATURAL_RETRIEVAL_20260821_CN.md): "
+        "per-window probability of picking one 32-64B in-window fragment, "
+        "blanking one ASCII word W in the tail question "
+        "('前文'<F with W -> ___>'空格处是什么？') and appending "
+        "'答案是：'+W as the echo; the echo is force-MASKED, the source W "
+        "force-UNMASKED (it must enter the state), byte CE on the echo slots "
+        "rides the completion conditioning. Wired in train_v36_s1.py only, "
+        "slm mode only, mutually exclusive with --cloze-prob>0; default 0.0 "
+        "= off, bitwise-identical legacy path.",
+    )
+    parser.add_argument(
+        "--retrieval-weight",
+        type=float,
+        default=1.0,
+        help="loss weight of the natural retrieval task; added ON TOP of the "
+        "three main tasks (their weights are untouched)",
+    )
+    parser.add_argument(
+        "--retrieval-block-prob",
+        type=float,
+        default=0.0,
+        help="r = 档 a 掩码级剔除比例 (prereg §4): per spliced sample, "
+        "probability of excising the source fragment's store rows from every "
+        "query position at/after the question's first chunk (store_block "
+        "thread, SLMBackbone), forcing K->state->readout. Must lie in [0, 1]; "
+        "preregistered ramp {0 -> 0.5 -> 1.0}.",
+    )
+    parser.add_argument(
         "--xcache-supp",
         type=int,
         default=0,
@@ -520,6 +552,12 @@ def main() -> None:
             "--cloze-prob>0 is wired in the S1 trainer only: run "
             "tools/train/v3_6/train_v36_s1.py (v3.7 slm cloze 检索回执, "
             "user-ruled 2026-08-17)"
+        )
+    if getattr(args, "retrieval_prob", 0.0) > 0:
+        raise SystemExit(
+            "--retrieval-prob>0 is wired in the S1 trainer only: run "
+            "tools/train/v3_6/train_v36_s1.py (v3.7 自然检索任务, 招募臂 "
+            "prereg 2026-08-21)"
         )
 
     device = torch.device(args.device if args.device == "cpu" or torch.cuda.is_available() else "cpu")
