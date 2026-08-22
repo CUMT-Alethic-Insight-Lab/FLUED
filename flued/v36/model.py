@@ -228,6 +228,17 @@ class V36Config:
     # deployment form is unchanged). Verdict lines are the probe profiles
     # (E89/E92 protocol), never the aux loss itself. Default False = every
     # legacy path bit-preserved.
+    # fork 3 F3 (user-ruled 2026-08-22; spec docs/versions/v3.7/
+    # FLUED_V3_7_FORK3_SUMMARIZER_FIDELITY_20260820_CN.md, E92 position-sink
+    # evidence): pooling form of the DiT summarizer. "mean" = masked mean
+    # pool (bit-preserved legacy). "qpool" = F3: 4 learned queries attention-
+    # pool the span, each bound to a fixed position anchor (Gaussian bias
+    # toward its span quartile — scout anti-slot-collapse guardrail), concat
+    # 4×d_byte -> FFN (the FFN/index_ffn input width changes: qpool
+    # checkpoints do NOT load into mean-pool builds — loud by design).
+    # "poswmean" = F3z zero-param control: position-weighted mean
+    # (w_t ∝ t+1, SGPT family), no new parameters.
+    summarizer_pool: str = "mean"
     summarizer_aux_recon: bool = False
     summarizer_aux_weight: float = 0.1
     # fork 2 (user-ruled 2026-08-19; spec docs/versions/v3.7/
@@ -342,16 +353,31 @@ class DiTChunkSummarizer(nn.Module):
     span (chunks processed in parallel and independently), masked mean pool,
     FFN to one memory vector per chunk. Matches the user's original mental
     model; `slot` (ChunkSummarizer) remains the canonical default.
+
+    fork 3 F3 (V36Config.summarizer_pool): "qpool" swaps the mean pool for 4
+    position-anchored attention queries (E92: the head-concentration is a
+    POSITIONAL sink, so pooling must become position-aware); "poswmean" is
+    the zero-param SGPT-family control (w_t ∝ t+1).
     """
+
+    QPOOL_QUERIES = 4
+    QPOOL_ANCHOR_TEMP = 16.0  # fixed Gaussian sharpness (zero learned params beyond the queries)
 
     def __init__(self, c: V36Config) -> None:
         super().__init__()
         self.blocks = nn.ModuleList(
             [DiTStyleBlock(c.d_byte, c.nhead, c.ffn_dim, True, False) for _ in range(c.summarizer_dit_layers)]
         )
+        self.pool_mode = getattr(c, "summarizer_pool", "mean")
+        if self.pool_mode not in ("mean", "qpool", "poswmean"):
+            raise ValueError(f"summarizer_pool must be mean|qpool|poswmean, got {self.pool_mode!r}")
+        pool_width = c.d_byte * (self.QPOOL_QUERIES if self.pool_mode == "qpool" else 1)
+        if self.pool_mode == "qpool":
+            self.pool_queries = nn.Parameter(torch.empty(self.QPOOL_QUERIES, c.d_byte))
+            nn.init.trunc_normal_(self.pool_queries, std=0.02)
         self.ffn = nn.Sequential(
-            nn.LayerNorm(c.d_byte),
-            nn.Linear(c.d_byte, c.summarizer_hidden),
+            nn.LayerNorm(pool_width),
+            nn.Linear(pool_width, c.summarizer_hidden),
             nn.SiLU(),
             nn.Linear(c.summarizer_hidden, c.d_mem),
         )
@@ -360,8 +386,8 @@ class DiTChunkSummarizer(nn.Module):
         # slm mode so pre-v3.7 checkpoints keep loading strict-clean.
         if getattr(c, "backbone_mode", "") == "slm":
             self.index_ffn = nn.Sequential(
-                nn.LayerNorm(c.d_byte),
-                nn.Linear(c.d_byte, c.summarizer_hidden),
+                nn.LayerNorm(pool_width),
+                nn.Linear(pool_width, c.summarizer_hidden),
                 nn.SiLU(),
                 nn.Linear(c.summarizer_hidden, c.d_mem),
             )
@@ -374,6 +400,25 @@ class DiTChunkSummarizer(nn.Module):
         for block in self.blocks:
             h = block(h, valid, noise)
         denom = valid.sum(dim=1, keepdim=False).clamp(min=1).unsqueeze(-1).to(h.dtype)
+        if self.pool_mode == "poswmean":
+            # F3z zero-param control: position-weighted mean (w_t ∝ t+1)
+            w = torch.arange(1, span + 1, device=h.device, dtype=h.dtype).unsqueeze(0)
+            w = w * valid.to(h.dtype)
+            wsum = w.sum(dim=1, keepdim=True).clamp(min=1.0)
+            return (h * (w / wsum).unsqueeze(-1)).sum(dim=1)  # (B*C, d_byte)
+        if self.pool_mode == "qpool":
+            # F3: 4 learned queries, each anchored to its span quartile by a
+            # fixed Gaussian position bias (scout anti-slot-collapse ruling).
+            q = self.pool_queries  # (Q, d)
+            score = torch.einsum("qd,bsd->qbs", q.float(), h.float()) / (dim ** 0.5)
+            lens = valid.sum(dim=1, keepdim=True).clamp(min=1).float()  # (B*C, 1)
+            pos = torch.arange(span, device=h.device, dtype=torch.float32).unsqueeze(0) / (lens - 1).clamp(min=1)
+            anchors = (torch.arange(self.QPOOL_QUERIES, device=h.device, dtype=torch.float32) + 0.5) / self.QPOOL_QUERIES
+            bias = -self.QPOOL_ANCHOR_TEMP * (pos.unsqueeze(0) - anchors.view(-1, 1, 1)).square()  # (Q, B*C, span)
+            score = (score + bias).masked_fill(~valid.unsqueeze(0), -1.0e4)
+            attn = score.softmax(dim=-1)
+            pooled = torch.einsum("qbs,bsd->bqd", attn, h.float())  # (B*C, Q, d)
+            return pooled.reshape(bsz * chunks, -1).to(h.dtype)  # (B*C, Q*d_byte)
         return (h * valid.unsqueeze(-1).to(h.dtype)).sum(dim=1) / denom  # (B*C, d_byte)
 
     def forward(self, spans: torch.Tensor, token_mask: torch.Tensor) -> torch.Tensor:

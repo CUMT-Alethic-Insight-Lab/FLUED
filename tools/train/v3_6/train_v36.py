@@ -89,6 +89,7 @@ def build_model(args: Namespace) -> FLUEDV36:
             seed_source=getattr(args, "seed_source", "v"),
             to_k_center=getattr(args, "to_k_center", False),
             to_k_whiten=getattr(args, "to_k_whiten", False),
+            summarizer_pool=getattr(args, "summarizer_pool", "mean"),
             summarizer_aux_recon=getattr(args, "summarizer_aux_recon", False),
             summarizer_aux_weight=getattr(args, "summarizer_aux_weight", 0.1),
             split_trunk=getattr(args, "split_trunk", False),
@@ -362,6 +363,16 @@ def build_parser() -> argparse.ArgumentParser:
         "False; fresh eval processes start with identity whitening until a "
         "training-mode forward warms the buffers). Default off = bit-"
         "preserved legacy paths.",
+    )
+    parser.add_argument(
+        "--summarizer-pool",
+        choices=["mean", "qpool", "poswmean"],
+        default="mean",
+        help="fork 3 F3 (user-ruled 2026-08-22, E92 position-sink evidence): "
+        "DiT summarizer pooling form — mean = masked mean (default, "
+        "bit-preserved); qpool = 4 position-anchored attention queries "
+        "(anti-slot-collapse Gaussian bias); poswmean = zero-param "
+        "position-weighted mean (F3z SGPT-family control).",
     )
     parser.add_argument(
         "--summarizer-aux-recon",
