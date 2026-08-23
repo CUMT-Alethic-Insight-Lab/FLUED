@@ -135,7 +135,7 @@ def induction_scores(model, ids, pairs, device):
     return results, n_chunks
 
 
-def load_trained(run_dir: str, device):
+def load_trained(run_dir: str, device, ckpt_name: str = "latest.pt"):
     import json as _json
     import tools.train.v3_6.train_v36_s1 as s1
     cfg = _json.loads((Path(run_dir) / "resolved_config.json").read_text(encoding="utf-8"))
@@ -146,7 +146,7 @@ def load_trained(run_dir: str, device):
     if s1._BPE_TOKENIZER is None and getattr(ns, "mask_mode", "mixed") == "mixed" and ns.mask_prob > 0:
         s1._load_bpe_tokenizer(ns.bpe_tokenizer_path)
     model = build_model(ns).to(device)
-    payload = torch.load(Path(run_dir) / "latest.pt", map_location=device, weights_only=False)
+    payload = torch.load(Path(run_dir) / ckpt_name, map_location=device, weights_only=False)
     model.load_state_dict(payload["model"], strict=True)
     model.eval()
     for p in model.parameters():
@@ -177,6 +177,7 @@ def main() -> None:
         sys.stdout.reconfigure(errors="replace")
     p = argparse.ArgumentParser()
     p.add_argument("--run-dir", default=TRAINED_RUN)
+    p.add_argument("--ckpt", default="latest.pt", help="checkpoint filename under run-dir (milestone sweep)")
     p.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     p.add_argument("--n-docs", type=int, default=16)
     p.add_argument("--seg-len", type=int, default=SEG_LEN)
@@ -188,7 +189,7 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
 
-    model_tr, ns = load_trained(args.run_dir, device)
+    model_tr, ns = load_trained(args.run_dir, device, args.ckpt)
     model_init = load_init(device, ns)
     print(f"[ind] models loaded (trained={Path(args.run_dir).name} + init点) ({time.time() - t0:.0f}s)", flush=True)
 
