@@ -77,6 +77,14 @@ Tasks (spec section 20, user-designed):
    are parser-visible but out-of-range values fail loudly). Mutually
    exclusive with cloze AND retrieval (同窗只允许一种注入任务). Default off
    (``--burst-prob 0.0`` = zero intrusion, bitwise-identical legacy path).
+   Q14 (修订案 2026-08-23): ``--burst-prior-sieve`` adds the construction-time
+   bare-guess sieve (reference model frozen at the 开工 checkpoint, 裸猜
+   byte_acc < 0.05 才录用, N=8 redraws, 全程不重筛), the burst_yield /
+   burst_sieve_reject_rate log metrics (<70% yield prints a warning line --
+   不静默放宽阈值), and the midpoint hook (at max_steps//2 the CURRENT model
+   re-measures the rolling ledger of in-training segments; mean drift >0.02
+   registers 先验侵蚀, per-segment table in out_dir/prior_erosion_midpoint.json).
+   Default off = Q13 form, bitwise-identical.
 
 Metric redefinition (S1.0+): direct fidelity excludes nothing but MASK_ID
 positions are reported separately (trivially correct); masked acc is backbone
@@ -118,6 +126,7 @@ import re
 import sys
 import time
 from argparse import Namespace
+from collections import deque
 from pathlib import Path
 
 import torch
@@ -792,6 +801,12 @@ _BURST_SAMPLER = None  # CorpusSampler, opened by main() when --burst-prob>0
 _BURST_REPEAT_FROZEN = 3
 _BURST_TAIL_MIN_CHARS = 2
 _BURST_TAIL_MAX_CHARS = 4
+# Q14 修订案 (2026-08-23 冻结, FLUED_V3_7_Q14_PRIOR_SIEVED_DEMAND_20260823_CN.md):
+# 先验筛阈值 (裸猜 <0.05 才录用) 与中点复测漂移线 (>0.02 = 先验侵蚀) ——
+# 不静默放宽, 阈值改动只走修订记录.
+_BURST_SIEVE_THRESHOLD = 0.05
+_BURST_MIDPOINT_DRIFT = 0.02
+_BURST_SIEVE_MODEL = None  # Q14 参考模型, main() 在筛开时固定于开工 checkpoint
 
 
 class CorpusSampler:
@@ -816,6 +831,17 @@ class CorpusSampler:
         if self._size < seg_max + 8:
             raise ValueError(f"CorpusSampler: corpus too small ({self._size}B): {self._path}")
         self._seen: set[tuple[int, int]] = set()
+        # Q14 中点复测钩 (修订案 §2.1): 滚动 ledger, 最近 <=2000 个已用段
+        # (实际 spliced 的段), 逐段记录 (段字节, 尾字节数, 筛时裸猜基准).
+        self.ledger: deque = deque(maxlen=2000)
+
+    def note_used(self, seg: bytes, tail_bytes: int, prior_baseline: float | None) -> None:
+        """Register one actually-spliced segment in the rolling ledger (Q14
+        臂中点复测用: 同一批在训片段). prior_baseline = 筛时参考模型实测裸猜率
+        (筛关时为 None, 该条目不参与中点漂移对比)."""
+        self.ledger.append(
+            {"seg": bytes(seg), "tail_bytes": int(tail_bytes), "prior_baseline": prior_baseline}
+        )
 
     def reset_epoch(self) -> None:
         """同 epoch 内不重复的登记簿在新 epoch 开始时清空."""
@@ -872,6 +898,10 @@ def _check_burst_args(args) -> None:
             f"--burst-tail-max-chars must lie in [2, 4] (Q13 预注册 §2 末 2-4 个 CJK 字符), got {tmax}"
         )
     if not _burst_enabled(args):
+        if bool(getattr(args, "burst_prior_sieve", False)):
+            raise SystemExit(
+                "--burst-prior-sieve requires --burst-prob>0 (Q14 先验筛只挂在 burst 形态上)"
+            )
         return
     if getattr(args, "backbone_mode", "") != "slm":
         raise SystemExit(
@@ -885,7 +915,7 @@ def _check_burst_args(args) -> None:
         )
 
 
-def _splice_burst(clean: torch.Tensor, prob: float, generator: torch.Generator, sampler: CorpusSampler, repeat: int = _BURST_REPEAT_FROZEN, tail_max_chars: int = _BURST_TAIL_MAX_CHARS):
+def _splice_burst(clean: torch.Tensor, prob: float, generator: torch.Generator, sampler: CorpusSampler, repeat: int = _BURST_REPEAT_FROZEN, tail_max_chars: int = _BURST_TAIL_MAX_CHARS, sieve_model=None, stats: dict | None = None):
     """Q13 突发性注入 (prereg §2): per selected window, draw ONE fresh 32-64B
     corpus segment (``sampler`` -- random file offset, 防背登记) and insert it
     verbatim at R=3 uniformly random in-window positions (insertion widening,
@@ -895,18 +925,29 @@ def _splice_burst(clean: torch.Tensor, prob: float, generator: torch.Generator, 
     boundary by construction) are the masked tail; the R-1 earlier occurrences
     stay fully visible (它们是突发性本体, 遮蔽即自毁需求).
 
-    Per-row draw order on ``generator`` (fixed): selection uniform, then per
-    segment attempt: the sampler's (offset, length) draws; on a segment whose
-    tail has no qualifying 2-4 char run, redraw up to _RETRIEVAL_MAX_RETRY
-    (N=8) then leave the row inactive. After a good segment: tail char count
-    k, then R insertion positions.
+    Q14 先验筛 (修订案 2026-08-23 §2.1, ``sieve_model`` 非 None 时启用):
+    each structurally accepted candidate segment then passes the bare-guess
+    measurement (_burst_prior_guess_acc on the reference model frozen at the
+    开工 checkpoint): 裸猜 byte_acc < 0.05 才录用, otherwise the candidate is
+    rejected and redrawn (same N=8 cap, exhausted = inactive). The reference
+    model is read-only for the whole run (筛子基准不随训练重筛); the accepted
+    segment's measured baseline lands in the sampler's rolling ledger for the
+    midpoint re-measurement.
 
-    Returns (new_clean, metas); metas[b] is None or {"seg_offset": int,
-    "seg_len": int, "occurrences": [(lo, hi)]*R in byte order, "echo_span":
-    (lo, hi) (the masked tail, cloze slot-grid compatible), "answer_b": bytes,
-    "tail_chars": int}. The (offset, length) registration lives in the
-    sampler's seen set; the probe's 窗内副本存在 audit column reads
-    ``occurrences``.
+    Per-row draw order on ``generator`` (fixed): selection uniform, then per
+    segment attempt: the sampler's (offset, length) draws and the tail char
+    count k; on a segment whose tail has no qualifying 2-4 char run (or which
+    the sieve rejects), redraw up to _RETRIEVAL_MAX_RETRY (N=8) then leave
+    the row inactive. After a good segment: R insertion positions.
+
+    ``stats`` (optional mutable bag) accumulates {"drawn", "spliced",
+    "sieve_measured", "sieve_rejected"} for the burst_yield /
+    burst_sieve_reject_rate log metrics. Returns (new_clean, metas);
+    metas[b] is None or {"seg_offset": int, "seg_len": int, "occurrences":
+    [(lo, hi)]*R in byte order, "echo_span": (lo, hi) (the masked tail, cloze
+    slot-grid compatible), "answer_b": bytes, "tail_chars": int}. The (offset,
+    length) registration lives in the sampler's seen set; the probe's
+    窗内副本存在 audit column reads ``occurrences``.
     """
     bsz, width = clean.shape
     metas: list[dict | None] = [None] * bsz
@@ -920,11 +961,14 @@ def _splice_burst(clean: torch.Tensor, prob: float, generator: torch.Generator, 
         # ineligible rows keep their content byte-identical.
         if u >= prob or n < 32 or not bool(valid[:n].all()) or bool(valid[n:].any()):
             continue
+        if stats is not None:
+            stats["drawn"] += 1  # 抽中样本 (产出率分母)
         raw = bytes(int(i) - BYTE_OFFSET for i in ids[:n].tolist())
         seg = None
         seg_key = None
         tail_bytes = 0
         tail_chars = 0
+        prior_baseline = None
         for _attempt in range(_RETRIEVAL_MAX_RETRY):
             got = sampler.draw(generator)  # raises after N=8 防背 collisions
             if got is None:
@@ -939,9 +983,20 @@ def _splice_burst(clean: torch.Tensor, prob: float, generator: torch.Generator, 
             tail = text[-k:]
             if any(ch in _BOUNDARY_CHARS for ch in tail):
                 continue
+            tail_b = sum(len(ch.encode("utf-8")) for ch in tail)
+            # Q14 先验筛 (修订案 §2.1): 裸猜 <0.05 才录用, 否则重抽 (N=8 沿用)
+            if sieve_model is not None:
+                acc = _burst_prior_guess_acc(sieve_model, cand, tail_b)
+                if stats is not None:
+                    stats["sieve_measured"] += 1
+                if acc is None or acc >= _BURST_SIEVE_THRESHOLD:
+                    if stats is not None:
+                        stats["sieve_rejected"] += 1
+                    continue
+                prior_baseline = acc
             seg = cand
             seg_key = cand_key
-            tail_bytes = sum(len(ch.encode("utf-8")) for ch in tail)
+            tail_bytes = tail_b
             tail_chars = k
             break
         if seg is None:
@@ -974,6 +1029,9 @@ def _splice_burst(clean: torch.Tensor, prob: float, generator: torch.Generator, 
             "tail_chars": tail_chars,
         }
         spliced[b] = new
+        if stats is not None:
+            stats["spliced"] += 1
+        sampler.note_used(seg, tail_bytes, prior_baseline)  # Q14 滚动 ledger
     out = clean
     if spliced:
         new_width = max([width] + [len(r) for r in spliced.values()])
@@ -983,6 +1041,104 @@ def _splice_burst(clean: torch.Tensor, prob: float, generator: torch.Generator, 
             out[b] = PAD_ID
             out[b, : len(r)] = torch.tensor([x + BYTE_OFFSET for x in r], dtype=clean.dtype)
     return out, metas
+
+
+@torch.no_grad()
+def _burst_prior_guess_acc(model, seg: bytes, tail_bytes: int) -> float | None:
+    """Q14 裸猜测量 (修订案 §2.1): the segment alone as the whole document
+    (无前次出现、无上下文), its trailing ``tail_bytes`` masked, fp32 eval
+    (model mode toggled and restored); returns the per-byte accuracy over the
+    masked tail slots. None when the tail never lands on the chunk grid
+    (callers treat as a rejected candidate)."""
+    device = next(model.parameters()).device
+    ids = torch.tensor([[b + BYTE_OFFSET for b in seg]], dtype=torch.long, device=device)
+    n = ids.size(1)
+    if n <= tail_bytes:
+        return None
+    mask = torch.zeros_like(ids, dtype=torch.bool)
+    mask[0, n - tail_bytes :] = True
+    source = ids.masked_fill(mask, MASK_ID)
+    was_training = model.training
+    model.eval()
+    try:
+        out = model(source)
+    finally:
+        if was_training:
+            model.train()
+    chunks = out.chunks
+    t = torch.arange(n - tail_bytes, n, device=device)
+    j = chunks.chunk_ids[0, t]
+    s = chunks.offsets[0, t]
+    if not bool((j.ge(0) & s.ge(0)).all()):
+        return None
+    pred = out.logits_backbone.argmax(dim=-1)
+    hits = pred[0, j, s] == ids[0, n - tail_bytes :]
+    return float(hits.float().mean())
+
+
+def _burst_yield_alarm(step: int, yield_val: float) -> None:
+    """Q14 产出率报警 (修订案 §2.2): 产出率 <70% 打警告行 -- 不静默放宽阈值,
+    阈值改动只走修订记录 (ASCII 词激活率塌方的前车)."""
+    if yield_val < 0.70:
+        print(
+            f"[s1][WARN] Q14 产出率报警: step={step} burst_yield={yield_val:.4f} < 0.70 "
+            "-- 不静默放宽阈值, 阈值改动只走修订记录",
+            flush=True,
+        )
+
+
+def _burst_prior_midpoint_check(model, args, device, out_dir: Path) -> None:
+    """Q14 臂中点复测钩 (修订案 §2.1): at max_steps//2, re-measure the
+    bare-guess rate of the SAME in-training segments (CorpusSampler rolling
+    ledger) with the CURRENT model, per-segment against the sieve baseline
+    (参考模型实测值, recorded at sieve time). drift = cur - base; 均值漂移
+    >0.02 = 先验侵蚀登记行 (print). The per-segment table always lands in
+    out_dir/prior_erosion_midpoint.json (判读分列由收官时做)."""
+    ledger = list(_BURST_SAMPLER.ledger) if _BURST_SAMPLER is not None else []
+    rows = []
+    for ent in ledger:
+        base = ent.get("prior_baseline")
+        if base is None:
+            continue  # 筛关时的条目无基准, 不参与漂移对比
+        cur = _burst_prior_guess_acc(model, ent["seg"], ent["tail_bytes"])
+        if cur is None:
+            continue
+        rows.append(
+            {
+                "seg_len": len(ent["seg"]),
+                "tail_bytes": ent["tail_bytes"],
+                "prior_at_init": round(base, 6),
+                "prior_at_midpoint": round(cur, 6),
+                "drift": round(cur - base, 6),
+            }
+        )
+    drift_mean = sum(r["drift"] for r in rows) / len(rows) if rows else 0.0
+    erosion = drift_mean > _BURST_MIDPOINT_DRIFT
+    payload = {
+        "probe": "Q14 臂中点先验复测 (修订案 §2.1)",
+        "step": int(args.max_steps) // 2,
+        "n_segments": len(rows),
+        "drift_mean": round(drift_mean, 6),
+        "drift_line": _BURST_MIDPOINT_DRIFT,
+        "prior_erosion": erosion,
+        "items": rows,
+    }
+    (Path(out_dir) / "prior_erosion_midpoint.json").write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    if erosion:
+        print(
+            f"[s1][WARN] Q14 先验侵蚀登记: 臂中点裸猜率漂移 {drift_mean:.4f} > {_BURST_MIDPOINT_DRIFT} "
+            f"(n={len(rows)}) -- 对应条目判读时单独分列 "
+            f"({Path(out_dir) / 'prior_erosion_midpoint.json'})",
+            flush=True,
+        )
+    else:
+        print(
+            f"[s1] Q14 臂中点先验复测: 漂移 {drift_mean:.4f} (线 {_BURST_MIDPOINT_DRIFT}, n={len(rows)}), "
+            "无先验侵蚀",
+            flush=True,
+        )
 
 
 def _burst_mask_overrides(byte_mask: torch.Tensor, metas: list) -> torch.Tensor:
@@ -1682,10 +1838,14 @@ def step_model(model, batch, args, device, train: bool):
                 "burst corpus sampler not loaded: main() opens --data-path via "
                 "CorpusSampler before training/eval (Q13 防背护栏: 每窗现采随机段)"
             )
+        burst_stats = {"drawn": 0, "spliced": 0, "sieve_measured": 0, "sieve_rejected": 0}
         clean, burst_metas = _splice_burst(
             clean, float(args.burst_prob), _BURST_GENERATOR, _BURST_SAMPLER,
             int(getattr(args, "burst_repeat", 3)),
             int(getattr(args, "burst_tail_max_chars", 4)),
+            # Q14 先验筛: 参考模型 (开工 checkpoint 固定基准) 只在旗标开时挂载
+            sieve_model=_BURST_SIEVE_MODEL if bool(getattr(args, "burst_prior_sieve", False)) else None,
+            stats=burst_stats,
         )
     clean = clean.to(device)
     valid = clean.ne(PAD_ID)
@@ -1972,6 +2132,10 @@ def step_model(model, batch, args, device, train: bool):
         "burst_tail_exact": torch.zeros((), device=device),
         "burst_count": torch.zeros((), device=device),
         "burst_tail_chars": torch.zeros((), device=device),
+        # Q14 (修订案 2026-08-23 §2.2): 先验筛拒收率与产出率 (激活率 =
+        # 激活样本/抽中样本); 筛关时 reject_rate 恒 0, 任务关时双双零占位.
+        "burst_sieve_reject_rate": torch.zeros((), device=device),
+        "burst_yield": torch.zeros((), device=device),
     }
     if burst_metas is not None:
         burst_slot, burst_active = _cloze_slot_grid(
@@ -1979,6 +2143,15 @@ def step_model(model, batch, args, device, train: bool):
         )
         burst_metrics.update(
             _burst_metrics(out["logits_backbone"], comp_targets, burst_slot, burst_active, burst_metas)
+        )
+        # Q14 §2.2 产出率入册: 无抽中样本的批次是空泡 (yield 记 1.0, 不计失败)
+        drawn = burst_stats.get("drawn", 0)
+        measured = burst_stats.get("sieve_measured", 0)
+        burst_metrics["burst_sieve_reject_rate"] = torch.tensor(
+            burst_stats["sieve_rejected"] / measured if measured else 0.0, device=device
+        )
+        burst_metrics["burst_yield"] = torch.tensor(
+            burst_stats["spliced"] / drawn if drawn else 1.0, device=device
         )
 
     loss = (
@@ -2033,6 +2206,8 @@ def step_model(model, batch, args, device, train: bool):
         "burst_tail_exact": burst_metrics["burst_tail_exact"],
         "burst_count": burst_metrics["burst_count"],
         "burst_tail_chars": burst_metrics["burst_tail_chars"],
+        "burst_sieve_reject_rate": burst_metrics["burst_sieve_reject_rate"],
+        "burst_yield": burst_metrics["burst_yield"],
         "mask_rate": (byte_mask.float().sum() / valid.float().sum().clamp(min=1.0)).detach(),
         "truncated_tokens": chunks.pack_info["truncated_tokens"].float().sum().detach(),
         "cut_capacity_overflow": out["cut_overflow"].float().sum().detach(),
@@ -2290,6 +2465,34 @@ def main() -> None:
                 param.requires_grad_(False)
                 n += 1
         print(f"[s1] frozen params={n} prefixes={frozen}", flush=True)
+    if bool(getattr(args, "burst_prior_sieve", False)):
+        # Q14 先验筛基准 (修订案 2026-08-23 §2.1): 参考模型 = 与开工 checkpoint
+        # 同一份 -- canonical 配置随机初始化 (同种子复演 step-0 初始化抽签, 全局
+        # RNG 状态先存后还) 叠加 init_checkpoint 的同口径部分加载; requires_grad
+        # False + eval + 驻 CPU, 全程只读, 训练中不重筛.
+        global _BURST_SIEVE_MODEL
+        rng_state = torch.get_rng_state()
+        torch.manual_seed(args.seed)
+        _BURST_SIEVE_MODEL = build_model(args)  # CPU
+        torch.set_rng_state(rng_state)
+        if args.init_checkpoint:
+            payload = torch.load(args.init_checkpoint, map_location="cpu", weights_only=False)
+            current = _BURST_SIEVE_MODEL.state_dict()
+            compatible = {
+                k: v for k, v in payload["model"].items() if k in current and current[k].shape == v.shape
+            }
+            init_prefixes = [p.strip() for p in args.init_prefixes.split(",") if p.strip()]
+            if init_prefixes:
+                compatible = {k: v for k, v in compatible.items() if any(k.startswith(p) for p in init_prefixes)}
+            _BURST_SIEVE_MODEL.load_state_dict(compatible, strict=False)
+        for p_ in _BURST_SIEVE_MODEL.parameters():
+            p_.requires_grad_(False)
+        _BURST_SIEVE_MODEL.eval()
+        print(
+            f"[s1] Q14 先验筛: 参考模型固定于开工 checkpoint "
+            f"(init={args.init_checkpoint or '无(纯随机初始化)'}, 阈值 {_BURST_SIEVE_THRESHOLD}, 全程不重筛)",
+            flush=True,
+        )
     if args.codec_final_state:
         # the backbone never enters the loss path in this arm -- freeze it so
         # the optimizer state and any stray decay stay out of the variable set
@@ -2342,6 +2545,9 @@ def main() -> None:
     step = start_step
     pending: dict[str, torch.Tensor] = {}
     pending_n = 0
+    # Q14 臂中点复测钩 (修订案 §2.1): 只在先验筛开时武装
+    midpoint_done = False
+    midpoint_armed = bool(getattr(args, "burst_prior_sieve", False)) and _burst_enabled(args)
     while step < args.max_steps:
         for batch in train_loader:
             if step >= args.max_steps:
@@ -2376,6 +2582,14 @@ def main() -> None:
                 _append_jsonl(log_path, row)
                 pending = {}
                 pending_n = 0
+                # Q14 产出率报警 (修订案 §2.2): <70% 打警告行, 不静默放宽阈值
+                if _burst_enabled(args):
+                    _burst_yield_alarm(step, row.get("burst_yield", 1.0))
+            if midpoint_armed and not midpoint_done and step >= args.max_steps // 2:
+                # Q14 臂中点复测钩: 当前模型 x 同一批在训片段 (滚动 ledger);
+                # >= 判定: 中点步恰好 NaN-skip 时顺延一步, 不静默丢钩
+                midpoint_done = True
+                _burst_prior_midpoint_check(model, args, device, out_dir)
             if step % args.ckpt_every == 0:
                 payload = {"step": step, "model": model.state_dict(), "args": vars(args)}
                 if args.save_optimizer:

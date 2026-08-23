@@ -563,6 +563,19 @@ def build_parser() -> argparse.ArgumentParser:
         "occurrence (per-sample draw); out-of-[2,4] values fail loudly.",
     )
     parser.add_argument(
+        "--burst-prior-sieve",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Q14 需求侧先验筛 (修订案 2026-08-23 冻结, "
+        "docs/versions/v3.7/FLUED_V3_7_Q14_PRIOR_SIEVED_DEMAND_20260823_CN.md): "
+        "on = 候选段构造期过裸猜筛 (参考模型固定在开工 checkpoint, 段单独成文档 "
+        "测段尾遮蔽 byte_acc, <0.05 才录用, 重抽 N=8 沿用, 全程不重筛); "
+        "burst_sieve_reject_rate / burst_yield 随行入册, 产出率 <70%% 日志报警 "
+        "(不静默放宽); 臂中点 (max_steps//2) 对在训片段滚动 ledger 复测裸猜率, "
+        "均值漂移 >0.02 登记先验侵蚀 (out_dir/prior_erosion_midpoint.json). "
+        "只在 --burst-prob>0 时有意义 (否则响亮报错); 默认关 = Q13 形态逐比特不变.",
+    )
+    parser.add_argument(
         "--xcache-supp",
         type=int,
         default=0,
