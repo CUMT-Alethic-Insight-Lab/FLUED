@@ -2469,11 +2469,12 @@ def main() -> None:
         # Q14 先验筛基准 (修订案 2026-08-23 §2.1): 参考模型 = 与开工 checkpoint
         # 同一份 -- canonical 配置随机初始化 (同种子复演 step-0 初始化抽签, 全局
         # RNG 状态先存后还) 叠加 init_checkpoint 的同口径部分加载; requires_grad
-        # False + eval + 驻 CPU, 全程只读, 训练中不重筛.
+        # False + eval + 驻训练设备 (GPU——驻 CPU 的 fla kernel 崩、torch 递推
+        # CPU 前向 ~10× 减速, 两次教训 2026-08-23), 全程只读, 训练中不重筛.
         global _BURST_SIEVE_MODEL
         rng_state = torch.get_rng_state()
         torch.manual_seed(args.seed)
-        _BURST_SIEVE_MODEL = build_model(args)  # CPU
+        _BURST_SIEVE_MODEL = build_model(args).to(device)
         torch.set_rng_state(rng_state)
         if args.init_checkpoint:
             payload = torch.load(args.init_checkpoint, map_location="cpu", weights_only=False)
