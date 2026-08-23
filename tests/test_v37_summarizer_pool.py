@@ -41,7 +41,7 @@ def test_default_mean_bit_preserved():
     spans, mask = _spans()
     assert a(spans, mask).eq(b(spans, mask)).all()
     assert not hasattr(a, "pool_queries")
-    assert V36Config().summarizer_pool == "mean"
+    assert V36Config().summarizer_pool == "qpool"  # v37.3 转正（E100）：默认=qpool，mean 为显式旧口径
 
 
 # 2. qpool: shapes, queries exist, gradient flows ---------------------------------
@@ -104,4 +104,4 @@ def test_full_model_and_cli():
     out = model(ids)
     assert out.memory is not None
     args_off = build_parser().parse_args(["--backbone-mode", "slm", "--k-row-source", "index"])
-    assert build_model(args_off).config.summarizer_pool == "mean"
+    assert build_model(args_off).config.summarizer_pool == "qpool"  # v37.3 起 qpool 为 CLI 默认

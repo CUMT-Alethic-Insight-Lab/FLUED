@@ -247,7 +247,7 @@ class V36Config:
     # Default False = bit-preserved legacy paths. Applies to whichever
     # WriteHead instances exist (same convention as to_k_center).
     pos_prior_keys: bool = False
-    summarizer_pool: str = "mean"
+    summarizer_pool: str = "qpool"  # v37.3 default (2026-08-23 转正, E100); "mean" = v37.2-and-earlier legacy (codec readings not mixable across the E100 boundary)
     summarizer_aux_recon: bool = False
     summarizer_aux_weight: float = 0.1
     # fork 2 (user-ruled 2026-08-19; spec docs/versions/v3.7/

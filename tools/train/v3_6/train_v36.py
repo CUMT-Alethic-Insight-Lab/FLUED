@@ -379,12 +379,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--summarizer-pool",
         choices=["mean", "qpool", "poswmean"],
-        default="mean",
-        help="fork 3 F3 (user-ruled 2026-08-22, E92 position-sink evidence): "
-        "DiT summarizer pooling form — mean = masked mean (default, "
-        "bit-preserved); qpool = 4 position-anchored attention queries "
-        "(anti-slot-collapse Gaussian bias); poswmean = zero-param "
-        "position-weighted mean (F3z SGPT-family control).",
+        default="qpool",
+        help="fork 3 F3 (user-ruled 2026-08-22, E92 position-sink evidence; "
+        "v37.3 起为默认值（2026-08-23 转正）：qpool = 4 position-anchored "
+        "attention queries (anti-slot-collapse Gaussian bias); poswmean = "
+        "zero-param position-weighted mean (F3z control); mean = v37.2 及之前"
+        "的 masked mean 旧口径（codec 读数不可与新默认混排，E100 为界）。",
     )
     parser.add_argument(
         "--summarizer-aux-recon",
