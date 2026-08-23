@@ -532,6 +532,37 @@ def build_parser() -> argparse.ArgumentParser:
         "cloze-mutex rules.",
     )
     parser.add_argument(
+        "--burst-prob",
+        type=float,
+        default=0.0,
+        help="Q13 突发性注入臂 (prereg "
+        "docs/versions/v3_7/FLUED_V3_7_Q13_BURSTINESS_INJECTION_20260822_CN.md, "
+        "frozen 2026-08-22): per-window probability of inserting ONE fresh "
+        "32-64B corpus segment (random file offset, 防背护栏: (偏移,长度) "
+        "进程级登记, 同 epoch 重复采中重抽 N=8 后响亮报错, 严禁固定段库) "
+        "verbatim at R=3 random in-window positions; the last occurrence's "
+        "trailing 2-4 CJK chars are force-MASKED, the R-1 earlier "
+        "occurrences force-UNMASKED. No new loss term (注入只改数据分布); "
+        "metrics burst_tail_byte_acc/burst_tail_exact/burst_count/"
+        "burst_tail_chars. Wired in train_v36_s1.py only, slm mode only, "
+        "mutually exclusive with --cloze-prob>0 and --retrieval-prob>0; "
+        "default 0.0 = off, bitwise-identical legacy path.",
+    )
+    parser.add_argument(
+        "--burst-repeat",
+        type=int,
+        default=3,
+        help="Q13 frozen value R=3 (prereg §2 逐字重复插入 3 次) — "
+        "parser-visible for logging, any other value fails loudly.",
+    )
+    parser.add_argument(
+        "--burst-tail-max-chars",
+        type=int,
+        default=4,
+        help="Q13 frozen range: masked tail = last 2-4 CJK chars of the R-th "
+        "occurrence (per-sample draw); out-of-[2,4] values fail loudly.",
+    )
+    parser.add_argument(
         "--xcache-supp",
         type=int,
         default=0,
@@ -629,6 +660,11 @@ def main() -> None:
             "--retrieval-prob>0 is wired in the S1 trainer only: run "
             "tools/train/v3_6/train_v36_s1.py (v3.7 自然检索任务, 招募臂 "
             "prereg 2026-08-21)"
+        )
+    if getattr(args, "burst_prob", 0.0) > 0:
+        raise SystemExit(
+            "--burst-prob>0 is wired in the S1 trainer only: run "
+            "tools/train/v3_6/train_v36_s1.py (Q13 突发性注入臂, prereg 2026-08-22)"
         )
 
     device = torch.device(args.device if args.device == "cpu" or torch.cuda.is_available() else "cpu")

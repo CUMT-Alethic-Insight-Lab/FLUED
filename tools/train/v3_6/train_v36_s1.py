@@ -62,6 +62,21 @@ Tasks (spec section 20, user-designed):
    chunk grid is a construction defect (sample discarded, counted). Per-batch
    metrics: retrieval_budget_ratio / retrieval_examples / retrieval_drop_rate
    / retrieval_defect. Default 0 = the example-free form, bitwise-identical.
+6. Q13 burstiness injection (v3.7 slm only, prereg
+   docs/versions/v3.7/FLUED_V3_7_Q13_BURSTINESS_INJECTION_20260822_CN.md,
+   frozen 2026-08-22): with probability ``--burst-prob`` one FRESH 32-64B
+   corpus segment (random file offset via CorpusSampler -- 防背护栏: no fixed
+   segment bank, (offset, length) registered process-wide, same-epoch repeats
+   redraw up to N=8 then fail loudly) is inserted verbatim at R=3 random
+   in-window positions (insertion widening). The last occurrence's trailing
+   2-4 CJK chars are force-MASKED; the R-1 earlier occurrences are
+   force-UNMASKED (它们是突发性本体). NO new loss term -- the codec three
+   tasks already cover the masked tail (注入只改数据分布). Metrics:
+   burst_tail_byte_acc / burst_tail_exact / burst_count / burst_tail_chars.
+   Frozen values: R=3, tail 2-4 chars (--burst-repeat / --burst-tail-max-chars
+   are parser-visible but out-of-range values fail loudly). Mutually
+   exclusive with cloze AND retrieval (同窗只允许一种注入任务). Default off
+   (``--burst-prob 0.0`` = zero intrusion, bitwise-identical legacy path).
 
 Metric redefinition (S1.0+): direct fidelity excludes nothing but MASK_ID
 positions are reported separately (trivially correct); masked acc is backbone
@@ -758,6 +773,258 @@ def _retrieval_loss_and_metrics(logits_backbone: torch.Tensor, comp_targets: tor
     }
 
 
+# ---------------------------------------------------------------------------
+# Q13 突发性注入臂 (burstiness injection, prereg 2026-08-22 frozen:
+# docs/versions/v3.7/FLUED_V3_7_Q13_BURSTINESS_INJECTION_20260822_CN.md)
+# Data-layer only: no new loss term -- the codec three tasks already cover the
+# masked tail (§2: 注入只改数据分布). E104 归因: 窗内基础复制回路从未形成,
+# 注入逐字重复段 (R=3 成簇出现 = burstiness) 把 induction 回路催出来.
+# ---------------------------------------------------------------------------
+
+# Dedicated CPU generator, same discipline as _RETRIEVAL_GENERATOR: main()
+# seeds from args.seed, evaluate() re-seeds from args.eval_mask_seed; its own
+# offset decorrelates the burst draw stream from the mask/cloze/retrieval
+# streams.
+_BURST_GENERATOR = torch.Generator()
+_BURST_SEED_OFFSET = 101_021
+_BURST_SAMPLER = None  # CorpusSampler, opened by main() when --burst-prob>0
+# Q13 §2 frozen values: repeat count R=3, masked tail = last 2-4 CJK chars.
+_BURST_REPEAT_FROZEN = 3
+_BURST_TAIL_MIN_CHARS = 2
+_BURST_TAIL_MAX_CHARS = 4
+
+
+class CorpusSampler:
+    """Q13 随机段现采器 (防背护栏, prereg §3 冻结): every segment is drawn
+    FRESH from the corpus by random file offset -- 严禁任何形式的固定段库.
+    Each drawn segment is registered as (file_offset, length) in a
+    process-level set; a repeat draw within the same epoch redraws up to
+    _RETRIEVAL_MAX_RETRY (N=8) times, then fails loudly (机械断言).
+
+    Draw order on the generator (fixed): offset, then length. The seek lands
+    anywhere, so the read window is UTF-8 snapped (start forward, end
+    backward, same discipline as the retrieval fragment draw); a segment that
+    cannot be snapped/decoded counts as a failed attempt WITHOUT registering.
+    """
+
+    def __init__(self, path: str, seg_min: int = 32, seg_max: int = 64):
+        self._path = str(path)
+        self._fh = open(self._path, "rb")
+        self._size = Path(self._path).stat().st_size
+        self._seg_min = seg_min
+        self._seg_max = seg_max
+        if self._size < seg_max + 8:
+            raise ValueError(f"CorpusSampler: corpus too small ({self._size}B): {self._path}")
+        self._seen: set[tuple[int, int]] = set()
+
+    def reset_epoch(self) -> None:
+        """同 epoch 内不重复的登记簿在新 epoch 开始时清空."""
+        self._seen.clear()
+
+    def draw(self, generator: torch.Generator) -> tuple[bytes, tuple[int, int]] | None:
+        """One fresh 32-64B UTF-8-snapped segment + its (offset, length)
+        registration key; raises RuntimeError when N=8 redraws keep hitting
+        already-registered (offset, length) pairs."""
+        for _attempt in range(_RETRIEVAL_MAX_RETRY):
+            off = int(torch.randint(0, self._size - self._seg_max - 1, (1,), generator=generator))
+            seg_len = int(torch.randint(self._seg_min, self._seg_max + 1, (1,), generator=generator))
+            key = (off, seg_len)
+            if key in self._seen:
+                continue  # 同 epoch 重复采中同一段: 重抽 (上限 N=8)
+            self._fh.seek(off)
+            raw = self._fh.read(seg_len + 8)  # slack for the boundary snap
+            start = 0
+            while start < len(raw) and (raw[start] & 0xC0) == 0x80:
+                start += 1
+            end = min(start + seg_len, len(raw))
+            # UTF-8 snap: end backward to a char boundary (retrieval discipline)
+            while end > start and end < len(raw) and (raw[end] & 0xC0) == 0x80:
+                end -= 1
+            seg = raw[start:end]
+            if end - start < self._seg_min // 2:
+                continue  # snap ate too much: failed attempt, unregistered
+            try:
+                seg.decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+            self._seen.add(key)
+            return seg, key
+        raise RuntimeError(
+            "CorpusSampler: 同 epoch 内重复采中段/无效段超过 N=8 次重抽 "
+            "(Q13 防背护栏, prereg §3) -- 响亮报错, 不静默放行"
+        )
+
+
+def _burst_enabled(args) -> bool:
+    return float(getattr(args, "burst_prob", 0.0)) > 0.0
+
+
+def _check_burst_args(args) -> None:
+    """Loud CLI validation for the Q13 burst task: the frozen values are not
+    negotiable (R 只能是 3, tail 只能 2-4 字); a live task is slm-only and
+    mutually exclusive with cloze AND retrieval (同窗只允许一种注入任务)."""
+    r = int(getattr(args, "burst_repeat", _BURST_REPEAT_FROZEN))
+    if r != _BURST_REPEAT_FROZEN:
+        raise SystemExit(f"--burst-repeat is frozen at R=3 (Q13 预注册 §2), got {r}")
+    tmax = int(getattr(args, "burst_tail_max_chars", _BURST_TAIL_MAX_CHARS))
+    if not _BURST_TAIL_MIN_CHARS <= tmax <= _BURST_TAIL_MAX_CHARS:
+        raise SystemExit(
+            f"--burst-tail-max-chars must lie in [2, 4] (Q13 预注册 §2 末 2-4 个 CJK 字符), got {tmax}"
+        )
+    if not _burst_enabled(args):
+        return
+    if getattr(args, "backbone_mode", "") != "slm":
+        raise SystemExit(
+            "--burst-prob>0 requires --backbone-mode slm (Q13 突发性注入臂, prereg "
+            "2026-08-22); xattn/paged/draft/attn paths are N/A"
+        )
+    if float(getattr(args, "cloze_prob", 0.0)) > 0 or float(getattr(args, "retrieval_prob", 0.0)) > 0:
+        raise SystemExit(
+            "--burst-prob>0 is mutually exclusive with --cloze-prob>0 and "
+            "--retrieval-prob>0 (同窗只允许一种注入任务)"
+        )
+
+
+def _splice_burst(clean: torch.Tensor, prob: float, generator: torch.Generator, sampler: CorpusSampler, repeat: int = _BURST_REPEAT_FROZEN, tail_max_chars: int = _BURST_TAIL_MAX_CHARS):
+    """Q13 突发性注入 (prereg §2): per selected window, draw ONE fresh 32-64B
+    corpus segment (``sampler`` -- random file offset, 防背登记) and insert it
+    verbatim at R=3 uniformly random in-window positions (insertion widening,
+    same legality as cloze/retrieval; positions UTF-8 snapped forward, not
+    fixed at window head/tail). The LAST occurrence in byte order is the R-th
+    occurrence: its trailing 2-4 non-boundary chars (k drawn per sample, UTF-8
+    boundary by construction) are the masked tail; the R-1 earlier occurrences
+    stay fully visible (它们是突发性本体, 遮蔽即自毁需求).
+
+    Per-row draw order on ``generator`` (fixed): selection uniform, then per
+    segment attempt: the sampler's (offset, length) draws; on a segment whose
+    tail has no qualifying 2-4 char run, redraw up to _RETRIEVAL_MAX_RETRY
+    (N=8) then leave the row inactive. After a good segment: tail char count
+    k, then R insertion positions.
+
+    Returns (new_clean, metas); metas[b] is None or {"seg_offset": int,
+    "seg_len": int, "occurrences": [(lo, hi)]*R in byte order, "echo_span":
+    (lo, hi) (the masked tail, cloze slot-grid compatible), "answer_b": bytes,
+    "tail_chars": int}. The (offset, length) registration lives in the
+    sampler's seen set; the probe's 窗内副本存在 audit column reads
+    ``occurrences``.
+    """
+    bsz, width = clean.shape
+    metas: list[dict | None] = [None] * bsz
+    spliced: dict[int, bytes] = {}
+    for b in range(bsz):
+        ids = clean[b]
+        valid = ids.ne(PAD_ID)
+        n = int(valid.sum())
+        u = float(torch.rand((), generator=generator))
+        # defense: only prefix-valid rows are eligible (same as cloze);
+        # ineligible rows keep their content byte-identical.
+        if u >= prob or n < 32 or not bool(valid[:n].all()) or bool(valid[n:].any()):
+            continue
+        raw = bytes(int(i) - BYTE_OFFSET for i in ids[:n].tolist())
+        seg = None
+        seg_key = None
+        tail_bytes = 0
+        tail_chars = 0
+        for _attempt in range(_RETRIEVAL_MAX_RETRY):
+            got = sampler.draw(generator)  # raises after N=8 防背 collisions
+            if got is None:
+                continue
+            cand, cand_key = got
+            # 段尾遮蔽 (Q13 §2): 末 k 个字符 (k 每样本抽 2..tail_max_chars),
+            # 全部非边界字符 (与 Q11 v2 同规, 不用比例制不用字节数)
+            k = int(torch.randint(_BURST_TAIL_MIN_CHARS, tail_max_chars + 1, (1,), generator=generator))
+            text = cand.decode("utf-8")  # sampler guarantees decodable
+            if len(text) < k + 2:  # the masked tail must not eat the whole segment
+                continue
+            tail = text[-k:]
+            if any(ch in _BOUNDARY_CHARS for ch in tail):
+                continue
+            seg = cand
+            seg_key = cand_key
+            tail_bytes = sum(len(ch.encode("utf-8")) for ch in tail)
+            tail_chars = k
+            break
+        if seg is None:
+            continue  # N retries exhausted: inactive (counted in burst activation)
+        positions = sorted(
+            int(torch.randint(0, n + 1, (1,), generator=generator)) for _ in range(repeat)
+        )
+        # UTF-8 snap forward, then insert (widen) in position order
+        parts = []
+        occ: list[tuple[int, int]] = []
+        prev = 0
+        shift = 0
+        for p in positions:
+            while p < n and (raw[p] & 0xC0) == 0x80:
+                p += 1
+            parts.append(raw[prev:p])
+            parts.append(seg)
+            occ.append((p + shift, p + shift + len(seg)))
+            shift += len(seg)
+            prev = p
+        parts.append(raw[prev:])
+        new = b"".join(parts)
+        last_lo, last_hi = occ[-1]
+        metas[b] = {
+            "seg_offset": seg_key[0],  # 段（文件偏移，长度）登记 -- 探针审计列用
+            "seg_len": seg_key[1],
+            "occurrences": occ,
+            "echo_span": (last_hi - tail_bytes, last_hi),
+            "answer_b": new[last_hi - tail_bytes : last_hi],
+            "tail_chars": tail_chars,
+        }
+        spliced[b] = new
+    out = clean
+    if spliced:
+        new_width = max([width] + [len(r) for r in spliced.values()])
+        out = clean.new_full((bsz, new_width), PAD_ID)
+        out[:, :width] = clean
+        for b, r in spliced.items():
+            out[b] = PAD_ID
+            out[b, : len(r)] = torch.tensor([x + BYTE_OFFSET for x in r], dtype=clean.dtype)
+    return out, metas
+
+
+def _burst_mask_overrides(byte_mask: torch.Tensor, metas: list) -> torch.Tensor:
+    """Q13 mask discipline (prereg §2), applied AFTER the regular mask: the
+    R-th occurrence's tail is force-MASKED (the induction training signal:
+    complete the tail by copying from an earlier occurrence); the R-1 earlier
+    occurrences are force-UNMASKED whole (它们是突发性本体, 遮蔽即自毁需求 --
+    they must enter the state). Everything else keeps the regular mask."""
+    for b, m in enumerate(metas):
+        if m is None:
+            continue
+        lo, hi = m["echo_span"]
+        byte_mask[b, lo:hi] = True
+        for lo, hi in m["occurrences"][:-1]:
+            byte_mask[b, lo:hi] = False
+    return byte_mask
+
+
+def _burst_metrics(logits_backbone: torch.Tensor, comp_targets: torch.Tensor, burst_slot: torch.Tensor, active: torch.Tensor, metas: list):
+    """Q13 仪表 (no loss term -- 注入只改数据分布, the codec three tasks
+    already cover the masked tail): per-byte acc and normalized exact over the
+    masked tail slots (same completion conditioning, same _ascii_casefold
+    normalization as the retrieval echo), burst_count = batch hit rate,
+    burst_tail_chars = mean masked tail length in chars over active samples."""
+    pred = logits_backbone.argmax(dim=-1)
+    hit = pred.eq(comp_targets) & burst_slot
+    byte_acc = hit.float().sum() / burst_slot.float().sum().clamp(min=1.0)
+    hit_norm = _ascii_casefold(pred).eq(_ascii_casefold(comp_targets)) & burst_slot
+    exact_per = (hit_norm | ~burst_slot).flatten(1).all(dim=1) & active
+    exact = exact_per.float().sum() / active.float().sum().clamp(min=1.0)
+    chars = [float(m["tail_chars"]) for b, m in enumerate(metas) if m is not None and bool(active[b])]
+    tail_chars = torch.tensor(
+        sum(chars) / len(chars) if chars else 0.0, device=logits_backbone.device
+    )
+    return {
+        "burst_tail_byte_acc": byte_acc.detach(),
+        "burst_tail_exact": exact.detach(),
+        "burst_count": active.float().mean().detach(),
+        "burst_tail_chars": tail_chars.detach(),
+    }
+
+
 def _load_bpe_tokenizer(path: str) -> None:
     global _BPE_TOKENIZER
     from tokenizers import Tokenizer
@@ -1395,6 +1662,31 @@ def step_model(model, batch, args, device, train: bool):
             # A2② 窗 = chunk-grid byte capacity (canonical 64x64 = 4096B)
             int(args.max_chunks) * int(args.max_span),
         )
+    burst_metas = None
+    if _burst_enabled(args):
+        # Q13 突发性注入臂 (prereg 2026-08-22): slm-only; the legacy
+        # xattn/paged/draft/attn paths and simultaneously live cloze/retrieval
+        # tasks are N/A and must fail loudly, not silently.
+        if getattr(model.config, "backbone_mode", "") != "slm":
+            raise ValueError(
+                "burst (--burst-prob>0) requires backbone_mode='slm' (Q13 突发性注入臂); "
+                "legacy xattn/paged/draft/attn paths are N/A"
+            )
+        if cloze_metas is not None or retrieval_metas is not None:
+            raise ValueError(
+                "burst (--burst-prob>0) is mutually exclusive with cloze (--cloze-prob>0) "
+                "and retrieval (--retrieval-prob>0) (同窗只允许一种注入任务)"
+            )
+        if _BURST_SAMPLER is None:
+            raise ValueError(
+                "burst corpus sampler not loaded: main() opens --data-path via "
+                "CorpusSampler before training/eval (Q13 防背护栏: 每窗现采随机段)"
+            )
+        clean, burst_metas = _splice_burst(
+            clean, float(args.burst_prob), _BURST_GENERATOR, _BURST_SAMPLER,
+            int(getattr(args, "burst_repeat", 3)),
+            int(getattr(args, "burst_tail_max_chars", 4)),
+        )
     clean = clean.to(device)
     valid = clean.ne(PAD_ID)
     if getattr(args, "mask_mode", "byte_span") == "mixed":
@@ -1416,6 +1708,10 @@ def step_model(model, batch, args, device, train: bool):
         # same E23 form (see _retrieval_mask_overrides): source answer word
         # force-unmasked, tail echo force-masked.
         byte_mask = _retrieval_mask_overrides(byte_mask, retrieval_metas)
+    if burst_metas is not None:
+        # Q13 discipline (see _burst_mask_overrides): the R-th occurrence's
+        # tail force-masked, the R-1 earlier occurrences force-unmasked.
+        byte_mask = _burst_mask_overrides(byte_mask, burst_metas)
     source = clean.masked_fill(byte_mask, MASK_ID)
     with torch.autocast("cuda", dtype=torch.bfloat16, enabled=args.amp and device.type == "cuda"):
         out = s1_forward(model, source, args, clean=clean, byte_mask=byte_mask, retrieval_metas=retrieval_metas)
@@ -1668,6 +1964,23 @@ def step_model(model, batch, args, device, train: bool):
                 device=device,
             )
 
+    # Q13 突发性注入臂 (prereg 2026-08-22 §2): NO new loss term -- 注入只改
+    # 数据分布, the codec three tasks already cover the masked tail. Metrics
+    # only, zero placeholders keep the log schema aligned when off.
+    burst_metrics = {
+        "burst_tail_byte_acc": torch.zeros((), device=device),
+        "burst_tail_exact": torch.zeros((), device=device),
+        "burst_count": torch.zeros((), device=device),
+        "burst_tail_chars": torch.zeros((), device=device),
+    }
+    if burst_metas is not None:
+        burst_slot, burst_active = _cloze_slot_grid(
+            burst_metas, chunks.chunk_ids, chunks.offsets, args.max_chunks, args.max_span
+        )
+        burst_metrics.update(
+            _burst_metrics(out["logits_backbone"], comp_targets, burst_slot, burst_active, burst_metas)
+        )
+
     loss = (
         args.task1_loss_weight * direct_loss
         + args.task2_loss_weight * completion_loss
@@ -1716,6 +2029,10 @@ def step_model(model, batch, args, device, train: bool):
         "retrieval_examples": retrieval_metrics["retrieval_examples"],
         "retrieval_drop_rate": retrieval_metrics["retrieval_drop_rate"],
         "retrieval_defect": retrieval_metrics["retrieval_defect"],
+        "burst_tail_byte_acc": burst_metrics["burst_tail_byte_acc"],
+        "burst_tail_exact": burst_metrics["burst_tail_exact"],
+        "burst_count": burst_metrics["burst_count"],
+        "burst_tail_chars": burst_metrics["burst_tail_chars"],
         "mask_rate": (byte_mask.float().sum() / valid.float().sum().clamp(min=1.0)).detach(),
         "truncated_tokens": chunks.pack_info["truncated_tokens"].float().sum().detach(),
         "cut_capacity_overflow": out["cut_overflow"].float().sum().detach(),
@@ -1768,6 +2085,8 @@ def evaluate(model, eval_loader, args, device):
     _CLOZE_GENERATOR.manual_seed(args.eval_mask_seed + _CLOZE_SEED_OFFSET)
     # retrieval eval determinism: same discipline, its own stream offset.
     _RETRIEVAL_GENERATOR.manual_seed(args.eval_mask_seed + _RETRIEVAL_SEED_OFFSET)
+    # burst eval determinism: same discipline, its own stream offset.
+    _BURST_GENERATOR.manual_seed(args.eval_mask_seed + _BURST_SEED_OFFSET)
     rows = []
     for i, batch in enumerate(eval_loader):
         if i >= args.max_eval_batches:
@@ -1898,6 +2217,19 @@ def main() -> None:
         global _RETRIEVAL_RAMP
         _RETRIEVAL_RAMP = _parse_block_ramp(args.retrieval_block_ramp)
         print(f"[s1] retrieval r 爬坡 (prereg §4): {_RETRIEVAL_RAMP}", flush=True)
+    _check_burst_args(args)
+    if _burst_enabled(args):
+        # Q13 突发性注入臂 (prereg 2026-08-22): the corpus sampler opens
+        # --data-path for random-offset fresh segment draws (防背护栏: 严禁
+        # 固定段库; (偏移, 长度) 进程级登记, 同 epoch 重复采中重抽 N=8 后响亮报错).
+        global _BURST_SAMPLER
+        _BURST_SAMPLER = CorpusSampler(args.data_path)
+        print(
+            f"[s1] Q13 突发性注入臂: prob={args.burst_prob} R={int(args.burst_repeat)} "
+            f"tail=2-{int(args.burst_tail_max_chars)}字 sampler={args.data_path} "
+            f"({_BURST_SAMPLER._size}B)",
+            flush=True,
+        )
     if args.codec_final_state:
         if not getattr(args, "state_channel", True):
             raise SystemExit("--codec-final-state requires --state-channel (this arm trains the state channel itself)")
@@ -1917,6 +2249,7 @@ def main() -> None:
     _MASK_GENERATOR.manual_seed(args.seed)
     _CLOZE_GENERATOR.manual_seed(args.seed + _CLOZE_SEED_OFFSET)
     _RETRIEVAL_GENERATOR.manual_seed(args.seed + _RETRIEVAL_SEED_OFFSET)
+    _BURST_GENERATOR.manual_seed(args.seed + _BURST_SEED_OFFSET)
 
     device = torch.device(args.device if args.device == "cpu" or torch.cuda.is_available() else "cpu")
     torch.manual_seed(args.seed)
