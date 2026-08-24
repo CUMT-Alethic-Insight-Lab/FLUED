@@ -1466,6 +1466,10 @@ class SLMBackbone(nn.Module):
                 )
             self.pos_proj = nn.Linear(POS_FEAT_DIM, d, bias=False)
             self.pos_gate = nn.Parameter(torch.zeros(()))
+        # Q15 need_attn (任务书 2026-08-25 §7.1): block-1 cross-attention 概率
+        # 寄存槽 (B, H, C, C, 保留梯度 -- L_attend 经它回传); None = 关态
+        # (legacy SDPA 路径, 逐位不动).
+        self.last_block1_attn = None
 
     def forward(
         self,
@@ -1475,6 +1479,7 @@ class SLMBackbone(nn.Module):
         pos: torch.Tensor,
         chunk_byte_off: torch.Tensor | None = None,
         store_block: torch.Tensor | None = None,
+        need_attn: bool = False,
     ) -> torch.Tensor:
         """k_rows: (B, C, d_mem|d_pack) K source rows (index or K~);
         v_rows: (B, C, d_mem|d_pack) V source rows (memory or V~);
@@ -1484,11 +1489,23 @@ class SLMBackbone(nn.Module):
         row is EXCISED for that query (recruitment arm 档 a mask-level
         excision, user-ruled 2026-08-21: the only bypass needing removal —
         direct path is per-chunk leak-free by construction). Applied before
-        the diagonal-keep so no query row ever goes fully masked."""
+        the diagonal-keep so no query row ever goes fully masked.
+        need_attn (Q15 回路养成臂, 任务书 §7.1): on = block-1 takes the manual
+        attention path (scores = q@kᵀ/√hd, masked positions -inf, softmax in
+        float32, then @v) and the probabilities land in
+        ``self.last_block1_attn`` with gradient kept (L_attend 经它回传);
+        off = legacy SDPA path, bitwise untouched."""
         bsz, n = chunk_mask.shape
+        self.last_block1_attn = None  # 默认关态 (views 路径提前返回也保持 None)
         kv = k_rows.size(2) if k_rows.dim() == 4 else 1
         vv = v_rows.size(2) if v_rows.dim() == 4 else 1
         if max(kv, vv) > 1:
+            if need_attn:
+                # Q15 校验 readout_views==1: views 路径不支持手工注意力, 响亮报错
+                raise ValueError(
+                    "need_attn=True is N/A on the multi-view store path "
+                    "(Q15 requires readout_views==1; the views path has no manual-attention form)"
+                )
             return self._forward_views(k_rows, v_rows, chunk_mask, pos, chunk_byte_off, max(kv, vv), store_block)
         nh = self.nhead
         hd = pos.size(-1) // nh
@@ -1524,7 +1541,17 @@ class SLMBackbone(nn.Module):
         allowed = allowed | torch.eye(n, dtype=torch.bool, device=k_rows.device).view(1, 1, n, n)
         # block 1: cross-read; Q self-produced from the hidden state
         q = self.q_proj(h).view(bsz, n, nh, hd).transpose(1, 2)
-        o = F.scaled_dot_product_attention(q, k, v, attn_mask=allowed)
+        if need_attn:
+            # Q15 (任务书 §7.1): 手工注意力 -- scores = q@kᵀ/√hd, 掩码位置
+            # -inf, softmax 在 float32 计算, 再 @v; 概率带梯度寄存 (L_attend
+            # 的奖励靶点). allowed|eye 已保对角, 无全掩码行 NaN 风险 (同 SDPA).
+            scores = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(hd)
+            scores = scores.float().masked_fill(~allowed, float("-inf"))
+            self.last_block1_attn = torch.softmax(scores, dim=-1)  # (B, H, C, C) float32
+            o = torch.matmul(self.last_block1_attn.to(v.dtype), v)
+        else:
+            self.last_block1_attn = None
+            o = F.scaled_dot_product_attention(q, k, v, attn_mask=allowed)
         h = h + self.o_proj(o.transpose(1, 2).reshape(bsz, n, nh * hd))
         h = h + self.ffn1(self.ln_ffn1(h))
         # blocks 2..L: standard causal self-attention + FFN

@@ -576,6 +576,18 @@ def build_parser() -> argparse.ArgumentParser:
         "只在 --burst-prob>0 时有意义 (否则响亮报错); 默认关 = Q13 形态逐比特不变.",
     )
     parser.add_argument(
+        "--q15-circuit-rearing",
+        action="store_true",
+        help="Q15 回路养成臂 (任务书 2026-08-25 冻结, "
+        "docs/versions/v3_7/FLUED_V3_7_Q15_CIRCUIT_REARING_20260825_CN.md): "
+        "过程奖励三件套 (L_attend 注意力引导 + sg(g) 门控结果损失 + L_couple "
+        "反作弊孪生铰链) + 压缩区档 a 剔除 (r 恒 1.0) + codec 回调线 "
+        "(steps 800-1000 臂内自锚, 退步 >2pp 三 λ 各 x0.5, 下限 x0.25). "
+        "要求 --burst-prob>0 + --burst-prior-sieve + slm + d 格 "
+        "(k_row_source=state 且 v_row_source=state) + --seed-source k + "
+        "readout_views==1, 缺任一项响亮报错. Wired in train_v36_s1.py only.",
+    )
+    parser.add_argument(
         "--xcache-supp",
         type=int,
         default=0,
@@ -678,6 +690,11 @@ def main() -> None:
         raise SystemExit(
             "--burst-prob>0 is wired in the S1 trainer only: run "
             "tools/train/v3_6/train_v36_s1.py (Q13 突发性注入臂, prereg 2026-08-22)"
+        )
+    if getattr(args, "q15_circuit_rearing", False):
+        raise SystemExit(
+            "--q15-circuit-rearing is wired in the S1 trainer only: run "
+            "tools/train/v3_6/train_v36_s1.py (Q15 回路养成臂, 任务书 2026-08-25)"
         )
 
     device = torch.device(args.device if args.device == "cpu" or torch.cuda.is_available() else "cpu")

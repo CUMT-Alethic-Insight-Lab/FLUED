@@ -85,6 +85,20 @@ Tasks (spec section 20, user-designed):
    re-measures the rolling ledger of in-training segments; mean drift >0.02
    registers 先验侵蚀, per-segment table in out_dir/prior_erosion_midpoint.json).
    Default off = Q13 form, bitwise-identical.
+   Q15 回路养成臂 (``--q15-circuit-rearing``, 任务书 2026-08-25 冻结, d 格限定):
+   on top of Q14 -- 压缩区档 a 剔除 (``_burst_store_block``, occurrences 1..R-1
+   的 store 行从遮蔽段尾首 chunk 起剔除, r 恒 1.0, train/eval 同开) + 过程奖励
+   三件套 (全部 train-only): L_attend 注意力引导 (block-1 need_attn 手工注意力
+   概率, T 掩码 = 源后目标行集, 逐样本 T∩src=∅ 机械断言), sg(g) 门控结果损失
+   (echo 槽位从常规 completion 网格剔除防双重计分, eval 不动网格), L_couple
+   反作弊孪生铰链 (head-tail swap 篡改, 孪生选择每条 splice 样本一抽
+   _BURST_GENERATOR). codec 回调线 (§5): steps 800-1000 训练批
+   direct_acc/backbone_acc 臂内自锚, 之后 log 事件窗均值退步 >2pp -> 三 λ 各
+   x0.5 (下限 x0.25), 事件落 q15_callback_events.jsonl. 指标 q15_attend_mass /
+   q15_attend_maxmass / q15_attend_chance / q15_attend_loss / q15_gate_mean /
+   q15_echo_loss / q15_couple_loss / q15_twin_d / q15_twin_count (门 = §3.2
+   修订 v1 单头超基线超出量: σ((maxmass−chance−δ)/s), δ=0.15 s=0.05 冻结),
+   off/eval 零占位 schema 对齐.
 
 Metric redefinition (S1.0+): direct fidelity excludes nothing but MASK_ID
 positions are reported separately (trivially correct); masked acc is backbone
@@ -1181,6 +1195,192 @@ def _burst_metrics(logits_backbone: torch.Tensor, comp_targets: torch.Tensor, bu
     }
 
 
+# ---------------------------------------------------------------------------
+# Q15 回路养成臂 (过程奖励 + 反作弊对偶, 任务书 2026-08-25 冻结:
+# docs/versions/v3_7/FLUED_V3_7_Q15_CIRCUIT_REARING_20260825_CN.md)
+# d 格 (k=state ∧ v=state, seed_source=k) 限定 -- §1 裁定: b 格下 block-1 的
+# V 侧是 memory 行, L_attend 会焊在"地址对但读不到内容"的路径上 (奖励焊错
+# 位置不是次优, 是预定结论). 三件套损失全部 train-only, 零新架构参数.
+# ---------------------------------------------------------------------------
+
+# 初值汇总 (任务书 §3.4, 全部冻结)
+_Q15_TWIN_P = 0.25  # 孪生选择概率 (作用于已 splice 样本, 不摊给非任务样本)
+_Q15_TWIN_M = 0.1  # 铰链边际 m
+_Q15_GATE_DELTA = 0.15  # 门控 δ (§3.2 修订 v1: 单头超基线超出量, 替代原 τ=0.25 标定)
+_Q15_GATE_S = 0.05  # 门控 s
+_Q15_EPS = 1e-6  # L_attend 的 ε
+_Q15_LAMBDA_ATT = 0.1  # λ_att (λ_out 继承 task2_loss_weight, 不写死数字)
+_Q15_LAMBDA_COUPLE = 0.5  # λ_couple
+# 回调线 (§5): 臂内自锚 steps 800-1000, 退步 >2pp 触发, 降权 x0.5/次,
+# 下限 x0.25 (初值倍数)
+_Q15_ANCHOR_RANGE = (800, 1000)
+_Q15_CALLBACK_MARGIN = 0.02
+_Q15_CALLBACK_DECAY = 0.5
+_Q15_CALLBACK_FLOOR = 0.25
+
+
+def _q15_enabled(args) -> bool:
+    return bool(getattr(args, "q15_circuit_rearing", False))
+
+
+def _check_q15_args(args) -> None:
+    """Q15 响亮校验 (任务书 §7.5): 主开关要求 burst 开 + 先验筛开 + slm +
+    d 格 (k=state ∧ v=state) + seed_source=k + readout_views==1; 与
+    cloze/retrieval 的互斥沿用 burst 既有校验 (_check_burst_args)."""
+    if not _q15_enabled(args):
+        return
+    if not _burst_enabled(args):
+        raise SystemExit("--q15-circuit-rearing requires --burst-prob>0 (Q15 建在 Q13/Q14 burst 构造上)")
+    if not bool(getattr(args, "burst_prior_sieve", False)):
+        raise SystemExit("--q15-circuit-rearing requires --burst-prior-sieve (任务书 §2: 先验筛保留)")
+    if getattr(args, "backbone_mode", "") != "slm":
+        raise SystemExit("--q15-circuit-rearing requires --backbone-mode slm (任务书 §7.5)")
+    if getattr(args, "k_row_source", "") != "state" or getattr(args, "v_row_source", "") != "state":
+        raise SystemExit(
+            "--q15-circuit-rearing requires d 格 (k_row_source=state 且 v_row_source=state; "
+            "任务书 §1 裁定: b 格下 L_attend 焊在结构性无答案路径上)"
+        )
+    if getattr(args, "seed_source", "") != "k":
+        raise SystemExit("--q15-circuit-rearing requires --seed-source k (任务书 §1 d 格裁定)")
+    if int(getattr(args, "readout_views", 1)) != 1:
+        raise SystemExit(
+            "--q15-circuit-rearing requires readout_views==1 (views 路径不支持 need_attn 手工注意力)"
+        )
+
+
+def _burst_store_block(metas: list, chunks):
+    """Q15 §2 压缩区激励改造 (档 a 语义, r 恒 1.0, 零随机抽): per spliced
+    sample, excise the store rows covered by occurrences 1..R-1 (第 1..R-1 次
+    出现的并集 chunk) from every query position at/after the masked tail's
+    first chunk (qc = echo_span 首字节所在 chunk) -- the answer then reaches
+    the tail only through the state channel. 剔除是任务构造本体, train/eval
+    同开 (§7.2). Returns None when no sample is spliced (零成本 legacy 路径)."""
+    chunk_ids = chunks.chunk_ids
+    n_chunks = chunks.chunk_mask.size(1)
+    block = None
+    for b, m in enumerate(metas):
+        if m is None:
+            continue
+        src = [chunk_ids[b, lo:hi] for lo, hi in m["occurrences"][:-1]]
+        src = [c[c.ge(0)] for c in src]
+        src = [c for c in src if c.numel()]
+        if not src:
+            continue  # 早次出现全部未入网格 (容量) -- 无可剔行
+        src_chunks = torch.unique(torch.cat(src))
+        elo, _ehi = m["echo_span"]
+        tail = chunk_ids[b, elo:]
+        q_chunks = tail[tail.ge(0)]
+        if q_chunks.numel() == 0:
+            continue  # 遮蔽段尾被挤出网格 -- 无 query 可剔 (slot 网格会计弃用)
+        qc = int(q_chunks[0])  # chunks 字节序: 首个有效 = 段尾首字节 chunk
+        if block is None:
+            block = torch.zeros(
+                chunk_ids.size(0), n_chunks, n_chunks, dtype=torch.bool, device=chunk_ids.device
+            )
+        block[b, qc:, src_chunks] = True
+    return block
+
+
+def _q15_assert_disjoint(t_mask: torch.Tensor, src_mask: torch.Tensor) -> None:
+    """逐样本机械断言 (任务书 §3 + §1 方法论备案首次执行): 奖励靶点行集 T
+    与掩码剔除集 src_chunks 交集必须为空, 违反即响亮报错."""
+    if bool((t_mask.any(dim=0) & src_mask).any()):
+        raise ValueError(
+            "Q15 T∩src≠∅: 奖励靶点行集与掩码剔除集相交 (任务书 §3 机械断言) -- "
+            "构造缺陷, 样本构造器须修正, 不静默放行"
+        )
+
+
+def _q15_echo_mass(attn_b: torch.Tensor, m: dict, chunk_ids_b: torch.Tensor, offsets_b: torch.Tensor, chunk_mask_b: torch.Tensor):
+    """One spliced sample's T 掩码 + per-echo-byte attention mass (任务书 §3.1)
+    + 门输入 (§3.2 修订 v1).
+
+    T(b, q) = {j : c1_end < j <= q, j ∉ src_chunks(b), chunk j valid}, c1_end
+    = 第 1 次出现的末 chunk. mass_i = Σ_h Σ_{j∈T(b,q_i)} A[h, q_i, j] -- 逐头
+    求和而非全头均值 (L_attend 公式不变, 允许单头特化成回路). 门输入
+    (修订 v1, 单头超基线超出量): maxmass_i = max_h Σ_{j∈T} A[h, q_i, j]
+    (逐头 T 质量的 max over heads, 不是求和); chance_i = |T(b,q_i)| /
+    |allowed(b,q_i)|, allowed = {j ≤ q_i ∧ chunk_mask 有效 ∧ j ∉ src_chunks}
+    (对角已在集内 -- echo chunk 永不属于 src, 不用特判), 由索引计数构成,
+    天然无梯度. Returns (mass, maxmass, chance, q_chunks, slots) -- 三个
+    (n_echo,) 张量 + 位置; None when the echo never lands on the grid
+    (样本不计入三件套, burst slot 网格的 active 判定同款)."""
+    n_chunks = int(chunk_mask_b.size(0))
+    src = [chunk_ids_b[lo:hi] for lo, hi in m["occurrences"][:-1]]
+    src = [c[c.ge(0)] for c in src]
+    src = [c for c in src if c.numel()]
+    src_mask = torch.zeros(n_chunks, dtype=torch.bool, device=chunk_ids_b.device)
+    if src:
+        src_mask[torch.unique(torch.cat(src))] = True
+    occ0_lo, occ0_hi = m["occurrences"][0]
+    c0 = chunk_ids_b[occ0_lo:occ0_hi]
+    c0 = c0[c0.ge(0)]
+    c1_end = int(c0.max()) if c0.numel() else -1  # 第 1 次出现的末 chunk
+    elo, ehi = m["echo_span"]
+    t = torch.arange(elo, ehi, device=chunk_ids_b.device)
+    q = chunk_ids_b[t]
+    s = offsets_b[t]
+    if not bool((q.ge(0) & s.ge(0)).all()):
+        return None
+    jj = torch.arange(n_chunks, device=chunk_ids_b.device)
+    causal = jj.view(1, -1) <= jj.view(-1, 1)  # (C, C): [query, store_row]
+    allowed = causal & chunk_mask_b.view(1, -1) & ~src_mask.view(1, -1)  # §3.2v1 allowed 集
+    t_mask = allowed & (jj.view(1, -1) > c1_end)
+    _q15_assert_disjoint(t_mask, src_mask)
+    # mass per query chunk: Σ_h Σ_j A[h, q, j]·T[q, j]; maxmass: max_h Σ_j
+    mass_head_q = (attn_b * t_mask.unsqueeze(0).to(attn_b.dtype)).sum(dim=2)  # (H, C)
+    mass_per_q = mass_head_q.sum(dim=0)  # (C,) 逐头求和 (L_attend 用)
+    maxmass_per_q = mass_head_q.max(dim=0).values  # (C,) 单头最大 (门输入)
+    # chance (修订 v1): |T| / |allowed| 逐 query chunk, 纯索引计数无梯度
+    chance_per_q = t_mask.sum(dim=1).float() / allowed.sum(dim=1).clamp(min=1).float()
+    return mass_per_q[q], maxmass_per_q[q], chance_per_q[q], q, s
+
+
+def _q15_gate(maxmass: torch.Tensor, chance: torch.Tensor) -> torch.Tensor:
+    """Q15 §3.2 修订 v1 门 (冻结 δ=0.15, s=0.05): g = σ((maxmass − chance −
+    δ)/s) -- 单头 T 质量超出该位置均匀基线 δ 才开门; 随机初始 max-head
+    mass ≈ chance+涨落 -> 门基本关闭, 单头特化 (max→1) 门全开.
+    stop-gradient 在调用侧 (反捷径条款: 不 detach 模型可压小 g 把损失幅度
+    趋零, 与 L_attend 对拉形成退化路径)."""
+    return torch.sigmoid((maxmass - chance - _Q15_GATE_DELTA) / _Q15_GATE_S)
+
+
+def _burst_twin_bytes(raw: bytes, m: dict) -> bytes:
+    """Q15 §3.3 反作弊对偶的孪生篡改 (机械确定性, 零随机流): copy the row and
+    replace, for each of occurrences 1..R-1, the tail tb bytes (tb = echo_span
+    长度) with occurrence 0's HEAD tb bytes (head-tail swap, UTF-8 合法 by
+    construction -- 段内字节互换). 只动这些字节, 其余逐位相同."""
+    tb = m["echo_span"][1] - m["echo_span"][0]
+    occ0_lo = m["occurrences"][0][0]
+    head = raw[occ0_lo : occ0_lo + tb]
+    buf = bytearray(raw)
+    for _lo, hi in m["occurrences"][:-1]:
+        buf[hi - tb : hi] = head
+    return bytes(buf)
+
+
+def _q15_callback_check(anchor: dict, window: dict, lambdas: dict, floors: dict, step: int):
+    """Q15 codec 回调线 (任务书 §5, 臂内自锚, 纯函数): 窗均值 (log 事件的
+    direct_acc/backbone_acc) 任一较锚退步 >0.02 -> 三个 λ 各 x0.5, 下限为
+    初值 x0.25 (floors). Returns (事件列表, 新 lambdas); 事件含
+    step/触发项/旧值/新值, 调用侧逐次落盘 q15_callback_events.jsonl."""
+    triggered = [
+        k for k in ("direct_acc", "backbone_acc") if anchor[k] - window[k] > _Q15_CALLBACK_MARGIN
+    ]
+    if not triggered:
+        return [], lambdas
+    new = {k: max(v * _Q15_CALLBACK_DECAY, floors[k]) for k, v in lambdas.items()}
+    event = {
+        "step": step,
+        "triggered": triggered,
+        "anchor": {k: round(anchor[k], 6) for k in triggered},
+        "window": {k: round(window[k], 6) for k in triggered},
+        "old": dict(lambdas),
+        "new": dict(new),
+    }
+    return [event], new
+
+
 def _load_bpe_tokenizer(path: str) -> None:
     global _BPE_TOKENIZER
     from tokenizers import Tokenizer
@@ -1390,7 +1590,7 @@ def _completion_target_grids(
     return targets, slot_mask, masked_slot, torch.zeros((), device=clean.device)
 
 
-def s1_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None, retrieval_metas=None) -> dict:
+def s1_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None, retrieval_metas=None, burst_metas_q15=None, store_block_override=None, need_attn: bool = False) -> dict:
     codec_final = getattr(args, "codec_final_state", False)
     if getattr(model.config, "backbone_mode", "") == "slm":
         # v3.7 (consensus §1-2): dedicated branch. codec_final / paged / draft
@@ -1404,11 +1604,13 @@ def s1_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None, re
                 "keystone this arm welds shut)"
             )
         return _slm_forward(
-            model, source, args, clean=clean, byte_mask=byte_mask, retrieval_metas=retrieval_metas
+            model, source, args, clean=clean, byte_mask=byte_mask, retrieval_metas=retrieval_metas,
+            burst_metas_q15=burst_metas_q15, store_block_override=store_block_override,
+            need_attn=need_attn,
         )
-    if retrieval_metas is not None:
+    if retrieval_metas is not None or burst_metas_q15 is not None or store_block_override is not None:
         raise ValueError(
-            "retrieval (--retrieval-prob>0) requires backbone_mode='slm' (v3.7 自然检索任务); "
+            "retrieval/burst store_block threading requires backbone_mode='slm' (v3.7); "
             "legacy xattn/paged/draft/attn paths are N/A"
         )
     byte_states, confidence, valid, _ = model._encode(source)
@@ -1631,7 +1833,7 @@ def s1_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None, re
     }
 
 
-def _slm_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None, retrieval_metas=None) -> dict:
+def _slm_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None, retrieval_metas=None, burst_metas_q15=None, store_block_override=None, need_attn: bool = False) -> dict:
     """v3.7 slm branch (docs/versions/v3.7/FLUED_V3_7_ARCHITECTURE_CONSENSUS_20260817_CN.md).
 
     Codec full-coverage law (consensus §2): any content task's loss covers the
@@ -1647,6 +1849,14 @@ def _slm_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None, 
     档 a store_block mask is built from the metas + chunk grid
     (``_retrieval_store_block``) and threaded into the backbone; the block
     rate rides out to step_model's metrics. None = bit-identical legacy.
+
+    Q15 (任务书 2026-08-25 §2/§7.1): ``store_block_override`` 给了就直接用
+    (优先级最高, 预留给调用侧自带网格的用法); 否则 ``burst_metas_q15`` 在本
+    函数内建 burst store_block (``_burst_store_block``, r 恒 1.0 零随机抽,
+    train/eval 同开 -- 剔除是任务定义) -- 构造点在此而非 step_model, 因为
+    chunk 网格只在这里存在; 再否则走 legacy retrieval 路径. ``need_attn``
+    线进 backbone block-1 手工注意力, 概率随 ``block1_attn`` 键带出 (关时
+    None).
     """
     byte_states, confidence, valid, _ = model._encode(source)
     hard_cut, utf8_cont, cut_overflow = model._cuts(source, confidence, valid)
@@ -1661,7 +1871,12 @@ def _slm_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None, 
     )
     store_block = None
     retrieval_block_rate = 0.0
-    if retrieval_metas is not None:
+    if store_block_override is not None:
+        store_block = store_block_override  # Q15: 调用侧直接给, 优先级最高
+    elif burst_metas_q15 is not None:
+        # Q15 §2 压缩区激励改造: 第 1..R-1 次出现覆盖的 store 行档 a 剔除
+        store_block = _burst_store_block(burst_metas_q15, chunks)
+    elif retrieval_metas is not None:
         store_block, retrieval_block_rate = _retrieval_store_block(
             retrieval_metas, chunks, float(getattr(args, "retrieval_block_prob", 0.0)), _RETRIEVAL_GENERATOR
         )
@@ -1671,6 +1886,7 @@ def _slm_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None, 
         v_store if v_store is not None else v_rows,
         chunks.chunk_mask, pos, chunk_byte_off=chunk_byte_off,
         store_block=store_block,
+        need_attn=need_attn,
     )
     cond_backbone = backbone_out + pos
     dec_in = model.decoder_in if model.config.v_row_source == "state" else model.decoder_in_mem
@@ -1687,6 +1903,7 @@ def _slm_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None, 
         "memory": memory,
         "index": index,  # summarizer K rows (resident key-geometry metrics, E80 补充 2)
         "retrieval_block_rate": retrieval_block_rate,  # 档 a excision hit rate (0.0 when off)
+        "block1_attn": model.backbone.last_block1_attn,  # Q15 need_attn 概率 (None when off)
         "think_steps": 0.0,
         "chunks": chunks,
         "cut_overflow": cut_overflow,
@@ -1780,6 +1997,7 @@ def _frozen_decoder_logits(model, cond: torch.Tensor, token_mask: torch.Tensor) 
 
 def step_model(model, batch, args, device, train: bool):
     clean = batch[0]
+    q15_on = _q15_enabled(args)
     cloze_metas = None
     if _cloze_enabled(args):
         # v3.7 cloze 检索回执 (user-ruled 2026-08-17): slm-only; the legacy
@@ -1874,7 +2092,13 @@ def step_model(model, batch, args, device, train: bool):
         byte_mask = _burst_mask_overrides(byte_mask, burst_metas)
     source = clean.masked_fill(byte_mask, MASK_ID)
     with torch.autocast("cuda", dtype=torch.bfloat16, enabled=args.amp and device.type == "cuda"):
-        out = s1_forward(model, source, args, clean=clean, byte_mask=byte_mask, retrieval_metas=retrieval_metas)
+        out = s1_forward(
+            model, source, args, clean=clean, byte_mask=byte_mask, retrieval_metas=retrieval_metas,
+            # Q15: 剔除是任务定义, train/eval 同开 (§7.2); need_attn 只在训练
+            # 前向开 (L_attend 的奖励靶点, eval 零成本零形态变化)
+            burst_metas_q15=burst_metas if q15_on else None,
+            need_attn=q15_on and train,
+        )
     chunks = out["chunks"]
     # Per-chunk base grids: direct (encoded) and predict views keep these.
     targets, slot_mask, masked_slot = make_targets(
@@ -1899,6 +2123,18 @@ def step_model(model, batch, args, device, train: bool):
         args.max_span,
         comp_cumulative,
     )
+    # burst echo slot 网格在这里算一次, 供三处共用: Q15 §3.2 的 echo 剔除
+    # (train-only, eval 不动网格)、Q15 三件套、burst 指标块.
+    burst_slot = burst_active = None
+    if burst_metas is not None:
+        burst_slot, burst_active = _cloze_slot_grid(
+            burst_metas, chunks.chunk_ids, chunks.offsets, args.max_chunks, args.max_span
+        )
+        if q15_on and train:
+            # Q15 §3.2: echo 槽位从常规 completion 网格剔除 (防双重计分;
+            # codec 覆盖由门控结果损失接续 -- g→1 等价全覆盖, g→0 段尾暂不
+            # 被任何项覆盖, 条件覆盖即设计)
+            comp_slot_mask = comp_slot_mask & ~burst_slot
     # as-encoded targets: the masked source itself (MASK_ID at masked slots)
     if slm_coarse_v:
         # coarse-V direct: cumulative as-encoded grid (row i restores the
@@ -2138,9 +2374,7 @@ def step_model(model, batch, args, device, train: bool):
         "burst_yield": torch.zeros((), device=device),
     }
     if burst_metas is not None:
-        burst_slot, burst_active = _cloze_slot_grid(
-            burst_metas, chunks.chunk_ids, chunks.offsets, args.max_chunks, args.max_span
-        )
+        # burst_slot/burst_active 已在 comp 网格处算好 (Q15 §3.2 剔除共用)
         burst_metrics.update(
             _burst_metrics(out["logits_backbone"], comp_targets, burst_slot, burst_active, burst_metas)
         )
@@ -2154,12 +2388,127 @@ def step_model(model, batch, args, device, train: bool):
             burst_stats["spliced"] / drawn if drawn else 1.0, device=device
         )
 
+    # Q15 回路养成臂三件套 (任务书 2026-08-25 §3, 全部 train-only; eval 零
+    # 占位, 网格不动 -- §7.2 形态纪律). λ 每步从 args 读 (回调线 §5 原地降权).
+    q15_metrics = {
+        "q15_attend_mass": torch.zeros((), device=device),
+        "q15_attend_maxmass": torch.zeros((), device=device),  # §3.2v1: 门所见单头最大 T 质量
+        "q15_attend_chance": torch.zeros((), device=device),  # §3.2v1: 均匀基线 (判读矩阵基线读数)
+        "q15_attend_loss": torch.zeros((), device=device),
+        "q15_gate_mean": torch.zeros((), device=device),
+        "q15_echo_loss": torch.zeros((), device=device),
+        "q15_couple_loss": torch.zeros((), device=device),
+        "q15_twin_d": torch.zeros((), device=device),
+        "q15_twin_count": torch.zeros((), device=device),
+    }
+    attend_loss = torch.zeros((), device=device)
+    echo_loss = torch.zeros((), device=device)
+    couple_loss = torch.zeros((), device=device)
+    if q15_on and train and burst_metas is not None:
+        attn = out.get("block1_attn")
+        if attn is None:
+            raise ValueError(
+                "Q15 train forward requires need_attn=True (block1_attn missing) -- "
+                "L_attend 的奖励靶点缺席, 响亮报错不静默"
+            )
+        masses, maxmasses, chances, ces = [], [], [], []
+        for b, m in enumerate(burst_metas):
+            if m is None or not bool(burst_active[b]):
+                continue
+            got = _q15_echo_mass(
+                attn[b], m, chunks.chunk_ids[b], chunks.offsets[b], chunks.chunk_mask[b]
+            )
+            if got is None:
+                continue
+            mass_i, maxmass_i, chance_i, q_i, s_i = got
+            masses.append(mass_i)
+            maxmasses.append(maxmass_i)
+            chances.append(chance_i)
+            logit_i = out["logits_backbone"][b, q_i, s_i].float()  # (n_echo, V)
+            ces.append(F.cross_entropy(logit_i, comp_targets[b, q_i, s_i], reduction="none"))
+        if masses:
+            # §3.1: mass 逐 echo 字节 (逐头求和, L_attend 公式不变). §3.2
+            # 修订 v1: 门输入 = 单头超基线超出量 (max_h T 质量 − 该位置均匀
+            # 基线 chance); g 取 stop-gradient (反捷径条款, 实现层改写已入册:
+            # 不 detach 模型可压小 g 把损失幅度趋零). chance 由索引计数构成,
+            # 天然无梯度.
+            mass = torch.cat(masses)
+            maxmass = torch.cat(maxmasses)
+            chance = torch.cat(chances)
+            ce = torch.cat(ces)
+            attend_loss = (-torch.log(mass + _Q15_EPS)).mean()
+            gate = _q15_gate(maxmass.detach(), chance)
+            echo_loss = (gate * ce).mean()
+            q15_metrics["q15_attend_mass"] = mass.detach().mean()
+            q15_metrics["q15_attend_maxmass"] = maxmass.detach().mean()
+            q15_metrics["q15_attend_chance"] = chance.mean()
+            q15_metrics["q15_attend_loss"] = attend_loss.detach()
+            q15_metrics["q15_gate_mean"] = gate.mean()
+            q15_metrics["q15_echo_loss"] = echo_loss.detach()
+        # §3.3 反作弊对偶: 孪生选择消耗 _BURST_GENERATOR 每条 splice 样本一抽
+        # (固定顺序, 同 retrieval block 抽取纪律); 篡改本身零随机流; twin 前向
+        # 带梯度但只取 logits_backbone 供铰链, 不进任何 codec 损失/指标 (§7.3)
+        twin_sel = []
+        for b, m in enumerate(burst_metas):
+            if m is None:
+                continue
+            u = float(torch.rand((), generator=_BURST_GENERATOR))
+            if u >= _Q15_TWIN_P or not bool(burst_active[b]):
+                continue
+            twin_sel.append(b)
+        if twin_sel:
+            width = clean.size(1)
+            twin_clean = clean.new_full((len(twin_sel), width), PAD_ID)
+            for i, b in enumerate(twin_sel):
+                raw = bytes(int(x) - BYTE_OFFSET for x in clean[b].tolist() if int(x) != PAD_ID)
+                tb = _burst_twin_bytes(raw, burst_metas[b])
+                twin_clean[i, : len(tb)] = torch.tensor(
+                    [x + BYTE_OFFSET for x in tb], dtype=clean.dtype
+                )
+            twin_source = twin_clean.masked_fill(byte_mask[twin_sel], MASK_ID)  # 同一 byte_mask 子集
+            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=args.amp and device.type == "cuda"):
+                twin_out = s1_forward(
+                    model, twin_source, args,
+                    burst_metas_q15=[burst_metas[b] for b in twin_sel],
+                    need_attn=False,
+                )
+            twin_metas = [burst_metas[b] for b in twin_sel]
+            twin_slot, twin_active = _cloze_slot_grid(
+                twin_metas, twin_out["chunks"].chunk_ids, twin_out["chunks"].offsets,
+                args.max_chunks, args.max_span,
+            )
+            ds = []
+            for i, b in enumerate(twin_sel):
+                if not bool(twin_active[i]):
+                    continue
+                p_clean = torch.softmax(out["logits_backbone"][b][burst_slot[b]].float(), dim=-1)
+                p_twin = torch.softmax(twin_out["logits_backbone"][i][twin_slot[i]].float(), dim=-1)
+                if p_clean.size(0) != p_twin.size(0):
+                    continue  # 篡改改了分段导致槽数不一致 -- 条目跳过, 不计入铰链
+                # ½·‖softmax(clean)−softmax(twin)‖₁ 逐 echo 槽位 (∈[0,1])
+                ds.append(0.5 * (p_clean - p_twin).abs().sum(dim=-1).mean())
+            q15_metrics["q15_twin_count"] = torch.tensor(
+                len(ds) / clean.size(0), device=device
+            )
+            if ds:
+                d = torch.stack(ds)
+                couple_loss = torch.clamp(_Q15_TWIN_M - d, min=0.0).mean()  # m=0.1 冻结
+                q15_metrics["q15_couple_loss"] = couple_loss.detach()
+                q15_metrics["q15_twin_d"] = d.detach().mean()
+
+    lam_att = float(getattr(args, "q15_lambda_att", _Q15_LAMBDA_ATT))
+    lam_out = getattr(args, "q15_lambda_out", None)
+    lam_out = float(args.task2_loss_weight) if lam_out is None else float(lam_out)  # λ_out 继承 task2_loss_weight
+    lam_couple = float(getattr(args, "q15_lambda_couple", _Q15_LAMBDA_COUPLE))
     loss = (
         args.task1_loss_weight * direct_loss
         + args.task2_loss_weight * completion_loss
         + args.predict_weight * predict_loss
         + getattr(args, "cloze_weight", 0.3) * cloze_loss
         + getattr(args, "retrieval_weight", 1.0) * retrieval_loss
+        + lam_att * attend_loss
+        + lam_out * echo_loss
+        + lam_couple * couple_loss
     )
     # fork 3 F2 (user-ruled 2026-08-21): auxiliary per-slot byte-reconstruction
     # loss on the summarizer's memory rows — the pressure path that tells the
@@ -2208,6 +2557,15 @@ def step_model(model, batch, args, device, train: bool):
         "burst_tail_chars": burst_metrics["burst_tail_chars"],
         "burst_sieve_reject_rate": burst_metrics["burst_sieve_reject_rate"],
         "burst_yield": burst_metrics["burst_yield"],
+        "q15_attend_mass": q15_metrics["q15_attend_mass"],
+        "q15_attend_maxmass": q15_metrics["q15_attend_maxmass"],
+        "q15_attend_chance": q15_metrics["q15_attend_chance"],
+        "q15_attend_loss": q15_metrics["q15_attend_loss"],
+        "q15_gate_mean": q15_metrics["q15_gate_mean"],
+        "q15_echo_loss": q15_metrics["q15_echo_loss"],
+        "q15_couple_loss": q15_metrics["q15_couple_loss"],
+        "q15_twin_d": q15_metrics["q15_twin_d"],
+        "q15_twin_count": q15_metrics["q15_twin_count"],
         "mask_rate": (byte_mask.float().sum() / valid.float().sum().clamp(min=1.0)).detach(),
         "truncated_tokens": chunks.pack_info["truncated_tokens"].float().sum().detach(),
         "cut_capacity_overflow": out["cut_overflow"].float().sum().detach(),
@@ -2393,6 +2751,20 @@ def main() -> None:
         _RETRIEVAL_RAMP = _parse_block_ramp(args.retrieval_block_ramp)
         print(f"[s1] retrieval r 爬坡 (prereg §4): {_RETRIEVAL_RAMP}", flush=True)
     _check_burst_args(args)
+    _check_q15_args(args)
+    if _q15_enabled(args):
+        # Q15 回路养成臂 (任务书 2026-08-25 冻结): λ 初值 (§3.4) 落 args
+        # 属性, step_model 每步读, 回调线 (§5) 原地降权. λ_out 继承
+        # task2_loss_weight (不作新自由度).
+        args.q15_lambda_att = _Q15_LAMBDA_ATT
+        args.q15_lambda_out = float(args.task2_loss_weight)
+        args.q15_lambda_couple = _Q15_LAMBDA_COUPLE
+        print(
+            f"[s1] Q15 回路养成臂 (d 格): λ_att={args.q15_lambda_att} "
+            f"λ_out={args.q15_lambda_out}(继承 task2) λ_couple={args.q15_lambda_couple} "
+            f"p_twin={_Q15_TWIN_P} δ/s={_Q15_GATE_DELTA}/{_Q15_GATE_S} m={_Q15_TWIN_M}",
+            flush=True,
+        )
     if _burst_enabled(args):
         # Q13 突发性注入臂 (prereg 2026-08-22): the corpus sampler opens
         # --data-path for random-offset fresh segment draws (防背护栏: 严禁
@@ -2549,6 +2921,18 @@ def main() -> None:
     # Q14 臂中点复测钩 (修订案 §2.1): 只在先验筛开时武装
     midpoint_done = False
     midpoint_armed = bool(getattr(args, "burst_prior_sieve", False)) and _burst_enabled(args)
+    # Q15 codec 回调线 (任务书 §5, 臂内自锚): 锚 = steps 800-1000 训练批
+    # direct_acc/backbone_acc 均值 (post-warmup 自锚; 训练中无周期 eval,
+    # 只能用训练批读数); resume 越过锚窗时锚缺席, 监控自动解除 (不静默伪造锚)
+    q15_anchor_sum = {"direct_acc": 0.0, "backbone_acc": 0.0}
+    q15_anchor_n = 0
+    q15_anchor = None
+    q15_lambdas = q15_floors = None
+    if _q15_enabled(args):
+        q15_lambdas = {
+            "att": args.q15_lambda_att, "out": args.q15_lambda_out, "couple": args.q15_lambda_couple
+        }
+        q15_floors = {k: v * _Q15_CALLBACK_FLOOR for k, v in q15_lambdas.items()}
     while step < args.max_steps:
         for batch in train_loader:
             if step >= args.max_steps:
@@ -2571,6 +2955,14 @@ def main() -> None:
             for k, v in metrics.items():
                 pending[k] = pending[k] + v if k in pending else v.clone()
             pending_n += 1
+            if _q15_enabled(args) and _Q15_ANCHOR_RANGE[0] <= step <= _Q15_ANCHOR_RANGE[1]:
+                # Q15 回调线锚窗 (§5): steps 800-1000 累计训练批读数
+                q15_anchor_sum["direct_acc"] += float(metrics["direct_acc"])
+                q15_anchor_sum["backbone_acc"] += float(metrics["backbone_acc"])
+                q15_anchor_n += 1
+                if step == _Q15_ANCHOR_RANGE[1]:
+                    q15_anchor = {k: v / q15_anchor_n for k, v in q15_anchor_sum.items()}
+                    print(f"[s1] Q15 回调线锚 (steps 800-1000 均值): {q15_anchor}", flush=True)
             if step % args.log_every == 0 or step == 1:
                 row = {
                     "step": step,
@@ -2586,6 +2978,23 @@ def main() -> None:
                 # Q14 产出率报警 (修订案 §2.2): <70% 打警告行, 不静默放宽阈值
                 if _burst_enabled(args):
                     _burst_yield_alarm(step, row.get("burst_yield", 1.0))
+                # Q15 回调线监控 (§5): step>1000 后每个 log 事件查窗均值
+                if q15_anchor is not None and step > _Q15_ANCHOR_RANGE[1]:
+                    events, q15_lambdas = _q15_callback_check(
+                        q15_anchor,
+                        {"direct_acc": row["direct_acc"], "backbone_acc": row["backbone_acc"]},
+                        q15_lambdas, q15_floors, step,
+                    )
+                    for ev in events:
+                        args.q15_lambda_att = q15_lambdas["att"]
+                        args.q15_lambda_out = q15_lambdas["out"]
+                        args.q15_lambda_couple = q15_lambdas["couple"]
+                        _append_jsonl(out_dir / "q15_callback_events.jsonl", ev)
+                        print(
+                            f"[s1][Q15] 回调线降权 step={step} 触发项={ev['triggered']} "
+                            f"λ: {ev['old']} -> {ev['new']}",
+                            flush=True,
+                        )
             if midpoint_armed and not midpoint_done and step >= args.max_steps // 2:
                 # Q14 臂中点复测钩: 当前模型 x 同一批在训片段 (滚动 ledger);
                 # >= 判定: 中点步恰好 NaN-skip 时顺延一步, 不静默丢钩
