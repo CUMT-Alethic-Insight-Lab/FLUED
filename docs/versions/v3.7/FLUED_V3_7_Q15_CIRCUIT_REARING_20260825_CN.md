@@ -117,9 +117,11 @@ E104 坐实窗内基础复制回路从未形成（init≈trained），Q13/Q14 �
 
 ## §8 预算与排程
 
-- 20K 步 @ 4096B，batch=1，LR 2e-4 + warmup 200 + cosine→0（E103 健康配方，不许回 1e-3 恒定）；init = canonical segmentor 快照（`s0pp_pro_v4_sft_20260805`），其余从头；
+- 20K 步 @ 4096B，batch=1（chunk 网格 1024×64），LR 2e-4 + warmup 200 + cosine→0（E103 健康配方，不许回 1e-3 恒定）；init = canonical segmentor 快照（`s0pp_pro_v4_sft_20260805`），其余从头；
 - 预计墙钟 ~2.5h（含孪生 +12.5%）；里程碑每 3K；
 - 收官：判读矩阵落格 + 逐条目 Δ + induction 全程轨迹 + 路由消融 + 剖面 + codec 双指标（含 no-excision 对照），一次性入册。
+
+**【偏差登记 v1（2026-08-25 首跑收官时）】** 原条款：20K @ 4096B / batch=1 / 网格 1024×64。**实际首跑**（run `v37ks_d_sm_q15_circuit_20k_ctx4096_20260825`）为 **512B / batch=8 / 网格 64×64**——点火命令漏传 `--seq-len/--stride/--batch-size/--max-chunks` 四面覆写旗标，canonical 默认值（512/8/64）生效（改写理由：点火纪律失误，非设计变更；改写时刻：首跑收官、Δ 探针实跑暴露窗宽时）。处置：该 run 降级为 **Q15-pilot**——off-spec 试运行，其全部读数标注 512B 形态、不与正臂及 Q13/Q14（4096B）混排；价值=奖励回路全链路演兵（门控/回调线/孪生/零 NaN/codec 健康均验证）+ 判读矩阵方向的廉价预览。正臂按冻结规格重点火。教训入册（点火纪律第四课，继 out_dir 占位符/S1 入口/data_path 占位符之后）：**点火命令必须与上一同族臂 resolved_config 做全键 diff 核对**，不止核"我打算改的那几项"。
 
 ## §9 备案
 

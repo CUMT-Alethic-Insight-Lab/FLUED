@@ -360,6 +360,93 @@ def test_parser_default_q15_off():
     assert args.q15_circuit_rearing is False
 
 
+# --- 10. 收官探针纯函数 (probe_burst_route_q15, 任务书 §6) ---------------------------
+
+
+def test_probe_swap_identity_audit():
+    from tools.analysis.v3_6 import probe_burst_route_q15 as probe
+
+    # 周期段: 段首 tb 字节 == 各段尾 tb 字节 -> head-tail swap 为恒等篡改
+    seg = "天地玄".encode("utf-8") * 8  # 24B, 周期 9B
+    raw = seg + b"AAAA" + seg + b"BBBB" + seg
+    n_seg, tb = len(seg), 9
+    occ = [(0, n_seg), (n_seg + 4, 2 * n_seg + 4), (2 * n_seg + 8, 3 * n_seg + 8)]
+    m = {"occurrences": occ, "echo_span": (occ[-1][1] - tb, occ[-1][1])}
+    assert probe._swap_identity(raw, m) is True
+    # 非周期段: 篡改非恒等
+    seg2 = "天地玄黄宇宙洪荒".encode("utf-8")  # 24B 非周期
+    raw2 = seg2 + b"AAAA" + seg2 + b"BBBB" + seg2
+    occ2 = [(0, 24), (28, 52), (56, 80)]
+    m2 = {"occurrences": occ2, "echo_span": (80 - tb, 80)}
+    assert probe._swap_identity(raw2, m2) is False
+
+
+def test_probe_delta_aggregate():
+    from tools.analysis.v3_6 import probe_burst_route_q15 as probe
+
+    def _item(d, swap=False):
+        return {
+            "intact": {"byte_acc": 0.8}, "src_scrambled": {"byte_acc": 0.8 - d},
+            "swap_identity": swap,
+        }
+
+    items = [_item(0.5), _item(0.0), _item(-0.5), _item(0.9, swap=True)]
+    agg = probe._delta_aggregate(items)
+    assert agg["n"] == 3 and agg["n_swap_identity_excluded"] == 1
+    assert agg["mean"] == 0.0
+    # sd = sqrt((0.25+0+0.25)/2) = 0.5; ci = 1.96*0.5/sqrt(3)
+    assert agg["ci95"] == pytest.approx(1.96 * 0.5 / 3**0.5, abs=1e-3)
+    assert agg["ci_excludes_zero"] is False
+    # 全正 Δ -> CI 不含 0
+    agg2 = probe._delta_aggregate([_item(0.5), _item(0.6), _item(0.4)])
+    assert agg2["n"] == 3 and agg2["mean"] == pytest.approx(0.5, abs=1e-4)
+    assert agg2["ci_excludes_zero"] is True
+    # 空/全剔除 -> n=0 零占位
+    agg3 = probe._delta_aggregate([_item(0.5, swap=True)])
+    assert agg3["n"] == 0 and agg3["mean"] == 0.0 and agg3["ci95"] == 0.0
+    assert agg3["n_swap_identity_excluded"] == 1
+    assert agg3["ci_excludes_zero"] is False
+
+
+def test_probe_patch_state_zero_channels():
+    """按通道清零 (d 格拆分): 假模型验证 k/v/k_store/v_store 各自独立清零."""
+    from types import SimpleNamespace
+
+    from tools.analysis.v3_6 import probe_burst_route_q15 as probe
+
+    def _fake():
+        fake = SimpleNamespace()
+
+        def rows(chunks, with_views=False):
+            k = torch.ones(1, 3, 4)
+            v = torch.full((1, 3, 4), 2.0)
+            if with_views:
+                return (k, v, None, None, None,
+                        torch.full((1, 3, 2, 4), 3.0), torch.full((1, 3, 2, 4), 4.0))
+            return k, v, None, None, None
+
+        fake._slm_store_rows = rows
+        return fake
+
+    fake = _fake()
+    restore = probe._patch_state_zero(fake, ("k",))
+    out = fake._slm_store_rows(None, with_views=True)
+    assert float(out[0].abs().sum()) == 0.0 and float(out[5].abs().sum()) == 0.0  # k 侧清零
+    assert float(out[1].abs().sum()) == 24.0 and float(out[6].abs().sum()) == 96.0  # v 侧不动
+    restore()
+    fake = _fake()
+    restore = probe._patch_state_zero(fake, ("v",))
+    out = fake._slm_store_rows(None, with_views=True)
+    assert float(out[1].abs().sum()) == 0.0 and float(out[6].abs().sum()) == 0.0  # v 侧清零
+    assert float(out[0].abs().sum()) == 12.0 and float(out[5].abs().sum()) == 72.0  # k 侧不动
+    restore()
+    fake = _fake()
+    restore = probe._patch_state_zero(fake, ("k", "v"))
+    out = fake._slm_store_rows(None)  # with_views=False: 五元组路径
+    assert float(out[0].abs().sum()) == 0.0 and float(out[1].abs().sum()) == 0.0
+    restore()
+
+
 # --- 9. e2e (d 格 tiny): 有限 loss + 指标 + eval 零占位 ---------------------------------
 
 
