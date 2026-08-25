@@ -1468,8 +1468,12 @@ class SLMBackbone(nn.Module):
             self.pos_gate = nn.Parameter(torch.zeros(()))
         # Q15 need_attn (任务书 2026-08-25 §7.1): block-1 cross-attention 概率
         # 寄存槽 (B, H, C, C, 保留梯度 -- L_attend 经它回传); None = 关态
-        # (legacy SDPA 路径, 逐位不动).
+        # (legacy SDPA 路径, 逐位不动). Q16 (任务书 §1 施工事实): 同模式加
+        # last_block1_ov (pre-o_proj 加权输出) / last_block1_h (block-1 完成
+        # 后隐藏态) 两个捕获槽, 关态 None.
         self.last_block1_attn = None
+        self.last_block1_ov = None
+        self.last_block1_h = None
 
     def forward(
         self,
@@ -1496,7 +1500,10 @@ class SLMBackbone(nn.Module):
         ``self.last_block1_attn`` with gradient kept (L_attend 经它回传);
         off = legacy SDPA path, bitwise untouched."""
         bsz, n = chunk_mask.shape
-        self.last_block1_attn = None  # 默认关态 (views 路径提前返回也保持 None)
+        # 捕获槽默认关态 (views 路径提前返回也保持 None; Q16: ov/h 同模式)
+        self.last_block1_attn = None
+        self.last_block1_ov = None
+        self.last_block1_h = None
         kv = k_rows.size(2) if k_rows.dim() == 4 else 1
         vv = v_rows.size(2) if v_rows.dim() == 4 else 1
         if max(kv, vv) > 1:
@@ -1552,8 +1559,17 @@ class SLMBackbone(nn.Module):
         else:
             self.last_block1_attn = None
             o = F.scaled_dot_product_attention(q, k, v, attn_mask=allowed)
-        h = h + self.o_proj(o.transpose(1, 2).reshape(bsz, n, nh * hd))
+        ov = o.transpose(1, 2).reshape(bsz, n, nh * hd)  # pre-o_proj (B, C, d)
+        if need_attn:
+            # Q16 捕获槽 (任务书 §1 施工事实): 探 A2 = 注意力加权值混合 ov
+            # (pre-o_proj, 实际流下去的货), 探 B = block-1 完成后隐藏态
+            # (post o_proj+residual+FFN1). 探针 no_grad 用; 不 detach, 与
+            # last_block1_attn 同策略; 关态 None (入口统一清空).
+            self.last_block1_ov = ov
+        h = h + self.o_proj(ov)
         h = h + self.ffn1(self.ln_ffn1(h))
+        if need_attn:
+            self.last_block1_h = h  # (B, C, d) block-1 完成后
         # blocks 2..L: standard causal self-attention + FFN
         for blk in self.self_blocks:
             hn = blk["ln_s"](h)
