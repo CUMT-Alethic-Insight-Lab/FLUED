@@ -122,9 +122,11 @@ def _delta_aggregate(items: list) -> dict:
 
 
 @torch.no_grad()
-def run_arm(model, ids_orig: torch.Tensor, meta: dict, arm: str, device, mask_seed: int, ns, kstate_ok: bool, vstate_ok: bool):
+def run_arm(model, ids_orig: torch.Tensor, meta: dict, arm: str, device, mask_seed: int, ns, kstate_ok: bool, vstate_ok: bool, excise: bool = True):
     """One arm over one burst window: forward (压缩区剔除经 burst_metas_q15
-    同开), score the masked-tail slots (byte_acc + exact, cloze 同 schema).
+    同开; excise=False = 无剔除形态, 规模轴 canonical 臂收官用——该口径对象
+    无剔除训练史, 剔除会结构性压死直通格的内容路径), score the masked-tail
+    slots (byte_acc + exact, cloze 同 schema).
     宽度纪律 (实跑事故修订): 入口先把拼接行剥到有效前缀 -- 批宽来自批内最长
     行, row 0 带 PAD 尾时 mask 与 scrambled 臂的 twin 行 (剥尾字节重建) 宽度
     会错位; 剥尾后 mask 锚在 intact 形态的有效内容上 (make_mixed_mask 内部
@@ -153,7 +155,7 @@ def run_arm(model, ids_orig: torch.Tensor, meta: dict, arm: str, device, mask_se
             return None  # 非 state 通道: 此臂 N/A
         restore = _patch_state_zero(model, channels)
     try:
-        out = s1.s1_forward(model, source, ns, burst_metas_q15=[meta])  # 剔除同开 (§7.2)
+        out = s1.s1_forward(model, source, ns, burst_metas_q15=[meta] if excise else None)  # 剔除同开 (§7.2) / 无剔除形态
     finally:
         if restore is not None:
             restore()
@@ -191,6 +193,8 @@ def main() -> None:
     p.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     p.add_argument("--max-items", type=int, default=48)
     p.add_argument("--out-dir", default=OUT_DIR)
+    p.add_argument("--no-excision", action="store_true",
+                   help="无剔除形态 (规模轴 canonical 臂收官口径: 对象无剔除训练史, 剔除会结构性压死直通格内容路径)")
     args = p.parse_args()
     device = torch.device("cuda" if (args.device == "auto" and torch.cuda.is_available()) or args.device == "cuda" else "cpu")
     out_dir = Path(args.out_dir)
@@ -240,7 +244,7 @@ def main() -> None:
         }
         skip = False
         for arm in ARMS:
-            r = run_arm(model, ids, m, arm, device, 1042 + wi, ns, kstate_ok, vstate_ok)
+            r = run_arm(model, ids, m, arm, device, 1042 + wi, ns, kstate_ok, vstate_ok, excise=not args.no_excision)
             if arm not in STATE_ARMS and r is None:
                 skip = True  # echo off-grid: item inactive (state 臂 N/A 不算)
                 break

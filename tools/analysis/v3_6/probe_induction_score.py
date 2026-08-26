@@ -156,16 +156,19 @@ def load_trained(run_dir: str, device, ckpt_name: str = "latest.pt"):
 
 def load_init(device, ns):
     """Same-seed fresh model + 底座前端（init_checkpoint 前缀）；backbone 随机
-    初始化（run 未存 step-0 快照——如实标注的近似 init 点）。"""
+    初始化（run 未存 step-0 快照——如实标注的近似 init 点）。
+    规模轴从零臂（init_checkpoint 空，2026-08-26）：被测 run 本身从零起训，
+    其 init 点 = 纯同种子新建模型（无前端的近似反而是精确口径），跳过加载。"""
     import tools.train.v3_6.train_v36_s1 as s1
     torch.manual_seed(ns.seed)
     model = build_model(ns).to(device)
-    payload = torch.load(ns.init_checkpoint, map_location=device, weights_only=False)
-    current = model.state_dict()
-    compat = {k: v for k, v in payload["model"].items() if k in current and current[k].shape == v.shape}
-    prefixes = [p.strip() for p in ns.freeze_prefixes.split(",") if p.strip()]
-    compat = {k: v for k, v in compat.items() if any(k.startswith(p) for p in prefixes)}
-    model.load_state_dict(compat, strict=False)
+    if getattr(ns, "init_checkpoint", ""):
+        payload = torch.load(ns.init_checkpoint, map_location=device, weights_only=False)
+        current = model.state_dict()
+        compat = {k: v for k, v in payload["model"].items() if k in current and current[k].shape == v.shape}
+        prefixes = [p.strip() for p in ns.freeze_prefixes.split(",") if p.strip()]
+        compat = {k: v for k, v in compat.items() if any(k.startswith(p) for p in prefixes)}
+        model.load_state_dict(compat, strict=False)
     model.eval()
     for p in model.parameters():
         p.requires_grad_(False)
