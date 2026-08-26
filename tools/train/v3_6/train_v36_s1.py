@@ -1090,6 +1090,47 @@ def _burst_prior_guess_acc(model, seg: bytes, tail_bytes: int) -> float | None:
     return float(hits.float().mean())
 
 
+def _window_burstiness(clean_row_bytes: bytes, gram: int = 12) -> float:
+    """窗内突发性密度 (任务书 FLUED_V3_7_LR_SCALE_2X2_20260826_CN §1 新增仪表,
+    2026-08-26 冻结): 窗内重复 >=12 字节子串的字节覆盖率 —— 12-gram 计数,
+    出现 >=2 次的 gram 覆盖的字节占窗长比例. 纯 CPU 函数; 只在 log 事件
+    调用 (逐步不算, 成本≈零), 无条件常开 (不加旗标, 任务书 §1 口径).
+    离线复算仪表: tools/analysis/v3_6/measure_stream_burstiness.py 同口径."""
+    n = len(clean_row_bytes)
+    if n < gram:
+        return 0.0
+    counts: dict[bytes, int] = {}
+    for i in range(n - gram + 1):
+        g = clean_row_bytes[i : i + gram]
+        counts[g] = counts.get(g, 0) + 1
+    diff = [0] * (n + 1)
+    for i in range(n - gram + 1):
+        if counts[clean_row_bytes[i : i + gram]] >= 2:
+            diff[i] += 1
+            diff[i + gram] -= 1
+    covered = 0
+    cur = 0
+    for i in range(n):
+        cur += diff[i]
+        if cur > 0:
+            covered += 1
+    return covered / n
+
+
+def _batch_data_burstiness(clean: torch.Tensor) -> float:
+    """log 事件的 data_burstiness 行键 (任务书 §1, 无条件常开): 当前批
+    各 row 有效前缀 (非 PAD) 的 _window_burstiness 均值. 输入取 step_model
+    注入任务之前的原始批 (canonical 2x2 臂 cloze/retrieval/burst 全关),
+    测的是语料流窗本身的喂养形态."""
+    burst_sum = 0.0
+    burst_n = 0
+    for row_ids in clean:
+        valid_ids = row_ids[row_ids.ne(PAD_ID)]
+        burst_sum += _window_burstiness((valid_ids - BYTE_OFFSET).to(torch.uint8).cpu().numpy().tobytes())
+        burst_n += 1
+    return burst_sum / max(burst_n, 1)
+
+
 def _burst_yield_alarm(step: int, yield_val: float) -> None:
     """Q14 产出率报警 (修订案 §2.2): 产出率 <70% 打警告行 -- 不静默放宽阈值,
     阈值改动只走修订记录 (ASCII 词激活率塌方的前车)."""
@@ -2964,12 +3005,18 @@ def main() -> None:
                     q15_anchor = {k: v / q15_anchor_n for k, v in q15_anchor_sum.items()}
                     print(f"[s1] Q15 回调线锚 (steps 800-1000 均值): {q15_anchor}", flush=True)
             if step % args.log_every == 0 or step == 1:
+                # 数据运气仪表 (任务书 FLUED_V3_7_LR_SCALE_2X2_20260826_CN §1,
+                # 无条件常开): 当前批原始流窗的窗内突发性密度 (重复 >=12B
+                # 子串字节覆盖率), 逐 log 事件在册 —— 只在 log 步计算,
+                # 成本≈零. 测的是 step_model 注入任务之前的原始语料窗
+                # (canonical 2x2 臂 cloze/retrieval/burst 全关).
                 row = {
                     "step": step,
                     "lr": float(opt.param_groups[0]["lr"]),
                     "grad": float(grad.item()),
                     "steps_per_sec": step / max(time.time() - t0, 1e-9),
                     "nan_skips": nan_skips,
+                    "data_burstiness": _batch_data_burstiness(batch[0]),
                     **{k: float((v / pending_n).item()) for k, v in pending.items()},
                 }
                 _append_jsonl(log_path, row)
