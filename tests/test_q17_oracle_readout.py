@@ -279,3 +279,141 @@ def test_run_dir_schema_loadable_by_probe_loader(tmp_path):
     assert step == 10000 and ns.backbone_mode == "slm"
     for p1, p2 in zip(loaded.parameters(), model.parameters()):
         assert torch.equal(p1, p2)  # strict 加载逐位一致
+
+
+# --- 8. 挂死急诊单 (2026-08-27): 向量化 parity + 步级看门狗 --------------------------------
+
+
+def _legacy_states_dual(gates, chunk_mask):
+    """向量化前的原实现 (逐 chunk ~12 小 kernel 循环), 留作 parity 参照——
+    冻结自 2026-08-27 挂死急诊单修复前版本, 勿改动。"""
+    keep = chunk_mask.float()
+    keep4 = keep.unsqueeze(-1).unsqueeze(-1)
+    k = gates["k"].float() * keep4
+    v = gates["v"].float() * keep4
+    beta = gates["beta"].float() * keep.unsqueeze(-1)
+    bsz, chunks, heads, hk = k.shape
+    hv = v.size(-1)
+    a = gates["alpha"][0].float().unsqueeze(-1)
+    a_eff = 1.0 - keep.view(-1, chunks, 1, 1, 1) + keep.view(-1, chunks, 1, 1, 1) * a
+    S_nat = k.new_zeros(bsz, heads, hk, hv, dtype=torch.float32)
+    S_or = torch.zeros_like(S_nat)
+    outs_nat, outs_or = [], []
+    for i in range(chunks):
+        ki, vi, bi = k[:, i], v[:, i], beta[:, i]
+        S_nat = a_eff[:, i] * S_nat
+        kTs = torch.einsum("bhk,bhkv->bhv", ki, S_nat)
+        S_nat = S_nat - bi.view(bsz, heads, 1, 1) * ki.unsqueeze(-1) * kTs.unsqueeze(-2)
+        S_nat = S_nat + bi.view(bsz, heads, 1, 1) * ki.unsqueeze(-1) * vi.unsqueeze(-2)
+        S_or = S_or + ki.unsqueeze(-1) * vi.unsqueeze(-2)
+        outs_nat.append(S_nat)
+        outs_or.append(S_or)
+    return torch.stack(outs_nat, dim=1), torch.stack(outs_or, dim=1)
+
+
+def test_states_dual_vectorized_matches_legacy_loop():
+    """向量化双态 (oracle=cumsum 一行 / natural=合并 kernel 递推) 与原循环近似
+    一致 (allclose 1e-5), 含 padded chunk 恒等步情形。注意考场纪律: k 必须
+    unit-norm (生产 WriteHead 输出如此)——随机未归一化 k 使 KDA 递推本身处于
+    发散区, 任何浮点重排都会被混沌放大 (实测量级 1e26), 不是数学分歧。"""
+    import torch.nn.functional as F
+
+    def prod_gates(bsz, chunks, pad_last):
+        torch.manual_seed(0)
+        gates = {
+            "k": F.normalize(torch.randn(bsz, chunks, 2, 16), dim=-1),  # WriteHead 同款单位范数
+            "v": torch.randn(bsz, chunks, 2, 32),
+            "beta": torch.rand(bsz, chunks, 2),
+            "alpha": torch.rand(1, 2, 16) * 0.4 + 0.6,
+        }
+        cm = torch.ones(bsz, chunks, dtype=torch.bool)
+        if pad_last:
+            cm[:, -1] = False
+        return gates, cm
+
+    for bsz, chunks, pad_last in ((1, 5, False), (1, 5, True), (2, 8, True)):
+        gates, cm = prod_gates(bsz, chunks, pad_last)
+        sn_new, so_new = q17._q17_states_dual(gates, cm)
+        sn_old, so_old = _legacy_states_dual(gates, cm)
+        assert torch.allclose(sn_new, sn_old, atol=1e-5), f"bsz={bsz} C={chunks} pad={pad_last} natural 分歧"
+        assert torch.allclose(so_new, so_old, atol=1e-5), f"bsz={bsz} C={chunks} pad={pad_last} oracle 分歧"
+
+
+def test_watchdog_call_fake_clock(monkeypatch):
+    """步级看门狗 (挂死急诊单): 假时钟 400s 步 -> overrun=True, loss/metrics
+    原样透传; 10s 步 -> 不触发; 阈值边界 (恰 300s) 不触发 (>才作废)。"""
+    seq = iter([1000.0, 1400.0])
+    monkeypatch.setattr(q17.time, "time", lambda: next(seq))
+    loss, met, elapsed, overrun = q17._watchdog_call(lambda: ("L", {"a": 1}))
+    assert overrun and elapsed == 400.0 and loss == "L" and met == {"a": 1}
+    seq = iter([1000.0, 1010.0])
+    monkeypatch.setattr(q17.time, "time", lambda: next(seq))
+    _, _, elapsed, overrun = q17._watchdog_call(lambda: (None, {}))
+    assert not overrun and elapsed == 10.0
+    seq = iter([0.0, q17._WATCHDOG_STEP_SEC])
+    monkeypatch.setattr(q17.time, "time", lambda: next(seq))
+    _, _, _, overrun = q17._watchdog_call(lambda: (None, {}))
+    assert not overrun  # 边界: 恰等于阈值不作废
+
+
+# --- 9. 内存根治单 (2026-08-27): 流式读出的 package 级 parity -------------------------------
+
+
+def test_stream_channel_package_parity():
+    """流式读出 (_q17_stream_channel, 内存压力根治单) vs 旧物化路径
+    (_legacy_states_dual → _q17_alpha_scale → where 选族 → _q17_readout):
+    package 输出 allclose 1e-5 (生产域 gates: k unit-norm; 含 padded/批量/
+    双族混合选择); α 与四族中位范数列逐位一致; 梯度经 readout_query/realign
+    流通 (S_i 无梯度)。考场纪律同 test_states_dual_vectorized_matches_legacy_loop:
+    未归一化 k 使递推发散, 任何浮点重排被混沌放大, 非数学分歧。"""
+    import torch.nn.functional as F
+
+    torch.manual_seed(0)
+    cfg = tiny_config(k_row_source="state", v_row_source="state", seed_source="k")
+    model = FLUEDV36(cfg)
+    sm = model.state_machine
+    H, hk, hv = cfg.kda_heads, cfg.kda_head_k, cfg.kda_head_v
+    w_dtype = next(sm.realign.parameters()).dtype
+
+    def prod_gates(bsz, chunks, pad_last):
+        torch.manual_seed(bsz * 100 + chunks)
+        gates = {
+            "k": F.normalize(torch.randn(bsz, chunks, H, hk), dim=-1),
+            "v": torch.randn(bsz, chunks, H, hv),
+            "beta": torch.rand(bsz, chunks, H),
+            "alpha": torch.rand(1, H, hk) * 0.4 + 0.6,
+        }
+        cm = torch.ones(bsz, chunks, dtype=torch.bool)
+        if pad_last:
+            cm[:, -1] = False
+        return gates, cm
+
+    for bsz, chunks, pad_last, used in ((1, 5, False, [True]), (1, 5, True, [False]), (2, 8, True, [True, False])):
+        gates, cm = prod_gates(bsz, chunks, pad_last)
+        used_t = torch.tensor(used, dtype=torch.bool)
+        # 旧物化路径 (急诊单前)
+        sn, so = _legacy_states_dual(gates, cm)
+        so_s, alpha_old = q17._q17_alpha_scale(sn, so, cm)
+        S = torch.where(used_t.view(-1, 1, 1, 1, 1), so_s, sn)
+        pkg_old = q17._q17_readout(sm, S)
+
+        def med_norm(S_):
+            n = S_.norm(dim=(-2, -1))  # (B, C, H)
+            return torch.stack([n[b][cm[b]].median() for b in range(S_.size(0))])
+
+        # 新流式路径
+        r = q17._q17_stream_channel(sm, gates, cm, used_t)
+        pkg_new = sm.realign(r["reads"].to(w_dtype))
+        assert torch.allclose(pkg_new, pkg_old, atol=1e-5), f"bsz={bsz} C={chunks} pad={pad_last} used={used} package 分歧"
+        assert torch.allclose(r["alpha"], alpha_old, atol=1e-6), "α 列分歧"
+        assert torch.allclose(r["snorm_nat"], med_norm(sn), atol=1e-6)
+        assert torch.allclose(r["snorm_or"], med_norm(so), atol=1e-6)
+
+    # 梯度: 经 readout_query/realign 流通 (S_i 常量)
+    sm.zero_grad()
+    gates, cm = prod_gates(1, 5, False)
+    r = q17._q17_stream_channel(sm, gates, cm, torch.tensor([True]))
+    pkg = sm.realign(r["reads"].to(w_dtype))
+    pkg.mean().backward()
+    assert sm.readout_query.grad is not None and sm.readout_query.grad.abs().sum() > 0
+    assert all(p.grad is not None for p in sm.realign.parameters())

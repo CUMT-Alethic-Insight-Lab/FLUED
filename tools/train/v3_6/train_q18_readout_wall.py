@@ -483,6 +483,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--q18-zc-threshold", type=float, default=_Q18_ZC_THRESHOLD)
     p.add_argument("--lam-unmix", type=float, default=1e-2, help="段1 ridge 解混 λ (Q19 同档)")
     p.add_argument("--lam-stage2", type=float, default=1.0, help="段2/收尾 ridge λ (相对预条件后, Q19 同档)")
+    p.add_argument("--kda-impl", default="", choices=["", "torch", "fla"], help="2026-08-27 挂死急诊单: 远端 4090 fla chunk_kda 死锁 -> 远端链传 torch")
     p.add_argument("--q18-xstate-target", action="store_true",
                    help="候选偏差 (默认关): oracle 列 package_target 取自然态生产行 (翻译挂载), 见 _q18_warmstart docstring")
     return p
@@ -495,7 +496,7 @@ def main() -> None:
     device = torch.device("cuda" if (args.device == "auto" and torch.cuda.is_available()) or args.device == "cuda" else "cpu")
     t0 = time.time()
 
-    model, sieve_model, ns, base_step = q17._q17_load_models(Path(args.ckpt), device)
+    model, sieve_model, ns, base_step = q17._q17_load_models(Path(args.ckpt), device, kda_impl_override=args.kda_impl)
     if args.data_path:
         ns.data_path = args.data_path
     if args.seq_len:
@@ -614,6 +615,9 @@ def main() -> None:
 
     log_path = out_dir / "train_log.jsonl"
     nan_skips = 0
+    watchdog_skips = 0  # 步级看门狗计数 (挂死急诊单 2026-08-27; 入 log schema)
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats()  # 显存峰值探针 (内存根治单): 只量训练循环段
     step = start_step
     pending: dict[str, float] = {}
     pending_n = 0
@@ -623,9 +627,18 @@ def main() -> None:
             if step >= max_steps:
                 break
             p = _q18_course_p(args.q18_arm, args.q18_warmstart, step)  # 课程断言: 恒定
-            loss, metrics = q17._q17_step(model, batch[0], ns, device, p, _Q18_GENERATOR)
-            if loss is None:
-                step += 1  # echo 离网: 步进照走, 不参训 (Q17 同款)
+            loss, metrics, step_sec, overrun = q17._watchdog_call(
+                q17._q17_step, model, batch[0], ns, device, p, _Q18_GENERATOR
+            )
+            if loss is None or overrun:
+                if overrun and loss is not None:
+                    watchdog_skips += 1  # 该窗作废: 步进照走不参训, 不中断训练
+                    print(
+                        f"[q18] 看门狗: step {step} 单步 {step_sec:.0f}s > {q17._WATCHDOG_STEP_SEC:.0f}s, "
+                        f"该窗作废不参训 (累计 {watchdog_skips})",
+                        flush=True,
+                    )
+                step += 1  # echo 离网/看门狗: 步进照走, 不参训 (Q17 同款)
                 sched.step()
                 continue
             if not bool(torch.isfinite(loss)):
@@ -651,6 +664,7 @@ def main() -> None:
                     "grad": float(grad.item()),
                     "steps_per_sec": step / max(time.time() - t0, 1e-9),
                     "nan_skips": nan_skips,
+                    "watchdog_step_skip": watchdog_skips,
                     "loss": pending_loss / max(pending_n, 1),
                     **{k: v / max(pending_n, 1) for k, v in pending.items()},
                     "q18_arm": args.q18_arm,
@@ -701,6 +715,8 @@ def main() -> None:
         "elapsed_sec": time.time() - t0,
         "steps_per_sec": step / max(time.time() - t0, 1e-9),
         "nan_skips": nan_skips,
+        "watchdog_step_skip": watchdog_skips,
+        "cuda_max_mem_gb": round(torch.cuda.max_memory_allocated() / 1e9, 3) if device.type == "cuda" else None,
         "args": vars(args),
         "q18_arm": args.q18_arm,
         "q18_seed": seed,

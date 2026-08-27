@@ -73,6 +73,23 @@ _Q17_CHAIN_MODULES = ("backbone", "decoder", "decoder_in", "decoder_in_mem")
 _Q17_CHAIN_SMS = ("state_machine", "state_machine_k")  # 重训 readout_query + realign (修订 v1)
 
 
+# 步级看门狗 (Q18 挂死急诊单 2026-08-27: 双机训练链反复挂死/病态变慢——单步
+# 墙钟超阈值即作废该窗, 保证活性; Q17/Q18 两主循环共用本段, 计数入 log schema)
+_WATCHDOG_STEP_SEC = 300.0
+
+
+def _watchdog_call(fn, *args, threshold: float = _WATCHDOG_STEP_SEC, clock=None):
+    """步级看门狗包装 (Q18 挂死急诊单 2026-08-27): 计 fn(*args) 墙钟。
+    Returns (loss, metrics, elapsed, overrun); overrun=True 时调用侧按
+    "echo 离网" 同款处理——步进照走不参训 (loss 未 backward 无梯度残留),
+    计 watchdog_step_skip 入 log 行, 不中断训练。"""
+    clock = clock or time.time
+    t0 = clock()
+    loss, metrics = fn(*args)
+    elapsed = clock() - t0
+    return loss, metrics, elapsed, elapsed > threshold
+
+
 def _q17_anneal_p(step: int, tier_steps: int = _Q17_TIER_STEPS) -> float:
     """退火档位表 (任务书 §1): step // 2000 索引 {1.0, 0.75, 0.5, 0.25, 0.0},
     超界钳到末档."""
@@ -80,10 +97,23 @@ def _q17_anneal_p(step: int, tier_steps: int = _Q17_TIER_STEPS) -> float:
 
 
 def _q17_states_dual(gates: dict, chunk_mask: torch.Tensor):
-    """逐 chunk 自然态 S_nat 与 oracle 态 S_or, 同一 fp32 参考循环
+    """逐 chunk 自然态 S_nat 与 oracle 态 S_or, 同一 fp32 参考递推
     (probe_oracle_write_verdict trained_states / oracle_states 同款数学;
     padded chunk = 恒等步, 不入累计). Returns (S_nat, S_or), 各 (B, C, H,
-    hk, hv) float32."""
+    hk, hv) float32.
+
+    向量化 (Q18 挂死急诊单 2026-08-27: 双机训练链在本函数反复挂死——主线程
+    100% CPU 空转 + GPU 忙 + 日志 30-50min 不动, faulthandler SIGABRT 取证;
+    根因候选 = 逐 chunk ~12 个小 kernel 的 launch 风暴触发驱动级病态;
+    KDAStateMachine._forward_torch/fla 只暴露逐 chunk 读出 q·S_i 不暴露状态
+    本体, 无单源可复用, 故保留递推但合并 kernel):
+    oracle 态 = keep 遮罩后 k⊗v 的纯 cumsum (一行; padded 已清零 = 零贡献 =
+    态不变, 与原循环同数学); natural 态 KDA delta 递推有顺序依赖不能 cumsum,
+    每 chunk 合并为 5 个大 kernel (decay 乘 / kTs einsum / 减 / delta 写
+    einsum / 加), erase+write 合并为单 einsum —— S + b·k⊗(v−kᵀS) 与原
+    "−b·k⊗kTs 再 +b·k⊗v" 三步代数等价。数值与原循环 1e-5 内一致
+    (tests/test_q17_oracle_readout.py::test_states_dual_vectorized_matches_legacy_loop
+    以原循环为参照守卫; 既有 1e-6 手算断言不受影响)。"""
     keep = chunk_mask.float()
     keep4 = keep.unsqueeze(-1).unsqueeze(-1)  # (B, C, 1, 1) for k/v (B, C, H, d)
     k = gates["k"].float() * keep4
@@ -94,21 +124,18 @@ def _q17_states_dual(gates: dict, chunk_mask: torch.Tensor):
     a = gates["alpha"][0].float().unsqueeze(-1)  # (1, H, hk, 1) per-channel decay
     # padded chunk = 恒等步 (model.py _forward_torch 同款): alpha_eff=1, beta=0
     a_eff = 1.0 - keep.view(-1, chunks, 1, 1, 1) + keep.view(-1, chunks, 1, 1, 1) * a
+    # oracle 态: 无衰减无 delta 的纯累计叠加 = 遮罩后外积的 cumsum (单行)
+    S_or = torch.einsum("bchk,bchv->bchkv", k, v).cumsum(dim=1)
+    # 自然态: KDA 递推 (衰减 + delta 擦除/写入合并)
     S_nat = k.new_zeros(bsz, heads, hk, hv, dtype=torch.float32)
-    S_or = torch.zeros_like(S_nat)
-    outs_nat, outs_or = [], []
+    outs_nat = []
     for i in range(chunks):
         ki, vi, bi = k[:, i], v[:, i], beta[:, i]
-        # 自然态: KDA 递推 (衰减 + delta 擦除)
         S_nat = a_eff[:, i] * S_nat
         kTs = torch.einsum("bhk,bhkv->bhv", ki, S_nat)
-        S_nat = S_nat - bi.view(bsz, heads, 1, 1) * ki.unsqueeze(-1) * kTs.unsqueeze(-2)
-        S_nat = S_nat + bi.view(bsz, heads, 1, 1) * ki.unsqueeze(-1) * vi.unsqueeze(-2)
-        # oracle 态: 无衰减无 delta 的纯累计叠加
-        S_or = S_or + ki.unsqueeze(-1) * vi.unsqueeze(-2)
+        S_nat = S_nat + torch.einsum("bh,bhk,bhv->bhkv", bi, ki, vi - kTs)
         outs_nat.append(S_nat)
-        outs_or.append(S_or)
-    return torch.stack(outs_nat, dim=1), torch.stack(outs_or, dim=1)
+    return torch.stack(outs_nat, dim=1), S_or
 
 
 def _q17_alpha_scale(S_nat: torch.Tensor, S_or: torch.Tensor, chunk_mask: torch.Tensor):
@@ -171,15 +198,18 @@ def _q17_reinit_readout_chain(model, ns, seed: int) -> None:
     del fresh
 
 
-def _q17_load_models(run_dir: Path, device: torch.device):
+def _q17_load_models(run_dir: Path, device: torch.device, kda_impl_override: str = ""):
     """基座加载 (任务书 §1): Q15 收官 ckpt 全模型构建 + latest.pt strict;
     先验筛参考模型 = 同一 ckpt 第二次独立加载 (固定, GPU 驻留 -- E101 教训).
     Returns (model, sieve_model, ns, step); 两者全部参数 requires_grad False
-    (model 的读出链由调用侧重初始化后解冻)."""
+    (model 的读出链由调用侧重初始化后解冻). kda_impl_override: 2026-08-27 挂死
+    急诊单——远端 4090 (triton 3.8/torch 2.15/sm_89) 上 fla chunk_kda 死锁,
+    传 "torch" 强制参考实现 (口径注记: 与 fla 有已知数值差, 跨机种子读数按
+    机器分档注册)."""
     cfg = json.loads((run_dir / "resolved_config.json").read_text(encoding="utf-8"))
     cfg["data_manifest"] = ""
-    if device.type != "cuda":
-        cfg["kda_impl"] = "torch"  # fla kernels are GPU-only
+    if device.type != "cuda" or kda_impl_override:
+        cfg["kda_impl"] = kda_impl_override or "torch"  # fla kernels are GPU-only
     ns = Namespace(**cfg)
     payload = torch.load(run_dir / "latest.pt", map_location=device, weights_only=False)
     model = build_model(ns).to(device)
@@ -245,9 +275,111 @@ def _q17_encode_and_states(model, source: torch.Tensor):
     }
 
 
+def _q17_stream_channel(sm, gates: dict, chunk_mask: torch.Tensor, used_t: torch.Tensor):
+    """流式单通道读出 (内存压力根治单 2026-08-27: 主会话十次周期堆栈转储
+    定罪——"楔死"实为内存压力下的减速爬行; 旧训练路径 (_q17_encode_and_states
+    + _q17_readout) 把全窗逐 chunk 状态矩阵 S_i (各 (B,H,hk,hv) fp32) 累积入
+    列表再 torch.stack, C≈64-700 时单步瞬态 ~0.7-1.5GB×2 通道, 16GB 卡被打进
+    分配器爬行态; s1 生产训练器 fla chunk kernel 不物化全窗状态故从不犯)。
+
+    本函数结构消灭该瞬态: 递推循环只驻留当前 S_nat/S_or (O(1) 驻留, no_grad),
+    逐 chunk 收集四族范数标量列 (metrics) 并立即用可训练 readout_query 算
+    读出行 (梯度只经 query/realign; S_i 无梯度, python 侧即用即弃——注意
+    autograd 为 query 的反向仍会暂存选中族 S_i (每窗每通道 ~256MB 级, 较旧
+    路径 GB 级列表+stack 复制降 5-6 倍; 进一步的 O(1) 化需分块 checkpoint,
+    留作后手)。收集 reads (B,C,nq,H*hv) ≈2MB/窗而非状态本体。
+
+    等价性注记: α 范数匹配施加于读出行 (读出对状态线性, 先读后缩放与旧
+    "先缩放 S 后读"数值等价; realign 首层 LayerNorm 对正标量行缩放不变,
+    双保险); realign 在窗口级一次调用 (LayerNorm 无跨行耦合, 逐行 = 逐 chunk
+    等价); padded chunk 恒等步语义与原循环同 (keep 遮罩原样); batch=1 冻结
+    路径只读选中族, B>1 读双族再 where (语义同旧 where)。parity 由
+    tests/test_q17_oracle_readout.py::test_stream_channel_package_parity
+    守卫 (1e-5, 生产域 gates)。Returns dict: reads (B,C,nq,H*hv) 带梯度 /
+    alpha (B,) / snorm_nat / snorm_or (B,) 中位范数列 (口径同旧 _med_norm:
+    缩放前原始范数, 有效 chunk×head 全集中位)。"""
+    keep = chunk_mask.float()
+    keep4 = keep.unsqueeze(-1).unsqueeze(-1)  # (B, C, 1, 1) for k/v (B, C, H, d)
+    k = gates["k"].float() * keep4
+    v = gates["v"].float() * keep4
+    beta = gates["beta"].float() * keep.unsqueeze(-1)  # (B, C, H)
+    bsz, chunks, heads, hk = k.shape
+    hv = v.size(-1)
+    a = gates["alpha"][0].float().unsqueeze(-1)  # (1, H, hk, 1) per-channel decay
+    # padded chunk = 恒等步 (model.py _forward_torch 同款): alpha_eff=1, beta=0
+    a_eff = 1.0 - keep.view(-1, chunks, 1, 1, 1) + keep.view(-1, chunks, 1, 1, 1) * a
+    q = sm.readout_query.float()  # 链上参数: 读出在 no_grad 外, 梯度经 query
+    single = bsz == 1  # batch=1 冻结 (任务书): 抽签逐窗单值, 只读选中族
+    sel = bool(used_t[0]) if single else None
+    S_nat = k.new_zeros(bsz, heads, hk, hv, dtype=torch.float32)
+    S_or = torch.zeros_like(S_nat)
+    norms_nat, norms_or, reads_nat, reads_or = [], [], [], []
+    for i in range(chunks):
+        ki, vi, bi = k[:, i], v[:, i], beta[:, i]  # 视图, 无 kernel
+        with torch.no_grad():
+            # 自然态: KDA 递推 (衰减 + delta 擦除/写入合并, 向量化单同款)
+            S_nat = a_eff[:, i] * S_nat
+            kTs = torch.einsum("bhk,bhkv->bhv", ki, S_nat)
+            S_nat = S_nat + torch.einsum("bh,bhk,bhv->bhkv", bi, ki, vi - kTs)
+            # oracle 态: 无衰减无 delta 的纯累计叠加
+            S_or = S_or + ki.unsqueeze(-1) * vi.unsqueeze(-2)
+            norms_nat.append(S_nat.norm(dim=(-2, -1)))  # (B, H)
+            norms_or.append(S_or.norm(dim=(-2, -1)))
+        if sel is None or sel:
+            reads_or.append(torch.einsum("qhk,bhkv->bqhv", q, S_or).reshape(bsz, q.size(0), -1))
+        if sel is None or not sel:
+            reads_nat.append(torch.einsum("qhk,bhkv->bqhv", q, S_nat).reshape(bsz, q.size(0), -1))
+    nn = torch.stack(norms_nat, dim=1)  # (B, C, H)
+    no_ = torch.stack(norms_or, dim=1)
+    med_nat = torch.stack([nn[b][chunk_mask[b]].median() for b in range(bsz)])
+    med_or = torch.stack([no_[b][chunk_mask[b]].median() for b in range(bsz)])
+    alpha = med_nat / med_or.clamp(min=1e-12)  # 冻结公式 (_q17_alpha_scale 同款)
+    if sel is None:
+        rn = torch.stack(reads_nat, dim=1)  # (B, C, nq, H*hv)
+        ro = torch.stack(reads_or, dim=1) * alpha.view(-1, 1, 1, 1)
+        reads = torch.where(used_t.view(-1, 1, 1, 1), ro, rn)
+    else:
+        reads = torch.stack(reads_or if sel else reads_nat, dim=1)
+        if sel:
+            reads = reads * alpha.view(-1, 1, 1, 1)
+    return {"reads": reads, "alpha": alpha, "snorm_nat": med_nat, "snorm_or": med_or}
+
+
+def _q17_stream_encode(model, source: torch.Tensor, p: float, gen: torch.Generator):
+    """流式训练步编码 (内存压力根治单 2026-08-27): 冻结前端与旧
+    _q17_encode_and_states 逐行同 (no-grad); 退火抽签提前到读出前 (专用
+    generator 每窗仍恰一抽/行, 抽签流与旧顺序逐比特一致); 双通道走
+    _q17_stream_channel; realign 窗口级一次。Returns dict: chunks / used_t /
+    package_k / package_v (带梯度, (B,C,nq,d_pack)) / alpha_k / alpha_v /
+    snorm_{k,v}_{nat,or} (各 (B,) 中位范数列, 口径同旧)。"""
+    with torch.no_grad():
+        byte_states, confidence, valid, _ = model._encode(source)
+        hard_cut, utf8_cont, _ = model._cuts(source, confidence, valid)
+        chunks = model.chunk_builder(byte_states, valid, hard_cut, confidence)
+        chunks = model.bridge(chunks, byte_states, confidence, valid, utf8_cont)
+        memory, index = model.summarizer.forward_with_index(chunks.span_embeddings, chunks.token_mask)
+        gates_k = model.write_head_k(index)  # K 通道: index gates (d 格)
+        gates_v = model.write_head(memory)  # V 通道: memory gates
+    # 退火抽签 (任务书 §1: 逐窗, 同一窗双通道同取; 专用 generator 固定顺序)
+    used_t = torch.tensor(
+        [float(torch.rand((), generator=gen)) < p for _ in range(source.size(0))],
+        dtype=torch.bool, device=source.device,
+    )
+    out = {"chunks": chunks, "used_t": used_t}
+    for tag, sm, gates in (("k", model.state_machine_k, gates_k), ("v", model.state_machine, gates_v)):
+        r = _q17_stream_channel(sm, gates, chunks.chunk_mask, used_t)
+        w_dtype = next(sm.realign.parameters()).dtype
+        out[f"package_{tag}"] = sm.realign(r["reads"].to(w_dtype))  # LN 无跨行耦合: 逐行=逐 chunk 等价
+        out[f"alpha_{tag}"] = r["alpha"]
+        out[f"snorm_{tag}_nat"] = r["snorm_nat"]
+        out[f"snorm_{tag}_or"] = r["snorm_or"]
+    return out
+
+
 def _q17_step(model, clean: torch.Tensor, ns, device, p: float, gen: torch.Generator):
     """One training step (batch=1 窗规格继承基座): burst splice (筛子) →
-    冻结前端双态 → 退火抽签 → 读出链前向 (带梯度) → echo CE. Returns
+    冻结前端 + 流式双通道读出 (内存压力根治单 2026-08-27, 见
+    _q17_stream_encode; 梯度只经读出链) → echo CE. Returns
     (loss_or_None, metrics dict)."""
     stats = {"drawn": 0, "spliced": 0, "sieve_measured": 0, "sieve_rejected": 0}
     clean, metas = s1._splice_burst(
@@ -268,18 +400,12 @@ def _q17_step(model, clean: torch.Tensor, ns, device, p: float, gen: torch.Gener
         byte_mask = s1.make_byte_mask(valid, ns.mask_prob, ns.mask_span_min, ns.mask_span_max)
     byte_mask = s1._burst_mask_overrides(byte_mask, metas)
     source = clean.masked_fill(byte_mask, MASK_ID)
-    enc = _q17_encode_and_states(model, source)
+    enc = _q17_stream_encode(model, source, p, gen)
     chunks = enc["chunks"]
-    # 退火抽签 (任务书 §1: 逐窗, 同一窗双通道同取; 专用 generator 固定顺序)
-    used = []
-    for _b in range(clean.size(0)):
-        used.append(float(torch.rand((), generator=gen)) < p)
-    used_t = torch.tensor(used, dtype=torch.bool, device=device)
-    S_k = torch.where(used_t.view(-1, 1, 1, 1, 1), enc["so_k"], enc["sn_k"])
-    S_v = torch.where(used_t.view(-1, 1, 1, 1, 1), enc["so_v"], enc["sn_v"])
-    # 读出链 (带梯度): readout_query → realign(冻) → K~/V~ 行 → backbone → decoder
-    package_k = _q17_readout(model.state_machine_k, S_k)
-    package_v = _q17_readout(model.state_machine, S_v)
+    used_t = enc["used_t"]
+    # 读出链 (带梯度): readout_query → realign → K~/V~ 行 → backbone → decoder
+    package_k = enc["package_k"]
+    package_v = enc["package_v"]
     k_rows = package_k.mean(dim=2)  # (B, C, d_pack)
     v_rows = package_v.mean(dim=2)
     n_chunks = chunks.chunk_mask.size(1)
@@ -402,6 +528,7 @@ def main() -> None:
 
     log_path = out_dir / "train_log.jsonl"
     nan_skips = 0
+    watchdog_skips = 0  # 步级看门狗计数 (Q18 挂死急诊单; 入 log schema)
     step = start_step
     pending: dict[str, float] = {}
     pending_n = 0
@@ -411,9 +538,18 @@ def main() -> None:
             if step >= args.max_steps:
                 break
             p = _q17_anneal_p(step)
-            loss, metrics = _q17_step(model, batch[0], ns, device, p, _Q17_GENERATOR)
-            if loss is None:
-                step += 1  # echo 离网: 步进照走 (课程按步), 不参训
+            loss, metrics, step_sec, overrun = _watchdog_call(
+                _q17_step, model, batch[0], ns, device, p, _Q17_GENERATOR
+            )
+            if loss is None or overrun:
+                if overrun and loss is not None:
+                    watchdog_skips += 1  # 该窗作废: 步进照走不参训, 不中断训练
+                    print(
+                        f"[q17] 看门狗: step {step} 单步 {step_sec:.0f}s > {_WATCHDOG_STEP_SEC:.0f}s, "
+                        f"该窗作废不参训 (累计 {watchdog_skips})",
+                        flush=True,
+                    )
+                step += 1  # echo 离网/看门狗: 步进照走 (课程按步), 不参训
                 sched.step()
                 continue
             if not bool(torch.isfinite(loss)):
@@ -439,6 +575,7 @@ def main() -> None:
                     "grad": float(grad.item()),
                     "steps_per_sec": step / max(time.time() - t0, 1e-9),
                     "nan_skips": nan_skips,
+                    "watchdog_step_skip": watchdog_skips,
                     "loss": pending_loss / max(pending_n, 1),
                     **{k: v / max(pending_n, 1) for k, v in pending.items()},
                 }
@@ -484,6 +621,7 @@ def main() -> None:
         "elapsed_sec": time.time() - t0,
         "steps_per_sec": step / max(time.time() - t0, 1e-9),
         "nan_skips": nan_skips,
+        "watchdog_step_skip": watchdog_skips,
         "args": vars(args),
         "base_ckpt": str(args.ckpt),
         "base_step": base_step,
