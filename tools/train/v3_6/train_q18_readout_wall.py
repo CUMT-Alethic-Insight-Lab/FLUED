@@ -484,6 +484,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--lam-unmix", type=float, default=1e-2, help="段1 ridge 解混 λ (Q19 同档)")
     p.add_argument("--lam-stage2", type=float, default=1.0, help="段2/收尾 ridge λ (相对预条件后, Q19 同档)")
     p.add_argument("--kda-impl", default="", choices=["", "torch", "fla"], help="2026-08-27 挂死急诊单: 远端 4090 fla chunk_kda 死锁 -> 远端链传 torch")
+    p.add_argument("--q18-no-sieve", action="store_true", help="2026-08-27 楔死急诊单 B-2: 关先验筛 (Q17/Q18 训练器每步筛子前向与基座前向交错疑致 CUDA 楔死; A 臂终审读数不依赖筛子——先验地板已在册 0.03-0.05, 口径注记入册)")
     p.add_argument("--q18-xstate-target", action="store_true",
                    help="候选偏差 (默认关): oracle 列 package_target 取自然态生产行 (翻译挂载), 见 _q18_warmstart docstring")
     return p
@@ -570,7 +571,7 @@ def main() -> None:
         s1._BURST_SAMPLER = s1.CorpusSampler(ns.data_path)
         _Q18_GENERATOR.manual_seed(seed + _Q18_SEED_OFFSET)
 
-    s1._BURST_SIEVE_MODEL = sieve_model
+    s1._BURST_SIEVE_MODEL = None if args.q18_no_sieve else sieve_model  # 楔死急诊单 B-2: --q18-no-sieve 时筛子卸载
     _seed_streams()
 
     # 零变化律自检 (A′, 任务书 §1 预注册; 考场口径修订 Q18-D7): 温启动后首步
@@ -684,6 +685,11 @@ def main() -> None:
                     flush=True,
                 )
             if step % 500 == 0:
+                # 楔死急诊单 B-3 (2026-08-27): 分配器碎片累积假说的对照修复——
+                # 周期 empty_cache (二分复现 L1/L2 实测 0.3-0.5MB/步缓爬,
+                # 历史楔点 5780-6380 ~ 外推 2-3GB 增量入爬行阈); 证据充分前按
+                # "候选修复"注册, 40K 不楔为治愈终证.
+                torch.cuda.empty_cache()
                 torch.save(
                     {"step": step, "model": model.state_dict(), "optimizer": opt.state_dict(),
                      "args": vars(args)},
