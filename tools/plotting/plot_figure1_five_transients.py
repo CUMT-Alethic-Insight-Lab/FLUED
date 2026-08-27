@@ -245,11 +245,22 @@ def main():
     xs_raw = [r["step"] / BUDGET["q17"] for r in q17]
     ys_raw = [r["echo_byte_acc"] for r in q17]
     rx, ry = rolling_mean(xs_raw, ys_raw, w=5)
+    # blind-guess prior band (user review 2026-08-27): lower edge = Q19 measured
+    # prior 0.0711; upper edge = E103-era OOD-gate prior 0.1047@20K, climbing to
+    # 0.1308@40K (dashed). Sources registered in figure1_data.json.
+    PRIOR_Q19 = 0.0711
+    PRIOR_OOD_20K = 0.1047
+    PRIOR_OOD_40K = 0.1308
+    ax.axhspan(PRIOR_Q19, PRIOR_OOD_20K, color=C_MAUVE, alpha=0.14, zorder=0,
+               label="blind-guess prior band 0.071-0.105")
+    ax.axhline(PRIOR_OOD_40K, color=C_MAUVE, lw=0.8, ls=":", zorder=0)
+    ax.text(0.995, PRIOR_OOD_40K + 0.004, "prior upper end 0.131 (E103, 40K)",
+            color=C_MAUVE, fontsize=7, ha="right")
     ax.axhline(0.30, color=C_D, lw=0.9, ls="-.", label="ignition criterion 0.30")
     ax.scatter(xs_raw, ys_raw, color=C_E, s=7, alpha=0.45, label="echo byte_acc (raw windows)")
     ax.plot(rx, ry, color=C_E, lw=1.6, label="rolling mean (w=5)")
-    ax.annotate("peak 0.1042 @ 800",
-                xy=(800 / BUDGET["q17"], 0.1042), xytext=(0.16, 0.135),
+    ax.annotate("peak 0.1042 @ 800\n≈ prior band upper edge",
+                xy=(800 / BUDGET["q17"], 0.1042), xytext=(0.16, 0.15),
                 color=C_E, fontsize=8,
                 arrowprops=dict(arrowstyle="->", color=C_E, lw=0.8))
     ax.annotate("0.040 @ 1900",
@@ -337,6 +348,19 @@ def main():
                 },
                 "anchors": {"peak": "0.1042@800", "decay": "0.040@1900", "criterion": 0.30,
                             "stopped_at": 2520},
+                "prior_band": {
+                    "lower_edge": {"value": 0.0711, "label": "Q19 measured blind-guess prior (mode-id constant predictor, acc_enc)",
+                                   "source": "outputs/q19_closed_form_20260827/closed_form_readout.json",
+                                   "registry": "docs/CURRENT_STATE.md E114"},
+                    "upper_edge": {"value": 0.1047, "label": "E103-era OOD-gate blind prior @20K",
+                                   "source": "outputs/q12A_ood_20260822/ood_gate.json (blind_prior_byte_acc)",
+                                   "registry": "docs/CURRENT_STATE.md E103"},
+                    "upper_dashed": {"value": 0.1308, "label": "E103 OOD-gate blind prior @40K (climb 0.105->0.131)",
+                                     "source": "outputs/q12_40k_ood_20260822/ood_gate.json (blind_prior_byte_acc)",
+                                     "registry": "docs/CURRENT_STATE.md E103"},
+                    "reading": "echo peak 0.1042@800 sits at the prior band upper edge -- barely separable from blind-guess prior",
+                    "caveat": "band edges come from different runs/probes (Q19 d-grid closed-form base; Q12 b-grid retrieval run); plotted as a phenomenological reference band, not a same-arm measurement",
+                },
                 "note": (
                     "raw log also contains a single-window spike 0.1429@2140 after the anneal "
                     "started (p=0.75); the registered narrative anchors on the p=1.0 segment "
@@ -350,16 +374,30 @@ def main():
     print(f"[fig1] wrote {OUT_DIR / 'figure1_data.json'}")
 
     caption = (
-        "# Figure 1 caption draft\n\n"
-        "**EN (one sentence):** Five independent training runs exhibit the same signature — a circuit-level "
-        "competence (key-geometry suppression, induction-head formation, rewarded attention, oracle echo readout) "
-        "transiently emerges early in training and is then re-absorbed as optimization proceeds — plotted on a "
-        "shared training-progress axis with the transient peak and decay points marked.\n\n"
-        "**CN 对照（一句）:** 五条独立训练臂呈现同一签名——回路级能力（键几何压制、induction 头形成、受奖励的"
-        "注意力、oracle 回声读出）在训练早期瞬态涌现、随后被优化过程重新吃掉——统一训练进度横轴、标注瞬态峰值"
-        "与消退点。\n\n"
-        "口径注记：面板 C 的 3K 峰值按仪器 JSON 绘为 2.09x（max/baseline，同式复现 E105/E107/E111 锚点）；"
-        "E110 叙事注册读数 2.74x 对应除以异源基线 0.1905，疑为簿记笔误，差异已在 figure1_data.json 登记。\n"
+        "# Figure 1 caption draft (v2, 2026-08-27, per user review)\n\n"
+        "**EN (one sentence):** Across five independent training runs, circuit-level competences — key-geometry\n"
+        "suppression under a soft constraint (A), induction-head formation at two model scales (B, C), reward-driven\n"
+        "attention (D), and oracle echo readout (E) — each transiently emerge early in training and are then re-absorbed\n"
+        "as optimization proceeds; plotted on a shared training-progress axis with transient peaks and decay points\n"
+        "marked, these are **qualitative recurrences of one dynamical motif across different metrics (key-coherence μ,\n"
+        "induction score, attention mass, byte accuracy) — not five measurements of one quantity**.\n\n"
+        "**CN 对照（一句）:** 五条独立训练臂上，回路级能力——软约束下的键几何压制（A）、两个规模上的 induction 头\n"
+        "形成（B、C）、受奖励的注意力（D）、oracle 回声读出（E）——各自在训练早期瞬态涌现、随后被优化过程重新\n"
+        "吸收；统一训练进度横轴、标注瞬态峰值与消退点。声明强度限定：**这是同一动力学形态在五种不同度量（键一致性\n"
+        "μ、induction 分数、注意力质量、字节准确率）上的五次定性复现，不是同一量的五次测量**——\"同一签名\"仅作\n"
+        "现象学声明，不暗示定量同一性。\n\n"
+        "## 口径注记（保留登记）\n\n"
+        "1. **面板 C 峰值**：按仪器 JSON 绘为 2.09×（max/baseline 口径，同式逐位复现 E105 的 1.71×/2.34×、E107 的\n"
+        "   2.13×、E111 的 1.61× 三条注册锚点）；E110 叙事注册读数 2.74× 恰等于峰值 0.5222 除以 q15b 仪器异源基线\n"
+        "   0.1905，疑为簿记笔误，差异已在 figure1_data.json 登记，待注册表裁定。\n"
+        "2. **E79 谷底勘误**：注册文写\"从 6K 最优 0.690\"，归档快照（audit_package_20260819 内 E79 时代原件）显示\n"
+        "   0.6903 在 **3K**、6K=0.757——图 A 按归档数据标注 \"suppressed floor 0.690 @ 3K\"。\n"
+        "3. **面板 E 先验参照带**：盲猜先验带 0.071–0.105（下沿=Q19 实测先验 0.0711，\n"
+        "   `outputs/q19_closed_form_20260827/closed_form_readout.json`；上沿=E103 时代 OOD 门盲猜先验 0.1047@20K，\n"
+        "   `outputs/q12A_ood_20260822/ood_gate.json`；40K 爬升端 0.1308 以虚线示出，\n"
+        "   `outputs/q12_40k_ood_20260822/ood_gate.json`）——echo 峰值 0.1042@800 与先验带上沿几乎不可分，直接可读。\n"
+        "4. **面板 E raw 尖刺**：原始日志在退火启动后（p=0.75）有单窗尖刺 0.1429@2140；注册叙事锚定 p=1.0 段\n"
+        "   （前 2K 步）。raw 点全画、滚动均值承载形态。\n"
     )
     (OUT_DIR / "caption_draft.md").write_text(caption, encoding="utf-8")
     print(f"[fig1] wrote {OUT_DIR / 'caption_draft.md'}")

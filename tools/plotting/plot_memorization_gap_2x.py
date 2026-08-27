@@ -35,6 +35,7 @@ C_GAP = "#f38ba8"     # red   — memorization gap
 C_IND = "#fab387"     # peach — induction ratio
 C_TRAIN = "#89dceb"   # cyan  — train loss
 C_EVAL = "#cba6f7"    # mauve — eval loss
+C_MAUVE = "#cba6f7"   # mauve — prior telemetry annotations
 
 OUT_DIR = Path("outputs/memorization_gap_2x_20260827")
 RUN_DIR = Path("checkpoints/v37ks_a_im_v373_scale2x_20k_ctx4096_20260826")
@@ -105,12 +106,12 @@ def main():
     gaps = [p["gap"] for p in points]
     ax.bar(xs, gaps, width=0.045, color=C_GAP, alpha=0.35)
     ax.plot(xs, gaps, color=C_GAP, marker="o", ms=5, lw=1.8,
-            label="memorization gap = eval - train completion_loss")
+            label="generalization gap = eval - train completion_loss")
     for p in points:
         ax.annotate(f"{p['gap']:+.3f}", xy=(p["progress"], p["gap"]),
                     xytext=(0, 7), textcoords="offset points", ha="center",
                     color=C_GAP, fontsize=7.5)
-    ax.set_ylabel("completion-loss gap (eval - train)", color=C_GAP)
+    ax.set_ylabel("generalization gap (single-pass regime: ≠ memorization)", color=C_GAP)
     ax.tick_params(axis="y", colors=C_GAP, labelsize=8)
     ax.set_ylim(0.0, max(gaps) * 1.35)
 
@@ -143,20 +144,35 @@ def main():
     ax.tick_params(axis="x", colors=TEXT, labelsize=8)
     for spine in ax.spines.values():
         spine.set_color(GRID)
-    ax.set_title("Scale-2x arm: memorization gap vs induction transient (E110, 20K@4096B)",
+    ax.set_title("Scale-2x arm: generalization gap (single-pass regime: ≠ memorization) vs induction transient (E110, 20K@4096B)",
                  color=TEXT, fontsize=10, loc="left")
+    # blind-guess prior telemetry (user review 2026-08-27): only two cross-run
+    # milestone readings exist (E103, Q12 retrieval run, b-grid: 0.1047@20K ->
+    # 0.1308@40K) -- no per-milestone series on this 2x arm, so per the ruling
+    # this is an annotation reference, not an overlaid curve.
+    ax.text(0.98, 0.97,
+            "blind-guess prior telemetry (E103, Q12 b-grid run): 0.105@20K → 0.131@40K\n"
+            "(cross-run reference — no per-milestone prior series on this arm)",
+            transform=ax.transAxes, color=C_MAUVE, fontsize=7.5, va="top", ha="right",
+            bbox=dict(boxstyle="round,pad=0.35", facecolor=BG, edgecolor=GRID))
+    fig.text(0.01, 0.005,
+             "Note (user ruling 2026-08-27): solvent-hypothesis telemetry belongs on blind-guess-prior / "
+             "exposure histograms, not on this gap.",
+             color=SUBTLE, fontsize=7)
     h1, l1 = ax.get_legend_handles_labels()
     h2, l2 = ax2.get_legend_handles_labels()
     ax.legend(h1 + h2, l1 + l2, fontsize=8, facecolor=BG, edgecolor=GRID,
-              labelcolor=TEXT, loc="upper center")
-    fig.tight_layout()
+              labelcolor=TEXT, loc="upper left")
+    fig.tight_layout(rect=(0, 0.02, 1, 1))
     png = OUT_DIR / "memorization_gap_2x.png"
     fig.savefig(png, dpi=200, facecolor=BG)
     print(f"[memgap] wrote {png}")
 
     payload = {
-        "figure": "memorization gap (held-out eval minus same-window train completion loss) "
-                  "vs induction trajectory, scale-2x arm",
+        "figure": "generalization gap (held-out eval minus same-window train completion loss; "
+                  "single-pass regime: NOT a memorization measurement) vs induction trajectory, scale-2x arm",
+        "relabel_note": "titled 'memorization gap' in v1; relabelled per user review 2026-08-27 -- "
+                        "single-pass streaming training makes this a generalization gap, != memorization",
         "created_by": "tools/plotting/plot_memorization_gap_2x.py",
         "run": str(RUN_DIR),
         "budget_steps": BUDGET,
@@ -166,12 +182,42 @@ def main():
             "run_summary_eval_completion_loss": summary["eval_completion_loss"],
             "match": anchor_ok,
         },
+        "blind_guess_prior_telemetry": {
+            "readings": [
+                {"step": 20000, "blind_prior_byte_acc": 0.1047,
+                 "source": "outputs/q12A_ood_20260822/ood_gate.json"},
+                {"step": 40000, "blind_prior_byte_acc": 0.1308,
+                 "source": "outputs/q12_40k_ood_20260822/ood_gate.json"},
+            ],
+            "registry": "docs/CURRENT_STATE.md E103 (prior climb 0.105 -> 0.131)",
+            "availability": "only two milestone readings, on the Q12 b-grid retrieval run (20K/40K), "
+                            "NOT on this scale-2x arm -- no per-milestone prior series exists for the 2x arm; "
+                            "per user ruling plotted as an annotation reference, not an overlaid curve",
+        },
+        "caption_note": "solvent-hypothesis telemetry belongs on blind-guess-prior / exposure histograms, "
+                        "not on this gap (user ruling 2026-08-27); CN: 溶剂假说的遥测应挂在盲猜先验/exposure "
+                        "直方图上，不在此间隙上（用户裁定）",
         "points": points,
         "induction": induction,
     }
     (OUT_DIR / "memorization_gap_data.json").write_text(
         json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"[memgap] wrote {OUT_DIR / 'memorization_gap_data.json'}")
+
+    caption = (
+        "# Generalization-gap figure caption note (2026-08-27, per user review)\n\n"
+        "**EN:** Scale-2x arm generalization gap (held-out eval minus same-window train completion loss) "
+        "against the induction transient; under the single-pass streaming regime this gap is a "
+        "generalization readout, not a memorization measurement.\n\n"
+        "**CN 对照：** 2x 臂泛化间隙（held-out eval 减同窗 train completion loss）与 induction 瞬态同轴；"
+        "单遍流式体制下此间隙是泛化读数，≠ 记忆化测量。\n\n"
+        "**图注句（用户裁定原文意思）：** 溶剂假说的遥测应挂在盲猜先验/exposure 直方图上，不在此间隙上。"
+        "(Solvent-hypothesis telemetry belongs on blind-guess-prior / exposure histograms, not on this gap.)\n\n"
+        "先验遥测可得性：E103 盲猜先验仅两点（0.1047@20K、0.1308@40K）且跨臂（Q12 b 格检索臂），本 2x 臂无"
+        "逐里程碑先验序列——按裁定以标注引用呈现，不叠线。\n"
+    )
+    (OUT_DIR / "caption_note.md").write_text(caption, encoding="utf-8")
+    print(f"[memgap] wrote {OUT_DIR / 'caption_note.md'}")
 
 
 if __name__ == "__main__":
