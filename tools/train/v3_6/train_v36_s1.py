@@ -99,6 +99,17 @@ Tasks (spec section 20, user-designed):
    q15_echo_loss / q15_couple_loss / q15_twin_d / q15_twin_count (门 = §3.2
    修订 v1 单头超基线超出量: σ((maxmass−chance−δ)/s), δ=0.15 s=0.05 冻结),
    off/eval 零占位 schema 对齐.
+7. Q18 v2 读出墙裁定臂 — B 计划 (``--q18-arm {A,Aprime}``, 2026-08-28 移植):
+   A/A′ 臂从独立训练器 (train_q18_readout_wall.py) 移植进 s1 骨架。为什么
+   移植: Q17/Q18 独立训练器双机双栈间歇楔死 (fresh 活 2-6K、resume 速楔、
+   楔点随权重态; 事故簿 = Q18 任务书 §6), s1 骨架经 20K×多臂验证稳定——
+   移植目的是稳定宿主, 机制一字不改 (流式双态读出/oracle 态/α 范数匹配/
+   链重初始化/闭式温启动全部从独立训练器模块懒导入调用, 零复制)。形态:
+   基座 --q18-base-ckpt strict 加载, 链范围 = Q17 修订 v1 足迹 A 从零 /
+   A′ 温启动+零变化律自检, 其余全冻; 训练步委托 q17._q17_step (echo CE
+   唯一损失, Q15 管束 burst R=3+末 2-4 字遮蔽+先验筛+store_block 全现成);
+   A 40K / A′ 20K, LR 1e-3 + warmup 200 + cosine→0, 种子参数化; log
+   schema 加 q18_arm/q18_seed。详见模块中部 Q18 节注记。
 
 Metric redefinition (S1.0+): direct fidelity excludes nothing but MASK_ID
 positions are reported separately (trivially correct); masked acc is backbone
@@ -149,6 +160,13 @@ import torch.nn.functional as F
 REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+
+# 双模块陷阱护栏 (B 计划 2026-08-28 实测): 本文件作为脚本运行时模块名是
+# __main__, Q18 模式懒导入的 train_q17_oracle_readout 再按包路径 import 本
+# 模块会产生第二个实例——_BURST_SAMPLER/_MASK_GENERATOR 等进程级全局两边分
+# 叉 (副本侧 sampler=None 即崩)。预注册规范名 → 全局唯一实例; 正常被 import
+# 时 sys.modules 已有本键, setdefault 无操作。
+sys.modules.setdefault("tools.train.v3_6.train_v36_s1", sys.modules[__name__])
 
 from flued.data import BYTE_OFFSET, MASK_ID, PAD_ID  # noqa: E402
 from flued.v36.model import _xcache_select, chunk_byte_offsets, paged_boundaries  # noqa: E402
@@ -1422,6 +1440,185 @@ def _q15_callback_check(anchor: dict, window: dict, lambdas: dict, floors: dict,
     return [event], new
 
 
+# ---------------------------------------------------------------------------
+# Q18 v2 读出墙裁定臂 — B 计划 (2026-08-28): A/A′ 臂移植进 s1 骨架
+# ---------------------------------------------------------------------------
+# 为什么移植 (任务书 §6 楔死事故簿): Q17/Q18 独立训练器在双机双栈上间歇楔死
+# (日志停摆+主线程 100% CPU+GPU 忙; fresh 活 2-6K 步, resume 速楔, 楔点随权重
+# 态; 全录 docs/versions/v3.7/FLUED_V3_7_Q18_V2_READOUT_WALL_20260827_CN.md
+# §6), s1 骨架经 20K×多臂 (Q12-Q15) 验证稳定——移植目的是稳定宿主, 机制一字
+# 不改: 流式双态读出 (_q17_stream_encode/_q17_stream_channel)/oracle 态构造/
+# α 范数匹配/链重初始化/闭式温启动全部从独立训练器模块 import 调用 (懒导入护
+# 栏: train_q17_oracle_readout 顶层 import 本模块, s1 顶层反向 import 会成
+# 环), 本节只有挂接控制流, 零机制复制。
+#
+# 形态 (与独立训练器逐项对齐): 模型从 --q18-base-ckpt (Q15 正臂 run dir)
+# strict 加载; 链范围 = realign×2+readout_query×2+align_k/align_v (在
+# backbone 内)+backbone+decoder_in+decoder (Q17 修订 v1 足迹), A 臂固定种子
+# 从零 / A′ 臂 Q19 闭式温启动 (q18._q18_warmstart + 零变化律自检, 不过响亮
+# 退出臂作废), 其余全冻; 训练步把 SLM store 行换成流式双态读出行 (A 臂与
+# A′ oracle 列 p≡1.0 / natural 列 p≡0.0), 损失 = echo CE (唯一); eval
+# (train=False) 走标准 s1 路径——独立训练器收官 eval 就是 s1.evaluate 全形
+# 态, 逐一对齐。预算 A 40K / A′ 20K (--q18-steps 覆写), LR 1e-3 + warmup
+# 200 + cosine→0 (强制覆写, 独立训练器硬编码同款), batch=1, 种子参数化。
+
+_Q18_CONFIG_EXCLUDE = frozenset({
+    # IO/运行时键不回填: out_dir/run_id 继承基座会把续跑写进基座 run dir
+    # (事故级); init_checkpoint 是基座自己的 S0 起点 (Q18 链初始化在 strict
+    # 基座之上做, 不回链 S0); eval_only/config 是本层旗标。
+    "out_dir", "run_id", "init_checkpoint", "init_prefixes", "eval_only", "config",
+})
+
+_Q18_DEPS = None  # (q17 模块, q18 模块) 懒导入缓存
+
+
+def _q18_enabled(args) -> bool:
+    return bool(getattr(args, "q18_arm", ""))
+
+
+def _q18_deps():
+    """懒导入独立训练器模块 (循环护栏: train_q17_oracle_readout 顶层 import
+    本模块, s1 顶层反向 import 会成环; 首次调用后缓存)。"""
+    global _Q18_DEPS
+    if _Q18_DEPS is None:
+        from tools.train.v3_6 import train_q17_oracle_readout as q17m
+        from tools.train.v3_6 import train_q18_readout_wall as q18m
+
+        _Q18_DEPS = (q17m, q18m)
+    return _Q18_DEPS
+
+
+def _q18_base_config_defaults(base_ckpt: str) -> dict:
+    """基座 run dir 的 resolved_config.json → parser defaults (窗规格/管束/
+    模型形态全部继承基座——独立训练器 _q17_load_models 的 cfg 同源); IO/运
+    行时键剔除 (_Q18_CONFIG_EXCLUDE); data_manifest 强制空 (独立训练器同款)。"""
+    cfg_path = Path(base_ckpt) / "resolved_config.json"
+    if not cfg_path.exists():
+        raise SystemExit(
+            f"--q18-base-ckpt {base_ckpt}: resolved_config.json 缺席 (预期 Q15 正臂 run dir)"
+        )
+    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    cfg["data_manifest"] = ""
+    return {k: v for k, v in cfg.items() if k not in _Q18_CONFIG_EXCLUDE}
+
+
+def _q18_validate_args(args) -> None:
+    """旗标响亮校验: 不合法组合点火前 SystemExit, 不静默降级。"""
+    base = Path(args.q18_base_ckpt) if args.q18_base_ckpt else None
+    if base is None or not (base / "resolved_config.json").exists():
+        raise SystemExit("--q18-arm 需要 --q18-base-ckpt <Q15 正臂 run dir> (resolved_config.json 可读)")
+    if not (base / "latest.pt").exists():
+        raise SystemExit(f"--q18-base-ckpt {args.q18_base_ckpt}: latest.pt 缺席")
+    if getattr(args, "backbone_mode", "") != "slm" or getattr(args, "v_row_source", "") != "state":
+        raise SystemExit(
+            "Q18 预期 d 格基座 (backbone_mode='slm', v_row_source='state'), got "
+            f"backbone_mode={getattr(args, 'backbone_mode', None)!r} "
+            f"v_row_source={getattr(args, 'v_row_source', None)!r}"
+        )
+    if args.q18_arm == "Aprime":
+        donor = Path(args.q18_donor_ckpt)
+        if not (donor / "resolved_config.json").exists() or not (donor / "latest.pt").exists():
+            raise SystemExit(
+                "A′ 臂温启动需要 --q18-donor-ckpt <b 格 v371 run dir> (Q19 D1 donor "
+                f"端口方案), got {args.q18_donor_ckpt!r}"
+            )
+    if args.eval_only:
+        raise SystemExit("Q18 模式不组合 --eval-only (收官 eval 由训练主循环尾部承担, 独立训练器同形态)")
+    if float(getattr(args, "cloze_prob", 0.0)) > 0.0 or float(getattr(args, "retrieval_prob", 0.0)) > 0.0:
+        raise SystemExit("Q18 模式不组合 cloze/retrieval (Q15 管束只有 burst; 独立训练器同口径)")
+
+
+def _q18_seed_streams(args) -> None:
+    """抽签流 (任务书 §4 可复现; 独立训练器 _seed_streams 同 discipline):
+    mask/burst 流 + 退火抽签流 (Q18 独立偏移, 与 Q17 的 101_033 不混)。
+    A′ 温启动/零变化律自检消耗抽签流后必须重调本函数 (RNG 隔离)。"""
+    _q17m, q18m = _q18_deps()
+    _MASK_GENERATOR.manual_seed(args.seed)
+    _BURST_GENERATOR.manual_seed(args.seed + _BURST_SEED_OFFSET)
+    q18m._Q18_GENERATOR.manual_seed(args.seed + q18m._Q18_SEED_OFFSET)
+
+
+def _q18_setup_chain(model, args, device, out_dir: Path, resuming: bool):
+    """链初始化 (机制零复制): 全冻 → A 臂固定种子从零 (Q17 修订 v1 足迹) /
+    A′ 臂 Q19 闭式温启动 + 零变化律自检 (不过响亮退出, 臂作废重查不许判负)
+    → 解冻链。resume 跳过初始化 (latest.pt 回放覆盖链权重, 独立训练器同款)。
+    Returns warmstart report (A 臂/resume 为 None)。"""
+    q17m, q18m = _q18_deps()
+    for p_ in model.parameters():
+        p_.requires_grad_(False)
+    warm_report = None
+    if not resuming and args.q18_arm == "A":
+        q17m._q17_reinit_readout_chain(model, args, args.seed)
+    elif not resuming:
+        donor, dns, donor_step = q18m.load_model(Path(args.q18_donor_ckpt), device)
+        # D1 接口断言 (Q19 同款, loud): donor 必须有 decoder_in_mem 且 v=memory
+        if getattr(dns, "v_row_source", "") != "memory" or not hasattr(donor, "decoder_in_mem"):
+            raise ValueError(
+                f"{args.q18_donor_ckpt}: donor 缺 decoder_in_mem "
+                f"(v_row_source={getattr(dns, 'v_row_source', None)!r})"
+            )
+        for k in ("max_chunks", "max_span"):
+            if getattr(args, k) != getattr(dns, k):
+                raise ValueError(f"base/donor {k} 不一致: {getattr(args, k)} vs {getattr(dns, k)}")
+        print(f"[s1][q18] donor={Path(args.q18_donor_ckpt).name} step={donor_step}", flush=True)
+        warm_report = q18m._q18_warmstart(
+            model, donor, args, device, args.q18_warmstart,
+            int(args.q18_calib_windows), float(args.lam_unmix), float(args.lam_stage2),
+        )
+        (out_dir / "warmstart_report.json").write_text(
+            json.dumps(warm_report, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        del donor  # 标定完即释放 (16GB 显存纪律)
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        # 零变化律自检 (任务书 §1 预注册; 考场口径 Q18-D7): 温启动后首步 fine
+        # 细格 acc 必须过阈, 不过响亮退出——初始化没接通, 臂作废重查不许判负
+        p_col = q18m._q18_course_p(args.q18_arm, args.q18_warmstart, 0)
+        zc_mean, zc_accs = q18m._q18_zero_change_check(
+            model, args, device, p_col, int(args.q18_zc_windows), float(args.q18_zc_threshold)
+        )
+        warm_report["zero_change"] = {
+            "threshold": float(args.q18_zc_threshold),
+            "windows": int(args.q18_zc_windows),
+            "metric": "fine 细格全槽 as-encoded acc, 判官=backbone 腿 (Q18-D7)",
+            "backbone_accs": [round(a, 4) for a in zc_accs["backbone"]],
+            "direct_accs": [round(a, 4) for a in zc_accs["direct"]],
+            "mean": round(zc_mean, 4),
+        }
+        (out_dir / "warmstart_report.json").write_text(
+            json.dumps(warm_report, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        print(
+            f"[s1][q18] 零变化律自检通过: 首步细格 acc(backbone)={zc_mean:.4f} > {args.q18_zc_threshold}",
+            flush=True,
+        )
+        _q18_seed_streams(args)  # 检查后重 seed 训练流 (RNG 隔离声明落到实处)
+    trainable = q17m._q17_unfreeze_chain(model)
+    print(
+        f"[s1][q18] arm={args.q18_arm} "
+        f"{'温启动 ' + args.q18_warmstart if args.q18_arm == 'Aprime' else '从零重初始化'} "
+        f"(seed={args.seed}), 可训练参数 {sum(p_.numel() for p_ in trainable)}"
+        + (" (resume: 跳过链初始化)" if resuming else ""),
+        flush=True,
+    )
+    return warm_report
+
+
+def _q18_train_step(model, batch, args, device):
+    """Q18 训练步: 整体委托 q17._q17_step (流式双态读出 + echo CE, 机制零复
+    制——splice/遮蔽/抽签流全部读本模块全局, 与独立训练器同一数据源)。
+    Returns (loss_or_None, metrics-tensor-dict); loss=None = echo 离网 (burst
+    未激活窗), 调用侧步进照走不参训 (独立训练器同款)。"""
+    q17m, q18m = _q18_deps()
+    p = q18m._q18_course_p(args.q18_arm, getattr(args, "q18_warmstart", "oracle"), 0)  # 课程断言: 恒定
+    loss, m = q17m._q17_step(model, batch[0], args, device, p, q18m._Q18_GENERATOR)
+    metrics = {k: torch.tensor(float(v), device=device) for k, v in m.items()}
+    if loss is None:
+        return None, metrics
+    metrics["loss"] = loss.detach()
+    return loss, metrics
+
+
 def _load_bpe_tokenizer(path: str) -> None:
     global _BPE_TOKENIZER
     from tokenizers import Tokenizer
@@ -2037,6 +2234,12 @@ def _frozen_decoder_logits(model, cond: torch.Tensor, token_mask: torch.Tensor) 
 
 
 def step_model(model, batch, args, device, train: bool):
+    if _q18_enabled(args) and train:
+        # Q18 v2 读出墙裁定臂 (B 计划移植): 训练步整体委托独立训练器机制
+        # (_q18_train_step → q17._q17_step, echo CE 唯一损失); eval
+        # (train=False) 走下方标准 s1 路径——独立训练器收官 eval 即
+        # s1.evaluate 全形态, 逐一对齐。
+        return _q18_train_step(model, batch, args, device)
     clean = batch[0]
     q15_on = _q15_enabled(args)
     cloze_metas = None
@@ -2713,6 +2916,41 @@ def _add_s1_args(parser: argparse.ArgumentParser) -> None:
         "--no-cumulative-mask-retention restores the pre-v36.8 zero-retention "
         "per-chunk targets for ablation. Direct and predict are unaffected.",
     )
+    # --- Q18 v2 读出墙裁定臂 (B 计划 2026-08-28): A/A′ 臂移植进 s1 骨架 ---
+    # 机制与动机见模块中部 Q18 节注记; 默认全关 (q18_arm="" = 零侵入,
+    # canonical 路径逐比特不变)。
+    parser.add_argument(
+        "--q18-arm", choices=["", "A", "Aprime"], default="",
+        help="Q18 臂: A=预算终审 (从零 40K); Aprime=闭式温启动双列 (20K); 空=关",
+    )
+    parser.add_argument(
+        "--q18-warmstart", choices=["oracle", "natural"], default="oracle",
+        help="A′ 列: oracle 态 (p≡1.0) / natural 态 (p≡0.0, 生产判词)",
+    )
+    parser.add_argument(
+        "--q18-base-ckpt", default="",
+        help="Q15 正臂收官 run dir (基座: resolved_config 回填 defaults + latest.pt strict 加载)",
+    )
+    parser.add_argument(
+        "--q18-donor-ckpt", default="checkpoints/v37ks_b_sm_v371_20k_ctx4096_20260817",
+        help="A′ donor 端口 (b 格 v371 冻结组件, Q19 D1 方案)",
+    )
+    parser.add_argument(
+        "--q18-steps", type=int, default=0,
+        help="0 = 臂默认 (A: 40K, A′: 20K); >0 覆写 (冒烟/奇偶校验)",
+    )
+    parser.add_argument("--q18-calib-windows", type=int, default=16, help="A′ 标定窗数 (16 = Q19 协议)")
+    parser.add_argument("--q18-zc-windows", type=int, default=8, help="零变化律自检窗数")
+    parser.add_argument(
+        "--q18-zc-threshold", type=float, default=0.15,
+        help="零变化律阈值 (任务书 §1 预注册 0.15; train_q18_readout_wall._Q18_ZC_THRESHOLD 同值)",
+    )
+    parser.add_argument(
+        "--q18-no-sieve", action="store_true",
+        help="关先验筛 (独立训练器楔死急诊单 B-2 移植保留; 默认开 = 参考臂同口径)",
+    )
+    parser.add_argument("--lam-unmix", type=float, default=1e-2, help="A′ 段1 ridge 解混 λ (Q19 同档)")
+    parser.add_argument("--lam-stage2", type=float, default=1.0, help="A′ 段2/收尾 ridge λ (相对预条件后, Q19 同档)")
 
 
 def main() -> None:
@@ -2720,11 +2958,16 @@ def main() -> None:
 
     pre = argparse.ArgumentParser(add_help=False)
     pre.add_argument("--config", default="")
+    pre.add_argument("--q18-base-ckpt", default="")
     pre_args, _ = pre.parse_known_args()
     parser = build_parser()
     _add_s1_args(parser)
     if pre_args.config:
         parser.set_defaults(**json.loads(Path(pre_args.config).read_text(encoding="utf-8")))
+    if pre_args.q18_base_ckpt:
+        # Q18 模式 (B 计划 2026-08-28): 基座 resolved_config 回填 defaults
+        # (窗规格/管束/模型形态继承基座; IO/运行时键剔除, 见 _Q18_CONFIG_EXCLUDE)
+        parser.set_defaults(**_q18_base_config_defaults(pre_args.q18_base_ckpt))
     args = parser.parse_args()
     if not args.per_chunk_readout:
         raise SystemExit("S1.0 requires --per-chunk-readout")
@@ -2753,6 +2996,31 @@ def main() -> None:
             )
         if args.prefix_task:
             raise SystemExit("--backbone-mode slm does not combine with --prefix-task (N/A in v3.7)")
+    q18_on = _q18_enabled(args)
+    if q18_on:
+        # Q18 v2 读出墙裁定臂 (B 计划 2026-08-28): 旗标响亮校验 + 冻结配方
+        # 覆写 (任务书 §1, 独立训练器硬编码同款: LR 1e-3 + warmup 200 +
+        # cosine→0, batch=1, 预算 A 40K / A′ 20K)。课程 p 恒定 (A/oracle 列
+        # ≡1.0, natural 列 ≡0.0), 训练步内在 _q18_train_step 现查。
+        _q18_validate_args(args)
+        args.lr = 1e-3
+        args.warmup_steps = 200
+        args.max_steps = int(args.q18_steps) or (40_000 if args.q18_arm == "A" else 20_000)
+        if args.batch_size != 1:
+            print(f"[s1][q18] batch_size 覆写 {args.batch_size} -> 1 (Q17 同款冻结)", flush=True)
+            args.batch_size = 1
+        tag = "q18a" if args.q18_arm == "A" else f"q18ap_{args.q18_warmstart}"
+        if "--run-id" not in sys.argv:
+            args.run_id = f"v37ks_d_{tag}_s{args.seed}_{args.max_steps // 1000}k_s1host_20260828"
+        if "--out-dir" not in sys.argv:
+            args.out_dir = f"checkpoints/{args.run_id}"
+        print(
+            f"[s1][q18] B 计划移植臂: arm={args.q18_arm} "
+            f"{'温启动 ' + args.q18_warmstart if args.q18_arm == 'Aprime' else '从零'} "
+            f"预算={args.max_steps} LR={args.lr} warmup={args.warmup_steps} "
+            f"基座={args.q18_base_ckpt} out={args.out_dir}",
+            flush=True,
+        )
     if getattr(args, "cloze_prob", 0.0) > 0:
         # v3.7 cloze 检索回执 (user-ruled 2026-08-17): slm-only -- on legacy
         # xattn/paged/draft/attn paths (and the codec_final/paged/draft/
@@ -2838,8 +3106,16 @@ def main() -> None:
     _CLOZE_GENERATOR.manual_seed(args.seed + _CLOZE_SEED_OFFSET)
     _RETRIEVAL_GENERATOR.manual_seed(args.seed + _RETRIEVAL_SEED_OFFSET)
     _BURST_GENERATOR.manual_seed(args.seed + _BURST_SEED_OFFSET)
+    if q18_on:
+        # Q18 抽签流 (退火抽签 Q18 独立偏移 101_077, 与 Q17 的 101_033 不混)
+        # + mask/burst 重断言——独立训练器 _seed_streams 同 discipline
+        _q18_seed_streams(args)
 
     device = torch.device(args.device if args.device == "cpu" or torch.cuda.is_available() else "cpu")
+    if q18_on and device.type != "cuda" and getattr(args, "kda_impl", "") != "torch":
+        # 独立训练器 _q17_load_models 同款: fla kernels GPU-only
+        print(f"[s1][q18] kda_impl 覆写 {args.kda_impl} -> torch (非 CUDA 设备)", flush=True)
+        args.kda_impl = "torch"
     torch.manual_seed(args.seed)
     if device.type == "cuda":
         torch.cuda.manual_seed_all(args.seed)
@@ -2870,21 +3146,58 @@ def main() -> None:
             compatible = {k: v for k, v in compatible.items() if any(k.startswith(p) for p in init_prefixes)}
         model.load_state_dict(compatible, strict=False)
         print(f"[s1] init: loaded={len(compatible)} skipped={len(payload['model']) - len(compatible)} prefixes={init_prefixes or 'ALL'}", flush=True)
+    q18_warm_report = None
+    q18_base_step = 0
+    q18_base_payload = None
+    if q18_on:
+        # Q18 基座 strict 加载 (独立训练器 _q17_load_models 同款) + 链初始化
+        # (A 从零 / A′ 温启动+零变化律自检, 机制零复制); init_checkpoint 已
+        # 经 _Q18_CONFIG_EXCLUDE 剔除——Q18 的初始化面 = 基座 + 链, 不回链 S0。
+        q18_base_payload = torch.load(
+            Path(args.q18_base_ckpt) / "latest.pt", map_location=device, weights_only=False
+        )
+        model.load_state_dict(q18_base_payload["model"], strict=True)
+        q18_base_step = int(q18_base_payload.get("step", 0))
+        print(f"[s1][q18] 基座 strict 加载: {args.q18_base_ckpt} step={q18_base_step}", flush=True)
+        q18_warm_report = _q18_setup_chain(
+            model, args, device, out_dir,
+            resuming=bool(args.resume and (out_dir / "latest.pt").exists()),
+        )
     frozen = [p.strip() for p in args.freeze_prefixes.split(",") if p.strip()]
-    if frozen:
+    if frozen and not q18_on:
+        # Q18 模式跳过本块: 冻结面由 _q18_setup_chain 全权定义 (独立训练器
+        # 没有 freeze_prefixes 概念)。基座 Q15 配方的 byte_lookup 前缀会把
+        # tied 嵌入 (decoder.byte_lookup 与模型级 byte_lookup 同一参数) 重
+        # 新冻结——而独立训练器里它经 decoder 在链上参训; 奇偶校验实测该差
+        # 异造成 +0.2 系统性 loss 偏移 (2026-08-28), 故必须跳过。
         n = 0
         for name, param in model.named_parameters():
             if any(name.startswith(p) for p in frozen):
                 param.requires_grad_(False)
                 n += 1
         print(f"[s1] frozen params={n} prefixes={frozen}", flush=True)
-    if bool(getattr(args, "burst_prior_sieve", False)):
+    if q18_on:
+        # Q18 先验筛参考模型 = 基座第二次独立加载 (E101 教训, 独立训练器同
+        # 款: 固定, 设备驻留, 全程只读); --q18-no-sieve 时卸载 (楔死急诊单
+        # B-2 移植保留)。注意: 本块必须覆盖/取代下方 Q14 标准筛块 (标准块在
+        # q18 模式跳过——它没有基座 ckpt 可载, 只会造随机初始化筛子)。
+        global _BURST_SIEVE_MODEL
+        _BURST_SIEVE_MODEL = None
+        if not args.q18_no_sieve:
+            _BURST_SIEVE_MODEL = build_model(args).to(device)
+            _BURST_SIEVE_MODEL.load_state_dict(q18_base_payload["model"], strict=True)
+            for p_ in _BURST_SIEVE_MODEL.parameters():
+                p_.requires_grad_(False)
+            _BURST_SIEVE_MODEL.eval()
+            print("[s1][q18] 先验筛参考模型: 基座第二次独立加载, 固定驻留", flush=True)
+    if bool(getattr(args, "burst_prior_sieve", False)) and not q18_on:
         # Q14 先验筛基准 (修订案 2026-08-23 §2.1): 参考模型 = 与开工 checkpoint
         # 同一份 -- canonical 配置随机初始化 (同种子复演 step-0 初始化抽签, 全局
         # RNG 状态先存后还) 叠加 init_checkpoint 的同口径部分加载; requires_grad
         # False + eval + 驻训练设备 (GPU——驻 CPU 的 fla kernel 崩、torch 递推
         # CPU 前向 ~10× 减速, 两次教训 2026-08-23), 全程只读, 训练中不重筛.
-        global _BURST_SIEVE_MODEL
+        # (global 声明已随 Q18 块上移至本函数首个使用点——同一函数内重复
+        # 声明在使用点之后是 SyntaxError)
         rng_state = torch.get_rng_state()
         torch.manual_seed(args.seed)
         _BURST_SIEVE_MODEL = build_model(args).to(device)
@@ -2961,7 +3274,7 @@ def main() -> None:
     pending_n = 0
     # Q14 臂中点复测钩 (修订案 §2.1): 只在先验筛开时武装
     midpoint_done = False
-    midpoint_armed = bool(getattr(args, "burst_prior_sieve", False)) and _burst_enabled(args)
+    midpoint_armed = bool(getattr(args, "burst_prior_sieve", False)) and _burst_enabled(args) and not q18_on
     # Q15 codec 回调线 (任务书 §5, 臂内自锚): 锚 = steps 800-1000 训练批
     # direct_acc/backbone_acc 均值 (post-warmup 自锚; 训练中无周期 eval,
     # 只能用训练批读数); resume 越过锚窗时锚缺席, 监控自动解除 (不静默伪造锚)
@@ -2969,7 +3282,7 @@ def main() -> None:
     q15_anchor_n = 0
     q15_anchor = None
     q15_lambdas = q15_floors = None
-    if _q15_enabled(args):
+    if _q15_enabled(args) and not q18_on:
         q15_lambdas = {
             "att": args.q15_lambda_att, "out": args.q15_lambda_out, "couple": args.q15_lambda_couple
         }
@@ -2981,6 +3294,12 @@ def main() -> None:
             if _RETRIEVAL_RAMP is not None:
                 args.retrieval_block_prob = _ramp_lookup(_RETRIEVAL_RAMP, step)
             loss, metrics = step_model(model, batch, args, device, train=True)
+            if loss is None:
+                # Q18 echo 离网 (burst 未激活窗): 步进照走不参训 (独立训练器
+                # 同款; legacy 路径永不返回 None —— 零行为变化)
+                step += 1
+                sched.step()
+                continue
             if not bool(torch.isfinite(loss)):
                 nan_skips += 1
                 opt.zero_grad(set_to_none=True)
@@ -2996,7 +3315,7 @@ def main() -> None:
             for k, v in metrics.items():
                 pending[k] = pending[k] + v if k in pending else v.clone()
             pending_n += 1
-            if _q15_enabled(args) and _Q15_ANCHOR_RANGE[0] <= step <= _Q15_ANCHOR_RANGE[1]:
+            if _q15_enabled(args) and not q18_on and _Q15_ANCHOR_RANGE[0] <= step <= _Q15_ANCHOR_RANGE[1]:
                 # Q15 回调线锚窗 (§5): steps 800-1000 累计训练批读数
                 q15_anchor_sum["direct_acc"] += float(metrics["direct_acc"])
                 q15_anchor_sum["backbone_acc"] += float(metrics["backbone_acc"])
@@ -3019,6 +3338,12 @@ def main() -> None:
                     "data_burstiness": _batch_data_burstiness(batch[0]),
                     **{k: float((v / pending_n).item()) for k, v in pending.items()},
                 }
+                if q18_on:
+                    # Q18 log schema (B 计划): 臂/种子入每行 (独立训练器同款)
+                    row["q18_arm"] = args.q18_arm
+                    row["q18_seed"] = int(args.seed)
+                    if args.q18_arm == "Aprime":
+                        row["q18_warmstart"] = args.q18_warmstart
                 _append_jsonl(log_path, row)
                 pending = {}
                 pending_n = 0
@@ -3071,6 +3396,15 @@ def main() -> None:
         "args": vars(args),
         **eval_stats,
     }
+    if q18_on:
+        # Q18 收官 schema (B 计划): 臂/种子/基座入册; A′ 附温启动报告
+        summary["q18_arm"] = args.q18_arm
+        summary["q18_seed"] = int(args.seed)
+        summary["q18_base_ckpt"] = str(args.q18_base_ckpt)
+        summary["q18_base_step"] = q18_base_step
+        if args.q18_arm == "Aprime":
+            summary["q18_warmstart"] = args.q18_warmstart
+            summary["warmstart_report"] = q18_warm_report
     (out_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
 

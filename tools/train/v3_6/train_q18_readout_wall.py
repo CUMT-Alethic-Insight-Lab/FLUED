@@ -481,6 +481,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--q18-calib-windows", type=int, default=16, help="A′ 标定窗数 (16 = Q19 协议)")
     p.add_argument("--q18-zc-windows", type=int, default=8, help="零变化律自检窗数")
     p.add_argument("--q18-zc-threshold", type=float, default=_Q18_ZC_THRESHOLD)
+    p.add_argument("--q18-segment-start", type=int, default=0, help="分段续跑 (2026-08-27 楔死攻坚): >0 时从 latest.pt 只载权重 (fresh Adam 在册纪律), 步数从该绝对步起算, cosine 排程 sched.step(offset) 续位——优化器态不载 (resume 楔死触发器候选)")
     p.add_argument("--lam-unmix", type=float, default=1e-2, help="段1 ridge 解混 λ (Q19 同档)")
     p.add_argument("--lam-stage2", type=float, default=1.0, help="段2/收尾 ridge λ (相对预条件后, Q19 同档)")
     p.add_argument("--kda-impl", default="", choices=["", "torch", "fla"], help="2026-08-27 挂死急诊单: 远端 4090 fla chunk_kda 死锁 -> 远端链传 torch")
@@ -613,6 +614,13 @@ def main() -> None:
         if start_step > 0:
             sched.step(start_step)
         print(f"[q18] resumed from step {start_step}", flush=True)
+    elif args.q18_segment_start > 0 and latest.exists():
+        # 分段续跑 (楔死攻坚 2026-08-27): 只载权重不载优化器, fresh Adam
+        payload = torch.load(latest, map_location=device, weights_only=False)
+        model.load_state_dict(payload["model"])
+        start_step = int(args.q18_segment_start)
+        sched.step(start_step)  # cosine 排程续位 (绝对步)
+        print(f"[q18] segment-resume: 权重续自 step {start_step} (fresh Adam, 优化器态不载)", flush=True)
 
     log_path = out_dir / "train_log.jsonl"
     nan_skips = 0
