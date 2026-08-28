@@ -162,6 +162,21 @@
 | 回路养成臂 | 回路养成臂（circuit-rearing arm） | Q15 激励层臂：把回路本身设为奖励靶点——过程奖励直接监督 block-1 注意力落到状态通道行（L_attend），条件挂钩结果损失（sg 门控）+ 反作弊对偶项（孪生篡改铰链）把"学会"与"表演"在损失函数层面分开；与数据层注入（Q13/Q14）正交，前提是 E104"回路从未形成"归因 | FLUED_V3_7_Q15_CIRCUIT_REARING_20260825_CN | 用户（协作设计稿）裁定设计与命名 | 2026-08-25 | 已注册 |
 | 影帝结局 | 影帝结局（theatre ending） | Q15 判读矩阵格二：过程奖励下注意力质量被监督到上涨、但孪生篡改无感且逐条目 Δ 平——注意力被监督成表演而非承重回路的结局；对注意力监督文献构成反例贡献，与"回路养成"同为论文级发现（奖励臂两头都赢设计的负向格） | 同上 | 用户（协作设计稿）裁定命名 | 2026-08-25 | 已注册 |
 
+### v3.7 外部文献锚点（2026-08-29 起，summarizer 撞车侦察）
+
+| 术语 | 中文全称 | 一句话定义 | 首次出现 | 提出方 | 日期 | 状态 |
+|---|---|---|---|---|---|---|
+| MQAR | 多查询联想回忆（Multi-Query Associative Recall） | Zoology 提出的合成考场：长上下文存多组键值对后按键查值，测联想回忆容量 | 侦察报告 §3.1（docs/research/FLUED_V3_7_SUMMARIZER_LIT_RECON_20260829_CN.md） | 外部（Zoology/Arora 等），AI(Kimi) 登记 | 2026-08-29 | 候选 |
+| MesaNet | MesaNet（共轭梯度读出网络） | 把层内状态读出写成共轭梯度迭代解正规方程的序列模型（arXiv 2506.05233）；E115 可学习性墙的正对设计模板 | 侦察报告 §4.3 | 外部，AI(Kimi) 登记 | 2026-08-29 | 候选 |
+| HOLA | 海马体线性注意力（Hippocampal Linear Attention） | delta-rule 压缩态 + 有界精确 KV 缓存双通道，残差准入 + 解耦归一化锐化读出（arXiv 2607.02303，外部证据未评审） | 侦察报告 §4.2 | 外部，AI(Kimi) 登记 | 2026-08-29 | 候选 |
+| 锐化读出 | 锐化读出（sharpened readout） | 读出侧用归一化/温度件把软平均读出压成近似硬检索 | 侦察报告 §4.2 | 外部（HOLA），AI(Kimi) 登记 | 2026-08-29 | 候选 |
+| DNC | 可微神经计算机（Differentiable Neural Computer） | Graves 2016 外存架构：usage 向量 + 最少使用优先分配 + free gate；写键塌缩缓解的机制件先例 | 侦察报告 §5 | 外部（DeepMind），AI(Kimi) 登记 | 2026-08-29 | 候选 |
+| Product Key Memory | 乘积键记忆（Product Key Memory） | 键从固定码本乘积分解选取的大记忆层（Lample 2019）；码本键臂的外部先例 | 侦察报告 §5 | 外部，AI(Kimi) 登记 | 2026-08-29 | 候选 |
+| KATA | 对称锥核化线性注意力（Kernelized Linear Attention with Symmetric Cones） | 用对称锥核扩大有效特征维以破容量墙的线性注意力（arXiv 2607.17419） | 侦察报告 §3.1 | 外部，AI(Kimi) 登记 | 2026-08-29 | 候选 |
+| OSDN | 在线对角预条件 DeltaNet（Online Scaled DeltaNet） | delta 规则标量步长升级为逐维对角预条件的写入规则（arXiv 2605.13473） | 侦察报告 §3.1 | 外部，AI(Kimi) 登记 | 2026-08-29 | 候选 |
+| GDN | 门控 DeltaNet（Gated DeltaNet） | delta 规则 + 标量衰减门控的线性注意力（arXiv 2412.06464）；KDA 的直系前身，S38 报告已用 | 侦察报告 §3.1 | 外部（Yang 等），AI(Kimi) 登记 | 2026-08-29 | 候选 |
+| ICAE | 上下文自编码器（In-context Autoencoder） | 冻结 LM 产 memory slot + AE/LM 双目标的上下文压缩器；fork 3 已引用 | 侦察报告 §2 | 外部，AI(Kimi) 登记 | 2026-08-29 | 候选 |
+
 ## 8. Changelog
 
 - 2026-07-18：本文创建。handoff §19 的 13 条移植为第 3 节（已注册）；v3.4/v3.5
@@ -215,3 +230,7 @@
   （circuit-rearing arm，Q15 激励层臂）、影帝结局（theatre ending，Q15 判读矩阵格二）。
   同批入册方法论备案：奖励焊错位置不是次优是预定结论，"奖励靶点与掩码剔除集的交集断言"
   自此为一切奖励臂的强制澄清项（Q15 预注册 §1）。
+- 2026-08-29：summarizer 撞车侦察报告落盘（docs/research/FLUED_V3_7_SUMMARIZER_LIT_RECON_20260829_CN.md）。
+  新增候选术语 10 条（MQAR/MesaNet/HOLA/锐化读出/DNC/Product Key Memory/KATA/OSDN/GDN/ICAE，
+  外部文献锚点，AI 提名待转正）；GDN 编号订正 2412.06464（旧误写 2412.06461 仅在侦察报告
+  注记中出现，仓内无误植）。
