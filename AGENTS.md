@@ -101,3 +101,5 @@ Full project status: [README.md](README.md) · Versioned documentation: [docs/RE
 6. **Versioned paths**: v3 experiment code lives under `tools/*/v3_*`; do not reintroduce pre-reorganization import paths.
 
 7. **证据表编辑序号核对（2026-08-09 两次事故的教训）**：编辑 `docs/CURRENT_STATE.md` 证据注册表后，必须立刻核对序号完整性——`grep -n "^| E[0-9]" docs/CURRENT_STATE.md` 对比编辑前后的编号清单，确认无丢行、无重号。整行替换式 Edit 的 new_string 必须显式带回原行内容（事故 1：E48 登记时 E47 行被原地替换，缺席 5 个 commit 才被发现；事故 2：E50 登记时吃掉 E49 行首）。并发会话（fork/主）同编一表时风险加倍，提交前再核一次。
+
+8. **parser 默认漂移 × 老 resolved_config（2026-08-29 冒烟事故）**：用 `--config <老 run 的 resolved_config.json>` 起老基座时，parser 现行默认值会填补老配置缺失的键（实例：`summarizer_pool` 默认已随 v37.3 转正为 qpool，吃 v37.1 老配置时 summarizer 6 个权重键被形状过滤**静默跳过**，水位塌到 0.05 才暴露）。纪律：① 点火老基座必须显式带上历史口径旗标（如 `--summarizer-pool mean`）；② 基座加载做全键全形校验、不齐 loud fail，禁止静默过滤。已知同款敞口：Q18 `_q18_base_config_defaults` 路径对 2026-08-23 前的基座。

@@ -1441,6 +1441,153 @@ def _q15_callback_check(anchor: dict, window: dict, lambdas: dict, floors: dict,
 
 
 # ---------------------------------------------------------------------------
+# decoder 去噪臂 (任务书 2026-08-29 冻结 v1.1: docs/versions/v3.7/
+# FLUED_V3_7_DECODER_DENOISE_20260829_CN.md) — slm 系 decoder direct 口
+# (decoder_in_mem) 的分布内模糊练钝; 可训练范围终审钉死 = 仅 decoder
+# ---------------------------------------------------------------------------
+
+_DENOISE_GENERATOR = torch.Generator()
+_DENOISE_SEED_OFFSET = 101_087  # 独立抽签流 (与 mask/cloze/retrieval/burst/q18 偏移不混)
+_DENOISE_FUZZ = None  # main() 装载的前置测量产物 (probe_decoder_fuzz_id 落盘)
+
+# 课程里程碑 (任务书 §1 冻结; 扰动强度只升不降, 中途降档 = 改判读条件须重新
+# 预注册): 0–5K 轻档 / 5K–10K 轻+中 / 10K 起三档均匀 + m̂ 列激活 (后者由
+# --decoder-denoise-mhat-start 旗标控制, 默认与三档开启同步)
+_DENOISE_MID_START = 5_000
+_DENOISE_FULL_START = 10_000
+_DENOISE_GRADE_INDEX = {"light": 0.0, "mid": 1.0, "heavy": 2.0}
+
+
+def _decoder_denoise_enabled(args) -> bool:
+    return bool(getattr(args, "decoder_denoise", False))
+
+
+def _denoise_curriculum(step: int, mhat_start: int):
+    """课程查表 (任务书 §1 冻结, 纯函数, 测试同用): Returns (本步可用噪声档
+    列表, m̂ 列是否激活)。"""
+    if step < _DENOISE_MID_START:
+        return ["light"], False
+    if step < _DENOISE_FULL_START:
+        return ["light", "mid"], False
+    return ["light", "mid", "heavy"], step >= mhat_start
+
+
+def _load_decoder_denoise_fuzz(fuzz_dir: str) -> dict:
+    """装载前置测量产物 (probe_decoder_fuzz_id 的落盘目录): 三档各自的部署桥
+    (W/scale) + 噪声采样件 (Cholesky L + ρ)。缺件响亮报错, 不静默降级。"""
+    import numpy as np
+
+    d = Path(fuzz_dir)
+    stats = json.loads((d / "fuzz_stats.json").read_text(encoding="utf-8"))
+    grade_map = stats["grade_map"]  # light/mid/heavy -> opt/under/over (实测定序)
+    fuzz = {}
+    for grade in ("light", "mid", "heavy"):
+        b = np.load(d / f"bridge_{grade}.npz")
+        c = np.load(d / f"resid_chol_{grade}.npz")
+        fuzz[grade] = {
+            "W": torch.from_numpy(np.asarray(b["W"], dtype=np.float32)),
+            "scale": float(b["scale"]),
+            "chol": torch.from_numpy(np.asarray(c["L"], dtype=np.float32)),
+            "rho": float(c["rho"]),
+            "lam": float(b["lam"]),
+            "tag": grade_map[grade],
+        }
+    return fuzz
+
+
+def _decoder_denoise_freeze(model) -> tuple[int, int]:
+    """可训练范围钉死 = 仅 decoder (任务书 2026-08-29 终审确认项①):
+    decoder_in_mem/chunk_pos/backbone/写入侧 (summarizer/WriteHead/状态机)/前端
+    全冻。tied byte_lookup: named_parameters 去重后只在模型级名字出现一次
+    (decoder.byte_lookup 是同一参数的别名, 不命中 "decoder." 前缀) —— 按
+    E31/E34 裁定字节表是固定公尺 (decoder/table geometry must not be
+    trainable), 留在冻结侧正是裁定语义; decoder 自身参数 (slot/blocks/scale)
+    不许被误冻 (E116 同类坑的反向: prefix 清单会误冻 tied 嵌入, 这里是显式
+    白名单, 两个方向都钉死)。Returns (n_trainable, n_frozen)。"""
+    n_train = n_frozen = 0
+    for name, param in model.named_parameters():
+        if name.startswith("decoder."):
+            param.requires_grad_(True)
+            n_train += 1
+        else:
+            param.requires_grad_(False)
+            n_frozen += 1
+    return n_train, n_frozen
+
+
+def _decoder_denoise_perturb(model, v_rows: torch.Tensor, chunks, index: torch.Tensor, args):
+    """direct 口扰动副本 (任务书 §1 三列, train-only; 调用侧已保证 b 格端口在
+    岗 + 旗标开 + train)。Returns (v_rows_dec, stats); v_rows 本体不动。
+
+    列① 统计匹配噪声: batch 级 p_noise 触发, 触发时随机 row_frac 实 chunk 行,
+    档位于课程允许集内均匀抽; 合成式 ṽ = ρ·m + ε, ε = z @ Lᵀ (z~N(0,I);
+    L/ρ 来自前置测量的「范数匹配后残差」收缩 Cholesky, 探针 F5 口径)。
+    列② m̂ 整行替换: batch 级 p_mhat 触发 (mhat_start 前不激活), 选中行整行
+    替换为同窗 m̂ (K 态段1 解混 + 部署桥, 非加性)。撞行时替换列覆盖噪声列
+    (整行替换语义, 实现层申报; 计数把撞行归替换列)。
+    列③ 干净行 = 两列都未碰的行 (p 的补集 + 未触发 batch), 水位护栏在训仪表。
+    全部常量化构造 (no_grad): 扰动值是常数, direct 腿梯度链形态不变。
+    """
+    fuzz = _DENOISE_FUZZ
+    step = int(getattr(args, "decoder_denoise_step", 0))
+    grades, mhat_on = _denoise_curriculum(step, int(getattr(args, "decoder_denoise_mhat_start", _DENOISE_FULL_START)))
+    g = _DENOISE_GENERATOR
+    device = v_rows.device
+    real = chunks.chunk_mask  # (B, C) bool
+    with torch.no_grad():
+        # .float() 对 fp32 输入是别名不复制 —— 必须显式 clone, 任何情况下都
+        # 不许原地改 v_rows (backbone 腿与 predict 锚吃它, 任务书 §3.2)
+        v_dec = v_rows.float().clone()
+        noise_sel = torch.zeros_like(real)
+        mhat_sel = torch.zeros_like(real)
+        grade_hit = None
+
+        # 列① 统计匹配噪声
+        if float(torch.rand((), generator=g)) < float(args.decoder_denoise_p_noise):
+            gi = int(torch.randint(len(grades), (), generator=g))
+            grade_hit = grades[gi]
+            sel = (torch.rand(real.shape, generator=g) < float(args.decoder_denoise_row_frac)).to(device) & real
+            if bool(sel.any()):
+                L = fuzz[grade_hit]["chol"].to(device)
+                rho = fuzz[grade_hit]["rho"]
+                z = torch.randn(int(sel.sum()), v_rows.size(-1), generator=g).to(device)
+                v_dec[sel] = rho * v_dec[sel] + z @ L.T
+                noise_sel = sel
+
+        # 列② m̂ 整行替换 (10K 里程碑前不激活; batch-1 形态, ridge_unmix 逐窗)
+        if mhat_on and float(torch.rand((), generator=g)) < float(args.decoder_denoise_p_mhat):
+            sel = (torch.rand(real.shape, generator=g) < float(args.decoder_denoise_row_frac)).to(device) & real
+            if bool(sel.any()):
+                if v_rows.size(0) != 1:
+                    raise ValueError("decoder-denoise m̂ 列只支持 batch_size=1 (ridge_unmix 逐窗形态)")
+                gi = int(torch.randint(len(grades), (), generator=g))
+                grade_hit = grade_hit or grades[gi]
+                # 延迟导入: 关态零依赖零导入成本 (条件创建纪律)
+                from tools.analysis.v3_6.probe_decoder_fuzz_id import mhat_from_window
+
+                with torch.autocast(device.type, enabled=False):
+                    mhat = mhat_from_window(
+                        model, index.float(), real, fuzz[grades[gi]]["W"], fuzz[grades[gi]]["scale"]
+                    )
+                n = mhat.size(1)
+                idx = sel[0, :n].nonzero(as_tuple=True)[0]
+                if idx.numel():
+                    v_dec[0, idx] = mhat[0, idx]
+                    mhat_sel[0, idx] = True
+
+        noise_sel = noise_sel & ~mhat_sel  # 撞行归替换列 (上面申报的覆盖语义)
+        n_real = real.float().sum().clamp(min=1.0)
+        stats = {
+            "noise_frac": float(noise_sel.float().sum() / n_real),
+            "mhat_frac": float(mhat_sel.float().sum() / n_real),
+            "clean_frac": float((real & ~noise_sel & ~mhat_sel).float().sum() / n_real),
+            "grade": _DENOISE_GRADE_INDEX.get(grade_hit, -1.0),
+            "clean_rows": (real & ~noise_sel & ~mhat_sel),  # (B, C) bool, step_model 干净水位仪表用
+        }
+    return v_dec.to(v_rows.dtype), stats
+
+
+# ---------------------------------------------------------------------------
 # Q18 v2 读出墙裁定臂 — B 计划 (2026-08-28): A/A′ 臂移植进 s1 骨架
 # ---------------------------------------------------------------------------
 # 为什么移植 (任务书 §6 楔死事故簿): Q17/Q18 独立训练器在双机双栈上间歇楔死
@@ -1828,7 +1975,7 @@ def _completion_target_grids(
     return targets, slot_mask, masked_slot, torch.zeros((), device=clean.device)
 
 
-def s1_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None, retrieval_metas=None, burst_metas_q15=None, store_block_override=None, need_attn: bool = False) -> dict:
+def s1_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None, retrieval_metas=None, burst_metas_q15=None, store_block_override=None, need_attn: bool = False, train: bool = False) -> dict:
     codec_final = getattr(args, "codec_final_state", False)
     if getattr(model.config, "backbone_mode", "") == "slm":
         # v3.7 (consensus §1-2): dedicated branch. codec_final / paged / draft
@@ -1844,7 +1991,7 @@ def s1_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None, re
         return _slm_forward(
             model, source, args, clean=clean, byte_mask=byte_mask, retrieval_metas=retrieval_metas,
             burst_metas_q15=burst_metas_q15, store_block_override=store_block_override,
-            need_attn=need_attn,
+            need_attn=need_attn, train=train,
         )
     if retrieval_metas is not None or burst_metas_q15 is not None or store_block_override is not None:
         raise ValueError(
@@ -2071,7 +2218,7 @@ def s1_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None, re
     }
 
 
-def _slm_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None, retrieval_metas=None, burst_metas_q15=None, store_block_override=None, need_attn: bool = False) -> dict:
+def _slm_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None, retrieval_metas=None, burst_metas_q15=None, store_block_override=None, need_attn: bool = False, train: bool = False) -> dict:
     """v3.7 slm branch (docs/versions/v3.7/FLUED_V3_7_ARCHITECTURE_CONSENSUS_20260817_CN.md).
 
     Codec full-coverage law (consensus §2): any content task's loss covers the
@@ -2094,7 +2241,8 @@ def _slm_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None, 
     train/eval 同开 -- 剔除是任务定义) -- 构造点在此而非 step_model, 因为
     chunk 网格只在这里存在; 再否则走 legacy retrieval 路径. ``need_attn``
     线进 backbone block-1 手工注意力, 概率随 ``block1_attn`` 键带出 (关时
-    None).
+    None). ``train`` 只喂 decoder 去噪臂 (任务书 2026-08-29): True 且旗标开
+    时 direct 腿吃扰动副本; False (默认/eval) = 零扰动, 旧路径逐位不变。
     """
     byte_states, confidence, valid, _ = model._encode(source)
     hard_cut, utf8_cont, cut_overflow = model._cuts(source, confidence, valid)
@@ -2128,7 +2276,16 @@ def _slm_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None, 
     )
     cond_backbone = backbone_out + pos
     dec_in = model.decoder_in if model.config.v_row_source == "state" else model.decoder_in_mem
-    cond_direct = dec_in(v_rows) + pos
+    # decoder 去噪臂 (任务书 FLUED_V3_7_DECODER_DENOISE_20260829_CN.md §1, 冻结
+    # v1.1): 扰动只发生在 direct 腿的输入副本上——v_rows 本体不动 (上面的
+    # backbone 腿与 step_model 的 predict 锚都吃它)。默认关 = 零随机流零行为
+    # 变化 (条件创建纪律同 decoder_in_mem 先例: 旧路径逐位不变); train=False
+    # (eval) 永不扰动。
+    denoise_stats = None
+    v_rows_direct = v_rows
+    if _decoder_denoise_enabled(args) and train and model.config.v_row_source == "memory":
+        v_rows_direct, denoise_stats = _decoder_denoise_perturb(model, v_rows, chunks, index, args)
+    cond_direct = dec_in(v_rows_direct) + pos
     logits_direct = model.decoder(cond_direct, chunks.token_mask)
     logits_backbone = model.decoder(cond_backbone, chunks.token_mask)
     return {
@@ -2138,6 +2295,7 @@ def _slm_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None, 
         "content": None,  # content channel retired in slm mode (consensus §4)
         "backbone_out": backbone_out,
         "v_rows": v_rows,  # decoder-side V source rows (the predict anchor, §1.4)
+        "denoise_stats": denoise_stats,  # decoder 去噪臂扰动计数 (None = 关/eval, 旧路径不变)
         "memory": memory,
         "index": index,  # summarizer K rows (resident key-geometry metrics, E80 补充 2)
         "retrieval_block_rate": retrieval_block_rate,  # 档 a excision hit rate (0.0 when off)
@@ -2342,6 +2500,7 @@ def step_model(model, batch, args, device, train: bool):
             # 前向开 (L_attend 的奖励靶点, eval 零成本零形态变化)
             burst_metas_q15=burst_metas if q15_on else None,
             need_attn=q15_on and train,
+            train=train,  # decoder 去噪臂: direct 腿扰动只在训练前向 (关态零影响)
         )
     chunks = out["chunks"]
     # Per-chunk base grids: direct (encoded) and predict views keep these.
@@ -2819,6 +2978,28 @@ def step_model(model, batch, args, device, train: bool):
         "boundary_confidence_mean": out["boundary_confidence_mean"].detach(),
         "think_steps": torch.tensor(out["think_steps"], device=loss.device),
     }
+    # decoder 去噪臂计数列 (任务书 2026-08-29 §1 + 冒烟条款): 扰动触发比例
+    # (noise/m̂/clean 行占比 + 命中档, grade 用 -1 哨兵) + 干净行 direct acc
+    # ——混合 direct_acc 在扰动臂下天然回落, 干净行读数才是 §2 有效性门的
+    # 判读面。关态/eval = 零占位, log schema 对齐 (本文件臂列惯例)。
+    denoise_metrics = {
+        "denoise_noise_frac": torch.zeros((), device=device),
+        "denoise_mhat_frac": torch.zeros((), device=device),
+        "denoise_clean_frac": torch.zeros((), device=device),
+        "denoise_grade": torch.full((), -1.0, device=device),
+        "denoise_direct_clean_acc": torch.zeros((), device=device),
+    }
+    dn = out.get("denoise_stats")
+    if dn is not None:
+        denoise_metrics["denoise_noise_frac"] = torch.tensor(dn["noise_frac"], device=device)
+        denoise_metrics["denoise_mhat_frac"] = torch.tensor(dn["mhat_frac"], device=device)
+        denoise_metrics["denoise_clean_frac"] = torch.tensor(dn["clean_frac"], device=device)
+        denoise_metrics["denoise_grade"] = torch.tensor(dn["grade"], device=device)
+        clean_slot = encoded_slot_mask & dn["clean_rows"].unsqueeze(-1)
+        denoise_metrics["denoise_direct_clean_acc"] = _acc_tensor(
+            out["logits_direct"].argmax(dim=-1), encoded_targets, clean_slot
+        )
+    metrics.update(denoise_metrics)
     if slm_mode:
         # E80 补充 2: resident key-geometry dashboard (slm default-on; legacy
         # paths never gain these keys)
@@ -2951,6 +3132,36 @@ def _add_s1_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--lam-unmix", type=float, default=1e-2, help="A′ 段1 ridge 解混 λ (Q19 同档)")
     parser.add_argument("--lam-stage2", type=float, default=1.0, help="A′ 段2/收尾 ridge λ (相对预条件后, Q19 同档)")
+    # --- decoder 去噪臂 (任务书 2026-08-29 冻结 v1.1: docs/versions/v3.7/
+    # FLUED_V3_7_DECODER_DENOISE_20260829_CN.md) ---
+    # direct 口 (decoder_in_mem) 分布内模糊练钝, 可训练范围 = 仅 decoder。
+    # 默认全关 = 旧路径逐位不变 (条件创建纪律同 decoder_in_mem 先例);
+    # 噪声参数只来自前置测量 (probe_decoder_fuzz_id 落盘), 不许拍脑袋。
+    parser.add_argument(
+        "--decoder-denoise",
+        action="store_true",
+        help="decoder 去噪臂总开关 (默认关 = 旧路径逐位不变; 要求 slm + v_row_source=memory)",
+    )
+    parser.add_argument(
+        "--decoder-denoise-fuzz-id", default="",
+        help="前置测量产物目录 (probe_decoder_fuzz_id 落盘: 三档桥 + 残差 Cholesky + ρ)",
+    )
+    parser.add_argument(
+        "--decoder-denoise-p-noise", type=float, default=0.5,
+        help="列① 统计匹配噪声 batch 级触发概率 (任务书 §1 冻结 0.5)",
+    )
+    parser.add_argument(
+        "--decoder-denoise-p-mhat", type=float, default=0.25,
+        help="列② m̂ 整行替换 batch 级触发概率 (任务书 §1 冻结 0.25)",
+    )
+    parser.add_argument(
+        "--decoder-denoise-row-frac", type=float, default=0.5,
+        help="触发时随机选中的实 chunk 行比例 (任务书 §1 冻结 0.5)",
+    )
+    parser.add_argument(
+        "--decoder-denoise-mhat-start", type=int, default=10000,
+        help="m̂ 列激活步 (任务书 §1 冻结 10K 里程碑; 课程 5K/10K 档切换为常量)",
+    )
 
 
 def main() -> None:
@@ -3021,6 +3232,25 @@ def main() -> None:
             f"基座={args.q18_base_ckpt} out={args.out_dir}",
             flush=True,
         )
+    denoise_on = _decoder_denoise_enabled(args)
+    if denoise_on:
+        # decoder 去噪臂 (任务书 2026-08-29 冻结 v1.1): 响亮校验——端口臂只在
+        # slm b/a 格 (v_row_source=memory → decoder_in_mem 在岗) 有意义; 现役
+        # canonical 是 attn 模式结构性无此端口, d 格 v=state 同理 (Q19 D1)。
+        if q18_on:
+            raise SystemExit(
+                "--decoder-denoise 不组合 Q18 臂 (Q18 训练步整体委托独立机制, direct 腿不经 _slm_forward)"
+            )
+        if getattr(args, "backbone_mode", "") != "slm" or getattr(args, "v_row_source", "memory") != "memory":
+            raise SystemExit(
+                "--decoder-denoise requires --backbone-mode slm + v_row_source=memory "
+                "(decoder_in_mem 端口臂; attn/d 格结构性无此端口)"
+            )
+        if not args.decoder_denoise_fuzz_id:
+            raise SystemExit(
+                "--decoder-denoise requires --decoder-denoise-fuzz-id <前置测量产物目录> "
+                "(probe_decoder_fuzz_id 落盘; 噪声参数只来自前置测量, 不许拍脑袋)"
+            )
     if getattr(args, "cloze_prob", 0.0) > 0:
         # v3.7 cloze 检索回执 (user-ruled 2026-08-17): slm-only -- on legacy
         # xattn/paged/draft/attn paths (and the codec_final/paged/draft/
@@ -3106,6 +3336,7 @@ def main() -> None:
     _CLOZE_GENERATOR.manual_seed(args.seed + _CLOZE_SEED_OFFSET)
     _RETRIEVAL_GENERATOR.manual_seed(args.seed + _RETRIEVAL_SEED_OFFSET)
     _BURST_GENERATOR.manual_seed(args.seed + _BURST_SEED_OFFSET)
+    _DENOISE_GENERATOR.manual_seed(args.seed + _DENOISE_SEED_OFFSET)  # 无条件播种; 关态零抽取零影响
     if q18_on:
         # Q18 抽签流 (退火抽签 Q18 独立偏移 101_077, 与 Q17 的 101_033 不混)
         # + mask/burst 重断言——独立训练器 _seed_streams 同 discipline
@@ -3176,6 +3407,38 @@ def main() -> None:
                 param.requires_grad_(False)
                 n += 1
         print(f"[s1] frozen params={n} prefixes={frozen}", flush=True)
+    if denoise_on:
+        # decoder 去噪臂 (任务书终审钉死): 装载前置测量产物 + 可训练范围 =
+        # 仅 decoder (_decoder_denoise_freeze 是显式白名单, 终态不受
+        # freeze_prefixes 内容影响——它先跑, 这里是确定性覆写)。
+        # 基座全键校验 (2026-08-29 冒烟事故入例): init_checkpoint 的通用加载
+        # 是静默形状过滤 (compatible dict), 而 parser 现行默认可能与老基座
+        # 架构漂移 (v37.1 基座无 summarizer_pool 键 → 现行默认 qpool 会静默
+        # 改 summarizer 架构, 段 3 端口直连报废) —— 本臂是端口微调臂, 基座
+        # 必须全键全形加载, 不齐响亮退出, 不许静默训一个残缺基座。
+        if not args.init_checkpoint:
+            raise SystemExit("--decoder-denoise 需要 --init-checkpoint <基座 latest.pt> (端口练钝是微调臂, 非从零)")
+        _dn_payload = torch.load(args.init_checkpoint, map_location="cpu", weights_only=False)["model"]
+        _dn_cur = model.state_dict()
+        _dn_bad = [k for k in _dn_cur if k not in _dn_payload or _dn_payload[k].shape != _dn_cur[k].shape]
+        if _dn_bad:
+            raise SystemExit(
+                f"[s1][denoise] 基座全键校验失败: {len(_dn_bad)} 键缺失/形不符 (如 {_dn_bad[:5]}) —— "
+                "检查 --config 来源与基座的架构漂移 (典型: summarizer_pool 现行默认 qpool vs v37.1 基座 mean, "
+                "需显式 --summarizer-pool mean)"
+            )
+        del _dn_payload, _dn_cur
+        global _DENOISE_FUZZ
+        _DENOISE_FUZZ = _load_decoder_denoise_fuzz(args.decoder_denoise_fuzz_id)
+        n_train, n_frozen = _decoder_denoise_freeze(model)
+        print(
+            f"[s1][denoise] decoder 去噪臂: fuzz_id={args.decoder_denoise_fuzz_id} "
+            f"p_noise={args.decoder_denoise_p_noise} p_mhat={args.decoder_denoise_p_mhat} "
+            f"row_frac={args.decoder_denoise_row_frac} mhat_start={args.decoder_denoise_mhat_start} | "
+            f"仅 decoder 可训: trainable={n_train} frozen={n_frozen} "
+            f"(decoder_in_mem/chunk_pos/backbone/写入侧/tied byte_lookup 全冻)",
+            flush=True,
+        )
     if q18_on:
         # Q18 先验筛参考模型 = 基座第二次独立加载 (E101 教训, 独立训练器同
         # 款: 固定, 设备驻留, 全程只读); --q18-no-sieve 时卸载 (楔死急诊单
@@ -3287,12 +3550,32 @@ def main() -> None:
             "att": args.q15_lambda_att, "out": args.q15_lambda_out, "couple": args.q15_lambda_couple
         }
         q15_floors = {k: v * _Q15_CALLBACK_FLOOR for k, v in q15_lambdas.items()}
+    # decoder 去噪臂 codec 护栏 (任务书 §2 有效性门: 干净行水位回落 >2pp 触发,
+    # 沿用 Q15 §5 自锚回调设施): 锚 = steps 800-1000 训练批「干净行 direct acc +
+    # backbone acc」均值 (backbone 腿永不被扰动; direct 侧读干净行仪表——混合
+    # direct_acc 在扰动臂下随课程天然回落, 不是水位判读面); step>1000 后每个
+    # log 事件查窗均值, 任一退步 >0.02 → p_noise/p_mhat 各 x0.5 (下限初值
+    # x0.25), 事件落 denoise_callback_events.jsonl。锚窗缺席 (resume 越过/
+    # 冒烟 <800 步) 时监控自动解除, 不静默伪造锚。anchor 字典键仍名
+    # "direct_acc" (_q15_callback_check 的固定键名, 值是干净行口径)。
+    denoise_anchor_sum = {"direct_acc": 0.0, "backbone_acc": 0.0}
+    denoise_anchor_n = 0
+    denoise_anchor = None
+    denoise_ps = denoise_floors = None
+    if denoise_on:
+        denoise_ps = {
+            "p_noise": float(args.decoder_denoise_p_noise),
+            "p_mhat": float(args.decoder_denoise_p_mhat),
+        }
+        denoise_floors = {k: v * _Q15_CALLBACK_FLOOR for k, v in denoise_ps.items()}
     while step < args.max_steps:
         for batch in train_loader:
             if step >= args.max_steps:
                 break
             if _RETRIEVAL_RAMP is not None:
                 args.retrieval_block_prob = _ramp_lookup(_RETRIEVAL_RAMP, step)
+            if denoise_on:
+                args.decoder_denoise_step = step  # 去噪课程查表步 (本 run 内 0 基; eval 路径不消费)
             loss, metrics = step_model(model, batch, args, device, train=True)
             if loss is None:
                 # Q18 echo 离网 (burst 未激活窗): 步进照走不参训 (独立训练器
@@ -3323,6 +3606,15 @@ def main() -> None:
                 if step == _Q15_ANCHOR_RANGE[1]:
                     q15_anchor = {k: v / q15_anchor_n for k, v in q15_anchor_sum.items()}
                     print(f"[s1] Q15 回调线锚 (steps 800-1000 均值): {q15_anchor}", flush=True)
+            if denoise_on and _Q15_ANCHOR_RANGE[0] <= step <= _Q15_ANCHOR_RANGE[1]:
+                # decoder 去噪臂回调线锚窗 (任务书 §2, Q15 §5 同设施): steps
+                # 800-1000 累计「干净行 direct acc + backbone acc」
+                denoise_anchor_sum["direct_acc"] += float(metrics["denoise_direct_clean_acc"])
+                denoise_anchor_sum["backbone_acc"] += float(metrics["backbone_acc"])
+                denoise_anchor_n += 1
+                if step == _Q15_ANCHOR_RANGE[1]:
+                    denoise_anchor = {k: v / denoise_anchor_n for k, v in denoise_anchor_sum.items()}
+                    print(f"[s1][denoise] 回调线锚 (steps 800-1000 均值): {denoise_anchor}", flush=True)
             if step % args.log_every == 0 or step == 1:
                 # 数据运气仪表 (任务书 FLUED_V3_7_LR_SCALE_2X2_20260826_CN §1,
                 # 无条件常开): 当前批原始流窗的窗内突发性密度 (重复 >=12B
@@ -3365,6 +3657,23 @@ def main() -> None:
                         print(
                             f"[s1][Q15] 回调线降权 step={step} 触发项={ev['triggered']} "
                             f"λ: {ev['old']} -> {ev['new']}",
+                            flush=True,
+                        )
+                # decoder 去噪臂回调线监控 (任务书 §2 有效性门, Q15 §5 同设施):
+                # 退步 >0.02 → p_noise/p_mhat 各 x0.5 (扰动强度刹车, 非课程降档)
+                if denoise_anchor is not None and step > _Q15_ANCHOR_RANGE[1]:
+                    events, denoise_ps = _q15_callback_check(
+                        denoise_anchor,
+                        {"direct_acc": row["denoise_direct_clean_acc"], "backbone_acc": row["backbone_acc"]},
+                        denoise_ps, denoise_floors, step,
+                    )
+                    for ev in events:
+                        args.decoder_denoise_p_noise = denoise_ps["p_noise"]
+                        args.decoder_denoise_p_mhat = denoise_ps["p_mhat"]
+                        _append_jsonl(out_dir / "denoise_callback_events.jsonl", ev)
+                        print(
+                            f"[s1][denoise] 回调线降权 step={step} 触发项={ev['triggered']} "
+                            f"p: {ev['old']} -> {ev['new']}",
                             flush=True,
                         )
             if midpoint_armed and not midpoint_done and step >= args.max_steps // 2:

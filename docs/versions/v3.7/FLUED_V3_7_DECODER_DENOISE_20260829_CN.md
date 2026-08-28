@@ -89,3 +89,33 @@ Q19 ridge 管线（闭式，m̂ 统计）──▶ 本臂（decoder 去噪，练
 5. ~~里程碑早停~~ 10K 门槛（修订：5K 过线不收官，防第六次瞬态重演）。
 6. ~~排产~~ 本地 5080 点火（Q18 已停、1x@1e-4 已收官，无排产冲突）。
 7. **E 行登记编号**：点火占 **E118**。
+
+---
+
+## §6 施工记录（2026-08-29 凌晨，冻结后执行链）
+
+**前置测量（模糊分布身份证）落盘** `outputs/decoder_denoise_fuzz_id_20260829/`（探针 `tools/analysis/v3_6/probe_decoder_fuzz_id.py`，32 训练流窗、分窗 2-fold held-out，口径偏差 F1–F5 全申报在 SUMMARY.txt）：
+
+- 端口在岗锚：真行直喂 direct 口 acc=0.8095（E68 收官 0.7917 同格参照，窗口径差已申报 F1）；
+- 段 1 解混 cos 0.699（b 格 K 通道自产自销，零跨格，F2/F3）；
+- 三档实测：λ{1.0/0.1/10.0} → cos 0.7080/0.7016/0.6996（极差 0.008 ≪ 档内 std~0.08）、范数收缩 ρ 0.815/0.890/0.748、残差总方差 24.3/26.5/23.5、有效秩 52–54——**λ 梯度在 32 窗 held-out 下是弱旋钮，三档 cos 统计不可分**；
+- 噪声合成式（F5 申报）：ṽ=ρ·m+ε_a（范数匹配后残差 ε_a=m̂−ρ·m 的收缩 Cholesky 采样，防收缩项 (1−ρ)²Cov(m) 被计两次）；ε=m−m̂ 全量统计已按任务书入册。
+
+**三档冻结值回填（待用户裁定，点火前定死）**：主智能体提案——λ 档作废，档值重定义为**部署桥（λopt=1.0）残差采样器的标量倍率 s∈{0.5, 1.0, 2.0}**（轻/中/重），m̂ 列用 λopt 桥（部署真实模糊）。理由：λ 三档统计不可分（上数），课程旋钮应是显式噪声强度而非假装 λ 给三种分布；同分布要求保持（s=1 即部署分布本身，s 只是 dilation）。备选（零改动）：按 ρ 定档（heavy=under/light=over）保留现实现。
+
+**冒烟验收（500 步，EXIT=0，`checkpoints/_smoke_decoder_denoise_20260829`）**：① 旋钮接通——noise_frac 均值 0.269 ≈ 期望 0.25（p0.5×row0.5），m̂ 列 10K 前全程 0（合规），grade 只命中 light 档；② 水位不崩——eval direct 0.7893 vs 基座 0.7917，回落 0.24pp ≪ 2pp 回调线；③ nan_skips=0 全程；④ ckpt 逐键对照**仅 50 个 `decoder.*` 键变化**，decoder_in_mem/chunk_pos/tied byte_lookup/summarizer/backbone 逐位未动（冻结单变量实锤）。测试基线 554+4 → 563+4 全绿（+9：关闭态逐比特/扰动仅 direct 腿/课程边界/冻结清单）。
+
+**冒烟事故（已修，教训入 AGENTS.md 坑 8）**：parser 现行默认 `summarizer_pool=qpool`（v37.3 转正）吃 2026-08-23 前的老 resolved_config 时静默跳过 summarizer 6 键（形状过滤），水位塌到 0.05 才暴露——修复=① 点火命令显式 `--summarizer-pool mean`；② denoise 臂基座加载全键全形校验、不齐 loud fail。同款敞口登记：Q18 `_q18_base_config_defaults` 路径对 2026-08-23 前基座。
+
+**回调线判读面注记**：Q15 设施原样复用（800–1000 自锚、>0.02、p×0.5、floor×0.25），但 direct 侧喂新增 `denoise_direct_clean_acc`（干净行水位）而非混合 direct_acc——混合列随课程天然回落会误触发刹车。冒烟 <800 步未实弹该路径（`_q15_callback_check` 纯函数复用）。
+
+**GPU 占用报警**：冒烟期间本机 5080 被外项目进程（`P:\Fursuit` qat_distill，7.4GB/93%）共享；b 格 20K@4096B 历史峰值 ~12GB——共存将越 16GB 红线，**点火前需用户裁定腾卡**。m̂ 列成本注记：10K 起每触发 batch 支付一次段 1 解混（~50–100ms/步，p=0.25，吞吐税 ~5% 量级）。
+
+**点火命令（含事故修复项，档值裁定后执行）**：
+
+```
+python tools/train/v3_6/train_v36_s1.py --config checkpoints/v37ks_b_sm_v371_20k_ctx4096_20260817/resolved_config.json \
+  --summarizer-pool mean --init-checkpoint checkpoints/v37ks_b_sm_v371_20k_ctx4096_20260817/latest.pt \
+  --decoder-denoise --decoder-denoise-fuzz-id outputs/decoder_denoise_fuzz_id_20260829 \
+  --run-id <E118 run id> --out-dir checkpoints/<...> --max-steps 20000
+```
