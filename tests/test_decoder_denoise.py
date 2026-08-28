@@ -1,14 +1,16 @@
-"""decoder 去噪臂单测（任务书 2026-08-29 冻结 v1.1:
+"""decoder 去噪臂单测（任务书 2026-08-29 冻结 v1.1 + 修订 v2 同日裁定:
 docs/versions/v3.7/FLUED_V3_7_DECODER_DENOISE_20260829_CN.md; 训练器旋钮在
 tools/train/v3_6/train_v36_s1.py 的 --decoder-denoise-* 旗标族）。
 
 Covers: (1) 默认关 = legacy 路径逐位不变（扰动函数零调用 + direct 腿手工复算
 逐位一致 + train=True 也不触发）; (2) 扰动只进 direct 腿——backbone 腿
 logits 与 predict 锚 (v_rows) 逐位未动, direct logits 确实变化; (3) eval
-(train=False) 永不扰动; (4) 课程边界 step 4999/5000/9999/10000 档切换与
-m̂ 列激活（含 mhat_start 覆写）; (5) m̂ 列整行替换语义（选中行 == 桥直算
-m̂, 非加性）; (6) 冻结清单：仅 decoder 可训, decoder_in_mem/chunk_pos/
-backbone/写入侧/tied byte_lookup 全冻; (7) step_model 计数列与干净水位仪表。
+(train=False) 永不扰动; (4) 课程边界 step 4999/5000/9999/10000 s 档前缀
+切片切换与 m̂ 列激活（含 mhat_start 覆写）; (5) m̂ 列整行替换语义（选中行 ==
+λopt 部署桥直算 m̂, 非加性）; (6) 冻结清单：仅 decoder 可训, decoder_in_mem/
+chunk_pos/backbone/写入侧/tied byte_lookup 全冻; (7) step_model 计数列与
+干净水位仪表; (8) 修订 v2 标量倍率语义：s 只乘 ε 项（s=0.5 vs s=2.0 同 seed
+下残差恰 4 倍）。
 Tiny 随机初始化 b 格 (k=state, v=memory) CPU 模型, boundary_mode="uniform"
 保持分块确定; 只测接线与代数, 不测训练行为。
 """
@@ -50,6 +52,7 @@ def _denoise_args(**overrides):
         decoder_denoise_row_frac=0.5,
         decoder_denoise_mhat_start=10000,
         decoder_denoise_step=0,
+        decoder_denoise_s_ladder="0.5,1.0,2.0",
     )
     for k, v in overrides.items():
         setattr(args, k, v)
@@ -58,19 +61,16 @@ def _denoise_args(**overrides):
 
 @pytest.fixture
 def fake_fuzz():
-    """注入玩具前置测量产物 (三档同桥异噪声件), 用后恢复全局。"""
+    """注入玩具前置测量产物 (修订 v2 单部署桥采样器), 用后恢复全局。"""
     d_mem, feat = 96, 2 * 32 + 1  # d_mem; H*hv + 截距行
     W = torch.randn(feat, d_mem, generator=torch.Generator().manual_seed(5)) * 0.02
     fuzz = {
-        grade: {
-            "W": W,
-            "scale": 1.0,
-            "chol": torch.eye(d_mem) * 0.1,
-            "rho": 0.8,
-            "lam": 1.0,
-            "tag": "opt",
-        }
-        for grade in ("light", "mid", "heavy")
+        "W": W,
+        "scale": 1.0,
+        "chol": torch.eye(d_mem) * 0.1,
+        "rho": 0.8,
+        "lam": 1.0,
+        "tag": "opt",
     }
     old = s1._DENOISE_FUZZ
     s1._DENOISE_FUZZ = fuzz
@@ -114,6 +114,7 @@ def test_parser_defaults_off():
     assert args.decoder_denoise_p_mhat == 0.25
     assert args.decoder_denoise_row_frac == 0.5
     assert args.decoder_denoise_mhat_start == 10000
+    assert args.decoder_denoise_s_ladder == "0.5,1.0,2.0"
 
 
 # --- 2. 扰动只进 direct 腿 ---------------------------------------------------
@@ -133,7 +134,7 @@ def test_perturbation_only_touches_direct_leg(fake_fuzz):
     st = out_on["denoise_stats"]
     assert st is not None
     assert st["noise_frac"] > 0.99 and st["mhat_frac"] == 0.0 and st["clean_frac"] < 0.01
-    assert st["grade"] == 0.0  # step 0 课程 = 轻档
+    assert st["grade"] == 0.5  # step 0 课程 = 仅 s=0.5 轻档
 
 
 def test_eval_never_perturbed(fake_fuzz):
@@ -149,21 +150,22 @@ def test_eval_never_perturbed(fake_fuzz):
 
 
 def test_curriculum_boundaries():
+    ladder = [0.5, 1.0, 2.0]
     cases = [
-        (0, ["light"], False),
-        (4999, ["light"], False),
-        (5000, ["light", "mid"], False),
-        (9999, ["light", "mid"], False),
-        (10000, ["light", "mid", "heavy"], True),
-        (20000, ["light", "mid", "heavy"], True),
+        (0, [0.5], False),
+        (4999, [0.5], False),
+        (5000, [0.5, 1.0], False),
+        (9999, [0.5, 1.0], False),
+        (10000, [0.5, 1.0, 2.0], True),
+        (20000, [0.5, 1.0, 2.0], True),
     ]
-    for step, grades, mhat in cases:
-        g, m = s1._denoise_curriculum(step, 10000)
-        assert g == grades and m == mhat, (step, g, m)
+    for step, s_grades, mhat in cases:
+        g, m = s1._denoise_curriculum(step, 10000, ladder)
+        assert g == s_grades and m == mhat, (step, g, m)
     # mhat_start 覆写: 三档 10K 起开, m̂ 列由旗标独立控制
-    g, m = s1._denoise_curriculum(10000, 15000)
-    assert g == ["light", "mid", "heavy"] and m is False
-    g, m = s1._denoise_curriculum(15000, 15000)
+    g, m = s1._denoise_curriculum(10000, 15000, ladder)
+    assert g == [0.5, 1.0, 2.0] and m is False
+    g, m = s1._denoise_curriculum(15000, 15000, ladder)
     assert m is True
 
 
@@ -184,8 +186,8 @@ def test_mhat_column_replaces_whole_rows(fake_fuzz):
     s1._DENOISE_GENERATOR.manual_seed(7)
     v_dec, st = s1._decoder_denoise_perturb(model, v_rows, chunks, index, args)
     real = chunks.chunk_mask
-    # 全实行被替换; 替换值 == 桥直算 m̂ (非加性, 三档同桥故档无关)
-    mhat = mhat_from_window(model, index.float(), real, fake_fuzz["light"]["W"], 1.0)
+    # 全实行被替换; 替换值 == λopt 部署桥直算 m̂ (非加性, 固定桥不抽档)
+    mhat = mhat_from_window(model, index.float(), real, fake_fuzz["W"], fake_fuzz["scale"])
     n = mhat.size(1)
     assert torch.allclose(v_dec[0, :n], mhat[0], atol=1e-5)
     assert st["mhat_frac"] == 1.0 and st["noise_frac"] == 0.0 and st["clean_frac"] == 0.0
@@ -194,7 +196,8 @@ def test_mhat_column_replaces_whole_rows(fake_fuzz):
 
 
 def test_noise_column_formula(fake_fuzz):
-    """列① 合成式: ṽ = ρ·m + ε (范数匹配后加性, 撞行归替换列)。"""
+    """列① 合成式 (修订 v2): ṽ = ρ·m + s·ε (范数匹配后加性, s 只乘 ε 项,
+    撞行归替换列)。"""
     model, ids = _model(), _ids()
     out0 = s1._slm_forward(model, ids, SimpleNamespace())
     chunks, v_rows, index = out0["chunks"], out0["v_rows"], out0["index"]
@@ -206,10 +209,28 @@ def test_noise_column_formula(fake_fuzz):
     v_dec, st = s1._decoder_denoise_perturb(model, v_rows, chunks, index, args)
     real = chunks.chunk_mask
     assert st["noise_frac"] == 1.0 and st["clean_frac"] == 0.0
+    assert st["grade"] == 0.5  # step 0 课程 = 仅 s=0.5 轻档
     # 扰动后行 != 原行, 且范数向 ρ 倍收缩方向移动 (玩具 chol=0.1I 小噪声)
     assert not torch.equal(v_dec[real], v_rows[real])
     assert torch.allclose(v_dec[~real], v_rows[~real])  # padded 行不动
     assert torch.equal(v_rows, out0["v_rows"])  # 本体不动
+    # 修订 v2 标量倍率语义: 同 seed 下 s=0.5 vs s=2.0 抽签序列一致 (档选择
+    # 与 z 抽取与 s 值无关), 实数行残差恰 4 倍
+    rho = fake_fuzz["rho"]
+    for ladder, scale in (("0.5", 0.5), ("2.0", 2.0)):
+        a = _denoise_args(
+            decoder_denoise_p_noise=1.0, decoder_denoise_p_mhat=0.0,
+            decoder_denoise_row_frac=1.0, decoder_denoise_step=0,
+            decoder_denoise_s_ladder=ladder,
+        )
+        s1._DENOISE_GENERATOR.manual_seed(11)
+        vd, st_l = s1._decoder_denoise_perturb(model, v_rows, chunks, index, a)
+        assert st_l["grade"] == scale
+        eps = vd[real] - rho * v_rows[real].float()
+        if scale == 0.5:
+            eps_ref = eps
+        else:
+            assert torch.allclose(eps, 4.0 * eps_ref, atol=1e-6)
 
 
 # --- 5. 冻结清单 -------------------------------------------------------------
@@ -260,5 +281,5 @@ def test_step_model_denoise_metrics(fake_fuzz):
     loss2, metrics2 = s1.step_model(model, (ids,), args2, DEVICE, train=True)
     assert float(metrics2["denoise_noise_frac"]) == 1.0
     assert float(metrics2["denoise_clean_frac"]) == 0.0
-    assert float(metrics2["denoise_grade"]) == 0.0  # step 0 轻档
+    assert float(metrics2["denoise_grade"]) == 0.5  # step 0 仅 s=0.5 轻档
     assert torch.isfinite(loss2)

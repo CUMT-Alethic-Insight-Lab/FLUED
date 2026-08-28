@@ -1441,58 +1441,80 @@ def _q15_callback_check(anchor: dict, window: dict, lambdas: dict, floors: dict,
 
 
 # ---------------------------------------------------------------------------
-# decoder 去噪臂 (任务书 2026-08-29 冻结 v1.1: docs/versions/v3.7/
-# FLUED_V3_7_DECODER_DENOISE_20260829_CN.md) — slm 系 decoder direct 口
-# (decoder_in_mem) 的分布内模糊练钝; 可训练范围终审钉死 = 仅 decoder
+# decoder 去噪臂 (任务书 2026-08-29 冻结 v1.1 + 修订 v2 同日用户裁定:
+# docs/versions/v3.7/FLUED_V3_7_DECODER_DENOISE_20260829_CN.md) — slm 系
+# decoder direct 口 (decoder_in_mem) 的分布内模糊练钝; 可训练范围终审钉死
+# = 仅 decoder
 # ---------------------------------------------------------------------------
 
 _DENOISE_GENERATOR = torch.Generator()
 _DENOISE_SEED_OFFSET = 101_087  # 独立抽签流 (与 mask/cloze/retrieval/burst/q18 偏移不混)
-_DENOISE_FUZZ = None  # main() 装载的前置测量产物 (probe_decoder_fuzz_id 落盘)
+_DENOISE_FUZZ = None  # main() 装载的前置测量产物 (probe_decoder_fuzz_id 落盘, 单部署桥)
 
-# 课程里程碑 (任务书 §1 冻结; 扰动强度只升不降, 中途降档 = 改判读条件须重新
-# 预注册): 0–5K 轻档 / 5K–10K 轻+中 / 10K 起三档均匀 + m̂ 列激活 (后者由
-# --decoder-denoise-mhat-start 旗标控制, 默认与三档开启同步)
+# 课程里程碑 (任务书 §1 修订 v2 冻结; 扰动强度只升不降, 中途降档 = 改判读
+# 条件须重新预注册): 0–5K 只 s=0.5 / 5K–10K 加 s=1.0 / 10K 起三档均匀 +
+# m̂ 列激活 (后者由 --decoder-denoise-mhat-start 旗标控制, 默认与三档开启
+# 同步)。档语义修订 v2: λ 桥档作废 (实测三档 cos 极差 0.008 ≪ 档内 std
+# 0.08, 档间不可分的课程是假课程), 改为部署桥 (λopt=1.0) 残差采样器的标量
+# 倍率 s∈{0.5,1.0,2.0}, s=1.0 恰是部署分布本身。
 _DENOISE_MID_START = 5_000
 _DENOISE_FULL_START = 10_000
-_DENOISE_GRADE_INDEX = {"light": 0.0, "mid": 1.0, "heavy": 2.0}
 
 
 def _decoder_denoise_enabled(args) -> bool:
     return bool(getattr(args, "decoder_denoise", False))
 
 
-def _denoise_curriculum(step: int, mhat_start: int):
-    """课程查表 (任务书 §1 冻结, 纯函数, 测试同用): Returns (本步可用噪声档
-    列表, m̂ 列是否激活)。"""
+def _denoise_s_ladder(args) -> list[float]:
+    """解析 --decoder-denoise-s-ladder (CSV 标量倍率档, 修订 v2): 每步解析
+    (3 元素成本可忽略), 空档/非正数响亮报错。"""
+    ladder = [float(x) for x in str(getattr(args, "decoder_denoise_s_ladder", "0.5,1.0,2.0")).split(",")]
+    if not ladder or any(s <= 0 for s in ladder):
+        raise ValueError(f"--decoder-denoise-s-ladder 非法: {ladder} (须为正数 CSV)")
+    return ladder
+
+
+def _denoise_curriculum(step: int, mhat_start: int, ladder: list[float]):
+    """课程查表 (任务书 §1 修订 v2 冻结, 纯函数, 测试同用): Returns (本步可
+    用 s 档列表 = ladder 前缀切片, m̂ 列是否激活)。"""
     if step < _DENOISE_MID_START:
-        return ["light"], False
+        return ladder[:1], False
     if step < _DENOISE_FULL_START:
-        return ["light", "mid"], False
-    return ["light", "mid", "heavy"], step >= mhat_start
+        return ladder[:2], False
+    return ladder, step >= mhat_start
 
 
 def _load_decoder_denoise_fuzz(fuzz_dir: str) -> dict:
-    """装载前置测量产物 (probe_decoder_fuzz_id 的落盘目录): 三档各自的部署桥
-    (W/scale) + 噪声采样件 (Cholesky L + ρ)。缺件响亮报错, 不静默降级。"""
+    """装载前置测量产物 (probe_decoder_fuzz_id 落盘目录) 中的部署桥
+    (λopt=1.0) 单采样器 (修订 v2: λ 三档作废, under/over 桥留在落盘目录不
+    装载)。W/scale + 噪声采样件 (Cholesky L + ρ) 同桥同源; 找不到恰好一个
+    λ=1.0 档响亮报错, 不静默降级。"""
     import numpy as np
 
     d = Path(fuzz_dir)
     stats = json.loads((d / "fuzz_stats.json").read_text(encoding="utf-8"))
     grade_map = stats["grade_map"]  # light/mid/heavy -> opt/under/over (实测定序)
-    fuzz = {}
-    for grade in ("light", "mid", "heavy"):
+    hits = []
+    for grade, tag in grade_map.items():
         b = np.load(d / f"bridge_{grade}.npz")
-        c = np.load(d / f"resid_chol_{grade}.npz")
-        fuzz[grade] = {
-            "W": torch.from_numpy(np.asarray(b["W"], dtype=np.float32)),
-            "scale": float(b["scale"]),
-            "chol": torch.from_numpy(np.asarray(c["L"], dtype=np.float32)),
-            "rho": float(c["rho"]),
-            "lam": float(b["lam"]),
-            "tag": grade_map[grade],
-        }
-    return fuzz
+        if float(b["lam"]) == 1.0:
+            hits.append(grade)
+    if len(hits) != 1:
+        raise SystemExit(
+            f"[s1][denoise] fuzz_id={fuzz_dir}: 部署桥 (lam=1.0) 命中 {len(hits)} 档 ({hits}), "
+            "预期恰好 1 —— 检查前置测量产物完整性"
+        )
+    grade = hits[0]
+    b = np.load(d / f"bridge_{grade}.npz")
+    c = np.load(d / f"resid_chol_{grade}.npz")
+    return {
+        "W": torch.from_numpy(np.asarray(b["W"], dtype=np.float32)),
+        "scale": float(b["scale"]),
+        "chol": torch.from_numpy(np.asarray(c["L"], dtype=np.float32)),
+        "rho": float(c["rho"]),
+        "lam": float(b["lam"]),
+        "tag": grade_map[grade],
+    }
 
 
 def _decoder_denoise_freeze(model) -> tuple[int, int]:
@@ -1516,21 +1538,25 @@ def _decoder_denoise_freeze(model) -> tuple[int, int]:
 
 
 def _decoder_denoise_perturb(model, v_rows: torch.Tensor, chunks, index: torch.Tensor, args):
-    """direct 口扰动副本 (任务书 §1 三列, train-only; 调用侧已保证 b 格端口在
-    岗 + 旗标开 + train)。Returns (v_rows_dec, stats); v_rows 本体不动。
+    """direct 口扰动副本 (任务书 §1 修订 v2 三列, train-only; 调用侧已保证
+    b 格端口在岗 + 旗标开 + train)。Returns (v_rows_dec, stats); v_rows 本
+    体不动。
 
-    列① 统计匹配噪声: batch 级 p_noise 触发, 触发时随机 row_frac 实 chunk 行,
-    档位于课程允许集内均匀抽; 合成式 ṽ = ρ·m + ε, ε = z @ Lᵀ (z~N(0,I);
-    L/ρ 来自前置测量的「范数匹配后残差」收缩 Cholesky, 探针 F5 口径)。
+    列① 统计匹配噪声: batch 级 p_noise 触发, 触发时随机 row_frac 实 chunk
+    行, s 档于课程允许集内均匀抽; 合成式 ṽ = ρ·m + s·ε, ε = z @ Lᵀ
+    (z~N(0,I); L/ρ 来自部署桥 (λopt=1.0) 前置测量的「范数匹配后残差」收缩
+    Cholesky, 探针 F5 口径; ρ 固定实测值, s 只乘 ε 项, s=1.0 恰是部署分布)。
     列② m̂ 整行替换: batch 级 p_mhat 触发 (mhat_start 前不激活), 选中行整行
-    替换为同窗 m̂ (K 态段1 解混 + 部署桥, 非加性)。撞行时替换列覆盖噪声列
-    (整行替换语义, 实现层申报; 计数把撞行归替换列)。
+    替换为同窗 m̂ (K 态段1 解混 + 部署桥, 固定 λopt 桥不抽档, 非加性)。撞行
+    时替换列覆盖噪声列 (整行替换语义, 实现层申报; 计数把撞行归替换列)。
     列③ 干净行 = 两列都未碰的行 (p 的补集 + 未触发 batch), 水位护栏在训仪表。
     全部常量化构造 (no_grad): 扰动值是常数, direct 腿梯度链形态不变。
     """
     fuzz = _DENOISE_FUZZ
     step = int(getattr(args, "decoder_denoise_step", 0))
-    grades, mhat_on = _denoise_curriculum(step, int(getattr(args, "decoder_denoise_mhat_start", _DENOISE_FULL_START)))
+    s_grades, mhat_on = _denoise_curriculum(
+        step, int(getattr(args, "decoder_denoise_mhat_start", _DENOISE_FULL_START)), _denoise_s_ladder(args)
+    )
     g = _DENOISE_GENERATOR
     device = v_rows.device
     real = chunks.chunk_mask  # (B, C) bool
@@ -1540,35 +1566,32 @@ def _decoder_denoise_perturb(model, v_rows: torch.Tensor, chunks, index: torch.T
         v_dec = v_rows.float().clone()
         noise_sel = torch.zeros_like(real)
         mhat_sel = torch.zeros_like(real)
-        grade_hit = None
+        s_hit = None
 
-        # 列① 统计匹配噪声
+        # 列① 统计匹配噪声 (修订 v2: 标量倍率 s 只乘 ε 项)
         if float(torch.rand((), generator=g)) < float(args.decoder_denoise_p_noise):
-            gi = int(torch.randint(len(grades), (), generator=g))
-            grade_hit = grades[gi]
+            gi = int(torch.randint(len(s_grades), (), generator=g))
+            s_hit = s_grades[gi]
             sel = (torch.rand(real.shape, generator=g) < float(args.decoder_denoise_row_frac)).to(device) & real
             if bool(sel.any()):
-                L = fuzz[grade_hit]["chol"].to(device)
-                rho = fuzz[grade_hit]["rho"]
+                L = fuzz["chol"].to(device)
+                rho = fuzz["rho"]
                 z = torch.randn(int(sel.sum()), v_rows.size(-1), generator=g).to(device)
-                v_dec[sel] = rho * v_dec[sel] + z @ L.T
+                v_dec[sel] = rho * v_dec[sel] + s_hit * (z @ L.T)
                 noise_sel = sel
 
-        # 列② m̂ 整行替换 (10K 里程碑前不激活; batch-1 形态, ridge_unmix 逐窗)
+        # 列② m̂ 整行替换 (10K 里程碑前不激活; batch-1 形态, ridge_unmix 逐窗;
+        # 固定 λopt 部署桥不抽档 —— m̂ 列零域移, 任务书修订 v2)
         if mhat_on and float(torch.rand((), generator=g)) < float(args.decoder_denoise_p_mhat):
             sel = (torch.rand(real.shape, generator=g) < float(args.decoder_denoise_row_frac)).to(device) & real
             if bool(sel.any()):
                 if v_rows.size(0) != 1:
                     raise ValueError("decoder-denoise m̂ 列只支持 batch_size=1 (ridge_unmix 逐窗形态)")
-                gi = int(torch.randint(len(grades), (), generator=g))
-                grade_hit = grade_hit or grades[gi]
                 # 延迟导入: 关态零依赖零导入成本 (条件创建纪律)
                 from tools.analysis.v3_6.probe_decoder_fuzz_id import mhat_from_window
 
                 with torch.autocast(device.type, enabled=False):
-                    mhat = mhat_from_window(
-                        model, index.float(), real, fuzz[grades[gi]]["W"], fuzz[grades[gi]]["scale"]
-                    )
+                    mhat = mhat_from_window(model, index.float(), real, fuzz["W"], fuzz["scale"])
                 n = mhat.size(1)
                 idx = sel[0, :n].nonzero(as_tuple=True)[0]
                 if idx.numel():
@@ -1581,7 +1604,7 @@ def _decoder_denoise_perturb(model, v_rows: torch.Tensor, chunks, index: torch.T
             "noise_frac": float(noise_sel.float().sum() / n_real),
             "mhat_frac": float(mhat_sel.float().sum() / n_real),
             "clean_frac": float((real & ~noise_sel & ~mhat_sel).float().sum() / n_real),
-            "grade": _DENOISE_GRADE_INDEX.get(grade_hit, -1.0),
+            "grade": float(s_hit) if s_hit is not None else -1.0,  # 修订 v2: 命中的 s 值, 未触发 = -1.0
             "clean_rows": (real & ~noise_sel & ~mhat_sel),  # (B, C) bool, step_model 干净水位仪表用
         }
     return v_dec.to(v_rows.dtype), stats
@@ -2978,10 +3001,10 @@ def step_model(model, batch, args, device, train: bool):
         "boundary_confidence_mean": out["boundary_confidence_mean"].detach(),
         "think_steps": torch.tensor(out["think_steps"], device=loss.device),
     }
-    # decoder 去噪臂计数列 (任务书 2026-08-29 §1 + 冒烟条款): 扰动触发比例
-    # (noise/m̂/clean 行占比 + 命中档, grade 用 -1 哨兵) + 干净行 direct acc
-    # ——混合 direct_acc 在扰动臂下天然回落, 干净行读数才是 §2 有效性门的
-    # 判读面。关态/eval = 零占位, log schema 对齐 (本文件臂列惯例)。
+    # decoder 去噪臂计数列 (任务书 2026-08-29 §1 修订 v2 + 冒烟条款): 扰动触发
+    # 比例 (noise/m̂/clean 行占比 + 命中 s 档, grade 列 = s 值, -1 哨兵 = 未触发)
+    # + 干净行 direct acc ——混合 direct_acc 在扰动臂下天然回落, 干净行读数才是
+    # §2 有效性门的判读面。关态/eval = 零占位, log schema 对齐 (本文件臂列惯例)。
     denoise_metrics = {
         "denoise_noise_frac": torch.zeros((), device=device),
         "denoise_mhat_frac": torch.zeros((), device=device),
@@ -3144,7 +3167,7 @@ def _add_s1_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--decoder-denoise-fuzz-id", default="",
-        help="前置测量产物目录 (probe_decoder_fuzz_id 落盘: 三档桥 + 残差 Cholesky + ρ)",
+        help="前置测量产物目录 (probe_decoder_fuzz_id 落盘; 修订 v2 只装载 λopt=1.0 部署桥 + 残差 Cholesky + ρ)",
     )
     parser.add_argument(
         "--decoder-denoise-p-noise", type=float, default=0.5,
@@ -3161,6 +3184,11 @@ def _add_s1_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--decoder-denoise-mhat-start", type=int, default=10000,
         help="m̂ 列激活步 (任务书 §1 冻结 10K 里程碑; 课程 5K/10K 档切换为常量)",
+    )
+    parser.add_argument(
+        "--decoder-denoise-s-ladder", default="0.5,1.0,2.0",
+        help="噪声强度档 = 部署桥 (λopt=1.0) 残差采样器的标量倍率 CSV (任务书 §1 修订 v2 "
+             "冻结 0.5,1.0,2.0; 课程 0–5K 取第 1 档 / 5K–10K 前 2 档 / 10K 起全档均匀)",
     )
 
 
@@ -3434,7 +3462,8 @@ def main() -> None:
         print(
             f"[s1][denoise] decoder 去噪臂: fuzz_id={args.decoder_denoise_fuzz_id} "
             f"p_noise={args.decoder_denoise_p_noise} p_mhat={args.decoder_denoise_p_mhat} "
-            f"row_frac={args.decoder_denoise_row_frac} mhat_start={args.decoder_denoise_mhat_start} | "
+            f"row_frac={args.decoder_denoise_row_frac} mhat_start={args.decoder_denoise_mhat_start} "
+            f"s_ladder={_denoise_s_ladder(args)} | "
             f"仅 decoder 可训: trainable={n_train} frozen={n_frozen} "
             f"(decoder_in_mem/chunk_pos/backbone/写入侧/tied byte_lookup 全冻)",
             flush=True,
