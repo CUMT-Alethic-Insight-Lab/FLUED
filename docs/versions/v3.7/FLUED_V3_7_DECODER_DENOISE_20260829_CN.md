@@ -120,3 +120,25 @@ python tools/train/v3_6/train_v36_s1.py --config checkpoints/v37ks_b_sm_v371_20k
   --decoder-denoise --decoder-denoise-fuzz-id outputs/decoder_denoise_fuzz_id_20260829 \
   --run-id <E118 run id> --out-dir checkpoints/<...> --max-steps 20000
 ```
+
+## §7 补注 v2.1（2026-08-29，t=0 基线与收官探针落盘）
+
+**四列收官探针**：`tools/analysis/v3_6/probe_decoder_denoise_eval.py`（+ 4 测，测试基线 563+4 → 567+4 全绿）。考场=eval 窗 seed+9999 前 16 窗 + mask_seed=1042，fine 细格 echo byte_acc as-encoded 主口径（与 fuzz_id 锚及训练器 eval 同函数链，零新造打分逻辑）。自检门：clean ∈ 0.7917±2pp 且 scrambled ≤0.10。
+
+**基座 t=0 四列读数**（`outputs/decoder_denoise_eval_base_t0_20260829/`，16 窗 48 条目，自检门过）：
+
+| 列 | byte_acc |
+|---|---|
+| clean（水位锚） | 0.7925（E68 0.7917 ±2pp 内，+0.08pp） |
+| noise_s0.5 / s1.0 / s2.0 | 0.6458 / 0.4075 / 0.1649 |
+| **mhat（主判据列）** | **0.3541**（=水位 44.7%，判读表「现值 ~0.33」假设成立） |
+| scrambled（地板门） | 0.0788 ≤ 0.10 过（贴先验 0.071 同档） |
+| Δ 监护列（q15 口径，n=48） | 0.0000 ± 0.0000 |
+
+主判据缺口：及格线 m̂≥0.56 差 +0.21，卓越档 ≥0.65 差 +0.30。
+
+**发现 1（裁定①：保留为零基线对照）**：Δ 监护列在本臂线上空转——b 格基座 v37.1 无 burst 训练史（burst 机制跑在 d 格线），源段完好本身贴地板（intact 0.0723 = scrambled 0.0723），「去噪不得进一步压 Δ」无从起压。处置：监护列保留，里程碑复测若仍 0±0 至少证明去噪无副作用；Δ 硬指标仍归 d 格线（Q15 系）另测，判词作用域「slm 系」限定语不变。仪器本身接线正确（q15 原函数复用、剔除同开、swap_identity 审计列在位）。
+
+**发现 2（监控注记修订）**：s=0.5 轻档在基座上已把 clean 打到 0.6458（−14.7pp）——课程首 5K 的扰动强度不是「温柔档」，**codec 回调线的真考验从 5K 前的轻档段就开始**，不限于修订 v2 注记说的中/重档上线时。
+
+**远端 4090 执行链（5080 被外项目占用，用户裁定整链搬远端）**：基座/fuzz_id/代码 bundle（728e3ca..84a093d）就位；500 步冒烟过（四项同本地口径）；E118 正式点火 `v37ks_b_sm_denoise_v2_20k_ctx4096_20260829`（20K，~5.1 steps/s）——点火日志确认：基座 loud-fail 校验过（loaded=353 skipped=0）、冻结实锤（trainable=50 frozen=300）、s_ladder=[0.5,1.0,2.0] 生效、回调线锚已自锚（800–1000 步均值：direct 0.7395 / backbone 0.6943）。
