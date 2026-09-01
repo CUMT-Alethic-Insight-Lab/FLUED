@@ -162,28 +162,28 @@
 | 回路养成臂 | 回路养成臂（circuit-rearing arm） | Q15 激励层臂：把回路本身设为奖励靶点——过程奖励直接监督 block-1 注意力落到状态通道行（L_attend），条件挂钩结果损失（sg 门控）+ 反作弊对偶项（孪生篡改铰链）把"学会"与"表演"在损失函数层面分开；与数据层注入（Q13/Q14）正交，前提是 E104"回路从未形成"归因 | FLUED_V3_7_Q15_CIRCUIT_REARING_20260825_CN | 用户（协作设计稿）裁定设计与命名 | 2026-08-25 | 已注册 |
 | 影帝结局 | 影帝结局（theatre ending） | Q15 判读矩阵格二：过程奖励下注意力质量被监督到上涨、但孪生篡改无感且逐条目 Δ 平——注意力被监督成表演而非承重回路的结局；对注意力监督文献构成反例贡献，与"回路养成"同为论文级发现（奖励臂两头都赢设计的负向格） | 同上 | 用户（协作设计稿）裁定命名 | 2026-08-25 | 已注册 |
 | 去噪正则化红利 | 去噪正则化红利（denoise regularization dividend） | decoder 去噪训练（端口练钝）的附带效应：训练混入扰动/岭估计 memory 行后，decoder 对**干净** memory 行的消费水位不降反升（E118：0.7925→0.8323，+4.0pp）——非本臂判据，但生产口径 direct 直读水位被免费抬高；架构篇 decoder 章素材 | E118 收官（任务书 §8，docs/versions/v3.7/FLUED_V3_7_DECODER_DENOISE_20260829_CN.md） | 用户命名（审计链裁定单独入账） | 2026-08-29 | 已注册 |
-| 多槽读出 | 多槽读出（multi-slot readout） | 读出端用 k 个可学习槽位查询各从压缩状态矩阵读一根向量、拼接投影回下游的读出形态（Q20 臂，k 作为容量轴显式扫描 M∈{1,4,8}）；命名避 "multi-query readout"（与 MQAR 撞词） | Q20 k 扫描复核报告 §6（docs/research/FLUED_V3_7_Q20_READOUT_K_SCAN_RECON_20260829_CN.md） | 用户（协作设计）裁定形态，AI(Kimi) 登记 | 2026-08-29 | 候选 |
+| 多槽读出 | 多槽读出（multi-slot readout） | 读出端用 k 个可学习槽位查询各从压缩状态矩阵读一根向量、拼接投影回下游的读出形态（Q20 臂，k 作为容量轴显式扫描 M∈{1,4,8}）；命名避 "multi-query readout"（与 MQAR 撞词） | Q20 k 扫描复核报告 §6（docs/research/FLUED_V3_7_Q20_READOUT_K_SCAN_RECON_20260829_CN.md） | 用户（协作设计）裁定形态，AI(Kimi) 登记 | 2026-08-29 | 已注册 |
 
 ### v3.7 外部文献锚点（2026-08-29 起，summarizer 撞车侦察）
 
 | 术语 | 中文全称 | 一句话定义 | 首次出现 | 提出方 | 日期 | 状态 |
 |---|---|---|---|---|---|---|
-| MQAR | 多查询联想回忆（Multi-Query Associative Recall） | Zoology 提出的合成考场：长上下文存多组键值对后按键查值，测联想回忆容量 | 侦察报告 §3.1（docs/research/FLUED_V3_7_SUMMARIZER_LIT_RECON_20260829_CN.md） | 外部（Zoology/Arora 等），AI(Kimi) 登记 | 2026-08-29 | 候选 |
-| MesaNet | MesaNet（共轭梯度读出网络） | 把层内状态读出写成共轭梯度迭代解正规方程的序列模型（arXiv 2506.05233）；E115 可学习性墙的正对设计模板 | 侦察报告 §4.3 | 外部，AI(Kimi) 登记 | 2026-08-29 | 候选 |
-| HOLA | 海马体线性注意力（Hippocampal Linear Attention） | delta-rule 压缩态 + 有界精确 KV 缓存双通道，残差准入 + 解耦归一化锐化读出（arXiv 2607.02303，外部证据未评审） | 侦察报告 §4.2 | 外部，AI(Kimi) 登记 | 2026-08-29 | 候选 |
-| 锐化读出 | 锐化读出（sharpened readout） | 读出侧用归一化/温度件把软平均读出压成近似硬检索 | 侦察报告 §4.2 | 外部（HOLA），AI(Kimi) 登记 | 2026-08-29 | 候选 |
-| DNC | 可微神经计算机（Differentiable Neural Computer） | Graves 2016 外存架构：usage 向量 + 最少使用优先分配 + free gate；写键塌缩缓解的机制件先例 | 侦察报告 §5 | 外部（DeepMind），AI(Kimi) 登记 | 2026-08-29 | 候选 |
-| Product Key Memory | 乘积键记忆（Product Key Memory） | 键从固定码本乘积分解选取的大记忆层（Lample 2019）；码本键臂的外部先例 | 侦察报告 §5 | 外部，AI(Kimi) 登记 | 2026-08-29 | 候选 |
-| KATA | 对称锥核化线性注意力（Kernelized Linear Attention with Symmetric Cones） | 用对称锥核扩大有效特征维以破容量墙的线性注意力（arXiv 2607.17419） | 侦察报告 §3.1 | 外部，AI(Kimi) 登记 | 2026-08-29 | 候选 |
-| OSDN | 在线对角预条件 DeltaNet（Online Scaled DeltaNet） | delta 规则标量步长升级为逐维对角预条件的写入规则（arXiv 2605.13473） | 侦察报告 §3.1 | 外部，AI(Kimi) 登记 | 2026-08-29 | 候选 |
-| GDN | 门控 DeltaNet（Gated DeltaNet） | delta 规则 + 标量衰减门控的线性注意力（arXiv 2412.06464）；KDA 的直系前身，S38 报告已用 | 侦察报告 §3.1 | 外部（Yang 等），AI(Kimi) 登记 | 2026-08-29 | 候选 |
-| ICAE | 上下文自编码器（In-context Autoencoder） | 冻结 LM 产 memory slot + AE/LM 双目标的上下文压缩器；fork 3 已引用 | 侦察报告 §2 | 外部，AI(Kimi) 登记 | 2026-08-29 | 候选 |
-| RAM-Net | 随机存取记忆网络（Random Access Memory Network） | 用乘积 softmax+Top-K 把输入映射为高维稀疏地址、显式槽化扩容线性注意力状态的架构（arXiv 2602.11958） | Q20 k 扫描复核报告 §3.2 | 外部，AI(Kimi) 登记 | 2026-08-29 | 候选 |
-| Q-Delta | 查询感知 delta 规则（Q-Delta） | 把查询条件化读出 ô_t=S_{t−1}q_t 混入 delta 规则更新、读出反馈写入侧的线性注意力（arXiv 2606.08804）；Q20 读出话语权最近邻 | Q20 k 扫描复核报告 §3.2 | 外部，AI(Kimi) 登记 | 2026-08-29 | 候选 |
-| PMA | 多头注意力池化（Pooling by Multihead Attention） | Set Transformer 的集合读出件：k 个可学习 seed vector 作查询对集合做交叉注意力读出 k 根向量（arXiv 1810.00825）；「可学习槽查询组读出」机制件正典 | Q20 k 扫描复核报告 §5 | 外部（Lee 等），AI(Kimi) 登记 | 2026-08-29 | 候选 |
-| KVM | 键值均值块循环记忆（Key-Value Means） | 块级 KV 均值作压缩态、softmax 注意力读全部块均值的可增容块循环注意力（arXiv 2605.09877） | Q20 k 扫描复核报告 §4 | 外部，AI(Kimi) 登记 | 2026-08-29 | 候选 |
-| SeDeM | 选择性隐态解压缩框架（Selective Decompression of Hidden-State Memory） | 隐态块存储+查询条件化选择器+解压缩喂 decoder 的长上下文框架（arXiv 2608.00311） | Q20 k 扫描复核报告 §4 | 外部，AI(Kimi) 登记 | 2026-08-29 | 候选 |
-| SDM | 稀疏 delta 记忆（Sparse Delta Memory） | 以稀疏化把门控线性 RNN 状态扩容数个量级的架构（arXiv 2607.07386，摘要级核实） | Q20 k 扫描复核报告 §3.2 | 外部，AI(Kimi) 登记 | 2026-08-29 | 候选 |
+| MQAR | 多查询联想回忆（Multi-Query Associative Recall） | Zoology 提出的合成考场：长上下文存多组键值对后按键查值，测联想回忆容量 | 侦察报告 §3.1（docs/research/FLUED_V3_7_SUMMARIZER_LIT_RECON_20260829_CN.md） | 外部（Zoology/Arora 等），AI(Kimi) 登记 | 2026-08-29 | 已注册 |
+| MesaNet | MesaNet（共轭梯度读出网络） | 把层内状态读出写成共轭梯度迭代解正规方程的序列模型（arXiv 2506.05233）；E115 可学习性墙的正对设计模板 | 侦察报告 §4.3 | 外部，AI(Kimi) 登记 | 2026-08-29 | 已注册 |
+| HOLA | 海马体线性注意力（Hippocampal Linear Attention） | delta-rule 压缩态 + 有界精确 KV 缓存双通道，残差准入 + 解耦归一化锐化读出（arXiv 2607.02303，外部证据未评审） | 侦察报告 §4.2 | 外部，AI(Kimi) 登记 | 2026-08-29 | 已注册 |
+| 锐化读出 | 锐化读出（sharpened readout） | 读出侧用归一化/温度件把软平均读出压成近似硬检索 | 侦察报告 §4.2 | 外部（HOLA），AI(Kimi) 登记 | 2026-08-29 | 已注册 |
+| DNC | 可微神经计算机（Differentiable Neural Computer） | Graves 2016 外存架构：usage 向量 + 最少使用优先分配 + free gate；写键塌缩缓解的机制件先例 | 侦察报告 §5 | 外部（DeepMind），AI(Kimi) 登记 | 2026-08-29 | 已注册 |
+| Product Key Memory | 乘积键记忆（Product Key Memory） | 键从固定码本乘积分解选取的大记忆层（Lample 2019）；码本键臂的外部先例 | 侦察报告 §5 | 外部，AI(Kimi) 登记 | 2026-08-29 | 已注册 |
+| KATA | 对称锥核化线性注意力（Kernelized Linear Attention with Symmetric Cones） | 用对称锥核扩大有效特征维以破容量墙的线性注意力（arXiv 2607.17419） | 侦察报告 §3.1 | 外部，AI(Kimi) 登记 | 2026-08-29 | 已注册 |
+| OSDN | 在线对角预条件 DeltaNet（Online Scaled DeltaNet） | delta 规则标量步长升级为逐维对角预条件的写入规则（arXiv 2605.13473） | 侦察报告 §3.1 | 外部，AI(Kimi) 登记 | 2026-08-29 | 已注册 |
+| GDN | 门控 DeltaNet（Gated DeltaNet） | delta 规则 + 标量衰减门控的线性注意力（arXiv 2412.06464）；KDA 的直系前身，S38 报告已用 | 侦察报告 §3.1 | 外部（Yang 等），AI(Kimi) 登记 | 2026-08-29 | 已注册 |
+| ICAE | 上下文自编码器（In-context Autoencoder） | 冻结 LM 产 memory slot + AE/LM 双目标的上下文压缩器；fork 3 已引用 | 侦察报告 §2 | 外部，AI(Kimi) 登记 | 2026-08-29 | 已注册 |
+| RAM-Net | 随机存取记忆网络（Random Access Memory Network） | 用乘积 softmax+Top-K 把输入映射为高维稀疏地址、显式槽化扩容线性注意力状态的架构（arXiv 2602.11958） | Q20 k 扫描复核报告 §3.2 | 外部，AI(Kimi) 登记 | 2026-08-29 | 已注册 |
+| Q-Delta | 查询感知 delta 规则（Q-Delta） | 把查询条件化读出 ô_t=S_{t−1}q_t 混入 delta 规则更新、读出反馈写入侧的线性注意力（arXiv 2606.08804）；Q20 读出话语权最近邻 | Q20 k 扫描复核报告 §3.2 | 外部，AI(Kimi) 登记 | 2026-08-29 | 已注册 |
+| PMA | 多头注意力池化（Pooling by Multihead Attention） | Set Transformer 的集合读出件：k 个可学习 seed vector 作查询对集合做交叉注意力读出 k 根向量（arXiv 1810.00825）；「可学习槽查询组读出」机制件正典 | Q20 k 扫描复核报告 §5 | 外部（Lee 等），AI(Kimi) 登记 | 2026-08-29 | 已注册 |
+| KVM | 键值均值块循环记忆（Key-Value Means） | 块级 KV 均值作压缩态、softmax 注意力读全部块均值的可增容块循环注意力（arXiv 2605.09877） | Q20 k 扫描复核报告 §4 | 外部，AI(Kimi) 登记 | 2026-08-29 | 已注册 |
+| SeDeM | 选择性隐态解压缩框架（Selective Decompression of Hidden-State Memory） | 隐态块存储+查询条件化选择器+解压缩喂 decoder 的长上下文框架（arXiv 2608.00311） | Q20 k 扫描复核报告 §4 | 外部，AI(Kimi) 登记 | 2026-08-29 | 已注册 |
+| SDM | 稀疏 delta 记忆（Sparse Delta Memory） | 以稀疏化把门控线性 RNN 状态扩容数个量级的架构（arXiv 2607.07386，摘要级核实） | Q20 k 扫描复核报告 §3.2 | 外部，AI(Kimi) 登记 | 2026-08-29 | 已注册 |
 
 ## 8. Changelog
 
@@ -247,3 +247,6 @@
 - 2026-08-29：Q20 k 扫描复核报告关联登记——多槽读出（内部，候选）+ RAM-Net /
   Q-Delta / PMA / KVM / SeDeM / SDM（外部锚点，候选）共 7 条，连同 08-29 早前 10 条
   候选一并待用户点头转正。
+- 2026-08-29：两批 17 条候选全部转正（用户点头）——外部锚点 16 条（MQAR/MesaNet/
+  HOLA/锐化读出/DNC/Product Key Memory/KATA/OSDN/GDN/ICAE/RAM-Net/Q-Delta/PMA/KVM/
+  SeDeM/SDM）+ 内部 1 条（多槽读出），Q20 立项门槛③落地。
