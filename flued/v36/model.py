@@ -1144,7 +1144,7 @@ class KDAStateMachine(nn.Module):
 # ---------------------------------------------------------------------------
 
 Q20_CG_ITERS = 8  # CG 臂迭代深度 T (任务书 §1 冻结: 固定不扫——迭代深度≠读出宽度)
-Q20_CG_LAM = 1.0  # CG 臂 Gram 正规方程 λ (=λopt=1.0 部署桥口径, 任务书 §1 冻结)
+Q20_CG_LAM = 0.01  # CG 臂 Gram 正规方程 λ——修订 v1（2026-09-02，点火前校准）：=fuzz_id 段1 解混 λ_unmix=0.01（CG 结构化的参照对象）；任务书原文"λ=λopt=1.0 部署桥口径"混同两处 λ（λopt=1.0 属段 2 桥），零变化律冒烟拒发（q20_k=0.2992<0.427）后修正
 
 
 def _kda_scan_post_states(gates: dict[str, torch.Tensor], chunk_mask: torch.Tensor) -> torch.Tensor:

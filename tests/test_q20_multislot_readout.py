@@ -29,7 +29,7 @@ import torch
 import torch.nn.functional as F
 
 from flued.v36 import FLUEDV36
-from flued.v36.model import CGRidgeReadout, MultiSlotReadout, _kda_scan_post_states
+from flued.v36.model import CGRidgeReadout, MultiSlotReadout, Q20_CG_LAM, _kda_scan_post_states
 import tools.train.v3_6.train_v36_s1 as s1
 from tools.analysis.v3_6 import probe_decoder_denoise_eval as probe
 from tools.analysis.v3_6 import probe_q20_ridge_direction as q20gen
@@ -307,7 +307,7 @@ def test_cg_converges_to_closed_form():
     for i in range(6):
         for h in range(H):
             K = kf[: i + 1, h]
-            A = K.T @ K + 1.0 * torch.eye(HK, dtype=torch.float64)
+            A = K.T @ K + Q20_CG_LAM * torch.eye(HK, dtype=torch.float64)
             c = torch.linalg.solve(A, K[i])
             vh_ref[0, i, h] = c @ states[0, i, h]
     out_ref = cg.proj(vh_ref.reshape(1, 6, H * HV).float())
