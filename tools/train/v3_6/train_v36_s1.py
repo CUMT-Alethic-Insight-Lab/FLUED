@@ -1611,6 +1611,109 @@ def _decoder_denoise_perturb(model, v_rows: torch.Tensor, chunks, index: torch.T
 
 
 # ---------------------------------------------------------------------------
+# Q20 多槽读出臂 (multi-slot readout, E119; 任务书冻结 v1 2026-08-29:
+# docs/versions/v3.7/FLUED_V3_7_Q20_MULTISLOT_READOUT_20260829_CN.md) — b 格
+# K 通道压缩状态 → decoder direct 口的读出端扩宽; 可训练范围 = 仅新增多槽
+# 读出件 (k 槽查询 + 拼接投影 / CG 臂的可学段 2 投影), 端口 (decoder_in_mem)
+# 与 decoder/backbone/写入侧全冻在 E118 收官态——端口作固定基板 = 「端口仍
+# 是损耗源」前提的实验化身。默认全关 = 旧路径逐位不变。
+# ---------------------------------------------------------------------------
+
+
+def _multislot_readout_enabled(args) -> bool:
+    return bool(getattr(args, "multislot_readout", False))
+
+
+def _multislot_readout_rows(model, index: torch.Tensor, chunk_mask: torch.Tensor) -> torch.Tensor:
+    """Q20 direct 腿读出行生产 (任务书 §3.3): index 行 → write_head_k gates →
+    多槽读出件 → (B, C, d_mem) fp32 行。写入侧全冻 (本臂白名单 = 仅读出件):
+    gates 在 no_grad 下复算 (常数件, 梯度只经读出件); autocast 关闭 + fp32,
+    与探针 q20_k 列行生产同链 (串联测零域移, 去噪臂 m̂ 列同款纪律)。"""
+    with torch.autocast(index.device.type, enabled=False):
+        with torch.no_grad():
+            gates_k = model.write_head_k(index.float())
+        return model.multislot_readout(gates_k, chunk_mask)
+
+
+def _multislot_readout_freeze(model) -> tuple[int, int]:
+    """可训练范围钉死 = 仅多槽读出件 (任务书 §1 终审裁定项④)。
+    (_decoder_denoise_freeze 的反向先例: 那里白名单是 decoder.*, 这里是
+    multislot_readout.*。) tied byte_lookup 同账: named_parameters 去重后只在
+    模型级名字出现一次 (decoder.byte_lookup 是同一参数的别名, 不命中白名单
+    前缀) —— 按 E31/E34 裁定字节表是固定公尺, 留在冻结侧正是裁定语义;
+    读出件自身参数不许被误冻 (两个方向都钉死)。Returns (n_trainable, n_frozen)。"""
+    n_train = n_frozen = 0
+    for name, param in model.named_parameters():
+        if name.startswith("multislot_readout."):
+            param.requires_grad_(True)
+            n_train += 1
+        else:
+            param.requires_grad_(False)
+            n_frozen += 1
+    return n_train, n_frozen
+
+
+def _multislot_readout_warm_start(model, fuzz_dir: str) -> str:
+    """温启动初始化 (任务书 §1 终审裁定项④, 零变化律可判读性前提):
+    - 投影 ← fuzz_id 落盘的 λopt=1.0 部署桥 W (折叠 RMS 预条件 scale 与截距
+      行); k>1 臂只装槽 0 块、其余槽块置零 (t=0 各 k 臂读数相同, 零变化律
+      对读干净)。
+    - k 槽臂槽 0 ← ridge 段 1 主方向 (q20_ridge_dir.npz 落盘件,
+      tools/analysis/v3_6/probe_q20_ridge_direction.py 产出); k>1 臂其余槽
+      保留构造时随机初始化, 并与已有槽逐头 Gram-Schmidt 正交化。
+    - CG 臂无槽查询, 只装段 2 投影。
+    缺件/键不齐/形状不符响亮报错 (SystemExit), 不静默降级。Returns 日志注记。"""
+    import numpy as np
+
+    from flued.v36.model import CGRidgeReadout
+
+    ms = model.multislot_readout  # 旗标开才创建 (main() 校验链已保证)
+    c = model.config
+    heads, hk, hv, d_mem = c.kda_heads, c.kda_head_k, c.kda_head_v, c.d_mem
+    fuzz = _load_decoder_denoise_fuzz(fuzz_dir)  # λopt=1.0 部署桥 (loud-fail 内建)
+    W, scale = fuzz["W"].float(), float(fuzz["scale"])  # (H*hv+1, d_mem), 末行截距
+    if W.shape != (heads * hv + 1, d_mem):
+        raise SystemExit(
+            f"[s1][q20] 部署桥形状不符: W{tuple(W.shape)} != ({heads * hv + 1}, {d_mem}) —— "
+            "fuzz_id 产物与本模型 H*hv/d_mem 不匹配, 检查 --multislot-readout-fuzz-id"
+        )
+    with torch.no_grad():
+        if isinstance(ms, CGRidgeReadout):
+            ms.proj.weight.copy_((W[:-1] / scale).T)
+            ms.proj.bias.copy_(W[-1])
+            return f"cg 臂: 段2 投影 <- 部署桥 (scale={scale:.4f})"
+        # k 槽臂: 槽 0 <- ridge 段 1 主方向 (loud-fail 装载)
+        ridge_path = Path(fuzz_dir) / "q20_ridge_dir.npz"
+        if not ridge_path.exists():
+            raise SystemExit(
+                f"[s1][q20] ridge 段 1 主方向缺席: {ridge_path} —— 先对基座跑 "
+                "tools/analysis/v3_6/probe_q20_ridge_direction.py 落盘 (不静默降级为随机初始化)"
+            )
+        z = np.load(ridge_path)
+        if "q_ridge" not in z:
+            raise SystemExit(f"[s1][q20] {ridge_path}: 缺 q_ridge 键 (实际键集 {list(z.keys())})")
+        q_ridge = torch.from_numpy(np.asarray(z["q_ridge"], dtype=np.float32))
+        if q_ridge.shape != (heads, hk):
+            raise SystemExit(f"[s1][q20] q_ridge 形状不符: {tuple(q_ridge.shape)} != ({heads}, {hk})")
+        ms.slot_query[0].copy_(q_ridge)
+        # 其余槽: 构造时随机初始化保留, 与已有槽逐头 Gram-Schmidt 正交化
+        basis = [F.normalize(ms.slot_query[0], dim=-1)]
+        for j in range(1, ms.k):
+            qj = ms.slot_query[j]
+            for b in basis:
+                qj = qj - (qj * b).sum(dim=-1, keepdim=True) * b
+            ms.slot_query[j].copy_(qj)
+            basis.append(F.normalize(ms.slot_query[j], dim=-1))
+        # 投影: 槽 0 块 <- 部署桥 (折叠 scale), 其余槽块置零, 偏置 <- 截距行
+        w = ms.proj.weight.view(d_mem, ms.k, heads * hv)
+        w[:, 0].copy_((W[:-1] / scale).T)
+        if ms.k > 1:
+            w[:, 1:].zero_()
+        ms.proj.bias.copy_(W[-1])
+    return f"k={ms.k} 臂: 槽0<-ridge 主方向 + {ms.k - 1} 正交随机槽, 投影槽0块<-部署桥 (scale={scale:.4f})"
+
+
+# ---------------------------------------------------------------------------
 # Q18 v2 读出墙裁定臂 — B 计划 (2026-08-28): A/A′ 臂移植进 s1 骨架
 # ---------------------------------------------------------------------------
 # 为什么移植 (任务书 §6 楔死事故簿): Q17/Q18 独立训练器在双机双栈上间歇楔死
@@ -2308,6 +2411,15 @@ def _slm_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None, 
     v_rows_direct = v_rows
     if _decoder_denoise_enabled(args) and train and model.config.v_row_source == "memory":
         v_rows_direct, denoise_stats = _decoder_denoise_perturb(model, v_rows, chunks, index, args)
+    # Q20 多槽读出臂 (multi-slot readout, E119; 任务书冻结 v1 §3.3): train 态
+    # 旗标开时构造 q20_rows 喂 direct 腿——v_rows 本体不动 (上面的 backbone
+    # 腿与 step_model 的 predict 锚照吃它), 副本机制与去噪臂同位同纪律;
+    # 默认关 = 旧路径逐位不变。不与去噪臂同开 (main() 响亮校验); 旗标开而
+    # 模型缺件 (配置未开) = AttributeError 响亮暴露, 不静默落旧路径。
+    q20_engaged = 0.0
+    if _multislot_readout_enabled(args) and train and model.config.v_row_source == "memory":
+        v_rows_direct = _multislot_readout_rows(model, index, chunks.chunk_mask)
+        q20_engaged = 1.0
     cond_direct = dec_in(v_rows_direct) + pos
     logits_direct = model.decoder(cond_direct, chunks.token_mask)
     logits_backbone = model.decoder(cond_backbone, chunks.token_mask)
@@ -2319,6 +2431,7 @@ def _slm_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None, 
         "backbone_out": backbone_out,
         "v_rows": v_rows,  # decoder-side V source rows (the predict anchor, §1.4)
         "denoise_stats": denoise_stats,  # decoder 去噪臂扰动计数 (None = 关/eval, 旧路径不变)
+        "q20_engaged": q20_engaged,  # Q20 多槽读出臂接通计 (1.0 = 本前向 direct 腿吃了读出行; 关态/eval 零占位)
         "memory": memory,
         "index": index,  # summarizer K rows (resident key-geometry metrics, E80 补充 2)
         "retrieval_block_rate": retrieval_block_rate,  # 档 a excision hit rate (0.0 when off)
@@ -3023,6 +3136,10 @@ def step_model(model, batch, args, device, train: bool):
             out["logits_direct"].argmax(dim=-1), encoded_targets, clean_slot
         )
     metrics.update(denoise_metrics)
+    # Q20 多槽读出臂接通计 (E119 冒烟条款① 旋钮接通仪表): 本前向 direct 腿
+    # 是否吃了多槽读出行 (train 态旗标开才 1; 关态/eval = 零占位, log schema
+    # 对齐本文件臂列惯例)
+    metrics["q20_engaged"] = torch.tensor(float(out.get("q20_engaged", 0.0)), device=device)
     if slm_mode:
         # E80 补充 2: resident key-geometry dashboard (slm default-on; legacy
         # paths never gain these keys)
@@ -3190,6 +3307,27 @@ def _add_s1_args(parser: argparse.ArgumentParser) -> None:
         help="噪声强度档 = 部署桥 (λopt=1.0) 残差采样器的标量倍率 CSV (任务书 §1 修订 v2 "
              "冻结 0.5,1.0,2.0; 课程 0–5K 取第 1 档 / 5K–10K 前 2 档 / 10K 起全档均匀)",
     )
+    # --- Q20 多槽读出臂 (multi-slot readout, E119; 任务书 2026-08-29 冻结 v1:
+    # docs/versions/v3.7/FLUED_V3_7_Q20_MULTISLOT_READOUT_20260829_CN.md) ---
+    # b 格 K 通道 post-state → decoder direct 口的读出端扩宽; 可训练范围 = 仅
+    # 新增多槽读出件, 端口/decoder/backbone/写入侧全冻在 E118 收官态。
+    # 默认全关 = 旧路径逐位不变 (--decoder-denoise-* 先例)。
+    parser.add_argument(
+        "--multislot-readout",
+        action="store_true",
+        help="Q20 多槽读出臂总开关 (默认关 = 旧路径逐位不变; 要求 slm b 格 + --init-checkpoint E118 基座)",
+    )
+    parser.add_argument(
+        "--multislot-readout-k",
+        choices=["1", "4", "8", "cg"],
+        default="4",
+        help="槽位扫描档 (任务书 §5.1 裁定 {1,4,8}) | cg = CG 结构内化对照臂 (T=8 步可微 CG 段1 + 可学段2 投影, 无 k 轴)",
+    )
+    parser.add_argument(
+        "--multislot-readout-fuzz-id",
+        default="outputs/decoder_denoise_fuzz_id_20260829",
+        help="温启动产物目录 (ridge 段1主方向 q20_ridge_dir.npz + λopt=1.0 部署桥; 缺件响亮报错不静默降级)",
+    )
 
 
 def main() -> None:
@@ -3278,6 +3416,32 @@ def main() -> None:
             raise SystemExit(
                 "--decoder-denoise requires --decoder-denoise-fuzz-id <前置测量产物目录> "
                 "(probe_decoder_fuzz_id 落盘; 噪声参数只来自前置测量, 不许拍脑袋)"
+            )
+    q20_on = _multislot_readout_enabled(args)
+    if q20_on:
+        # Q20 多槽读出臂 (任务书冻结 v1): 响亮校验——b 格限定 (K 通道状态机 +
+        # d_mem 端口同在, 现役 canonical attn 模式结构性无此链); 微调臂需
+        # E118 基座; 不与去噪臂同开 (基座已是练钝态, denoise 旗标关——任务书
+        # §3.1); 不组合 Q18 (训练步整体委托独立机制, direct 腿不经
+        # _slm_forward)。模型侧创建校验 (recurrence/档位) 在 build_model。
+        if denoise_on:
+            raise SystemExit("--multislot-readout 不与 --decoder-denoise 同开 (基座已是 E118 练钝态, 任务书 §3.1)")
+        if q18_on:
+            raise SystemExit(
+                "--multislot-readout 不组合 Q18 臂 (Q18 训练步整体委托独立机制, direct 腿不经 _slm_forward)"
+            )
+        if (
+            getattr(args, "backbone_mode", "") != "slm"
+            or getattr(args, "k_row_source", "") != "state"
+            or getattr(args, "v_row_source", "memory") != "memory"
+        ):
+            raise SystemExit(
+                "--multislot-readout requires --backbone-mode slm + k_row_source=state + v_row_source=memory "
+                "(b 格: 读出对象 = K 通道 post-state, 落口 = decoder_in_mem d_mem 端口)"
+            )
+        if not args.init_checkpoint:
+            raise SystemExit(
+                "--multislot-readout 需要 --init-checkpoint <E118 收官 latest.pt> (读出端扩宽是微调臂, 非从零)"
             )
     if getattr(args, "cloze_prob", 0.0) > 0:
         # v3.7 cloze 检索回执 (user-ruled 2026-08-17): slm-only -- on legacy
@@ -3466,6 +3630,36 @@ def main() -> None:
             f"s_ladder={_denoise_s_ladder(args)} | "
             f"仅 decoder 可训: trainable={n_train} frozen={n_frozen} "
             f"(decoder_in_mem/chunk_pos/backbone/写入侧/tied byte_lookup 全冻)",
+            flush=True,
+        )
+    if q20_on:
+        # Q20 多槽读出臂 (任务书冻结 v1 §3.1/§3.3): 基座 = E118 收官 (端口练
+        # 钝态)。基座全键全形校验 (去噪臂冒烟事故入例的 loud-fail 同款, 豁免
+        # multislot_readout.* 新件键——它们由温启动装载, 双向核对) → 温启动
+        # (缺件响亮报错) → 冻结白名单 = 仅多槽读出件 (终态不受
+        # freeze_prefixes 内容影响——它先跑, 这里是确定性覆写)。
+        _q20_payload = torch.load(args.init_checkpoint, map_location="cpu", weights_only=False)["model"]
+        _q20_cur = model.state_dict()
+        _q20_bad = [
+            k
+            for k in _q20_cur
+            if not k.startswith("multislot_readout.")
+            and (k not in _q20_payload or _q20_payload[k].shape != _q20_cur[k].shape)
+        ]
+        _q20_extra = [k for k in _q20_payload if k not in _q20_cur]
+        if _q20_bad or _q20_extra:
+            raise SystemExit(
+                f"[s1][q20] 基座全键全形校验失败: {len(_q20_bad)} 键缺失/形不符 + {len(_q20_extra)} 冗键 "
+                f"(如 {(_q20_bad + _q20_extra)[:5]}) —— 检查 --config 来源与基座的架构漂移 "
+                "(典型: summarizer_pool 现行默认 qpool vs v37.1 基座 mean, 需显式 --summarizer-pool mean)"
+            )
+        del _q20_payload, _q20_cur
+        warm_note = _multislot_readout_warm_start(model, args.multislot_readout_fuzz_id)
+        n_train, n_frozen = _multislot_readout_freeze(model)
+        print(
+            f"[s1][q20] 多槽读出臂 (E119): k={args.multislot_readout_k} fuzz_id={args.multislot_readout_fuzz_id} "
+            f"温启动[{warm_note}] | 仅多槽读出件可训: trainable={n_train} frozen={n_frozen} "
+            f"(decoder/decoder_in_mem/backbone/写入侧/tied byte_lookup 全冻在 E118 收官态)",
             flush=True,
         )
     if q18_on:

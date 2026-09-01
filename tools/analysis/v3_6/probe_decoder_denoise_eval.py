@@ -19,6 +19,15 @@ eval_direct_acc 同函数链）。
   scrambled   置乱行: 实行在窗内随机置换（边缘分布保留、行↔chunk 绑定摧毁）,
               地板门 ≤0.10（先验 0.071 同档; 漏 = decoder 学会无视条件行, 读数作废）。
 
+Q20 五列形态（E119, 任务书冻结 v1 §2/§3.6——ckpt 的 resolved_config 带
+multislot_readout=True 即自动切换, 旗标关 = 四列旧行为逐位不变）:
+  q20_k       多槽读出行（本臂产出）过练钝端口端到端——主判据列, 唯一硬通货
+              (行生产与训练器 _multislot_readout_rows 同链, 零域移);
+  q20_e68     同读出行过 E118 前未练钝端口 (E68 基座 ckpt, --q20-e68-ckpt;
+              eval-only)——辅助归因列, 端口练钝贡献分账, 非硬通货;
+  mhat        降级为闭式参照列 (同函数不动, E118 收官值 0.4572 同场复测)。
+  自检门修订: clean ∈ 0.8323±2pp (换 E118 锚) 且 scrambled ≤0.10。
+
 监护列（§2 唯一硬指标随测, 工具臂不承诺张开）: 逐条目 Δ = burst_tail 源段
 完好−置乱, 复用 probe_burst_route_q15 的 run_arm/_splice_burst/_delta_aggregate
 原函数（intact/src_scrambled 两臂, 压缩区剔除同开, SPLICE_SEED 同源）——
@@ -67,6 +76,8 @@ S_LADDER = (0.5, 1.0, 2.0)  # 修订 v2 冻结档 (轻/中/重)
 NOISE_SEED = 20260829  # 独立抽签流 (与训练器 101087 偏移、q15 SPLICE_SEED 不混)
 SCRAMBLE_SEED = 20260830
 CLEAN_REF, CLEAN_TOL = 0.7917, 0.02  # E68 收官水位 ±2pp (自检门)
+CLEAN_REF_Q20 = 0.8323  # E118 收官水位 (Q20 五列形态自检门锚, 任务书 §3.6 修订)
+Q20_E68_CKPT = "checkpoints/v37ks_b_sm_v371_20k_ctx4096_20260817"  # q20×E68 归因列的未练钝端口 donor (E68 b 格)
 FLOOR_GATE = 0.10  # 置乱地板门 (先验 0.071 同档, §2 冻结)
 
 DECLARED_NOTES = [
@@ -98,11 +109,17 @@ def scramble_rows(m: torch.Tensor, gen: torch.Generator) -> tuple[torch.Tensor, 
 def column_rows(model, m: torch.Tensor, index: torch.Tensor, chunk_mask: torch.Tensor, fuzz: dict,
                 gen_noise: torch.Generator, gen_scr: torch.Generator, s_ladder=S_LADDER) -> dict[str, torch.Tensor]:
     """四列行变体 (输入 m = (n_real, d_mem) 真实 memory 行, fp32 任意设备;
-    噪声/置乱抽签在 CPU 故设备无关)。Returns {列名: (n_real, d_mem) 与 m 同设备}。"""
+    噪声/置乱抽签在 CPU 故设备无关)。Returns {列名: (n_real, d_mem) 与 m 同设备}。
+    Q20 五列形态 (E119): 模型带 multislot_readout 件 (臂 ckpt) 时 clean 之后
+    追加 q20_k 列——多槽读出行 (与训练器 _multislot_readout_rows 同链); 模型
+    无该件 = 四列旧行为逐位不变。"""
     device = m.device
     z = torch.randn(m.shape, generator=gen_noise)  # 同窗三档共享 z (M2)
     L = fuzz["chol"].float().cpu()
     cols = {"clean": m}
+    if hasattr(model, "multislot_readout"):
+        n_real = int(chunk_mask[0].sum())
+        cols["q20_k"] = s1._multislot_readout_rows(model, index, chunk_mask)[0, :n_real]
     for s in s_ladder:
         cols[f"noise_s{s:g}"] = (fuzz["rho"] * m.cpu() + s * (z @ L.T)).to(device)
     scr, _perm = scramble_rows(m.cpu(), gen_scr)
@@ -111,12 +128,13 @@ def column_rows(model, m: torch.Tensor, index: torch.Tensor, chunk_mask: torch.T
     return cols
 
 
-def self_check_failures(clean_acc: float, scrambled_acc: float) -> list[str]:
-    """基座 t=0 自检门 (任务书 §2 + 交接验收): clean 贴 E68 水位 ±2pp,
+def self_check_failures(clean_acc: float, scrambled_acc: float, clean_ref: float = CLEAN_REF) -> list[str]:
+    """基座 t=0 自检门 (任务书 §2 + 交接验收): clean 贴水位锚 ±2pp (旧行为 =
+    E68 锚 0.7917; Q20 五列形态换 E118 锚 0.8323, 任务书 §3.6 修订),
     scrambled 贴地板 ≤0.10。Returns 失败原因列表 (空 = 过)。"""
     fails = []
-    if not (CLEAN_REF - CLEAN_TOL <= clean_acc <= CLEAN_REF + CLEAN_TOL):
-        fails.append(f"clean={clean_acc:.4f} 不在 [{CLEAN_REF - CLEAN_TOL:.4f}, {CLEAN_REF + CLEAN_TOL:.4f}] (E68 水位 {CLEAN_REF}±2pp)")
+    if not (clean_ref - CLEAN_TOL <= clean_acc <= clean_ref + CLEAN_TOL):
+        fails.append(f"clean={clean_acc:.4f} 不在 [{clean_ref - CLEAN_TOL:.4f}, {clean_ref + CLEAN_TOL:.4f}] (水位锚 {clean_ref}±2pp)")
     if scrambled_acc > FLOOR_GATE:
         fails.append(f"scrambled={scrambled_acc:.4f} 漏地板门 (> {FLOOR_GATE}; 先验 0.071 同档)")
     return fails
@@ -161,9 +179,13 @@ def load_ckpt(ckpt: str, device: torch.device):
 
 @torch.no_grad()
 def eval_window_columns(model, ns, clean: torch.Tensor, byte_mask: torch.Tensor, device, fuzz: dict,
-                        gen_noise: torch.Generator, gen_scr: torch.Generator, s_ladder=S_LADDER) -> dict:
+                        gen_noise: torch.Generator, gen_scr: torch.Generator, s_ladder=S_LADDER,
+                        donor=None) -> dict:
     """单窗四列: 前端 → 真 memory 行 → 列变体 → direct 腿 (decode_rows_donor)
-    → fine 细格 echo byte_acc (as-encoded 主口径 + clean 视图备查)。batch=1。"""
+    → fine 细格 echo byte_acc (as-encoded 主口径 + clean 视图备查)。batch=1。
+    Q20 五列形态 (donor 在岗时): q20_k 行再过 donor (E68 未练钝端口) 的
+    decode 链得 q20_e68 归因列 (eval-only, 非硬通货)——前端位级同源 (写入侧/
+    前端全冻), token_mask 取本窗 chunks (decode_rows_donor D1 借口同款)。"""
     source = clean.masked_fill(byte_mask, MASK_ID)
     chunks, memory, index = _front_end(model, source)
     n_real = int(chunks.chunk_mask[0].sum())
@@ -181,6 +203,15 @@ def eval_window_columns(model, ns, clean: torch.Tensor, byte_mask: torch.Tensor,
             targets_enc.to(device), torch.zeros_like(slot_mask).to(device),
         )
         rec[name] = {"acc": round(gm["acc"], 4), "acc_clean": round(gm["acc_clean"], 4), "n_slots": gm["n_slots"]}
+        if name == "q20_k" and donor is not None:
+            logits_e68 = decode_rows_donor(donor, rows.unsqueeze(0).float(), chunks.token_mask)
+            gm_e68 = grid_metrics(
+                logits_e68, targets_enc.to(device), slot_mask.to(device),
+                targets_enc.to(device), torch.zeros_like(slot_mask).to(device),
+            )
+            rec["q20_e68"] = {
+                "acc": round(gm_e68["acc"], 4), "acc_clean": round(gm_e68["acc_clean"], 4), "n_slots": gm_e68["n_slots"]
+            }
     return rec
 
 
@@ -201,7 +232,9 @@ def main() -> None:
     p.add_argument("--s-ladder", default=",".join(f"{s:g}" for s in S_LADDER), help="噪声档 CSV (修订 v2 冻结 0.5,1,2)")
     p.add_argument("--out-dir", default=DEFAULT_OUT)
     p.add_argument("--self-check", action="store_true",
-                   help="基座 t=0 自检门: clean 贴 E68 水位 ±2pp 且 scrambled ≤0.10, 不过非零退出")
+                   help="基座 t=0 自检门: clean 贴水位锚 ±2pp (E68 0.7917; Q20 形态换 E118 0.8323) 且 scrambled ≤0.10, 不过非零退出")
+    p.add_argument("--q20-e68-ckpt", default=Q20_E68_CKPT,
+                   help="Q20 五列形态的 q20×E68 归因列 donor (E68 未练钝端口基座; 仅 q20 模式装载)")
     args = p.parse_args()
     device = torch.device("cuda" if (args.device == "auto" and torch.cuda.is_available()) or args.device == "cuda" else "cpu")
     out_dir = Path(args.out_dir)
@@ -212,10 +245,21 @@ def main() -> None:
     model, ns, step, run_name, pt_name = load_ckpt(args.ckpt, device)
     if getattr(ns, "v_row_source", "") != "memory" or not hasattr(model, "decoder_in_mem"):
         raise SystemExit(f"{run_name}: 预期 b 格 v_row_source='memory' + decoder_in_mem 在岗 (去噪臂作用端口缺席)")
+    # Q20 五列形态 (E119 任务书冻结 v1 §2/§3.6): ckpt 的 resolved_config 带
+    # multislot_readout=True → q20_k 主判据列 + q20×E68 归因列; 否则四列旧
+    # 行为逐位不变
+    q20_mode = bool(getattr(ns, "multislot_readout", False))
+    donor = None
+    donor_name = ""
+    if q20_mode:
+        if not hasattr(model, "multislot_readout"):
+            raise SystemExit(f"{run_name}: resolved_config 开 multislot_readout 但模型缺件 —— 装载事故, 响亮退出")
+        donor, _dns, _dstep, donor_name, _dpt = load_ckpt(args.q20_e68_ckpt, device)
     fuzz = s1._load_decoder_denoise_fuzz(args.fuzz_id)  # λopt=1.0 部署桥单采样器 (修订 v2)
     print(
         f"[denoise-eval] ckpt={run_name}/{pt_name} step={step} device={device.type} "
-        f"fuzz={args.fuzz_id} (tag={fuzz['tag']}, lam={fuzz['lam']}, ρ={fuzz['rho']:.4f}) s_ladder={s_ladder}",
+        f"fuzz={args.fuzz_id} (tag={fuzz['tag']}, lam={fuzz['lam']}, ρ={fuzz['rho']:.4f}) s_ladder={s_ladder}"
+        + (f" | Q20 五列形态: k={getattr(ns, 'multislot_readout_k', '?')} donor={donor_name}" if q20_mode else ""),
         flush=True,
     )
 
@@ -224,13 +268,14 @@ def main() -> None:
     masks = build_masks(windows, ns)
     gen_noise = torch.Generator().manual_seed(NOISE_SEED)
     gen_scr = torch.Generator().manual_seed(SCRAMBLE_SEED)
-    col_names = ["clean"] + [f"noise_s{s:g}" for s in s_ladder] + ["mhat", "scrambled"]
+    col_names = ["clean"] + (["q20_k", "q20_e68"] if q20_mode else []) + [f"noise_s{s:g}" for s in s_ladder] + ["mhat", "scrambled"]
     items_path = out_dir / "items.jsonl"
     items_fp = items_path.open("w", encoding="utf-8")
     win_recs = []
     for wi, (clean, byte_mask) in enumerate(zip(windows, masks)):
         rec = eval_window_columns(
-            model, ns, clean.to(device), byte_mask.to(device), device, fuzz, gen_noise, gen_scr, s_ladder
+            model, ns, clean.to(device), byte_mask.to(device), device, fuzz, gen_noise, gen_scr, s_ladder,
+            donor=donor,
         )
         rec = {"kind": "column_window", "window": wi, **rec}
         win_recs.append(rec)
@@ -290,8 +335,14 @@ def main() -> None:
     delta = q15p._delta_aggregate(d_items)
 
     # --- 聚合 + 自检门 + 落盘 ---
-    fails = self_check_failures(col_acc["clean"], col_acc["scrambled"]) if args.self_check else []
+    clean_ref = CLEAN_REF_Q20 if q20_mode else CLEAN_REF  # 自检门修订 (任务书 §3.6): Q20 形态换 E118 锚
+    fails = self_check_failures(col_acc["clean"], col_acc["scrambled"], clean_ref=clean_ref) if args.self_check else []
     floor_ok = col_acc["scrambled"] <= FLOOR_GATE
+    col_defs = {"clean": "干净行 (水位锚)", "noise_s*": "统计匹配噪声 ṽ=ρ·m+s·(z@Lᵀ)",
+                "mhat": "m̂ 岭估计行 (λopt 部署桥整行替换)", "scrambled": "置乱行 (地板门 ≤0.10)"}
+    if q20_mode:
+        col_defs["q20_k"] = "多槽读出行 (本臂产出) 过练钝端口端到端 —— 主判据列, 唯一硬通货"
+        col_defs["q20_e68"] = f"同读出行过 E68 未练钝端口 ({donor_name}, eval-only) —— 辅助归因列, 非硬通货"
     report = {
         "probe": "decoder 去噪臂四列收官探针 (任务书 §2 判读表评测仪器, 修订 v2 s 档)",
         "spec": "docs/versions/v3.7/FLUED_V3_7_DECODER_DENOISE_20260829_CN.md",
@@ -306,30 +357,43 @@ def main() -> None:
         "columns": {
             "byte_acc": col_acc,  # as-encoded 主口径 (E60–E68 fine 细格 echo)
             "byte_acc_clean_view": col_acc_clean,
-            "defs": {"clean": "干净行 (水位锚)", "noise_s*": "统计匹配噪声 ṽ=ρ·m+s·(z@Lᵀ)",
-                     "mhat": "m̂ 岭估计行 (λopt 部署桥整行替换)", "scrambled": "置乱行 (地板门 ≤0.10)"},
+            "defs": col_defs,
         },
         "floor_gate": {"scrambled": col_acc["scrambled"], "gate": FLOOR_GATE, "pass": floor_ok},
         "delta_monitor": delta,  # 监护列: 逐条目 Δ 聚合 (q15 口径; 只报相对移动)
-        "self_check": {"requested": bool(args.self_check), "failures": fails, "pass": not fails},
+        "self_check": {"requested": bool(args.self_check), "clean_ref": clean_ref, "failures": fails, "pass": not fails},
         "items_path": str(items_path),
         "timing_sec": round(time.time() - t0, 1),
     }
+    if q20_mode:
+        # Q20 形态注记 (E119): 新口径边界 (任务书 §3.5)——本 ckpt 的列读数不与
+        # E60–E118 的 b 格锚混排, 对比读数须标注「多槽读出口径」
+        report["q20"] = {
+            "mode": True, "k": str(getattr(ns, "multislot_readout_k", "?")),
+            "e68_donor": donor_name,
+            "spec": "docs/versions/v3.7/FLUED_V3_7_Q20_MULTISLOT_READOUT_20260829_CN.md",
+            "primary_column": "q20_k",
+            "note": "多槽读出口径: 本表读数不与 E60–E118 的 b 格锚混排 (新口径边界, 任务书 §3.5)",
+        }
     (out_dir / "summary.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def fmt(v):
         return "N/A" if v is None else f"{v:.4f}"
 
+    q20_col_str = (
+        f"q20_k {fmt(col_acc['q20_k'])} (主判据) | q20_e68 {fmt(col_acc['q20_e68'])} (归因) | " if q20_mode else ""
+    )
     lines = [
-        "decoder 去噪臂四列收官探针（任务书 §2 判读表仪器, 修订 v2 s 档, fine 细格 echo byte_acc）",
+        "decoder 去噪臂四列收官探针（任务书 §2 判读表仪器, 修订 v2 s 档, fine 细格 echo byte_acc）"
+        + ("—— Q20 五列形态 (E119 多槽读出口径)" if q20_mode else ""),
         f"日期 {report['created']}  设备 {device.type}  ckpt={run_name}/{pt_name} (step {step})  "
         f"eval 窗 {len(win_recs)} (seed+9999, mask_seed={ns.eval_mask_seed})",
         f"fuzz_id={args.fuzz_id} (λopt 部署桥 tag={fuzz['tag']}, ρ={fuzz['rho']:.4f})",
         "",
-        "四列 byte_acc (as-encoded 主口径):",
-        f"  clean {fmt(col_acc['clean'])} | "
+        f"{'五' if q20_mode else '四'}列 byte_acc (as-encoded 主口径):",
+        f"  clean {fmt(col_acc['clean'])} | " + q20_col_str
         + " | ".join(f"noise_s{s:g} {fmt(col_acc[f'noise_s{s:g}'])}" for s in s_ladder)
-        + f" | mhat {fmt(col_acc['mhat'])} | scrambled {fmt(col_acc['scrambled'])}",
+        + f" | mhat {fmt(col_acc['mhat'])} (闭式参照) | scrambled {fmt(col_acc['scrambled'])}",
         f"地板门: scrambled {fmt(col_acc['scrambled'])} ≤ {FLOOR_GATE} → {'过' if floor_ok else '漏 (读数作废, 不发判词)'}",
         "",
         f"监护列 Δ (burst_tail 完好−置乱, q15 口径): {delta['mean']:.4f} ± {delta['ci95']:.4f} "

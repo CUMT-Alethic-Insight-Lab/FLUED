@@ -314,6 +314,17 @@ class V36Config:
     # decoder conditions each chunk on its page's output row. Needs targets
     # for the residual criterion (S1 trainer path only).
     paged_cache_rows: int = 1
+    # Q20 多槽读出 (multi-slot readout, E119; 任务书冻结 v1 2026-08-29:
+    # docs/versions/v3.7/FLUED_V3_7_Q20_MULTISLOT_READOUT_20260829_CN.md):
+    # b 格 K 通道压缩状态 → decoder direct 口的读出端扩宽——k 个可学习槽位
+    # 查询逐段读 K 通道 post-state、拼接后单层 Linear 投影回 d_mem (decoder
+    # 入口宽度); multislot_readout_k="cg" = CG 对照臂 (段1 由 T=8 步可微 CG
+    # 迭代逼 Gram 正规方程闭式解, 段2 可学投影, 无 k 轴)。独立成件
+    # (model.multislot_readout), 不动 KDAStateMachine.readout_query/realign
+    # (那是 backbone store 的生产读出)。默认关 = 旧路径逐位不变, 老 ckpt
+    # strict-load 干净 (条件创建纪律同 decoder_in_mem/aux_recon 先例)。
+    multislot_readout: bool = False
+    multislot_readout_k: str = "4"  # 预注册槽位扫描档 "1"|"4"|"8" | "cg" (CG 对照臂)
 
 
 @dataclass
@@ -1125,6 +1136,150 @@ class KDAStateMachine(nn.Module):
         read = torch.einsum("qhk,bhkv->bqhv", q, state)
         read = read.reshape(bsz, 1, q.size(0), heads * dv).to(k.dtype)
         return self.realign(read), state
+
+
+# ---------------------------------------------------------------------------
+# Q20 多槽读出 (multi-slot readout, E119; 任务书冻结 v1 2026-08-29:
+# docs/versions/v3.7/FLUED_V3_7_Q20_MULTISLOT_READOUT_20260829_CN.md)
+# ---------------------------------------------------------------------------
+
+Q20_CG_ITERS = 8  # CG 臂迭代深度 T (任务书 §1 冻结: 固定不扫——迭代深度≠读出宽度)
+Q20_CG_LAM = 1.0  # CG 臂 Gram 正规方程 λ (=λopt=1.0 部署桥口径, 任务书 §1 冻结)
+
+
+def _kda_scan_post_states(gates: dict[str, torch.Tensor], chunk_mask: torch.Tensor) -> torch.Tensor:
+    """逐段 KDA post-state 轨迹: S_i = 吃完 chunk i 后的状态 (fp32 torch 串行
+    扫描, 更新律同 KDAStateMachine._forward_torch; padded 行 = 恒等步, 与
+    probe_oracle_write_verdict.trained_states 同形)。Returns (B, C, H, hk, hv)。
+    仅 kda 递推 (gdn2 不在 Q20 作用域, 配置层已响亮拒绝)。"""
+    k, v = gates["k"], gates["v"]
+    keep = chunk_mask.unsqueeze(-1).unsqueeze(-1).to(k.dtype)
+    k = k * keep
+    v = v * keep
+    bsz, chunks, heads, dk = k.shape
+    dv = v.size(-1)
+    state = k.new_zeros(bsz, heads, dk, dv, dtype=torch.float32)
+    kf, vf = k.float(), v.float()
+    alpha = gates["alpha"][0].unsqueeze(0).unsqueeze(-1)
+    mask5 = chunk_mask.float().view(bsz, chunks, 1, 1, 1)
+    alpha_eff = 1.0 - mask5 + mask5 * alpha
+    beta = gates["beta"].float() * chunk_mask.float().unsqueeze(-1)
+    states = []
+    for i in range(chunks):
+        ki, vi, bi, ai = kf[:, i], vf[:, i], beta[:, i], alpha_eff[:, i]
+        state = ai * state
+        kTs = torch.einsum("bhk,bhkv->bhv", ki, state)
+        state = state - bi.view(bsz, heads, 1, 1) * ki.unsqueeze(-1) * kTs.unsqueeze(-2)
+        state = state + bi.view(bsz, heads, 1, 1) * ki.unsqueeze(-1) * vi.unsqueeze(-2)
+        states.append(state)
+    return torch.stack(states, dim=1)
+
+
+class MultiSlotReadout(nn.Module):
+    """Q20 多槽读出件 (multi-slot readout) 的 k 槽查询臂 (预注册 k∈{1,4,8})。
+
+    k 个可学习槽位查询 (k, H, hk) 逐段读 K 通道 post-state (每段吃完该
+    chunk 后的状态 S_i), k 根读出拼接 (k×H×hv) 经单层 Linear 投影回 d_mem
+    (decoder 入口宽度), 喂冻结的 decoder_in_mem → decoder。独立成件——不动
+    KDAStateMachine.readout_query/realign (那是 backbone store 的生产读出)。
+    读状态走 _fla_chunk_kda 任意 q 展开 (KDAStateMachine._forward_fla 的
+    readout_queries 循环先例); torch 串行扫描为回落/参考路径 (同
+    _forward_torch 更新律, fp32)。padded 行垃圾但下游掩码, 与主路径同约定。
+    """
+
+    def __init__(self, c: V36Config, k: int) -> None:
+        super().__init__()
+        self.c = c
+        self.k = k
+        self.slot_query = nn.Parameter(torch.empty(k, c.kda_heads, c.kda_head_k))
+        nn.init.trunc_normal_(self.slot_query, std=0.02)
+        self.proj = nn.Linear(k * c.kda_heads * c.kda_head_v, c.d_mem)
+
+    def forward(self, gates: dict[str, torch.Tensor], chunk_mask: torch.Tensor) -> torch.Tensor:
+        """gates = write_head_k(index) 的 K 通道生产写门。Returns (B, C, d_mem)
+        fp32 读出行 (逐段, 与 v_rows 同网格)。"""
+        if self.c.kda_impl == "fla" and _fla_chunk_kda is not None:
+            return self._forward_fla(gates, chunk_mask)
+        return self._forward_torch(gates, chunk_mask)
+
+    def _forward_fla(self, gates: dict[str, torch.Tensor], chunk_mask: torch.Tensor) -> torch.Tensor:
+        k, v, alpha = gates["k"], gates["v"], gates["alpha"]
+        beta = gates["beta"]
+        keep = chunk_mask.unsqueeze(-1).unsqueeze(-1).to(k.dtype)
+        k = k * keep
+        v = v * keep
+        beta = beta * chunk_mask.unsqueeze(-1).to(beta.dtype)
+        g = torch.log(alpha.clamp_min(1.0e-6)).to(k.dtype) * keep
+        bsz, chunks = k.size(0), k.size(1)
+        outs = []
+        for s in range(self.k):  # 任意 q 展开: readout_queries 循环先例 (_forward_fla)
+            o, _ = _fla_chunk_kda(
+                q=self.slot_query[s].to(k.dtype).unsqueeze(0).unsqueeze(0).expand(bsz, chunks, -1, -1).contiguous(),
+                k=k,
+                v=v,
+                g=g.expand(bsz, chunks, -1, -1).contiguous(),
+                beta=beta,
+                scale=1.0,
+                use_qk_l2norm_in_kernel=False,
+                output_final_state=False,
+            )
+            outs.append(o)  # (B, C, H, hv)
+        read = torch.stack(outs, dim=2).reshape(bsz, chunks, self.k * self.c.kda_heads * self.c.kda_head_v)
+        return self.proj(read.float())
+
+    def _forward_torch(self, gates: dict[str, torch.Tensor], chunk_mask: torch.Tensor) -> torch.Tensor:
+        c = self.c
+        states = _kda_scan_post_states(gates, chunk_mask)  # (B, C, H, hk, hv) fp32
+        q = self.slot_query.float()  # (k, H, hk)
+        read = torch.einsum("qhk,bchkv->bcqhv", q, states)  # (B, C, k, H, hv)
+        read = read.reshape(states.size(0), states.size(1), self.k * c.kda_heads * c.kda_head_v)
+        return self.proj(read)
+
+
+class CGRidgeReadout(nn.Module):
+    """Q20 CG 对照臂 (结构内化, MesaNet 模板, 无 k 轴): 段 1 解混不前馈学习,
+    由 T=Q20_CG_ITERS 步可微 CG 迭代逼闭式解——逐段对窗内写入键的 Gram 正规
+    方程 (K_iᵀK_i + λI) c_i = k_i (ridge 段1 own-chunk 回收方向
+    c_i = K_iᵀ(K_iK_iᵀ+λI)⁻¹e_i 的键空间等价形, λ=Q20_CG_LAM 部署桥口径),
+    v̂_i = c_iᵀ S_i; 段 2 = 可学投影 (H*hv → d_mem)。T 固定不扫 (迭代深度≠
+    读出宽度)。CG 迭代全部可微 (matmul/加法展开), 梯度可穿迭代件落写入门——
+    本臂冻结纪律下写侧无梯度, 可训的只有段 2 投影。全 fp32 torch 路径 (逐段
+    post-state 轨迹只有串行扫描生产, CG 臂迭代税已预注册 +25%)。"""
+
+    def __init__(self, c: V36Config) -> None:
+        super().__init__()
+        self.c = c
+        self.proj = nn.Linear(c.kda_heads * c.kda_head_v, c.d_mem)
+
+    def forward(self, gates: dict[str, torch.Tensor], chunk_mask: torch.Tensor) -> torch.Tensor:
+        """gates = write_head_k(index) 的 K 通道生产写门。Returns (B, C, d_mem)
+        fp32 读出行 (逐段, 与 v_rows 同网格)。"""
+        c = self.c
+        k = gates["k"]
+        keep = chunk_mask.unsqueeze(-1).unsqueeze(-1).to(k.dtype)
+        kf = (k * keep).float()  # padded 键置零: 零外积不进 Gram, b=0 行解出 c=0
+        bsz, chunks, heads, dk = kf.shape
+        states = _kda_scan_post_states(gates, chunk_mask)  # (B, C, H, hk, hv) fp32
+        # 段 1: 逐段 Gram 正规方程 (K_iᵀK_i + λI) c_i = k_i, K_i = 前 i+1 个
+        # 写入键 (cumsum 累计); T 步可微 CG 逼闭式解
+        kh = kf.permute(0, 2, 1, 3)  # (B, H, C, hk)
+        outer = torch.einsum("bhci,bhcj->bhcij", kh, kh)
+        A = outer.cumsum(dim=2) + Q20_CG_LAM * torch.eye(dk, device=kh.device, dtype=torch.float32)
+        x = torch.zeros_like(kh)
+        r = kh.clone()
+        p = r.clone()
+        for _ in range(Q20_CG_ITERS):
+            Ap = torch.einsum("bhcij,bhcj->bhci", A, p)
+            rr = (r * r).sum(dim=-1)
+            alpha_cg = rr / (p * Ap).sum(dim=-1).clamp_min(1e-12)
+            x = x + alpha_cg.unsqueeze(-1) * p
+            r = r - alpha_cg.unsqueeze(-1) * Ap
+            rr_new = (r * r).sum(dim=-1)
+            p = r + (rr_new / rr.clamp_min(1e-12)).unsqueeze(-1) * p
+        # v̂_i = c_iᵀ S_i (逐头), 拼接 H*hv → 段 2 可学投影
+        vh = torch.einsum("bhcj,bchjv->bchv", x, states)  # (B, C, H, hv)
+        read = vh.reshape(bsz, chunks, heads * c.kda_head_v)
+        return self.proj(read)
 
 
 def _xcache_select(scores: torch.Tensor, chunk_mask: torch.Tensor, frac: float) -> torch.Tensor:
@@ -2107,6 +2262,28 @@ class FLUEDV36(nn.Module):
                 nn.GELU(),
             )
             self.aux_out = nn.Linear(h_dim, 258)
+        # Q20 多槽读出臂 (multi-slot readout, E119; 任务书冻结 v1 2026-08-29:
+        # docs/versions/v3.7/FLUED_V3_7_Q20_MULTISLOT_READOUT_20260829_CN.md):
+        # b 格 K 通道 post-state → decoder direct 口的读出端扩宽件。条件创建
+        # 纪律同 decoder_in_mem/aux_recon 先例: 默认关 = 不创建, 旧路径逐位
+        # 不变, 老 ckpt strict-load 干净; 旗标开且读出对象 (K 通道状态机) 与
+        # 落口 (d_mem 端口) 缺一 = 结构性 N/A, 响亮报错不静默。
+        if getattr(c, "multislot_readout", False):
+            if not (slm and c.k_row_source == "state" and c.v_row_source == "memory"):
+                raise ValueError(
+                    "multislot_readout requires backbone_mode='slm' + k_row_source='state' "
+                    "+ v_row_source='memory' (Q20 读出对象 = b 格 K 通道 post-state, "
+                    "落口 = decoder_in_mem d_mem 端口)"
+                )
+            if getattr(c, "recurrence", "kda") != "kda":
+                raise ValueError("multislot_readout supports recurrence='kda' only (gdn2 不在本臂作用域)")
+            k_spec = str(getattr(c, "multislot_readout_k", "4"))
+            if k_spec == "cg":
+                self.multislot_readout = CGRidgeReadout(c)
+            elif k_spec in ("1", "4", "8"):
+                self.multislot_readout = MultiSlotReadout(c, int(k_spec))
+            else:
+                raise ValueError(f"multislot_readout_k 非法: {k_spec!r} (预注册档位 1|4|8|cg)")
 
     def aux_recon_logits(self, memory: torch.Tensor) -> torch.Tensor:
         """(B, C, d_mem) memory rows -> (B, C, max_span, 258) per-slot byte

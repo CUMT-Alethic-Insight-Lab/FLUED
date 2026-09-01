@@ -99,6 +99,10 @@ def build_model(args: Namespace) -> FLUEDV36:
             supp_source=getattr(args, "supp_source", "state"),
             residual_gate_temp=getattr(args, "residual_gate_temp", 1.0),
             paged_cache_rows=getattr(args, "paged_cache_rows", 1),
+            # Q20 多槽读出臂 (E119): 默认关 = 不创建 (条件创建纪律); getattr
+            # 兜默认, 老 resolved_config 无此键也安全 (关态)
+            multislot_readout=getattr(args, "multislot_readout", False),
+            multislot_readout_k=str(getattr(args, "multislot_readout_k", "4")),
             decoder_hidden=args.decoder_hidden,
             decoder_layers=args.decoder_layers,
             max_chunks=args.max_chunks,
