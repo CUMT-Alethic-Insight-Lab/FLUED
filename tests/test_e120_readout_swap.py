@@ -126,6 +126,7 @@ def test_parser_defaults_off():
     s1._add_s1_args(parser)
     args = parser.parse_args([])
     assert args.e120_readout_swap is False
+    assert args.e120_random_init is False
     assert args.e120_fit_dir == "outputs/e120_warmstart_fit_20260903"
 
 

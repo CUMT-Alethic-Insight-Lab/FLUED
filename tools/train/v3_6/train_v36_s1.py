@@ -3430,6 +3430,13 @@ def _add_s1_args(parser: argparse.ArgumentParser) -> None:
         help="温启动产物目录 (probe_e120_warmstart_fit.py 落盘: bridge_deploy.npz + q_ridge_dir.npz; "
              "缺件/缺键/形不符响亮报错不静默降级)",
     )
+    parser.add_argument(
+        "--e120-random-init",
+        action="store_true",
+        help="E120 随机初始化对照列 (修订 v3 2026-09-04 用户裁定: 裁 3 读数 b 格 k=1 t=0 温启动 "
+             "0.0598 < 随机 0.1173, E119「温启动承重」降级为待本列判决的开放假说; 显式豁免 "
+             "温启动装载, 保持 trunc_normal 0.02 随机初始化; 仅乙列训练态可用, 甲列 eval-only 响亮拒绝)",
+    )
 
 
 def main() -> None:
@@ -3584,6 +3591,11 @@ def main() -> None:
             raise SystemExit(
                 "--e120-readout-swap 需要 --init-checkpoint <25b 收官 latest.pt> (乙列微调臂, 非从零) "
                 "或 --eval-only <基座 latest.pt> (甲列纯插拔)"
+            )
+        if getattr(args, "e120_random_init", False) and args.eval_only:
+            raise SystemExit(
+                "--e120-random-init 仅乙列训练态可用 (甲列语义 = 温启动件纯插拔测 Δ, "
+                "随机件插拔不在判读表四格内)"
             )
         # 乙列解冻语义 (任务书 §1 两臂同测: 全模型解冻, 含新件): 基座配方继承的
         # freeze_prefixes (前端冻结) 在本臂清空, resolved_config 落盘最终语义
@@ -3861,10 +3873,17 @@ def main() -> None:
                 "(典型: summarizer_pool 现行默认 qpool vs v37.1 基座 mean, 需显式 --summarizer-pool mean)"
             )
         del _e120_payload, _e120_cur
-        warm_note = _e120_warm_start(model, args.e120_fit_dir)
+        if getattr(args, "e120_random_init", False):
+            # 随机对照列 (修订 v3 2026-09-04, 修订 v2 ④ 提前并入主批): 显式豁免温
+            # 启动装载——读出件保持 __init__ 的 trunc_normal(0.02) 随机初始化,
+            # 单变量 = 初始化 (其余配置逐键同乙列)。裁 3 已证 b 格 t=0 温启动
+            # 0.0598 < 随机 0.1173, E119「温启动承重」开放假说由本列判决。
+            warm_note = "随机初始化对照 (显式豁免温启动装载, 修订 v3)"
+        else:
+            warm_note = _e120_warm_start(model, args.e120_fit_dir)
         n_train, n_frozen = _e120_unfreeze_all(model)
         print(
-            f"[s1][e120] 端到端点燃臂乙列: fit_dir={args.e120_fit_dir} 温启动[{warm_note}] | "
+            f"[s1][e120] 端到端点燃臂乙列: fit_dir={args.e120_fit_dir} 初始化[{warm_note}] | "
             f"全模型解冻: trainable={n_train} frozen={n_frozen} "
             f"(q15_circuit_rearing=off 修订 v2, 被替换的生产读出链外无梯度通路)",
             flush=True,
