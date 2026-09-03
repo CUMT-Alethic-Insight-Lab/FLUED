@@ -1307,6 +1307,20 @@ def _check_q15_args(args) -> None:
         )
 
 
+def _check_q15_attn_diag_args(args) -> None:
+    """--q15-attn-diag 响亮校验 (E120 修订 v3): 仪器化档只需 slm + need_attn
+    支持 (readout_views==1) + burst 在岗 (指标附着在 burst echo 网格上);
+    不要 d 格 (不碰损失/孪生), 与 q15 主开关互斥无 (q15_on 时本就全量计算)。"""
+    if not bool(getattr(args, "q15_attn_diag", False)):
+        return
+    if getattr(args, "backbone_mode", "") != "slm":
+        raise SystemExit("--q15-attn-diag requires --backbone-mode slm (block1_attn 来源)")
+    if int(getattr(args, "readout_views", 1)) != 1:
+        raise SystemExit("--q15-attn-diag requires readout_views==1 (views 路径不支持 need_attn)")
+    if not _burst_enabled(args):
+        raise SystemExit("--q15-attn-diag requires --burst-prob>0 (指标附着在 burst echo 网格上)")
+
+
 def _burst_store_block(metas: list, chunks):
     """Q15 §2 压缩区激励改造 (档 a 语义, r 恒 1.0, 零随机抽): per spliced
     sample, excise the store rows covered by occurrences 1..R-1 (第 1..R-1 次
@@ -2622,6 +2636,10 @@ def step_model(model, batch, args, device, train: bool):
         return _q18_train_step(model, batch, args, device)
     clean = batch[0]
     q15_on = _q15_enabled(args)
+    # E120 修订 v3 (2026-09-04 裁②): --q15-attn-diag 仪器化档——只算注意力质量
+    # 指标 (mass/maxmass/chance) 不进损失不跑孪生 (零 RNG 消耗), 供乙列/随机/
+    # 对照三列同仪表监控「注意力没看 vs 内容没用」分流 (前 2K maxmass 轨迹)。
+    q15_diag = q15_on or bool(getattr(args, "q15_attn_diag", False))
     cloze_metas = None
     if _cloze_enabled(args):
         # v3.7 cloze 检索回执 (user-ruled 2026-08-17): slm-only; the legacy
@@ -2719,9 +2737,10 @@ def step_model(model, batch, args, device, train: bool):
         out = s1_forward(
             model, source, args, clean=clean, byte_mask=byte_mask, retrieval_metas=retrieval_metas,
             # Q15: 剔除是任务定义, train/eval 同开 (§7.2); need_attn 只在训练
-            # 前向开 (L_attend 的奖励靶点, eval 零成本零形态变化)
+            # 前向开 (L_attend 的奖励靶点, eval 零成本零形态变化); q15_diag
+            # 档同开 (仪器化只取 block1_attn, 不进损失)
             burst_metas_q15=burst_metas if q15_on else None,
-            need_attn=q15_on and train,
+            need_attn=q15_diag and train,
             train=train,  # decoder 去噪臂: direct 腿扰动只在训练前向 (关态零影响)
         )
     chunks = out["chunks"]
@@ -3029,7 +3048,7 @@ def step_model(model, batch, args, device, train: bool):
     attend_loss = torch.zeros((), device=device)
     echo_loss = torch.zeros((), device=device)
     couple_loss = torch.zeros((), device=device)
-    if q15_on and train and burst_metas is not None:
+    if q15_diag and train and burst_metas is not None:
         attn = out.get("block1_attn")
         if attn is None:
             raise ValueError(
@@ -3061,26 +3080,32 @@ def step_model(model, batch, args, device, train: bool):
             maxmass = torch.cat(maxmasses)
             chance = torch.cat(chances)
             ce = torch.cat(ces)
-            attend_loss = (-torch.log(mass + _Q15_EPS)).mean()
-            gate = _q15_gate(maxmass.detach(), chance)
-            echo_loss = (gate * ce).mean()
+            # q15_diag 仪器化档 (E120 修订 v3): 指标三枚照算 (分流器读数),
+            # 损失/门控只在 q15_on 下激活——不进总损失, 不碰孪生 (零 RNG
+            # 消耗, 三列流逐位一致)
             q15_metrics["q15_attend_mass"] = mass.detach().mean()
             q15_metrics["q15_attend_maxmass"] = maxmass.detach().mean()
             q15_metrics["q15_attend_chance"] = chance.mean()
-            q15_metrics["q15_attend_loss"] = attend_loss.detach()
-            q15_metrics["q15_gate_mean"] = gate.mean()
-            q15_metrics["q15_echo_loss"] = echo_loss.detach()
+            if q15_on:
+                attend_loss = (-torch.log(mass + _Q15_EPS)).mean()
+                gate = _q15_gate(maxmass.detach(), chance)
+                echo_loss = (gate * ce).mean()
+                q15_metrics["q15_attend_loss"] = attend_loss.detach()
+                q15_metrics["q15_gate_mean"] = gate.mean()
+                q15_metrics["q15_echo_loss"] = echo_loss.detach()
         # §3.3 反作弊对偶: 孪生选择消耗 _BURST_GENERATOR 每条 splice 样本一抽
         # (固定顺序, 同 retrieval block 抽取纪律); 篡改本身零随机流; twin 前向
         # 带梯度但只取 logits_backbone 供铰链, 不进任何 codec 损失/指标 (§7.3)
+        # q15_diag 档不跑孪生 (RNG 纪律: 保持三列流逐位一致)
         twin_sel = []
-        for b, m in enumerate(burst_metas):
-            if m is None:
-                continue
-            u = float(torch.rand((), generator=_BURST_GENERATOR))
-            if u >= _Q15_TWIN_P or not bool(burst_active[b]):
-                continue
-            twin_sel.append(b)
+        if q15_on:
+            for b, m in enumerate(burst_metas):
+                if m is None:
+                    continue
+                u = float(torch.rand((), generator=_BURST_GENERATOR))
+                if u >= _Q15_TWIN_P or not bool(burst_active[b]):
+                    continue
+                twin_sel.append(b)
         if twin_sel:
             width = clean.size(1)
             twin_clean = clean.new_full((len(twin_sel), width), PAD_ID)
@@ -3437,6 +3462,13 @@ def _add_s1_args(parser: argparse.ArgumentParser) -> None:
              "0.0598 < 随机 0.1173, E119「温启动承重」降级为待本列判决的开放假说; 显式豁免 "
              "温启动装载, 保持 trunc_normal 0.02 随机初始化; 仅乙列训练态可用, 甲列 eval-only 响亮拒绝)",
     )
+    parser.add_argument(
+        "--q15-attn-diag",
+        action="store_true",
+        help="Q15 注意力质量仪器化档 (修订 v3 裁②: 只算 q15_attend_mass/maxmass/chance 三枚指标, "
+             "不进损失不跑孪生零 RNG 消耗——E120 三列同仪表监控 maxmass 轨迹「注意力没看 vs "
+             "内容没用」分流器; 要求与 --q15-circuit-rearing 同域 slm d 格 readout_views==1)",
+    )
 
 
 def main() -> None:
@@ -3645,6 +3677,7 @@ def main() -> None:
         print(f"[s1] retrieval r 爬坡 (prereg §4): {_RETRIEVAL_RAMP}", flush=True)
     _check_burst_args(args)
     _check_q15_args(args)
+    _check_q15_attn_diag_args(args)
     if _q15_enabled(args):
         # Q15 回路养成臂 (任务书 2026-08-25 冻结): λ 初值 (§3.4) 落 args
         # 属性, step_model 每步读, 回调线 (§5) 原地降权. λ_out 继承

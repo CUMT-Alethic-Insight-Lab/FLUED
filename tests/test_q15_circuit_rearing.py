@@ -360,6 +360,34 @@ def test_parser_default_q15_off():
     assert args.q15_circuit_rearing is False
 
 
+# --- 9.5 E120 修订 v3 仪器化档 (--q15-attn-diag, 2026-09-04 裁②) ----------------------
+
+
+def test_check_q15_attn_diag_args_loud():
+    s1._check_q15_attn_diag_args(_s1_args())  # 关态静默通过
+    with pytest.raises(SystemExit, match="slm"):
+        s1._check_q15_attn_diag_args(_s1_args(q15_attn_diag=True, backbone_mode="xattn",
+                                              burst_prob=0.5))
+    with pytest.raises(SystemExit, match="readout_views"):
+        s1._check_q15_attn_diag_args(_s1_args(q15_attn_diag=True, backbone_mode="slm",
+                                              readout_views=2, burst_prob=0.5))
+    with pytest.raises(SystemExit, match="burst-prob"):
+        s1._check_q15_attn_diag_args(_s1_args(q15_attn_diag=True, backbone_mode="slm",
+                                              readout_views=1, burst_prob=0.0))
+    # 合法域 (slm + views==1 + burst 开) 通过; q15 主开关不在要求内 (仪器化档语义)
+    s1._check_q15_attn_diag_args(_s1_args(q15_attn_diag=True, backbone_mode="slm",
+                                          readout_views=1, burst_prob=0.5))
+
+
+def test_parser_default_q15_attn_diag_off():
+    from tools.train.v3_6.train_v36 import build_parser
+
+    s1_parser = build_parser()
+    s1._add_s1_args(s1_parser)
+    args = s1_parser.parse_args([])
+    assert args.q15_attn_diag is False
+
+
 # --- 10. 收官探针纯函数 (probe_burst_route_q15, 任务书 §6) ---------------------------
 
 
