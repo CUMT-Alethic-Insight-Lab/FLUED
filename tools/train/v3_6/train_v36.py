@@ -103,6 +103,7 @@ def build_model(args: Namespace) -> FLUEDV36:
             # 兜默认, 老 resolved_config 无此键也安全 (关态)
             multislot_readout=getattr(args, "multislot_readout", False),
             multislot_readout_k=str(getattr(args, "multislot_readout_k", "4")),
+            e120_readout_swap=getattr(args, "e120_readout_swap", False),
             decoder_hidden=args.decoder_hidden,
             decoder_layers=args.decoder_layers,
             max_chunks=args.max_chunks,

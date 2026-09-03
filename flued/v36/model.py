@@ -325,6 +325,14 @@ class V36Config:
     # strict-load 干净 (条件创建纪律同 decoder_in_mem/aux_recon 先例)。
     multislot_readout: bool = False
     multislot_readout_k: str = "4"  # 预注册槽位扫描档 "1"|"4"|"8" | "cg" (CG 对照臂)
+    # E120 端到端点燃臂 (任务书冻结 v1+修订 v2 2026-09-03: docs/versions/v3.7/
+    # FLUED_V3_7_E120_END_TO_END_IGNITION_20260903_CN.md): d 格 V 通道生产读出
+    # 替换——k=1 温启动读出件 (E119 定型档: ridge 段 1 主方向 + 部署桥) 读 V 通道
+    # post-state, 投影回生产读出行空间 d_pack; _slm_store_rows 的 v_rows 整行
+    # 换源 (backbone store 与 decoder direct 的同一行源, 三任务一个 V §1.4)。
+    # 默认关 = 旧路径逐位不变, 老 ckpt strict-load 干净 (条件创建纪律同
+    # multislot_readout 先例)。温启动装载在训练器 _e120_warm_start (loud-fail)。
+    e120_readout_swap: bool = False
 
 
 @dataclass
@@ -1279,6 +1287,63 @@ class CGRidgeReadout(nn.Module):
         # v̂_i = c_iᵀ S_i (逐头), 拼接 H*hv → 段 2 可学投影
         vh = torch.einsum("bhcj,bchjv->bchv", x, states)  # (B, C, H, hv)
         read = vh.reshape(bsz, chunks, heads * c.kda_head_v)
+        return self.proj(read)
+
+
+class E120WarmReadout(nn.Module):
+    """E120 端到端点燃臂读出件 (任务书冻结 v1+修订 v2 2026-09-03): k=1 槽查询
+    读 d 格 V 通道 post-state (每段吃完该 chunk 后的 KDA 自然态 S_i), 单层
+    Linear 投影回生产读出行空间 d_pack——替换 _slm_store_rows 的 v_rows 产源
+    (backbone store 与 decoder direct 的同一行源, 三任务一个 V §1.4)。
+    温启动装载 = 训练器 _e120_warm_start (bridge_deploy.npz 的 W/scale 折叠 +
+    截距行 → proj; q_ridge_dir.npz 的 q_ridge (H, hk) → slot_query), t=0 即
+    E119 定型档。不动 KDAStateMachine.readout_query/realign (被替换的生产
+    读出保留原地、旗标关时零路径差; 开时照跑只产 state_norm 诊断)。读状态
+    走 _fla_chunk_kda 任意 q 展开 (readout_queries 循环先例); torch 串行扫描
+    为回落/参考路径 (同 _forward_torch 更新律, fp32)。gdn2 不在作用域
+    (配置层响亮拒绝)。"""
+
+    def __init__(self, c: V36Config) -> None:
+        super().__init__()
+        self.c = c
+        self.slot_query = nn.Parameter(torch.empty(1, c.kda_heads, c.kda_head_k))
+        nn.init.trunc_normal_(self.slot_query, std=0.02)
+        self.proj = nn.Linear(c.kda_heads * c.kda_head_v, c.d_pack)
+
+    def forward(self, gates: dict[str, torch.Tensor], chunk_mask: torch.Tensor) -> torch.Tensor:
+        """gates = write_head(memory) 的 V 通道生产写门。Returns (B, C, d_pack)
+        fp32 读出行 (逐段, 与被替换的 v_rows 同网格同宽)。"""
+        if self.c.kda_impl == "fla" and _fla_chunk_kda is not None:
+            return self._forward_fla(gates, chunk_mask)
+        return self._forward_torch(gates, chunk_mask)
+
+    def _forward_fla(self, gates: dict[str, torch.Tensor], chunk_mask: torch.Tensor) -> torch.Tensor:
+        k, v, alpha = gates["k"], gates["v"], gates["alpha"]
+        beta = gates["beta"]
+        keep = chunk_mask.unsqueeze(-1).unsqueeze(-1).to(k.dtype)
+        k = k * keep
+        v = v * keep
+        beta = beta * chunk_mask.unsqueeze(-1).to(beta.dtype)
+        g = torch.log(alpha.clamp_min(1.0e-6)).to(k.dtype) * keep
+        bsz, chunks = k.size(0), k.size(1)
+        o, _ = _fla_chunk_kda(
+            q=self.slot_query[0].to(k.dtype).unsqueeze(0).unsqueeze(0).expand(bsz, chunks, -1, -1).contiguous(),
+            k=k,
+            v=v,
+            g=g.expand(bsz, chunks, -1, -1).contiguous(),
+            beta=beta,
+            scale=1.0,
+            use_qk_l2norm_in_kernel=False,
+            output_final_state=False,
+        )
+        read = o.reshape(bsz, chunks, self.c.kda_heads * self.c.kda_head_v)
+        return self.proj(read.float())
+
+    def _forward_torch(self, gates: dict[str, torch.Tensor], chunk_mask: torch.Tensor) -> torch.Tensor:
+        c = self.c
+        states = _kda_scan_post_states(gates, chunk_mask)  # (B, C, H, hk, hv) fp32
+        read = torch.einsum("qhk,bchkv->bcqhv", self.slot_query.float(), states)  # (B, C, 1, H, hv)
+        read = read.reshape(states.size(0), states.size(1), c.kda_heads * c.kda_head_v)
         return self.proj(read)
 
 
@@ -2284,6 +2349,22 @@ class FLUEDV36(nn.Module):
                 self.multislot_readout = MultiSlotReadout(c, int(k_spec))
             else:
                 raise ValueError(f"multislot_readout_k 非法: {k_spec!r} (预注册档位 1|4|8|cg)")
+        # E120 端到端点燃臂 (任务书 2026-09-03 冻结 v1+修订 v2): d 格 V 通道生产
+        # 读出替换件。条件创建纪律同 multislot_readout 先例: 默认关 = 不创建,
+        # 旧路径逐位不变, 老 ckpt strict-load 干净; 旗标开而 d 格 (K/V 双状态机)
+        # 缺一 = 结构性 N/A, 响亮报错不静默。
+        if getattr(c, "e120_readout_swap", False):
+            if not (slm and c.k_row_source == "state" and c.v_row_source == "state"):
+                raise ValueError(
+                    "e120_readout_swap requires backbone_mode='slm' + k_row_source='state' "
+                    "+ v_row_source='state' (d 格: 读出对象 = V 通道 post-state, "
+                    "落口 = 生产读出行空间 d_pack)"
+                )
+            if getattr(c, "recurrence", "kda") != "kda":
+                raise ValueError("e120_readout_swap supports recurrence='kda' only (gdn2 不在本臂作用域)")
+            if getattr(c, "readout_views", 1) > 1:
+                raise ValueError("e120_readout_swap 不组合 readout_views>1 (v_rows 整行换源, 多视图 store 无定义)")
+            self.e120_readout = E120WarmReadout(c)
 
     def aux_recon_logits(self, memory: torch.Tensor) -> torch.Tensor:
         """(B, C, d_mem) memory rows -> (B, C, max_span, 258) per-slot byte
@@ -2367,7 +2448,13 @@ class FLUEDV36(nn.Module):
         if self.config.v_row_source == "state":
             gates_v = self.write_head(memory)
             package_v, sn_v = self.state_machine(gates_v, chunks.chunk_mask)
-            v_rows = package_v.mean(dim=2)  # V~ per chunk (B, C, d_pack)
+            if getattr(self.config, "e120_readout_swap", False):
+                # E120: v_rows 整行换源 (k=1 温启动读出件, 任务书 2026-09-03)。
+                # 被替换的生产读出 (readout_query/realign) 照跑但出链外——只留
+                # state_norm 诊断口径不变; package_v 本体不再进任何损失路径。
+                v_rows = self.e120_readout(gates_v, chunks.chunk_mask)
+            else:
+                v_rows = package_v.mean(dim=2)  # V~ per chunk (B, C, d_pack)
             if with_views and views > 1:
                 v_store = self.state_machine.forward_views(gates_v, chunks.chunk_mask)
             norms.append(sn_v)

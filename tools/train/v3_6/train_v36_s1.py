@@ -1714,6 +1714,92 @@ def _multislot_readout_warm_start(model, fuzz_dir: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# E120 端到端点燃臂 (d 格 Δ 补测; 任务书冻结 v1+修订 v2 2026-09-03:
+# docs/versions/v3_7/FLUED_V3_7_E120_END_TO_END_IGNITION_20260903_CN.md)
+# ---------------------------------------------------------------------------
+
+
+def _e120_enabled(args) -> bool:
+    return bool(getattr(args, "e120_readout_swap", False))
+
+
+def _e120_freeze_all(model) -> tuple[int, int]:
+    """甲列冻结语义 (纯插拔, eval-only/探针侧): 全模型冻结——含新件
+    e120_readout.* (温启动即最终态, 无可训参数)。Returns (n_trainable=0,
+    n_frozen)。tied byte_lookup 同账: named_parameters 去重后只出现一次,
+    冻结是全集, 无别名敞口。"""
+    n_frozen = 0
+    for _name, param in model.named_parameters():
+        param.requires_grad_(False)
+        n_frozen += 1
+    return 0, n_frozen
+
+
+def _e120_unfreeze_all(model) -> tuple[int, int]:
+    """乙列解冻语义 (主格): 全模型解冻——含新件 e120_readout.* 与被替换的
+    生产读出链外件 (后者无梯度通路, 留在原值)。freeze_prefixes 已在 main()
+    旗标校验段清空 (25b 配方继承的前端冻结不进本臂), 这里是确定性兜底。
+    Returns (n_trainable, n_frozen=0)。"""
+    n_train = 0
+    for _name, param in model.named_parameters():
+        param.requires_grad_(True)
+        n_train += 1
+    return n_train, 0
+
+
+def _e120_warm_start(model, fit_dir: str) -> str:
+    """E120 温启动初始化 (任务书 §1: 温启动源 = d 格基座自产状态上的闭式解,
+    预跑 probe_e120_warmstart_fit.py 落盘):
+    - slot_query[0] ← ridge 段 1 主方向 (q_ridge_dir.npz 键 q_ridge, (H, hk));
+    - proj ← 部署桥 (bridge_deploy.npz 键 W/scale: 折叠 RMS 预条件 scale +
+      末行截距; 应用形 = apply_bridge 同款 [v̂/scale, 1] @ W)。
+    缺目录/缺文件/缺键/形状不符响亮报错 (SystemExit), 不静默降级——t=0 必须
+    就是 E119 定型档, 零变化律判读才有基尺。Returns 日志注记。"""
+    import numpy as np
+
+    rd = model.e120_readout  # 旗标开才创建 (main() 校验链已保证)
+    c = model.config
+    heads, hk, hv, d_pack = c.kda_heads, c.kda_head_k, c.kda_head_v, c.d_pack
+    fit = Path(fit_dir)
+    if not fit.is_dir():
+        raise SystemExit(
+            f"[s1][e120] 温启动产物目录缺席: {fit} —— 先跑 "
+            "tools/analysis/v3_6/probe_e120_warmstart_fit.py 落盘 (不静默降级为随机初始化)"
+        )
+    bridge_path = fit / "bridge_deploy.npz"
+    if not bridge_path.exists():
+        raise SystemExit(f"[s1][e120] 部署桥缺席: {bridge_path}")
+    z = np.load(bridge_path)
+    for key in ("W", "scale", "lam"):
+        if key not in z:
+            raise SystemExit(f"[s1][e120] {bridge_path}: 缺 {key} 键 (实际键集 {list(z.keys())})")
+    W = torch.from_numpy(np.asarray(z["W"], dtype=np.float32))
+    scale = float(z["scale"])
+    if W.shape != (heads * hv + 1, d_pack):
+        raise SystemExit(
+            f"[s1][e120] 部署桥形状不符: W{tuple(W.shape)} != ({heads * hv + 1}, {d_pack}) —— "
+            "fit 产物与本模型 H*hv/d_pack 不匹配, 检查 --e120-fit-dir"
+        )
+    ridge_path = fit / "q_ridge_dir.npz"
+    if not ridge_path.exists():
+        raise SystemExit(f"[s1][e120] ridge 段 1 主方向缺席: {ridge_path}")
+    zr = np.load(ridge_path)
+    if "q_ridge" not in zr:
+        raise SystemExit(f"[s1][e120] {ridge_path}: 缺 q_ridge 键 (实际键集 {list(zr.keys())})")
+    q_ridge = torch.from_numpy(np.asarray(zr["q_ridge"], dtype=np.float32))
+    if q_ridge.shape != (heads, hk):
+        raise SystemExit(f"[s1][e120] q_ridge 形状不符: {tuple(q_ridge.shape)} != ({heads}, {hk})")
+    with torch.no_grad():
+        rd.slot_query[0].copy_(q_ridge)
+        rd.proj.weight.copy_((W[:-1] / scale).T)
+        rd.proj.bias.copy_(W[-1])
+    return (
+        f"slot_query<-q_ridge 主方向 (||q||={float(q_ridge.norm()):.4f}), "
+        f"proj<-部署桥 (scale={scale:.4f}, λ={float(z['lam']):.1f})"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Q18 v2 读出墙裁定臂 — B 计划 (2026-08-28): A/A′ 臂移植进 s1 骨架
 # ---------------------------------------------------------------------------
 # 为什么移植 (任务书 §6 楔死事故簿): Q17/Q18 独立训练器在双机双栈上间歇楔死
@@ -3328,6 +3414,22 @@ def _add_s1_args(parser: argparse.ArgumentParser) -> None:
         default="outputs/decoder_denoise_fuzz_id_20260829",
         help="温启动产物目录 (ridge 段1主方向 q20_ridge_dir.npz + λopt=1.0 部署桥; 缺件响亮报错不静默降级)",
     )
+    # --- E120 端到端点燃臂 (任务书 2026-09-03 冻结 v1+修订 v2) ---
+    # d 格 V 通道生产读出替换: k=1 温启动读出件 (E119 定型档) 读 V 通道
+    # post-state → 部署桥投影 → 生产读出行空间 d_pack (v_rows 整行换源)。
+    # 默认关 = 旧路径逐位不变 (--multislot-readout-* 先例)。
+    parser.add_argument(
+        "--e120-readout-swap",
+        action="store_true",
+        help="E120 端到端点燃臂总开关 (d 格 V 通道生产读出替换; 默认关 = 旧路径逐位不变; "
+             "要求 slm d 格 + config 显式 q15_circuit_rearing=false; 训练态需 --init-checkpoint 25b 基座)",
+    )
+    parser.add_argument(
+        "--e120-fit-dir",
+        default="outputs/e120_warmstart_fit_20260903",
+        help="温启动产物目录 (probe_e120_warmstart_fit.py 落盘: bridge_deploy.npz + q_ridge_dir.npz; "
+             "缺件/缺键/形不符响亮报错不静默降级)",
+    )
 
 
 def main() -> None:
@@ -3443,6 +3545,54 @@ def main() -> None:
             raise SystemExit(
                 "--multislot-readout 需要 --init-checkpoint <E118 收官 latest.pt> (读出端扩宽是微调臂, 非从零)"
             )
+    e120_on = _e120_enabled(args)
+    if e120_on:
+        # E120 端到端点燃臂 (任务书冻结 v1+修订 v2): 响亮校验——d 格限定 (K/V
+        # 双状态机, 读出对象 = V 通道 post-state, 落口 = 生产读出行空间); 乙列
+        # 显式关 q15_circuit_rearing (修订 v2 写死: 生产环境无过程奖励拐杖,
+        # q15_lambda_* 三枚随总开关失活 keep-inert); 不与 denoise/Q18/Q20 同开
+        # (Q20=b 格 K 通道 direct 口扩宽, 两臂对象互斥); 训练态 (乙列) 需
+        # init-checkpoint (25b 基座, 修订 v2 钉死), eval-only 态即甲列。
+        if denoise_on:
+            raise SystemExit(
+                "--e120-readout-swap 不与 --decoder-denoise 同开 (denoise 端口臂是 b 格 v_row_source=memory 专属)"
+            )
+        if q18_on:
+            raise SystemExit(
+                "--e120-readout-swap 不组合 Q18 臂 (训练步整体委托独立机制, direct 腿不经 _slm_forward)"
+            )
+        if q20_on:
+            raise SystemExit(
+                "--e120-readout-swap 不与 --multislot-readout 同开 (Q20=b 格 K 通道 direct 口扩宽, "
+                "E120=d 格 V 通道生产读出替换, 两臂读出对象互斥)"
+            )
+        if (
+            getattr(args, "backbone_mode", "") != "slm"
+            or getattr(args, "k_row_source", "") != "state"
+            or getattr(args, "v_row_source", "") != "state"
+        ):
+            raise SystemExit(
+                "--e120-readout-swap requires --backbone-mode slm + k_row_source=state + v_row_source=state "
+                "(d 格: 读出对象 = V 通道 post-state, 落口 = 生产读出行空间)"
+            )
+        if getattr(args, "q15_circuit_rearing", False):
+            raise SystemExit(
+                "--e120-readout-swap 需要显式关闭 q15_circuit_rearing (修订 v2 写死: 生产环境无过程奖励拐杖; "
+                "CLI 无 false 档, 必须经 config 传 q15_circuit_rearing=false, 如 configs/v3_7_e120_d25b.json)"
+            )
+        if not args.eval_only and not args.init_checkpoint:
+            raise SystemExit(
+                "--e120-readout-swap 需要 --init-checkpoint <25b 收官 latest.pt> (乙列微调臂, 非从零) "
+                "或 --eval-only <基座 latest.pt> (甲列纯插拔)"
+            )
+        # 乙列解冻语义 (任务书 §1 两臂同测: 全模型解冻, 含新件): 基座配方继承的
+        # freeze_prefixes (前端冻结) 在本臂清空, resolved_config 落盘最终语义
+        if getattr(args, "freeze_prefixes", ""):
+            print(
+                f"[s1][e120] freeze_prefixes 覆写 {args.freeze_prefixes!r} -> '' (乙列全模型解冻)",
+                flush=True,
+            )
+            args.freeze_prefixes = ""
     if getattr(args, "cloze_prob", 0.0) > 0:
         # v3.7 cloze 检索回执 (user-ruled 2026-08-17): slm-only -- on legacy
         # xattn/paged/draft/attn paths (and the codec_final/paged/draft/
@@ -3552,7 +3702,34 @@ def main() -> None:
         # S39 probes (e.g. --k-block-eval, user-ruled 2026-08-17): load one
         # checkpoint strict, run the standard eval pass, print JSON, exit.
         payload = torch.load(args.eval_only, map_location=device, weights_only=False)
-        model.load_state_dict(payload["model"], strict=True)
+        if e120_on:
+            # E120 甲列 (纯插拔, eval-only): 基座全键全形校验豁免 e120_readout.*
+            # 新件键 → 温启动 (t=0 即最终态) → 全模型冻结含新件 → 标准 eval。
+            # 路由消融/Δ 仪器在探针侧 (probe_burst_route_q15 同族), 本处只保证
+            # 冻结语义与温启动装载响亮。
+            _cur = model.state_dict()
+            _bad = [
+                k
+                for k in _cur
+                if not k.startswith("e120_readout.")
+                and (k not in payload["model"] or payload["model"][k].shape != _cur[k].shape)
+            ]
+            _extra = [k for k in payload["model"] if k not in _cur]
+            if _bad or _extra:
+                raise SystemExit(
+                    f"[s1][e120] 甲列基座全键全形校验失败: {len(_bad)} 键缺失/形不符 + {len(_extra)} 冗键 "
+                    f"(如 {(_bad + _extra)[:5]}) —— --eval-only 的 ckpt 与现行 config 架构漂移"
+                )
+            model.load_state_dict(payload["model"], strict=False)
+            _warm = _e120_warm_start(model, args.e120_fit_dir)
+            n_train, n_frozen = _e120_freeze_all(model)
+            print(
+                f"[s1][e120] 甲列纯插拔 (eval-only): fit_dir={args.e120_fit_dir} 温启动[{_warm}] | "
+                f"全模型冻结: trainable={n_train} frozen={n_frozen}",
+                flush=True,
+            )
+        else:
+            model.load_state_dict(payload["model"], strict=True)
         model.eval()
         _t, eval_loader = make_dataloaders(args)
         stats = evaluate(model, eval_loader, args, device)
@@ -3660,6 +3837,36 @@ def main() -> None:
             f"[s1][q20] 多槽读出臂 (E119): k={args.multislot_readout_k} fuzz_id={args.multislot_readout_fuzz_id} "
             f"温启动[{warm_note}] | 仅多槽读出件可训: trainable={n_train} frozen={n_frozen} "
             f"(decoder/decoder_in_mem/backbone/写入侧/tied byte_lookup 全冻在 E118 收官态)",
+            flush=True,
+        )
+    if e120_on:
+        # E120 端到端点燃臂乙列 (任务书 §1 两臂同测): 基座 = 25b 收官 (修订 v2
+        # 钉死, 无 b 后缀的 512B off-spec pilot 禁混排)。基座全键全形校验 (去噪
+        # 臂冒烟事故入例的 loud-fail 同款, 豁免 e120_readout.* 新件键——它们由
+        # 温启动装载, 双向核对) → 温启动 (缺件/缺键/形不符响亮报错) → 乙列全
+        # 模型解冻 (freeze_prefixes 已在旗标校验段清空, 这里确定性兜底)。
+        _e120_payload = torch.load(args.init_checkpoint, map_location="cpu", weights_only=False)["model"]
+        _e120_cur = model.state_dict()
+        _e120_bad = [
+            k
+            for k in _e120_cur
+            if not k.startswith("e120_readout.")
+            and (k not in _e120_payload or _e120_payload[k].shape != _e120_cur[k].shape)
+        ]
+        _e120_extra = [k for k in _e120_payload if k not in _e120_cur]
+        if _e120_bad or _e120_extra:
+            raise SystemExit(
+                f"[s1][e120] 基座全键全形校验失败: {len(_e120_bad)} 键缺失/形不符 + {len(_e120_extra)} 冗键 "
+                f"(如 {(_e120_bad + _e120_extra)[:5]}) —— 检查 --config 来源与基座的架构漂移 "
+                "(典型: summarizer_pool 现行默认 qpool vs v37.1 基座 mean, 需显式 --summarizer-pool mean)"
+            )
+        del _e120_payload, _e120_cur
+        warm_note = _e120_warm_start(model, args.e120_fit_dir)
+        n_train, n_frozen = _e120_unfreeze_all(model)
+        print(
+            f"[s1][e120] 端到端点燃臂乙列: fit_dir={args.e120_fit_dir} 温启动[{warm_note}] | "
+            f"全模型解冻: trainable={n_train} frozen={n_frozen} "
+            f"(q15_circuit_rearing=off 修订 v2, 被替换的生产读出链外无梯度通路)",
             flush=True,
         )
     if q18_on:
