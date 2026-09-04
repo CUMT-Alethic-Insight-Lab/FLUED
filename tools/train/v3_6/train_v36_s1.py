@@ -154,6 +154,7 @@ from argparse import Namespace
 from collections import deque
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -180,6 +181,12 @@ from tools.train.v3_3.train_v33 import (  # noqa: E402
     make_targets,
 )
 from tools.train.v3_6.train_v36 import _ce, build_model  # noqa: E402
+# E121 D1 跨段续尾重加权 (任务书 2026-09-04 冻结 v1): 在线扫描器与密度账仪器
+# **同源 import** (施工注记 1 字面执行——不许复制改写, 冒烟条款③逐键 diff 只见接线)
+from tools.analysis.v3_6.demand_density_book import (  # noqa: E402
+    CHUNK as _D1_SCAN_CHUNK,
+    cross_chunk_occurrences,
+)
 
 # ---------------------------------------------------------------------------
 # Mixed char/BPE-word masking (v36.3, T3)
@@ -1845,6 +1852,155 @@ _Q18_CONFIG_EXCLUDE = frozenset({
 _Q18_DEPS = None  # (q17 模块, q18 模块) 懒导入缓存
 
 
+# ---------------------------------------------------------------------------
+# E121 D1 跨段续尾损失重加权 (任务书 2026-09-04 冻结 v1:
+# docs/versions/v3.7/FLUED_V3_7_D1_CROSSSEG_TAIL_20260904_CN.md)
+#
+# 单变量 = 损失计价有无。数据侧在线扫描训练窗 (4096B): 对「目标字节延续的是本窗
+# 严格更早 chunk (16B) 出现过、且语料级稀有的 L-gram」的续尾 T 个字节位置, per-
+# position 损失乘权重 w。口径与密度账仪器逐位同源 (注记 1: cross_chunk_occurrences
+# 直接 import, 零复制)。稀有阈值 = 窗内命中分位数档 (最稀有 20%, 终审①: 命中集
+# 大小恒定, 密度可复算)。权重图不进反向图 (注记 3: torch.no_grad 构造 + detach
+# 双保险, 漏接则整臂作废)。默认全关 = 旧路径逐位不变。
+# ---------------------------------------------------------------------------
+
+# Module-level so the multi-million-entry frequency table never lands in
+# vars(args) (resolved_config.json / summary.json dump the full args namespace;
+# same discipline as _CLOZE_BANK / _BPE_TOKENIZER).
+_D1_RARE_TABLE: dict[bytes, int] | None = None
+
+
+def _d1_enabled(args) -> bool:
+    return bool(getattr(args, "d1_tail_rewire", False))
+
+
+def _load_d1_rare_table(path: str) -> int:
+    """装载 build_d1_rare_table.py 落盘的 npz (grams 'S6' + counts int64)。
+    缺文件/键/形状响亮报错, 不静默降级 (坑 8 纪律)。返回表内 gram 数。"""
+    global _D1_RARE_TABLE
+    resolved = Path(path)
+    if not resolved.is_absolute():
+        resolved = REPO_ROOT / resolved
+    if not resolved.exists():
+        raise SystemExit(
+            f"[s1][d1] rare table 缺席: {resolved} "
+            "(先跑 tools/analysis/v3_6/build_d1_rare_table.py, 不静默空表)"
+        )
+    with np.load(resolved) as z:
+        missing = {"grams", "counts"} - set(z.files)
+        if missing:
+            raise SystemExit(f"[s1][d1] rare table 缺键: {sorted(missing)} ({resolved})")
+        grams = z["grams"]
+        counts = z["counts"]
+    if len(grams) != len(counts):
+        raise SystemExit(
+            f"[s1][d1] rare table 形不符: grams={len(grams)} vs counts={len(counts)} ({resolved})"
+        )
+    # grams 两种落盘形态: (N, L) uint8 矩阵 (build_d1_rare_table.py 主形态,
+    # NUL 无损——'S6' 会把尾随零字节当终止符截断) 或 (N,) 'S6' 旧/测试形态
+    if grams.ndim == 2:
+        key_of = lambda row: row.tobytes()
+    else:
+        key_of = lambda g: bytes(g)
+    _D1_RARE_TABLE = {key_of(g): int(c) for g, c in zip(grams, counts)}
+    return len(_D1_RARE_TABLE)
+
+
+def _d1_select_rare_grams(occ: dict[bytes, list[int]], table: dict[bytes, int],
+                          quantile: float) -> tuple[set[bytes], int]:
+    """窗内命中 gram 按频率表计数升序取最稀有 quantile 档 (任务书 §1 终审①):
+    命中集大小 = 窗内命中 gram 数 × quantile (floor, 平局按 (计数, 字节序) 稳定
+    排序)。表中缺席的 gram 视为非稀有 (诚实边界: 稀有度过滤是代理), 计数返回
+    落日志。返回 (稀有 gram 集, 表外命中 gram 数)。"""
+    hits = list(occ.keys())
+    k = int(len(hits) * quantile)
+    if k <= 0:
+        return set(), 0
+    counted: list[tuple[int, bytes]] = []
+    off_table = 0
+    for g in hits:
+        c = table.get(g)
+        if c is None:
+            off_table += 1
+        else:
+            counted.append((c, g))
+    if not counted:
+        return set(), off_table
+    counted.sort()
+    return {g for _c, g in counted[:k]}, off_table
+
+
+def _d1_build_weight_map(clean: torch.Tensor, chunk_ids: torch.Tensor,
+                         offsets: torch.Tensor, args) -> tuple[torch.Tensor, torch.Tensor, dict]:
+    """逐训练窗扫跨 chunk 重复 gram → 续尾 T 个字节位置的权重图 (B, C, S)。
+
+    调用方必须包 torch.no_grad() (注记 3 第一重保险), 返回前再 detach (第二重)。
+    扫描 = 密度账同源 cross_chunk_occurrences (L=6, chunk=16B); 命中 gram 经
+    _d1_select_rare_grams 分位数档过滤; 稀有命中处起的 T 个续尾字节位置 (byte
+    索引 p+L .. p+L+T-1, 与密度账 supervised_count 同一 range 语义) 经
+    chunk_ids/offsets 映射到 (chunk, slot) 目标格。返回 (权重图, 选择布尔图,
+    stats): 选择图与 w 值解耦——w=1 恒等对照列的双仪表也落在「拟加权位」上
+    (任务书 §2: 同窗同分布判读基准)。"""
+    table = _D1_RARE_TABLE
+    if table is None:
+        raise ValueError(
+            "d1 rare table not loaded: main() loads --d1-rare-table via "
+            "_load_d1_rare_table before training/eval"
+        )
+    w = float(args.d1_w)
+    L = int(args.d1_ngram_len)
+    tail = int(args.d1_tail)
+    quantile = float(args.d1_rare_quantile)
+    bsz, win_len = clean.shape
+    # 目标格宽 = make_targets 同款 (B, max_chunks, max_span); chunk_ids/offsets
+    # 是逐字节 (B, T) 张量, 值域守卫与 make_targets 的 valid 掩码一致
+    n_chunks, n_slots = int(args.max_chunks), int(args.max_span)
+    selected = torch.zeros(bsz, n_chunks, n_slots, dtype=torch.bool)
+    stats = {"hit_grams": 0, "offtable_grams": 0, "weighted_positions": 0}
+    for b in range(bsz):
+        ids = clean[b].tolist()
+        cut = ids.index(PAD_ID) if PAD_ID in ids else win_len
+        raw = bytes(i - BYTE_OFFSET for i in ids[:cut])
+        if len(raw) < L:
+            continue
+        occ = cross_chunk_occurrences(raw, L)  # 密度账同源核心 (注记 1)
+        if not occ:
+            continue
+        stats["hit_grams"] += len(occ)
+        rare, off = _d1_select_rare_grams(occ, table, quantile)
+        stats["offtable_grams"] += off
+        for g in rare:
+            for p in occ[g]:
+                for t in range(p + L, min(p + L + tail, len(raw))):
+                    c = int(chunk_ids[b, t])
+                    s = int(offsets[b, t])
+                    if 0 <= c < n_chunks and 0 <= s < n_slots:
+                        selected[b, c, s] = True
+                        stats["weighted_positions"] += 1
+    selected = selected.to(clean.device)
+    wmap = torch.where(selected, torch.full_like(selected, w, dtype=torch.float32),
+                       torch.ones_like(selected, dtype=torch.float32))
+    return wmap.detach(), selected.detach(), stats
+
+
+def _d1_weighted_ce(logits: torch.Tensor, targets: torch.Tensor,
+                    slot: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """per-position CE × 权重图的加权均值 (只对 slot 内非 PAD 目标)。weight 已
+    detach (注记 3) —— 权重只改计价, 不开第二梯度源。"""
+    picked_logits = logits[slot]
+    picked_targets = targets[slot]
+    picked_w = weight[slot]
+    keep = picked_targets.ne(PAD_ID)
+    if not bool(keep.any()):
+        return logits.sum() * 0.0
+    ce = F.cross_entropy(
+        picked_logits[keep].float(),
+        picked_targets[keep].clamp(min=0, max=257),
+        reduction="none",
+    )
+    return (ce * picked_w[keep]).sum() / picked_w[keep].sum()
+
+
 def _q18_enabled(args) -> bool:
     return bool(getattr(args, "q18_arm", ""))
 
@@ -2794,8 +2950,46 @@ def step_model(model, batch, args, device, train: bool):
         )
     unmasked_slot = comp_slot_mask & ~comp_masked_slot
 
-    direct_loss = _ce(out["logits_direct"], encoded_targets, encoded_slot_mask)
-    completion_loss = _ce(out["logits_backbone"], comp_targets, comp_slot_mask)
+    # --- E121 D1 跨段续尾重加权 (任务书 2026-09-04 冻结 v1) ---
+    # 结构守卫 (响亮报错, 不静默绕路): 权重按「目标字节位置 ↔ (chunk, slot)」
+    # 一一对应乘进 direct/completion 的 per-position CE —— 累积网格 (row i 追加
+    # 0..i-1 的召回槽) 与 Markov/mid 头重构 codec CE 的臂形态破坏该对应, N/A。
+    d1_on = _d1_enabled(args)
+    d1_wmap = None
+    d1_sel = None
+    d1_stats = None
+    if d1_on:
+        if comp_cumulative:
+            raise ValueError(
+                "d1-tail-rewire requires per-chunk completion grids (cumulative "
+                "retention appends recalled slots and breaks the byte->slot "
+                "correspondence; E121 a 格口径 = slm + v_row_source=memory)"
+            )
+        if getattr(args, "decoder_markov", 0) > 0:
+            raise ValueError(
+                "d1-tail-rewire does not combine with --decoder-markov "
+                "(Markov head restructures the codec CE; E121 单变量纪律)"
+            )
+        if out.get("logits_backbone_mid") is not None:
+            raise ValueError(
+                "d1-tail-rewire does not combine with draft-intermediate mid CE "
+                "(codec CE restructured; E121 单变量纪律)"
+            )
+        # 注记 3 双保险: no_grad 构造 (函数内 fresh 张量无 grad) + 返回前 detach
+        with torch.no_grad():
+            d1_wmap, d1_sel, d1_stats = _d1_build_weight_map(
+                clean, chunks.chunk_ids, chunks.offsets, args
+            )
+        d1_wmap = d1_wmap.detach()
+    if d1_on and float(args.d1_w) != 1.0:
+        # 加权列: 续尾位计价 ×w, 其余位 ×1 (加权均值)
+        direct_loss = _d1_weighted_ce(out["logits_direct"], encoded_targets, encoded_slot_mask, d1_wmap)
+        completion_loss = _d1_weighted_ce(out["logits_backbone"], comp_targets, comp_slot_mask, d1_wmap)
+    else:
+        # 关态与 w=1 恒等列 (对照): 未改 _ce 路径, 逐位同基座 (冒烟条款②;
+        # 扫描/仪表照跑——d1_acc_* 两键是同窗同分布判读基准, 不碰损失)
+        direct_loss = _ce(out["logits_direct"], encoded_targets, encoded_slot_mask)
+        completion_loss = _ce(out["logits_backbone"], comp_targets, comp_slot_mask)
     if getattr(args, "decoder_markov", 0) > 0 and hasattr(model.decoder, "markov_out"):
         # DSpark Markov head (post-hoc on logits, teacher-forced prev byte):
         # NOTE this makes the metrics a teacher-forced protocol -- arms using
@@ -3247,6 +3441,21 @@ def step_model(model, batch, args, device, train: bool):
             out["logits_direct"].argmax(dim=-1), encoded_targets, clean_slot
         )
     metrics.update(denoise_metrics)
+    if d1_on:
+        # E121 induction 仪表 (任务书 §2 双仪表即判据): 同窗内「拟加权位」与
+        # 「未加权位」的 completion byte_acc —— 同窗同分布, 先验水分两边同消。
+        # 判读基准走 w=1 对照列: 选择图与 w 解耦, 对照列两键照常有数。induction
+        # 对象 = completion (召回路径); 拟加权位空集时 weighted 侧 0.0 占位。
+        _d1_pred_b = out["logits_backbone"].argmax(dim=-1)
+        metrics["d1_acc_weighted"] = _acc_tensor(_d1_pred_b, comp_targets, comp_slot_mask & d1_sel)
+        metrics["d1_acc_unweighted"] = _acc_tensor(_d1_pred_b, comp_targets, comp_slot_mask & ~d1_sel)
+        metrics["d1_weighted_positions"] = torch.tensor(
+            float(d1_stats["weighted_positions"]), device=device
+        )
+        metrics["d1_hit_grams"] = torch.tensor(float(d1_stats["hit_grams"]), device=device)
+        metrics["d1_offtable_grams"] = torch.tensor(
+            float(d1_stats["offtable_grams"]), device=device
+        )
     # Q20 多槽读出臂接通计 (E119 冒烟条款① 旋钮接通仪表): 本前向 direct 腿
     # 是否吃了多槽读出行 (train 态旗标开才 1; 关态/eval = 零占位, log schema
     # 对齐本文件臂列惯例)
@@ -3469,6 +3678,42 @@ def _add_s1_args(parser: argparse.ArgumentParser) -> None:
              "不进损失不跑孪生零 RNG 消耗——E120 三列同仪表监控 maxmass 轨迹「注意力没看 vs "
              "内容没用」分流器; 要求与 --q15-circuit-rearing 同域 slm d 格 readout_views==1)",
     )
+    # --- E121 D1 跨段续尾损失重加权臂 (任务书 2026-09-04 冻结 v1: docs/versions/
+    # v3.7/FLUED_V3_7_D1_CROSSSEG_TAIL_20260904_CN.md) ---
+    # 数据侧在线扫描 + per-position 损失重加权, 单变量 = 损失计价有无。
+    # 默认全关 = 旧路径逐位不变 (--decoder-denoise-* 先例)。
+    parser.add_argument(
+        "--d1-tail-rewire",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="E121 跨段续尾重加权总开关 (默认关 = 旧路径逐位不变; 要求 slm a 格 "
+             "v_row_source=memory 的 per-chunk codec 网格 + bytes_per_chunk=16; "
+             "BooleanOptionalAction——冒烟基座列从继承配置经 --no-d1-tail-rewire "
+             "显式关回旗标关路径)",
+    )
+    parser.add_argument(
+        "--d1-w", type=float, default=2.0,
+        help="续尾位损失权重 (任务书 §1 终审① 冻结 2.0; 1.0 = 恒等对照列, 损失走 "
+             "未改 _ce 路径逐位同基座, 扫描/双仪表照跑)",
+    )
+    parser.add_argument(
+        "--d1-rare-table", default="",
+        help="稀有度频率表 npz (build_d1_rare_table.py 落盘; 总开关开时必填, "
+             "缺件响亮报错不静默空表)",
+    )
+    parser.add_argument(
+        "--d1-rare-quantile", type=float, default=0.2,
+        help="稀有阈值 = 窗内命中分位数档, 取最稀有该份额 (任务书 §1 终审① 冻结 0.2; "
+             "命中集大小 = 窗内命中 gram 数 × 档, 恒定可复算)",
+    )
+    parser.add_argument(
+        "--d1-ngram-len", type=int, default=6,
+        help="跨段重复 gram 长度 L (任务书 §1 终审① 冻结 6, 与密度账 L=6 同源)",
+    )
+    parser.add_argument(
+        "--d1-tail", type=int, default=3,
+        help="稀有命中处起的续尾字节数 T (任务书 §1 终审① 冻结 3)",
+    )
 
 
 def main() -> None:
@@ -3678,6 +3923,40 @@ def main() -> None:
     _check_burst_args(args)
     _check_q15_args(args)
     _check_q15_attn_diag_args(args)
+    d1_on = _d1_enabled(args)
+    if d1_on:
+        # E121 跨段续尾重加权臂 (任务书 2026-09-04 冻结 v1): 响亮校验——扫描
+        # 口径与密度账同源 (chunk=16B 硬编码在 cross_chunk_occurrences), 分块
+        # 粒度漂移即错位; 权重图按「目标字节 ↔ per-chunk 网格 slot」一一对应
+        # 乘进 direct/completion CE, 累积网格臂形态 N/A (step_model 内再守卫)。
+        if q18_on:
+            raise SystemExit(
+                "--d1-tail-rewire 不组合 Q18 臂 (Q18 训练步整体委托独立机制, "
+                "标准 codec CE 不在链上, D1 旗标会静默失效)"
+            )
+        if not args.d1_rare_table:
+            raise SystemExit(
+                "--d1-tail-rewire requires --d1-rare-table <npz> "
+                "(build_d1_rare_table.py 落盘; 缺件响亮报错不静默空表)"
+            )
+        if int(getattr(args, "bytes_per_chunk", _D1_SCAN_CHUNK)) != _D1_SCAN_CHUNK:
+            raise SystemExit(
+                f"--d1-tail-rewire requires bytes_per_chunk={_D1_SCAN_CHUNK} "
+                f"(扫描器与密度账同源, chunk 粒度硬编码; 现 {getattr(args, 'bytes_per_chunk', '?')})"
+            )
+        if getattr(args, "backbone_mode", "") == "slm" and \
+                getattr(args, "v_row_source", "memory") == "state":
+            raise SystemExit(
+                "--d1-tail-rewire requires v_row_source=memory (a 格 per-chunk 网格; "
+                "d/coarse 格累积召回槽破坏 byte->slot 对应, N/A)"
+            )
+        n_d1_grams = _load_d1_rare_table(args.d1_rare_table)
+        print(
+            f"[s1][d1] E121 跨段续尾重加权: w={args.d1_w} q={args.d1_rare_quantile} "
+            f"L={args.d1_ngram_len} T={args.d1_tail} table={args.d1_rare_table} "
+            f"grams={n_d1_grams}",
+            flush=True,
+        )
     if _q15_enabled(args):
         # Q15 回路养成臂 (任务书 2026-08-25 冻结): λ 初值 (§3.4) 落 args
         # 属性, step_model 每步读, 回调线 (§5) 原地降权. λ_out 继承
