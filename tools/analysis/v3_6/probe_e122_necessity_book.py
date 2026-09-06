@@ -792,6 +792,9 @@ def main() -> None:
     p.add_argument("--bootstrap", type=int, default=2000)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--strong-line", type=float, default=STRONG_LINE_NAT)
+    p.add_argument("--data-path", default=None,
+                   help="覆盖 resolved_config 的 data_path（远端语料路径与老 config "
+                        "Windows 路径不同时用；缺省不覆盖）")
     args = p.parse_args()
 
     arms = [a.strip() for a in args.arms.split(",") if a.strip()]
@@ -813,6 +816,10 @@ def main() -> None:
 
     model, ns, step = load_model(Path(args.ckpt), device)
     assert_cell_keys(ns, model.config)  # 坑 8：缺键/错值 loud fail，不许兜底
+    if args.data_path:
+        ns.data_path = args.data_path
+    if not Path(ns.data_path).exists():
+        raise SystemExit(f"data_path 不存在: {ns.data_path}（--data-path 覆盖或修 resolved_config）")
     # 任务注入零（预注册 §3 卫生；前向只走 s1_forward，metas 全 None 已零注入，
     # 此处显式清零防下游误读 ns）
     ns.burst_prob = 0
