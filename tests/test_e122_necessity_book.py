@@ -7,12 +7,14 @@ Covers: (1) b1 替换三匹配（长度/UTF-8 续字节结构/稀有表内）+ �
 取数对拍 + drifted 标记）; (3) d 格累积网格
 字节位→(chunk,slot) 映射代数（与 make_cumulative_retention_targets 对拍 +
 追加召回槽只装遮蔽字节的完备性）; (4) 坑 8 全键断言 loud fail; (5) 扫描器与
-密度账同源 import 断言; (6) 对照手术统计匹配（同三匹配约束 + 保护区）; (7)
+密度账同源 import 断言; (6) v1.2 同体半分手术统计匹配（同三匹配约束 + 两半
+保护区 + 对照源不动 + 诱饵最近合格）+ 半分确定性/均衡性; (7)
 bootstrap 可复现（种子固定）; (8) 逐位 NLL 无梯度图 + fp32; (9) b2 行置换
 （行存在性保留、源行只取非源行）; (10) 选择图与 D1 _d1_build_weight_map 同
-语义对拍（合成窗）; (11) 合成冒烟: 目标位确需源 gram 的窗上 b1 ΔNLL=ln(258)
->0 且对照位 ΔNLL=0（stub 前向代数对拍, 不依赖语料/GPU/checkpoint）; (12) b2
-源 chunk 内计分位剔除标记（对角自读污染, 裁定 2026-09-06）。
+语义对拍（合成窗）; (11) 合成冒烟: 目标位确需源 gram 的窗上处理位 b1
+ΔNLL=ln(258)>0 且对照位（源不动+诱饵）ΔNLL=0（stub 前向代数对拍, 不依赖
+语料/GPU/checkpoint）; (12) b2 源 chunk 内计分位剔除标记（对角自读污染,
+裁定 2026-09-06; v1.2 起行手术只处置处理半源 chunk, split_override 钉死分组）。
 """
 
 from __future__ import annotations
@@ -176,8 +178,8 @@ def _stub_forward(raw0: bytes, magic: tuple[bytes, ...] = (), L: int = 6,
 
 @pytest.mark.parametrize("seed", [0, 1, 2, 3])
 def test_algebra_smoke_stub_b1_positive_control_zero(seed):
-    """合成冒烟（预注册 §8.3 前置条件）：选中位 ΔNLL_b1 = ln258 > 0 且对照位
-    ΔNLL_b1 = 0 的代数对拍。"""
+    """合成冒烟（预注册 §8.3 前置条件 + v1.2 同体半分）：处理位 ΔNLL_b1=ln258>0
+    且对照位（源不动+诱饵替换）ΔNLL_b1=0 的代数对拍。"""
     raw0, table = _smoke_window()
     idx = e122.build_pattern_index(table)
     clean = torch.tensor([[b + 1 for b in raw0]], dtype=torch.long)
@@ -192,18 +194,24 @@ def test_algebra_smoke_stub_b1_positive_control_zero(seed):
     )
     assert rec["status"] == "ok"
     s = rec["sums"]
-    assert s["n_sel"] == 6 and s["n_strong"] == 6  # 6 个选中位全强命中
     sel_items = [it for it in rec["items"] if it["role"] == "selected"]
     ctl_items = [it for it in rec["items"] if it["role"] == "control"]
-    assert {it["byte_pos"] for it in sel_items} == {70, 71, 72, 102, 103, 104}
+    # v1.2 半分: g/h 一处理一对照 → 3+3, 并集不变
+    assert {it["byte_pos"] for it in sel_items + ctl_items} == {70, 71, 72, 102, 103, 104}
+    assert s["n_sel"] == 3 and s["n_ctl"] == 3
+    assert s["n_strong"] == 3  # 处理半 3 位全强命中
+    assert len(rec["split"]["treatment_clusters"]) == 1
+    assert len(rec["split"]["control_clusters"]) == 1
     for it in sel_items:
         assert it["NLL_a"] < 1e-6
         assert abs(it["NLL_b1"] - LN_VOCAB) < 1e-6
         assert it["delta_b1"] == pytest.approx(LN_VOCAB, abs=1e-6)
     for it in ctl_items:
-        assert it["delta_b1"] == 0.0  # 对照位两臂逐位同 logits → 严格 0
+        assert it["delta_b1"] == 0.0  # 对照源不动（诱饵=u@40 非 magic）→ 严格 0
+        assert it["decoy_gram"] == bytes([12] * 6).hex()  # 唯一合格诱饵 u@40
+        assert it["decoy_pos"] == 40
     assert s["ctl_d_b1"] == 0.0
-    # 主判读量代数: 对比 = ln258 - 0 > 0, 强命中密度 = 6/窗
+    # 主判读量代数: 对比 = ln258 - 0 > 0
     assert s["sel_d_b1"] / s["n_sel"] == pytest.approx(LN_VOCAB, abs=1e-6)
 
 
@@ -239,22 +247,20 @@ def test_drift_remap_scores_at_post_grid():
 
 
 def test_b2_own_chunk_exclusion_flagged():
-    """b2 污染剔除（裁定 2026-09-06）：落在被置换源 chunk 内的计分位打
-    b2_own_chunk_excluded 并从 b2 分层剔除（NLL_b2=None）, b1 照常计。
-    合成窗: g 首现 chunk 0、重复 chunk 2（续尾 38-40 落 chunk 2）; h 首现
-    chunk 2（41-46, 与 g 续尾同 chunk）、重复 chunk 4（续尾 78-80）。源 chunk
-    集 ⊇ {0, 2} → g 续尾 38-40 在被置换 chunk 2 内 = 剔除, h 续尾保留。"""
+    """b2 污染剔除（裁定 2026-09-06）× v1.2 半分：行手术只处置**处理半**源
+    chunk。split_override 钉死 h 为处理（源 @41-46 落 chunk 2）→ g（对照）续尾
+    38-40 在被置换 chunk 2 内 = 剔除, h 续尾 78-80（chunk 4）保留, b1 照常计。"""
     raw = _counter_filler(96)
     g, h, u = bytes([10] * 6), bytes([11] * 6), bytes([12] * 6)
     g2, h2, u2 = bytes([13] * 6), bytes([14] * 6), bytes([15] * 6)
     raw[0:6] = g
     raw[6:9] = b"\x20\x21\x22"       # g 首现续尾（chunk 0）
-    raw[16:22] = bytes([9] * 6)      # 一次性表内 gram 占位（无重复 → 无选中位）
+    raw[16:22] = bytes([9] * 6)      # 一次性非表内 gram 占位（无重复 → 无选中位）
     raw[32:38] = g                   # g 重复（chunk 2）
     raw[38:41] = b"\x20\x21\x22"     # g 续尾 38-40 → chunk 2
     raw[41:47] = h                   # h 首现（chunk 2）
     raw[47:50] = b"\x30\x31\x32"     # h 首现续尾
-    raw[56:62] = u                   # 对照手术落点（chunk 3, 无重复）
+    raw[56:62] = u                   # 诱饵手术落点（chunk 3, 无重复）
     raw[72:78] = h                   # h 重复（chunk 4）
     raw[78:81] = b"\x30\x31\x32"     # h 续尾 78-80 → chunk 4
     raw0 = bytes(raw)
@@ -277,22 +283,28 @@ def test_b2_own_chunk_exclusion_flagged():
         model=_PatchableModel(), ns=ns, clean_ids=clean, byte_mask=zero_mask,
         table=table, scan=scan, arms={"a", "b1", "b2"}, rng=random.Random(0),
         pattern_index=idx, window_id=0, forward_fn=fwd,
+        split_override=(frozenset({h}), frozenset({g})),  # 钉死: h 处理 / g 对照
     )
     assert rec["status"] == "ok"
     by_pos = {it["byte_pos"]: it for it in rec["items"]}
-    assert {it["byte_pos"] for it in rec["items"] if it["role"] == "selected"} == {38, 39, 40, 78, 79, 80}
-    for t in (38, 39, 40):  # 被置换源 chunk 2 内 → b2 剔除, b1 照常
+    assert {it["byte_pos"] for it in rec["items"] if it["role"] == "selected"} == {78, 79, 80}
+    assert {it["byte_pos"] for it in rec["items"] if it["role"] == "control"} == {38, 39, 40}
+    for t in (38, 39, 40):  # 对照 g 续尾在被置换源 chunk 2 内 → b2 剔除, b1 照常
         it = by_pos[t]
         assert it["b2_own_chunk_excluded"] is True
         assert it["NLL_b2"] is None and it["delta_b2"] is None
         assert it["NLL_b1"] is not None and it["delta_b1"] is not None
-    for t in (78, 79, 80):  # chunk 4 非源 → b2 保留
+    for t in (78, 79, 80):  # 处理 h 续尾在 chunk 4（未置换）→ b2 保留
         it = by_pos[t]
         assert it["b2_own_chunk_excluded"] is False
         assert it["NLL_b2"] is not None
-    assert rec["counts"]["n_b2_own_chunk_selected"] == 3
+    assert rec["counts"]["n_b2_own_chunk_control"] == 3
+    assert rec["counts"]["n_b2_own_chunk_selected"] == 0
+    # 对照 g 的诱饵 = u@56（唯一非选中表内 gram 出现处）；源 g@0 保持不动
+    assert by_pos[38]["decoy_gram"] == u.hex() and by_pos[38]["decoy_pos"] == 56
     s = rec["sums"]
-    assert s["n_sel"] == 6 and s["n_sel_b2"] == 3  # 只有 h 续尾进 b2 分层
+    assert s["n_sel"] == 3 and s["n_ctl"] == 3
+    assert s["n_sel_b2"] == 3 and s["n_ctl_b2"] == 0  # 只有处理 h 续尾进 b2 分层
     assert s["n_strong"] == 0  # confident_all stub: 两臂同为置信 → ΔNLL≡0（本测只验剔除标记）
 
 
@@ -376,10 +388,101 @@ def test_scanner_same_source_import():
     assert e122.cross_chunk_occurrences(win, 6).keys() == ddb.cross_chunk_occurrences(win, 6).keys()
 
 
-# --- 6. 对照手术统计匹配 --------------------------------------------------------------
+# --- 6. 半分手术统计匹配（v1.3a 簇级） -------------------------------------------------
 
 
-def test_control_surgery_stats_matched():
+def _cluster_window():
+    """簇级构造窗：7 字节短语 P 在 0/64 两处出现 → 移位 gram 家族 p0g=P[0:6]、
+    p1g=P[1:7] 源 span (0,6)/(1,7) 重叠成簇；q 在 16/96 两处 = 独立簇；
+    r1@40 一次性表内 gram（诱饵合格域）。"""
+    raw = _counter_filler(128)
+    p0g = bytes([21, 22, 23, 24, 25, 26])
+    p1g = bytes([22, 23, 24, 25, 26, 27])
+    q = bytes([31] * 6)
+    r1, r2, r3 = bytes([41] * 6), bytes([42] * 6), bytes([43] * 6)
+    raw[0:7] = p0g + bytes([27])   # p0g@0, p1g@1（chunk 0）
+    raw[64:71] = p0g + bytes([27])  # 重复（chunk 4）→ 跨 chunk 选中
+    raw[16:22] = q
+    raw[96:102] = q                # q 重复（chunk 6）
+    raw[40:46] = r1                # 一次性 → 不选中，诱饵候选
+    r4, r5 = bytes([44] * 6), bytes([45] * 6)  # 同图案桶扩充（禁集耗尽防）
+    table = {p0g: 0, p1g: 1, q: 2, r1: 3, r2: 4, r3: 5, r4: 6, r5: 7}
+    return bytes(raw), table, (p0g, p1g, q, r1)
+
+
+def test_split_clusters_deterministic_balanced():
+    """v1.3a 簇级半分：源 span 重叠链并簇（移位家族同簇、永不跨半），簇间洗牌
+    对半、同种子可复现。"""
+    raw, table, (p0g, p1g, q, _r1) = _cluster_window()
+    occ = e122.cross_chunk_occurrences(raw, 6)
+    rare, _off = s1._d1_select_rare_grams(occ, table, 1.0)
+    sel, _ov = e122.select_tail_positions(occ, rare, 6, 3, len(raw))
+    assert {g for g, _p in sel.values()} == {p0g, p1g, q}
+    clusters = e122.build_source_clusters(sel, raw, 6)
+    assert sorted(sorted(c) for c in clusters) == sorted([sorted([p0g, p1g]), sorted([q])])
+    t1, c1, tcl1, ccl1 = e122.split_selected_clusters(sel, raw, random.Random(42), 6)
+    t2, c2, _, _ = e122.split_selected_clusters(sel, raw, random.Random(42), 6)
+    assert t1 == t2 and c1 == c2  # 同种子同分组（可复现）
+    assert not (t1 & c1) and (t1 | c1) == frozenset({p0g, p1g, q})
+    assert len(tcl1) == 1 and len(ccl1) == 1  # 簇级对半
+    for seed in range(8):  # 簇完整性：移位家族永不跨半
+        tt, cc, _, _ = e122.split_selected_clusters(sel, raw, random.Random(seed), 6)
+        assert (p0g in tt) == (p1g in tt)
+        assert (q in tt) != (p0g in tt)
+
+
+def test_cluster_surgery_union_coverage_and_all_or_nothing():
+    """v1.3a 处理簇联合替换：移位家族全体成员源 span 都被替换（短语源整体灭活，
+    接缝后写覆盖）；任一成员压保护区 → 整簇跳过（全有或全无）；对照簇源不动、
+    等量诱饵在最近合格处。"""
+    raw, table, (p0g, p1g, q, r1) = _cluster_window()
+    idx = e122.build_pattern_index(table)
+    occ = e122.cross_chunk_occurrences(raw, 6)
+    rare, _off = s1._d1_select_rare_grams(occ, table, 1.0)
+    sel, _ov = e122.select_tail_positions(occ, rare, 6, 3, len(raw))
+    plan = e122.plan_window_surgery(
+        raw, rare, sel, frozenset({p0g, p1g}), frozenset({q}), table, idx,
+        random.Random(0), 6, 3,
+        treat_clusters=[frozenset({p0g, p1g})], ctrl_clusters=[frozenset({q})],
+    )
+    applied = plan.apply(raw)
+    # 接缝语义（后写覆盖）：p0g 替换只剩首字节，p1g 替换整体在位 → union 全覆盖
+    assert applied[0:1] == plan.replacements[p0g][0:1]
+    assert applied[1:7] == plan.replacements[p1g]
+    assert applied[0:7] != raw[0:7]  # 短语源整体灭活
+    assert plan.n_source_overlap_skipped == 0
+    assert applied[16:22] == q  # 对照源不动
+    # 对照簇 1 成员 → 1 处诱饵 = 唯一合格出现处 r1@40
+    assert plan.decoy_span.get(q) is not None and len(plan.decoy_span[q]) == 1
+    g2, p2, _r = plan.spans[plan.decoy_span[q][0]]
+    assert g2 == r1 and p2 == 40
+    # 全有或全无：构造 B 簇源压 A 簇重复保护区 → 整簇跳过
+    raw2 = _counter_filler(128)
+    a, b = bytes([51] * 6), bytes([52] * 6)
+    raw2[0:6] = a
+    raw2[64:70] = a              # A 重复（chunk 4）→ 保护区 (64,73)
+    raw2[70:76] = b              # B 源 (70,76) 压 A 保护区 [70,73) 但不毁 A 本体
+    raw2[96:102] = b             # B 重复（chunk 6）
+    raw2 = bytes(raw2)
+    table2 = {**table, a: 8, b: 9}  # 沿用簇窗大桶（禁集耗尽防）
+    occ2 = e122.cross_chunk_occurrences(raw2, 6)
+    rare2, _ = s1._d1_select_rare_grams(occ2, table2, 1.0)
+    sel2, _ov2 = e122.select_tail_positions(occ2, rare2, 6, 3, len(raw2))
+    assert {g for g, _p in sel2.values()} == {a, b}
+    plan2 = e122.plan_window_surgery(
+        raw2, rare2, sel2, frozenset({b}), frozenset({a}), table2, idx,
+        random.Random(0), 6, 3,
+        treat_clusters=[frozenset({b})], ctrl_clusters=[frozenset({a})],
+    )
+    assert plan2.n_source_overlap_skipped == 1  # B 簇整簇跳过
+    assert b not in plan2.replacements
+    assert plan2.apply(raw2)[70:76] == b  # 未动
+
+
+def test_split_half_surgery_stats_matched():
+    """v1.3a 簇级同体半分手术单（用户裁定 2026-09-06）：处理簇源联合替换+对照
+    簇等量诱饵同三匹配同保护；对照源保持不动；诱饵=离簇源锚最近合格非选中
+    表内出现处。"""
     raw0, table = _smoke_window()
     idx = e122.build_pattern_index(table)
     occ = e122.cross_chunk_occurrences(raw0, 6)
@@ -387,32 +490,47 @@ def test_control_surgery_stats_matched():
     sel, _ov = e122.select_tail_positions(occ, rare, 6, 3, len(raw0))
     n = len(raw0)
     protected = [(p, min(p + 6 + 3, n)) for _g, p in set(sel.values())]
-    control_positions = [8, 30, 55, 80, 110, 120]
-    plan = e122.plan_window_surgery(raw0, rare, sel, control_positions, table, idx,
-                                    random.Random(0), 6, 3)
-    # 全部替换（选中源 + 对照）同三匹配
+    treat, ctrl, tcl, ccl = e122.split_selected_clusters(sel, raw0, random.Random(0), 6)
+    plan = e122.plan_window_surgery(raw0, rare, sel, treat, ctrl, table, idx,
+                                    random.Random(0), 6, 3,
+                                    treat_clusters=tcl, ctrl_clusters=ccl)
+    # 全部替换（处理源 + 诱饵）同三匹配
     for g0, p0, r in plan.spans:
         assert len(r) == len(g0)
         assert e122.continuation_pattern(r) == e122.continuation_pattern(g0)
         assert r in table and r != g0
         assert raw0[p0:p0 + len(g0)] == g0
         assert plan.apply(raw0)[p0:p0 + len(r)] == r  # 应用后该处确实是替换串
-    # 对照手术与选中手术同约束域（同图案桶、同表、同禁集纪律）→ 统计匹配;
-    # 且不落在保护区（选中出现处+续尾）与对照位自身
-    ctl_spans = [plan.spans[i] for i in plan.control_span.values()]
-    assert ctl_spans, "合成窗必须至少有一个对照手术落点"
-    for g0, p0, _r in ctl_spans:
+    # 全部 span 不压保护区（两半的重复出现处+续尾，处理源与诱饵同受约束）
+    for g0, p0, _r in plan.spans:
         lo, hi = p0, p0 + len(g0)
         assert not any(lo < ph and pl < hi for pl, ph in protected)
-    for q, i in plan.control_span.items():
-        _g0, p0, _r = plan.spans[i]
-        assert not (p0 <= q < p0 + len(plan.spans[i][2]))
-    # 每个对照位要么有手术、要么如实计数（无合格出现处）
-    assert plan.n_control_no_occurrence == len(control_positions) - len(plan.control_span)
+    applied = plan.apply(raw0)
+    # 处理簇：全体成员源被替换（全有或全无）
+    for c in tcl:
+        replaced = [g for g in c if g in plan.replacements]
+        assert not replaced or len(replaced) == len(c)
+        for g in replaced:
+            p0 = raw0.find(g)
+            assert applied[p0:p0 + 6] == plan.replacements[g]
+    # 对照簇：源不动、诱饵数=簇成员数、诱饵非任何选中串
+    assert plan.decoy_span and set(plan.decoy_span) <= set(ctrl)
+    sel_originals = {gg for gg, _p in sel.values()}
+    for g, sis in plan.decoy_span.items():
+        p0 = raw0.find(g)
+        assert applied[p0:p0 + 6] == g  # 对照源不动
+        cluster_of_g = next(c for c in ccl if g in c)
+        assert len(sis) == len(cluster_of_g)  # 等量诱饵
+        for si in sis:
+            g2, _p2, _r = plan.spans[si]
+            assert g2 not in sel_originals
+    # 合成窗唯一合格诱饵 = u@40
+    for g, sis in plan.decoy_span.items():
+        assert all(plan.spans[si][0] == bytes([12] * 6) and plan.spans[si][1] == 40
+                   for si in sis)
     # 手术不改变窗长
-    assert len(plan.apply(raw0)) == n
+    assert len(applied) == n
     # 同串多出现共用一个替换 gram（记录在 replacements）
-    assert len(plan.replacements) <= len(plan.spans)
     for g0, _p0, r in plan.spans:
         assert plan.replacements[g0] == r
 

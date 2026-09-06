@@ -14,17 +14,26 @@ L=6/T=3 续尾语义与 _d1_build_weight_map 一致）对**源 L-gram 内容**�
        （统计匹配、内容错误、行存在性保留；_patch_state_zero 同款机制）——
        显式索引路径（不进主判读表，分层素材）。
 
-对照：同窗未选中位（等量随机抽样）；对照位的手术 = 同窗随机挑一个稀有表
-gram 出现处做同款替换（吸收替换本身的 surprisal 位移）。主判读量 =
-mean ΔNLL_b1(选中) − mean ΔNLL_b1(对照)，窗级 bootstrap 95% CI。
+对照（v1.3a 簇级同体半分，用户裁定 2026-09-06——v1.0 随机自由位对照被口径
+审计证伪：每窗 31–55% 字节腐蚀 × 对照位无保护区 → 对比估计量结构性负偏；
+v1.2 gram 级半分再被证伪：跨段稀有内容以 1–5 字节移位 gram **簇**存在，
+gram 级独立手术只毁源 6 字节、54% 跳过稀释集中处理侧、同簇尾位相邻混杂跨
+半）：选中 gram 先按**源 span 重叠链并簇**（union 扫描），簇集洗牌对半——
+处理簇全体成员源 span **联合替换**（短语源整体灭活，全有或全无：任一成员
+压 used/protected 整簇跳过并计数）；对照簇源**不动**、改在离簇源锚最近合
+格位置做与簇成员数等量的**诱饵**替换。两侧计分位同型（跨段稀有 gram 续
+尾）、同保护、同腐蚀暴露；对比 = 「源内容整体被打掉 − 同区域等量无关替
+换」= 内容特异性依赖。主判读量 =
+mean ΔNLL_b1(处理) − mean ΔNLL_b1(对照)，窗级 bootstrap 95% CI。
 
 卫生：eval mask 命中位剔除并计数；b1 分段漂移改「术后窗重映射续计分」（裁定
 2026-09-06：目标字节与局部上下文未变，分段响应是模型对手术的合法中介效应，
-机械网格噪声由选中/对照对比吸收——逐位记 drifted 布尔进分层稳健性读数，原
-「整窗剔除」废止）；被替换 span 覆盖的计分位按侧伤剔除；落在被置换源 chunk
-内的计分位从 b2 分层剔除（对角自读污染，b1 照常计）；任务注入零（burst/
-cloze/retrieval 清零）；坑 8 全键断言（缺键 loud fail，禁止 build_model 兜底
-默认）。
+机械网格噪声由处理/对照对比吸收——逐位记 drifted 布尔进分层稳健性读数，原
+「整窗剔除」废止）；两半的重复出现处+续尾全进保护区且**处理源替换同样受保
+护区约束**（v1.2 起）；被替换 span 覆盖的计分位按侧伤剔除；落在被置换源
+chunk 内的计分位从 b2 分层剔除（对角自读污染，b1 照常计）；任务注入零
+（burst/cloze/retrieval 清零）；坑 8 全键断言（缺键 loud fail，禁止
+build_model 兜底默认）。
 
 主读数面 = codec direct 路径（logits_direct，D1 加权训练的同一表面）。d 格
 （coarse V）direct 的靶网格是累积 as-encoded 格（make_cumulative_retention_targets
@@ -207,13 +216,14 @@ def _overlaps(span: tuple[int, int], spans: list[tuple[int, int]]) -> bool:
 
 
 class SurgeryPlan:
-    """一窗的 b1 手术单：被替换 span（原 gram、窗内位置、替换 gram）+ 计数。"""
+    """一窗的 b1 手术单（v1.2）：被替换 span（原 gram、窗内位置、替换 gram）
+    + 对照 gram → 诱饵 span 映射 + 计数。"""
 
     def __init__(self):
         self.spans: list[tuple[bytes, int, bytes]] = []  # (orig_gram, pos, repl)
-        self.control_span: dict[int, int] = {}  # control byte_pos -> spans 下标
-        self.n_control_no_occurrence = 0
-        self.n_source_overlap_skipped = 0
+        self.decoy_span: dict[bytes, list[int]] = {}  # 对照 gram -> 其簇诱饵 spans 下标表
+        self.n_control_no_decoy = 0
+        self.n_source_overlap_skipped = 0  # v1.3a 起按**簇**计数（全有或全无）
         self.replacements: dict[bytes, bytes] = {}  # orig -> repl（同窗同串同替换）
 
     def apply(self, raw: bytes) -> bytes:
@@ -229,60 +239,130 @@ class SurgeryPlan:
         return out
 
 
-def plan_window_surgery(raw: bytes, rare: set[bytes], sel: dict[int, tuple[bytes, int]],
-                        control_positions: list[int], table: dict[bytes, int],
-                        pattern_index: dict[int, list[bytes]], rng: random.Random,
-                        L: int, tail: int) -> SurgeryPlan:
-    """一窗手术单。
+def build_source_clusters(sel: dict[int, tuple[bytes, int]], raw: bytes,
+                          L: int) -> list[frozenset[bytes]]:
+    """选中 gram 按**源 span（最早出现处 L 字节）重叠链**并簇（区间扫描合并）：
+    跨段重复稀有内容以簇存在——同一稀有词/短语的 1–L-1 字节移位 gram 家族源
+    span 互相重叠（审计 2026-09-06：v1.2 冒烟 54% 处理源跳过的真身）。v1.3a
+    裁定：split 与手术的诚实单位是簇不是 gram（同簇尾位 1 字节相邻、内容依赖
+    同一，不许分进两半；簇外源 span 才可独立灭活）。"""
+    grams = sorted({g for g, _p in sel.values()})
+    spans = sorted((raw.find(g), g) for g in grams)  # p0 升序
+    clusters: list[list[bytes]] = []
+    cur: list[bytes] = []
+    cur_hi = -1
+    for p0, g in spans:
+        if cur and p0 < cur_hi:
+            cur.append(g)
+            cur_hi = max(cur_hi, p0 + L)
+        else:
+            if cur:
+                clusters.append(cur)
+            cur, cur_hi = [g], p0 + L
+    if cur:
+        clusters.append(cur)
+    return [frozenset(c) for c in clusters]
 
-    选中位：每个选中 gram 的**最早出现处**（raw.find = cross_chunk_occurrences
-    语义下的 first_chunk 出现）替换——目标位（重复出现处续尾）字节保持不变。
-    同串多出现共用一个替换 gram；span 相互重叠的 gram 跳过并计数（其选中位仍
-    计分、如实稀释，对照侧同款吸收）。
-    对照位：每对照位随机挑一个稀有表 gram 出现处做同款替换；排除规则 = 已用
-    span、选中位保护区（选中出现处+续尾，防对照手术污染选中处理）、含该对照
-    位自身的 span；无合格出现处 → 该对照位剔除计数。
-    原串互为禁集（替换不落回任何被替换原串，杜绝串别名）。"""
+
+def split_selected_clusters(sel: dict[int, tuple[bytes, int]], raw: bytes,
+                            rng: random.Random, L: int):
+    """v1.3a 簇级同体半分（用户裁定 2026-09-06）：簇集洗牌对半——处理簇全体
+    成员源联合替换，对照簇源不动+等长诱饵替换。奇数簇时处理半多一簇。
+    返回 (处理 gram 集, 对照 gram 集, 处理簇表, 对照簇表)。"""
+    clusters = sorted(build_source_clusters(sel, raw, L), key=lambda c: min(c))
+    rng.shuffle(clusters)
+    k = (len(clusters) + 1) // 2
+    treat_cl, ctrl_cl = clusters[:k], clusters[k:]
+    treat = frozenset().union(*treat_cl) if treat_cl else frozenset()
+    ctrl = frozenset().union(*ctrl_cl) if ctrl_cl else frozenset()
+    return treat, ctrl, treat_cl, ctrl_cl
+
+
+def plan_window_surgery(raw: bytes, rare: set[bytes], sel: dict[int, tuple[bytes, int]],
+                        treat_grams: frozenset[bytes], ctrl_grams: frozenset[bytes],
+                        table: dict[bytes, int],
+                        pattern_index: dict[int, list[bytes]], rng: random.Random,
+                        L: int, tail: int,
+                        treat_clusters: list[frozenset[bytes]] | None = None,
+                        ctrl_clusters: list[frozenset[bytes]] | None = None) -> SurgeryPlan:
+    """一窗手术单（v1.3a 簇级同体半分，用户裁定 2026-09-06——v1.0 随机自由位
+    对照被口径审计证伪（高腐蚀×保护不对称→对比结构性负偏）；v1.2 gram 级半分
+    再被证伪（跨段稀有内容以移位 gram 簇存在，gram 级独立手术只毁源 6 字节、
+    簇内欠强+54% 跳过稀释集中处理侧、同簇尾位 1 字节相邻跨半混杂）。
+
+    处理簇：全体成员源 span（各自最早出现处）**联合替换**——短语源整体灭活
+    （簇内重叠 span 顺序写入，交叠字节以后写为准，接缝处图案匹配放宽、如实
+    记录）；任一成员源 span 压 used/protected → **整簇跳过**（全有或全无，
+    其续尾位仍计分、如实稀释，两侧同款对称）并计数。
+    对照簇：源**不动**；诱饵 = 离簇源锚（成员源最小 p0）最近的合格稀有表出现
+    处起、与簇成员数等量的逐处替换——几何匹配「源区域被扰动」噪音，内容非
+    特异。诱饵合格域：非任何选中 gram（防毁掉两侧自身依赖）、未被替换过、
+    不压 used/protected。零合格出现处 → 整簇无诱饵计数。
+    保护区 = 两半的重复出现处+续尾（全部计分位及其 gram 出现处），处理源与
+    诱饵同受约束。原串互为禁集（替换不落回任何被替换原串，杜绝串别名）。"""
     plan = SurgeryPlan()
     n = len(raw)
     used: list[tuple[int, int]] = []
-    # 选中位保护区：选中（重复）出现处 + 续尾
-    protected = [(p, min(p + L + tail, n)) for _g, p in set(sel.values())]
-
-    # 1) 选中源替换
     sel_originals = {g for g, _p in sel.values()}
-    for g in sorted(sel_originals):
-        p0 = raw.find(g)  # 最早出现（first_chunk）
-        if _overlaps((p0, p0 + L), used):
-            plan.n_source_overlap_skipped += 1
-            continue
-        base = sel_originals | set(plan.replacements) | set(plan.replacements.values())
-        r = pick_replacement(g, pattern_index, rng, forbidden=frozenset(base - {g}), window=raw)
-        plan.replacements[g] = r
-        plan.spans.append((g, p0, r))
-        used.append((p0, p0 + L))
+    # 保护区：两半的（重复）出现处 + 续尾——全部计分位及其 gram 出现处
+    protected = [(p, min(p + L + tail, n)) for _g, p in set(sel.values())]
+    if treat_clusters is None or ctrl_clusters is None:
+        treat_clusters = [c for c in (build_source_clusters(sel, raw, L))
+                          if c <= treat_grams]
+        ctrl_clusters = [c for c in (build_source_clusters(sel, raw, L))
+                         if c <= ctrl_grams]
 
-    # 2) 对照替换（等量吸收替换本身的 surprisal 位移）
-    occ_table = table_occurrences(raw, L, table)
-    for q in control_positions:
-        eligible = [
-            (g, p)
-            for g, p in occ_table
-            if not _overlaps((p, p + L), used)
-            and not _overlaps((p, p + L), protected)
-            and not (p <= q < p + L)
-            and g not in plan.replacements
-        ]
-        if not eligible:
-            plan.n_control_no_occurrence += 1
+    # 1) 处理簇：全体成员源联合替换（全有或全无）
+    for cluster in sorted(treat_clusters, key=lambda c: min(c)):
+        members = sorted(cluster, key=lambda g: raw.find(g))  # 源位升序，接缝确定
+        member_spans = [(g, raw.find(g)) for g in members]
+        if any(
+            _overlaps((p0, p0 + L), used) or _overlaps((p0, p0 + L), protected)
+            for _g, p0 in member_spans
+        ):
+            plan.n_source_overlap_skipped += 1  # 整簇跳过（如实稀释+计数）
             continue
-        g, p = eligible[rng.randrange(len(eligible))]
-        base = sel_originals | set(plan.replacements) | set(plan.replacements.values())
-        r = pick_replacement(g, pattern_index, rng, forbidden=frozenset(base - {g}), window=raw)
-        plan.replacements[g] = r
-        plan.control_span[q] = len(plan.spans)
-        plan.spans.append((g, p, r))
-        used.append((p, p + L))
+        for g, p0 in member_spans:
+            base = sel_originals | set(plan.replacements) | set(plan.replacements.values())
+            r = pick_replacement(g, pattern_index, rng, forbidden=frozenset(base - {g}),
+                                 window=raw)
+            plan.replacements[g] = r
+            plan.spans.append((g, p0, r))
+            used.append((p0, p0 + L))
+
+    # 2) 对照簇：源不动；诱饵 = 离簇源锚最近合格处起等量逐处替换
+    occ_table = table_occurrences(raw, L, table)
+    for cluster in sorted(ctrl_clusters, key=lambda c: min(c)):
+        anchor = min(raw.find(g) for g in cluster)
+        eligible = sorted(
+            (
+                (g2, p2)
+                for g2, p2 in occ_table
+                if g2 not in sel_originals
+                and g2 not in plan.replacements
+                and not _overlaps((p2, p2 + L), used)
+                and not _overlaps((p2, p2 + L), protected)
+            ),
+            key=lambda gp: abs(gp[1] - anchor),
+        )
+        if not eligible:
+            plan.n_control_no_decoy += 1
+            continue
+        picked = []
+        for g2, p2 in eligible:
+            if len(picked) >= len(cluster):
+                break
+            if _overlaps((p2, p2 + L), used):
+                continue  # 贪心途中 used 在长，逐处复查
+            base = sel_originals | set(plan.replacements) | set(plan.replacements.values())
+            r = pick_replacement(g2, pattern_index, rng, forbidden=frozenset(base - {g2}),
+                                 window=raw)
+            plan.replacements[g2] = r
+            picked.append(len(plan.spans))
+            plan.spans.append((g2, p2, r))
+            used.append((p2, p2 + L))
+        for g in cluster:
+            plan.decoy_span[g] = picked  # 对照 gram -> 其簇的诱饵 span 下标表
     return plan
 
 
@@ -396,11 +476,13 @@ def default_forward(model, source: torch.Tensor, ns) -> dict:
 def run_window(model, ns, clean_ids: torch.Tensor, byte_mask: torch.Tensor, table: dict[bytes, int],
                scan: Namespace, arms: set[str], rng: random.Random,
                pattern_index: dict[int, list[bytes]], window_id: int,
-               forward_fn=None) -> dict:
-    """三臂同窗：返回 {status, items, sums, counts}。status ∈ ok / empty。
+               forward_fn=None, split_override: tuple[frozenset, frozenset] | None = None) -> dict:
+    """三臂同窗：返回 {status, items, sums, counts, split}。status ∈ ok / empty。
     漂移门（2026-09-06 裁定：重映射续计分，整窗剔除废止）——目标字节与局部
-    上下文未变，分段响应是模型对手术的合法中介效应，机械网格噪声由选中/对照
+    上下文未变，分段响应是模型对手术的合法中介效应，机械网格噪声由处理/对照
     对比吸收：b1 术后在术后窗重算格位取 NLL，逐位记 drifted 布尔进分层读数。
+    v1.2 同体半分对照（用户裁定 2026-09-06）：split = 处理/对照 gram 分组审计
+    （正册逐窗可复诊）；split_override 为复现/测试钩子（钉死分组，绕过 rng）。
     clean_ids/byte_mask: (1, T)（已剥 PAD，模型设备）。"""
     forward_fn = forward_fn or default_forward
     L, tail, quantile = scan.ngram_len, scan.tail, scan.rare_quantile
@@ -413,11 +495,14 @@ def run_window(model, ns, clean_ids: torch.Tensor, byte_mask: torch.Tensor, tabl
         "n_grid_excluded": 0, "n_post_grid_excluded": 0,
         "n_selected_collateral": 0, "n_control_collateral": 0,
         "n_b2_own_chunk_selected": 0, "n_b2_own_chunk_control": 0,
-        "n_control_no_occurrence": 0,
-        "n_source_overlap_skipped": 0, "n_selection_overlap": 0,
+        "n_control_no_decoy": 0,
+        "n_treatment_clusters_skipped": 0, "n_selection_overlap": 0,
+        "n_treatment_grams": 0, "n_control_grams": 0,
+        "n_treatment_clusters": 0, "n_control_clusters": 0,
         "hit_grams": 0, "offtable_grams": 0,
     }
-    empty = {"status": "empty", "items": [], "sums": _zero_sums(), "counts": counts}
+    empty = {"status": "empty", "items": [], "sums": _zero_sums(), "counts": counts,
+             "split": None}
     if n < L + 1:
         return empty
 
@@ -430,13 +515,33 @@ def run_window(model, ns, clean_ids: torch.Tensor, byte_mask: torch.Tensor, tabl
     if not sel:
         return empty
 
-    free = [t for t in range(n) if t not in sel]
-    control_positions = rng.sample(free, min(len(sel), len(free)))
-    plan = plan_window_surgery(raw, rare, sel, control_positions, table, pattern_index,
-                               rng, L, tail)
-    counts["n_control_no_occurrence"] = plan.n_control_no_occurrence
-    counts["n_source_overlap_skipped"] = plan.n_source_overlap_skipped
-    controls_planned = [q for q in control_positions if q in plan.control_span]
+    # v1.3a 簇级同体半分（用户裁定 2026-09-06）：跨段稀有内容以移位 gram 簇
+    # 存在——split/手术单位=簇；两半续尾位全部计分（同型同保护同腐蚀暴露）。
+    if split_override is not None:
+        treat_grams, ctrl_grams = split_override
+        treat_cl = [c for c in build_source_clusters(sel, raw, L) if c <= treat_grams]
+        ctrl_cl = [c for c in build_source_clusters(sel, raw, L) if c <= ctrl_grams]
+    else:
+        treat_grams, ctrl_grams, treat_cl, ctrl_cl = split_selected_clusters(sel, raw, rng, L)
+    counts["n_treatment_grams"] = len(treat_grams)
+    counts["n_control_grams"] = len(ctrl_grams)
+    counts["n_treatment_clusters"] = len(treat_cl)
+    counts["n_control_clusters"] = len(ctrl_cl)
+    plan = plan_window_surgery(raw, rare, sel, treat_grams, ctrl_grams, table,
+                               pattern_index, rng, L, tail,
+                               treat_clusters=treat_cl, ctrl_clusters=ctrl_cl)
+    counts["n_control_no_decoy"] = plan.n_control_no_decoy
+    counts["n_treatment_clusters_skipped"] = plan.n_source_overlap_skipped
+    treat_positions = sorted(t for t, (g, _p) in sel.items() if g in treat_grams)
+    ctl_positions = sorted(t for t, (g, _p) in sel.items() if g in ctrl_grams)
+    split_audit = {
+        "treatment_clusters": [sorted(g.hex() for g in c) for c in
+                               sorted(treat_cl, key=lambda c: min(c))],
+        "control_clusters": [sorted(g.hex() for g in c) for c in
+                             sorted(ctrl_cl, key=lambda c: min(c))],
+        "treatment_replaced": sorted(g.hex() for g in treat_grams if g in plan.replacements),
+        "control_decoy_placed": sorted(g.hex() for g in plan.decoy_span),
+    }
 
     # 臂 (a)：完整窗基线
     source_a = clean_ids.masked_fill(byte_mask.bool(), MASK_ID)
@@ -461,10 +566,10 @@ def run_window(model, ns, clean_ids: torch.Tensor, byte_mask: torch.Tensor, tabl
             tgts.append(int(clean_ids[0, t]))
         return keep, tgts
 
-    sel_valid, _sel_tgt = score_set(sorted(sel))
-    ctl_valid, _ctl_tgt = score_set(sorted(controls_planned))
-    counts["n_selected_mask_excluded"] = sum(1 for t in sorted(sel) if bool(byte_mask[0, t]))
-    counts["n_control_mask_excluded"] = sum(1 for t in sorted(controls_planned) if bool(byte_mask[0, t]))
+    sel_valid, _sel_tgt = score_set(treat_positions)
+    ctl_valid, _ctl_tgt = score_set(ctl_positions)
+    counts["n_selected_mask_excluded"] = sum(1 for t in treat_positions if bool(byte_mask[0, t]))
+    counts["n_control_mask_excluded"] = sum(1 for t in ctl_positions if bool(byte_mask[0, t]))
     if not sel_valid:
         return {**empty, "status": "empty"}
 
@@ -513,10 +618,12 @@ def run_window(model, ns, clean_ids: torch.Tensor, byte_mask: torch.Tensor, tabl
     b2_on = "b2" in arms and bool(plan.spans)
     b2_keep_sel, b2_keep_ctl = sel_scored, ctl_scored
     if b2_on:
+        # v1.2：行手术只处置**处理半**源 chunk（诱饵手术是 b1 字节面噪音匹配件，
+        # 不进 b2）；对照半源行保持不动——b2 对比 = 处理续尾 vs 对照续尾同型几何
         src_chunks = {
             int(ca[0, p])
-            for _g, p, _r in plan.spans
-            if 0 <= int(ca[0, p]) < max_chunks
+            for g, p, _r in plan.spans
+            if g in treat_grams and 0 <= int(ca[0, p]) < max_chunks
         }
         b2_keep_sel = [t for t in sel_scored if int(ca[0, t]) not in src_chunks]
         b2_keep_ctl = [t for t in ctl_scored if int(ca[0, t]) not in src_chunks]
@@ -544,11 +651,11 @@ def run_window(model, ns, clean_ids: torch.Tensor, byte_mask: torch.Tensor, tabl
 
     items, sums = [], _zero_sums()
     strong = scan.strong_line
-    for role, pos_list, sel_map in (("selected", sel_scored, sel), ("control", ctl_scored, None)):
+    for role, pos_list in (("selected", sel_scored), ("control", ctl_scored)):
         keep_b2 = b2_keep_sel if role == "selected" else b2_keep_ctl
         for t in pos_list:
             na = nll_a_sel[t] if role == "selected" else nll_a_ctl[t]
-            g, p = sel_map[t] if role == "selected" else (b"", -1)
+            g, p = sel[t]  # v1.2：两半计分位同型（都是跨段稀有 gram 续尾）
             item = {
                 "window_id": window_id,
                 "byte_pos": t,
@@ -564,6 +671,11 @@ def run_window(model, ns, clean_ids: torch.Tensor, byte_mask: torch.Tensor, tabl
                 "NLL_b2": (nll_b2_sel if role == "selected" else nll_b2_ctl).get(t),
                 "NLL_b2_base": (nll_b2_base_sel if role == "selected" else nll_b2_base_ctl).get(t),
             }
+            if role == "control":  # 诱饵手术审计（对照源保持不动）
+                ds = plan.decoy_span.get(g)
+                item["decoy_gram"] = plan.spans[ds[0]][0].hex() if ds else None
+                item["decoy_pos"] = plan.spans[ds[0]][1] if ds else None
+                item["decoy_n_spans"] = len(ds) if ds else 0
             items.append(item)
             d1 = item["NLL_b1"] - na if item["NLL_b1"] is not None else None
             # b2 读数面=backbone（行手术对非源 chunk 的 direct 面恒等 0）：同面基线相减
@@ -591,7 +703,8 @@ def run_window(model, ns, clean_ids: torch.Tensor, byte_mask: torch.Tensor, tabl
                 sums["n_ctl_nodrift"] += int(d1 is not None and not drifted)
                 sums["ctl_d_b1_nodrift"] += d1 if (d1 is not None and not drifted) else 0.0
 
-    return {"status": "ok", "items": items, "sums": sums, "counts": counts}
+    return {"status": "ok", "items": items, "sums": sums, "counts": counts,
+            "split": split_audit}
 
 
 def _zero_sums() -> dict:
@@ -725,6 +838,7 @@ def main() -> None:
     rng = random.Random(args.seed)
 
     items_path = out_dir / "items.jsonl"
+    splits_path = out_dir / "splits.jsonl"  # v1.2 逐窗处理/对照分组审计
     window_sums: list[dict] = []
     tally = {"n_windows_attempted": 0, "n_windows_used": 0, "n_windows_empty": 0}
     totals: dict[str, int] = {}
@@ -748,6 +862,9 @@ def main() -> None:
                 with items_path.open("a", encoding="utf-8") as f:
                     for item in rec["items"]:
                         f.write(json.dumps(item, ensure_ascii=False) + "\n")
+                with splits_path.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps({"window_id": wi, **rec["split"]},
+                                       ensure_ascii=False) + "\n")
             else:
                 tally["n_windows_empty"] += 1
             s = rec["sums"]
@@ -803,8 +920,13 @@ def main() -> None:
     strong_per_window = (
         sum(w["n_strong"] for w in window_sums) / len(window_sums) if window_sums else 0.0
     )
+    # v1.2 同体半分的密度锚折算（用户裁定 2026-09-06）：处理半只覆盖 D1 监督集
+    # 的 realized 份额 f = n_sel/(n_sel+n_ctl)——强命中原始口径按 1/f 折算回全集
+    # 当量再对 54.8（=110 监督字节/窗 × 50% 落点线）判算术关自洽
+    treat_frac = (n_sel / (n_sel + n_ctl)) if (n_sel + n_ctl) else None
+    strong_full_equiv = (strong_per_window / treat_frac) if treat_frac else None
     summary = {
-        "probe": "E122 跨段必要性账（冻结预注册 v1.0, 2026-09-06；漂移门改重映射续计分 2026-09-06 裁定）",
+        "probe": "E122 跨段必要性账（冻结预注册 v1.0 + v1.1 漂移门 + v1.3a 簇级同体半分对照, 2026-09-06）",
         "created": time.strftime("%Y-%m-%d %H:%M:%S"),
         "device": device.type,
         "ckpt": {"run": Path(args.ckpt).name, "step": step},
@@ -825,12 +947,18 @@ def main() -> None:
         },
         "drift_stratification": drift_stratification,
         "density": {
-            # 判读主锚（裁定 2026-09-06）：强命中字节/窗绝对数 ≥ 54.8（算术关自洽
-            # 原始形式）；对 110/54.8 的比值与 50% 落点线为次级口径
+            # 判读主锚（裁定 2026-09-06）：强命中字节/窗全集当量 ≥ 54.8（算术关
+            # 自洽原始形式）；原始口径（处理半）与份额 f 同报
             "strong_bytes_per_window": round(strong_per_window, 4),
-            "landing_pass_absolute": bool(strong_per_window >= DENSITY_STRICT_BPW),
-            "vs_110_bpw": round(strong_per_window / DENSITY_SUPERVISED_BPW, 4),
-            "vs_54_8_bpw_strict": round(strong_per_window / DENSITY_STRICT_BPW, 4),
+            "treatment_share_f": round(treat_frac, 4) if treat_frac is not None else None,
+            "strong_full_set_equivalent": (round(strong_full_equiv, 4)
+                                           if strong_full_equiv is not None else None),
+            "landing_pass_absolute": bool(strong_full_equiv is not None
+                                          and strong_full_equiv >= DENSITY_STRICT_BPW),
+            "vs_110_bpw": (round(strong_full_equiv / DENSITY_SUPERVISED_BPW, 4)
+                           if strong_full_equiv is not None else None),
+            "vs_54_8_bpw_strict": (round(strong_full_equiv / DENSITY_STRICT_BPW, 4)
+                                   if strong_full_equiv is not None else None),
             "landing_line_ratio": round(DENSITY_STRICT_BPW / DENSITY_SUPERVISED_BPW, 4),
         },
         "exclusions": {
@@ -842,16 +970,21 @@ def main() -> None:
             "collateral_control": totals.get("n_control_collateral", 0),
             "b2_own_chunk_selected": totals.get("n_b2_own_chunk_selected", 0),
             "b2_own_chunk_control": totals.get("n_b2_own_chunk_control", 0),
-            "selected_unsourced_overlap_skipped": totals.get("n_source_overlap_skipped", 0),
-            "control_no_occurrence": totals.get("n_control_no_occurrence", 0),
+            "treatment_clusters_skipped": totals.get("n_treatment_clusters_skipped", 0),
+            "control_no_decoy": totals.get("n_control_no_decoy", 0),
             "selection_overlap": totals.get("n_selection_overlap", 0),
+            "treatment_grams": totals.get("n_treatment_grams", 0),
+            "control_grams": totals.get("n_control_grams", 0),
+            "treatment_clusters": totals.get("n_treatment_clusters", 0),
+            "control_clusters": totals.get("n_control_clusters", 0),
         },
         "verdict": verdict(mean_sel, boot),
         "b2_note": (
             "b2 不进主判读表（预注册 §4）：ΔNLL_b2 ≈ ΔNLL_b1 → 依赖走显式行索引；"
             "ΔNLL_b2 ≪ ΔNLL_b1 → 依赖被 encoder 隐式混入 own-row。行手术保留行存在性"
-            "（长度侧信道容忍，预注册 §5.7）；落在被置换源 chunk 内的计分位已从 b2 "
-            "分层剔除（对角自读污染，裁定 2026-09-06，b1 照常计）。"
+            "（长度侧信道容忍，预注册 §5.7）；v1.2 起行手术只处置处理半源 chunk，"
+            "落在被置换源 chunk 内的计分位从 b2 分层剔除（对角自读污染，裁定 "
+            "2026-09-06，b1 照常计）。"
         ),
         "timing_sec": round(time.time() - t0, 1),
     }
