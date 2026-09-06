@@ -18,10 +18,13 @@ L=6/T=3 续尾语义与 _d1_build_weight_map 一致）对**源 L-gram 内容**�
 gram 出现处做同款替换（吸收替换本身的 surprisal 位移）。主判读量 =
 mean ΔNLL_b1(选中) − mean ΔNLL_b1(对照)，窗级 bootstrap 95% CI。
 
-卫生：eval mask 命中位剔除并计数；b1 分段漂移检查（手术前后 chunk 网格在
-计分位不一致的窗整窗剔除并报剔除率）；被替换 span 覆盖的计分位按侧伤剔除；
-任务注入零（burst/cloze/retrieval 清零）；坑 8 全键断言（缺键 loud fail，
-禁止 build_model 兜底默认）。
+卫生：eval mask 命中位剔除并计数；b1 分段漂移改「术后窗重映射续计分」（裁定
+2026-09-06：目标字节与局部上下文未变，分段响应是模型对手术的合法中介效应，
+机械网格噪声由选中/对照对比吸收——逐位记 drifted 布尔进分层稳健性读数，原
+「整窗剔除」废止）；被替换 span 覆盖的计分位按侧伤剔除；落在被置换源 chunk
+内的计分位从 b2 分层剔除（对角自读污染，b1 照常计）；任务注入零（burst/
+cloze/retrieval 清零）；坑 8 全键断言（缺键 loud fail，禁止 build_model 兜底
+默认）。
 
 主读数面 = codec direct 路径（logits_direct，D1 加权训练的同一表面）。d 格
 （coarse V）direct 的靶网格是累积 as-encoded 格（make_cumulative_retention_targets
@@ -307,8 +310,8 @@ def byte_to_grid_slots(chunk_ids: torch.Tensor, offsets: torch.Tensor, byte_mask
 
 def drifted_positions(ca: torch.Tensor, oa: torch.Tensor, cb: torch.Tensor, ob: torch.Tensor,
                       positions: list[int]) -> list[int]:
-    """b1 手术后 chunk 网格在计分位漂移的位清单（预注册 §3：目标位上游分段
-    漂移 → 整窗剔除并报剔除率）。"""
+    """b1 手术后 chunk 网格在计分位漂移的位清单（v1.1 修订 2026-09-06：整窗剔除
+    废止，漂移位重映射续计分并逐位记 drifted 布尔进分层读数）。"""
     return [
         t for t in positions
         if (int(ca[0, t]), int(oa[0, t])) != (int(cb[0, t]), int(ob[0, t]))
@@ -394,8 +397,11 @@ def run_window(model, ns, clean_ids: torch.Tensor, byte_mask: torch.Tensor, tabl
                scan: Namespace, arms: set[str], rng: random.Random,
                pattern_index: dict[int, list[bytes]], window_id: int,
                forward_fn=None) -> dict:
-    """三臂同窗：返回 {status, items, sums, counts}。status ∈ ok / dropped_drift
-    / empty。clean_ids/byte_mask: (1, T)（已剥 PAD，模型设备）。"""
+    """三臂同窗：返回 {status, items, sums, counts}。status ∈ ok / empty。
+    漂移门（2026-09-06 裁定：重映射续计分，整窗剔除废止）——目标字节与局部
+    上下文未变，分段响应是模型对手术的合法中介效应，机械网格噪声由选中/对照
+    对比吸收：b1 术后在术后窗重算格位取 NLL，逐位记 drifted 布尔进分层读数。
+    clean_ids/byte_mask: (1, T)（已剥 PAD，模型设备）。"""
     forward_fn = forward_fn or default_forward
     L, tail, quantile = scan.ngram_len, scan.tail, scan.rare_quantile
     max_chunks, max_span = int(ns.max_chunks), int(ns.max_span)
@@ -404,7 +410,9 @@ def run_window(model, ns, clean_ids: torch.Tensor, byte_mask: torch.Tensor, tabl
 
     counts = {
         "n_selected_mask_excluded": 0, "n_control_mask_excluded": 0,
-        "n_grid_excluded": 0, "n_selected_collateral": 0, "n_control_collateral": 0,
+        "n_grid_excluded": 0, "n_post_grid_excluded": 0,
+        "n_selected_collateral": 0, "n_control_collateral": 0,
+        "n_b2_own_chunk_selected": 0, "n_b2_own_chunk_control": 0,
         "n_control_no_occurrence": 0,
         "n_source_overlap_skipped": 0, "n_selection_overlap": 0,
         "hit_grams": 0, "offtable_grams": 0,
@@ -472,8 +480,10 @@ def run_window(model, ns, clean_ids: torch.Tensor, byte_mask: torch.Tensor, tabl
     nll_a_ctl = dict(zip(ctl_scored, gather_nll(out_a["logits_direct"], ca, oa, ctl_scored,
                                                 [int(clean_ids[0, t]) for t in ctl_scored])))
 
-    # 臂 (b1)：外科替换（字节面）
+    # 臂 (b1)：外科替换（字节面）。术后窗重映射续计分（漂移门裁定 2026-09-06）：
+    # 目标字节逻辑位与内容不变，在其术后新格位取 NLL；漂移位进分层读数。
     nll_b1_sel, nll_b1_ctl = {}, {}
+    drift_flags: dict[int, bool] = {}
     if "b1" in arms:
         raw_b1 = plan.apply(raw)
         ids_b1 = torch.tensor([[b + BYTE_OFFSET for b in raw_b1]], dtype=clean_ids.dtype,
@@ -481,29 +491,37 @@ def run_window(model, ns, clean_ids: torch.Tensor, byte_mask: torch.Tensor, tabl
         source_b1 = ids_b1.masked_fill(byte_mask.bool(), MASK_ID)
         out_b1 = forward_fn(model, source_b1, ns)
         cb, ob = out_b1["chunks"].chunk_ids, out_b1["chunks"].offsets
-        scored = sel_scored + ctl_scored
-        drift = drifted_positions(ca, oa, cb, ob, scored)
-        if drift:
-            return {
-                "status": "dropped_drift",
-                "items": [],
-                "sums": _zero_sums(),
-                "counts": {**counts, "n_drift_positions": len(drift)},
-                "drift_positions": drift[:16],
-            }
-        nll_b1_sel = dict(zip(sel_scored, gather_nll(out_b1["logits_direct"], cb, ob, sel_scored,
-                                                     [int(clean_ids[0, t]) for t in sel_scored])))
-        nll_b1_ctl = dict(zip(ctl_scored, gather_nll(out_b1["logits_direct"], cb, ob, ctl_scored,
-                                                     [int(clean_ids[0, t]) for t in ctl_scored])))
+        _c1, _s1, valid_b = byte_to_grid_slots(cb, ob, byte_mask, max_chunks, max_span)
+        sel_b1 = [t for t in sel_scored if bool(valid_b[0, t])]
+        ctl_b1 = [t for t in ctl_scored if bool(valid_b[0, t])]
+        counts["n_post_grid_excluded"] = (len(sel_scored) - len(sel_b1)) + (len(ctl_scored) - len(ctl_b1))
+        for t in drifted_positions(ca, oa, cb, ob, sel_b1 + ctl_b1):
+            drift_flags[t] = True
+        nll_b1_sel = dict(zip(sel_b1, gather_nll(out_b1["logits_direct"], cb, ob, sel_b1,
+                                                 [int(clean_ids[0, t]) for t in sel_b1])))
+        nll_b1_ctl = dict(zip(ctl_b1, gather_nll(out_b1["logits_direct"], cb, ob, ctl_b1,
+                                                 [int(clean_ids[0, t]) for t in ctl_b1])))
 
-    # 臂 (b2)：源 chunk 行手术（行面；字节不动）
+    # 臂 (b2)：源 chunk 行手术（行面；字节不动）。读数面 = completion/backbone
+    # （logits_backbone）——slm direct 面上 chunk c 的解码只条件于自身状态行
+    # v_rows[c]（_slm_forward: cond_direct=dec_in(v_rows)+pos），行手术对非源
+    # chunk 的 direct 读数恒等 0，路径 B（backbone block1 跨行因果 cross-read,
+    # 预注册 §2）只在 backbone 面出读数。落在被置换源 chunk 内的计分位从 b2
+    # 分层剔除（对角自读污染，裁定 2026-09-06——b1 不受影响照常计）。
     nll_b2_sel, nll_b2_ctl = {}, {}
-    if "b2" in arms and plan.spans:
+    nll_b2_base_sel, nll_b2_base_ctl = {}, {}
+    b2_on = "b2" in arms and bool(plan.spans)
+    b2_keep_sel, b2_keep_ctl = sel_scored, ctl_scored
+    if b2_on:
         src_chunks = {
             int(ca[0, p])
             for _g, p, _r in plan.spans
             if 0 <= int(ca[0, p]) < max_chunks
         }
+        b2_keep_sel = [t for t in sel_scored if int(ca[0, t]) not in src_chunks]
+        b2_keep_ctl = [t for t in ctl_scored if int(ca[0, t]) not in src_chunks]
+        counts["n_b2_own_chunk_selected"] = len(sel_scored) - len(b2_keep_sel)
+        counts["n_b2_own_chunk_control"] = len(ctl_scored) - len(b2_keep_ctl)
         n_real = int(out_a["chunks"].chunk_mask[0].sum())
         perm = build_row_perm(src_chunks, n_real)
         restore = patch_store_rows_perm(model, perm)
@@ -512,14 +530,22 @@ def run_window(model, ns, clean_ids: torch.Tensor, byte_mask: torch.Tensor, tabl
         finally:
             restore()
         cb2, ob2 = out_b2["chunks"].chunk_ids, out_b2["chunks"].offsets
-        nll_b2_sel = dict(zip(sel_scored, gather_nll(out_b2["logits_direct"], cb2, ob2, sel_scored,
-                                                     [int(clean_ids[0, t]) for t in sel_scored])))
-        nll_b2_ctl = dict(zip(ctl_scored, gather_nll(out_b2["logits_direct"], cb2, ob2, ctl_scored,
-                                                     [int(clean_ids[0, t]) for t in ctl_scored])))
+        # ΔNLL_b2 = 背骨面术后 − 背骨面基线（同面对照）
+        nll_b2_base_sel = dict(zip(b2_keep_sel, gather_nll(out_a["logits_backbone"], ca, oa, b2_keep_sel,
+                                                           [int(clean_ids[0, t]) for t in b2_keep_sel])))
+        nll_b2_base_ctl = dict(zip(b2_keep_ctl, gather_nll(out_a["logits_backbone"], ca, oa, b2_keep_ctl,
+                                                           [int(clean_ids[0, t]) for t in b2_keep_ctl])))
+        nll_b2_sel = dict(zip(b2_keep_sel, gather_nll(out_b2["logits_backbone"], cb2, ob2, b2_keep_sel,
+                                                      [int(clean_ids[0, t]) for t in b2_keep_sel])))
+        nll_b2_ctl = dict(zip(b2_keep_ctl, gather_nll(out_b2["logits_backbone"], cb2, ob2, b2_keep_ctl,
+                                                      [int(clean_ids[0, t]) for t in b2_keep_ctl])))
+        # NLL_b2/NLL_b2_base 存原始读数（backbone 面），Δ 在 item 循环内同面相减
+        # ——与 b1 的「存原始、算 delta」口径一致，items.jsonl 保留可审计原值。
 
     items, sums = [], _zero_sums()
     strong = scan.strong_line
     for role, pos_list, sel_map in (("selected", sel_scored, sel), ("control", ctl_scored, None)):
+        keep_b2 = b2_keep_sel if role == "selected" else b2_keep_ctl
         for t in pos_list:
             na = nll_a_sel[t] if role == "selected" else nll_a_ctl[t]
             g, p = sel_map[t] if role == "selected" else (b"", -1)
@@ -531,26 +557,39 @@ def run_window(model, ns, clean_ids: torch.Tensor, byte_mask: torch.Tensor, tabl
                 "repeat_pos": p,
                 "grid_chunk": int(ca[0, t]),
                 "grid_slot": int(oa[0, t]),
+                "drifted": drift_flags.get(t, False),
+                "b2_own_chunk_excluded": (t not in keep_b2) if b2_on else (False if "b2" in arms else None),
                 "NLL_a": na,
                 "NLL_b1": (nll_b1_sel if role == "selected" else nll_b1_ctl).get(t),
                 "NLL_b2": (nll_b2_sel if role == "selected" else nll_b2_ctl).get(t),
+                "NLL_b2_base": (nll_b2_base_sel if role == "selected" else nll_b2_base_ctl).get(t),
             }
             items.append(item)
             d1 = item["NLL_b1"] - na if item["NLL_b1"] is not None else None
-            d2 = item["NLL_b2"] - na if item["NLL_b2"] is not None else None
+            # b2 读数面=backbone（行手术对非源 chunk 的 direct 面恒等 0）：同面基线相减
+            d2 = (item["NLL_b2"] - item["NLL_b2_base"]) if item["NLL_b2"] is not None else None
             item["delta_b1"] = d1
             item["delta_b2"] = d2
+            drifted = bool(item["drifted"])
             if role == "selected":
                 sums["n_sel"] += 1
                 sums["sel_d_b1"] += d1 or 0.0
                 sums["sel_d_b2"] += d2 or 0.0
                 sums["n_sel_b2"] += int(d2 is not None)
                 sums["n_strong"] += int(d1 is not None and d1 >= strong)
+                sums["n_sel_drift"] += int(d1 is not None and drifted)
+                sums["sel_d_b1_drift"] += d1 if (d1 is not None and drifted) else 0.0
+                sums["n_sel_nodrift"] += int(d1 is not None and not drifted)
+                sums["sel_d_b1_nodrift"] += d1 if (d1 is not None and not drifted) else 0.0
             else:
                 sums["n_ctl"] += 1
                 sums["ctl_d_b1"] += d1 or 0.0
                 sums["ctl_d_b2"] += d2 or 0.0
                 sums["n_ctl_b2"] += int(d2 is not None)
+                sums["n_ctl_drift"] += int(d1 is not None and drifted)
+                sums["ctl_d_b1_drift"] += d1 if (d1 is not None and drifted) else 0.0
+                sums["n_ctl_nodrift"] += int(d1 is not None and not drifted)
+                sums["ctl_d_b1_nodrift"] += d1 if (d1 is not None and not drifted) else 0.0
 
     return {"status": "ok", "items": items, "sums": sums, "counts": counts}
 
@@ -558,7 +597,9 @@ def run_window(model, ns, clean_ids: torch.Tensor, byte_mask: torch.Tensor, tabl
 def _zero_sums() -> dict:
     return {
         "n_sel": 0, "sel_d_b1": 0.0, "sel_d_b2": 0.0, "n_sel_b2": 0, "n_strong": 0,
+        "n_sel_drift": 0, "sel_d_b1_drift": 0.0, "n_sel_nodrift": 0, "sel_d_b1_nodrift": 0.0,
         "n_ctl": 0, "ctl_d_b1": 0.0, "ctl_d_b2": 0.0, "n_ctl_b2": 0,
+        "n_ctl_drift": 0, "ctl_d_b1_drift": 0.0, "n_ctl_nodrift": 0, "ctl_d_b1_nodrift": 0.0,
     }
 
 
@@ -685,10 +726,7 @@ def main() -> None:
 
     items_path = out_dir / "items.jsonl"
     window_sums: list[dict] = []
-    tally = {
-        "n_windows_attempted": 0, "n_windows_used": 0, "n_windows_dropped_drift": 0,
-        "n_windows_empty": 0,
-    }
+    tally = {"n_windows_attempted": 0, "n_windows_used": 0, "n_windows_empty": 0}
     totals: dict[str, int] = {}
     wi = 0
     for batch, mbatch in zip(batches, masks):
@@ -710,25 +748,49 @@ def main() -> None:
                 with items_path.open("a", encoding="utf-8") as f:
                     for item in rec["items"]:
                         f.write(json.dumps(item, ensure_ascii=False) + "\n")
-            elif rec["status"] == "dropped_drift":
-                tally["n_windows_dropped_drift"] += 1
             else:
                 tally["n_windows_empty"] += 1
             s = rec["sums"]
             print(
-                f"[e122] win {wi:4d} {rec['status']:13s} sel={s['n_sel']:3d} ctl={s['n_ctl']:3d}"
-                f" strong={s['n_strong']:3d} ({time.time() - t0:.0f}s)",
+                f"[e122] win {wi:4d} {rec['status']:5s} sel={s['n_sel']:3d} ctl={s['n_ctl']:3d}"
+                f" strong={s['n_strong']:3d} drift={s['n_sel_drift']:3d} ({time.time() - t0:.0f}s)",
                 flush=True,
             )
             wi += 1
         if wi >= args.n_windows:
             break
 
-    # 聚合（选中/对照两臂均值差 + 窗级 bootstrap CI + 强命中密度换算）
+    # 聚合（选中/对照两臂均值差 + 窗级 bootstrap CI + 漂移分层 + 强命中密度换算）
     n_sel = sum(w["n_sel"] for w in window_sums)
     n_ctl = sum(w["n_ctl"] for w in window_sums)
     mean_sel = sum(w["sel_d_b1"] for w in window_sums) / n_sel if n_sel else None
     mean_ctl = sum(w["ctl_d_b1"] for w in window_sums) / n_ctl if n_ctl else None
+
+    def _strat(role: str, key: str) -> dict:
+        nk, sk = f"n_{role}_{key}", f"{role}_d_b1_{key}"
+        n_ = sum(w[nk] for w in window_sums)
+        return {
+            "n": n_,
+            "mean_delta_b1": (sum(w[sk] for w in window_sums) / n_) if n_ else None,
+        }
+
+    sel_drift, sel_nodrift = _strat("sel", "drift"), _strat("sel", "nodrift")
+    ctl_drift, ctl_nodrift = _strat("ctl", "drift"), _strat("ctl", "nodrift")
+    drift_stratification = {
+        "selected": {"drifted": sel_drift, "non_drifted": sel_nodrift},
+        "control": {"drifted": ctl_drift, "non_drifted": ctl_nodrift},
+        "contrast_drifted": (
+            sel_drift["mean_delta_b1"] - ctl_drift["mean_delta_b1"]
+            if sel_drift["mean_delta_b1"] is not None and ctl_drift["mean_delta_b1"] is not None
+            else None
+        ),
+        "contrast_non_drifted": (
+            sel_nodrift["mean_delta_b1"] - ctl_nodrift["mean_delta_b1"]
+            if sel_nodrift["mean_delta_b1"] is not None and ctl_nodrift["mean_delta_b1"] is not None
+            else None
+        ),
+        "note": "漂移门裁定（2026-09-06）：术后窗重映射续计分，drifted=术前术后格位变化位；分层只作稳健性读数",
+    }
     mean_sel_b2 = (
         sum(w["sel_d_b2"] for w in window_sums) / max(sum(w["n_sel_b2"] for w in window_sums), 1)
         if any(w["n_sel_b2"] for w in window_sums) else None
@@ -741,9 +803,8 @@ def main() -> None:
     strong_per_window = (
         sum(w["n_strong"] for w in window_sums) / len(window_sums) if window_sums else 0.0
     )
-    strong_rate = strong_per_window / DENSITY_SUPERVISED_BPW
     summary = {
-        "probe": "E122 跨段必要性账（冻结预注册 v1.0, 2026-09-06）",
+        "probe": "E122 跨段必要性账（冻结预注册 v1.0, 2026-09-06；漂移门改重映射续计分 2026-09-06 裁定）",
         "created": time.strftime("%Y-%m-%d %H:%M:%S"),
         "device": device.type,
         "ckpt": {"run": Path(args.ckpt).name, "step": step},
@@ -755,31 +816,32 @@ def main() -> None:
             "eval_mask_seed": getattr(ns, "eval_mask_seed", None),
             "mask_prob": getattr(ns, "mask_prob", None),
         },
-        "windows": {
-            **tally,
-            "drift_drop_rate": round(
-                tally["n_windows_dropped_drift"] / max(tally["n_windows_attempted"], 1), 4
-            ),
-        },
+        "windows": {**tally},
         "selected": {"n": n_sel, "mean_delta_b1": mean_sel, "mean_delta_b2": mean_sel_b2},
         "control": {"n": n_ctl, "mean_delta_b1": mean_ctl, "mean_delta_b2": mean_ctl_b2},
         "contrast_b1": {
             **boot,
             "mean": (mean_sel - mean_ctl) if (mean_sel is not None and mean_ctl is not None) else None,
         },
+        "drift_stratification": drift_stratification,
         "density": {
-            "strong_hits_per_window": round(strong_per_window, 4),
+            # 判读主锚（裁定 2026-09-06）：强命中字节/窗绝对数 ≥ 54.8（算术关自洽
+            # 原始形式）；对 110/54.8 的比值与 50% 落点线为次级口径
+            "strong_bytes_per_window": round(strong_per_window, 4),
+            "landing_pass_absolute": bool(strong_per_window >= DENSITY_STRICT_BPW),
             "vs_110_bpw": round(strong_per_window / DENSITY_SUPERVISED_BPW, 4),
             "vs_54_8_bpw_strict": round(strong_per_window / DENSITY_STRICT_BPW, 4),
-            "landing_line": round(DENSITY_STRICT_BPW / DENSITY_SUPERVISED_BPW, 4),
-            "landing_pass": bool(strong_rate >= DENSITY_STRICT_BPW / DENSITY_SUPERVISED_BPW),
+            "landing_line_ratio": round(DENSITY_STRICT_BPW / DENSITY_SUPERVISED_BPW, 4),
         },
         "exclusions": {
             "mask_hit_selected": totals.get("n_selected_mask_excluded", 0),
             "mask_hit_control": totals.get("n_control_mask_excluded", 0),
             "grid_excluded": totals.get("n_grid_excluded", 0),
+            "post_surgery_grid_excluded": totals.get("n_post_grid_excluded", 0),
             "collateral_selected": totals.get("n_selected_collateral", 0),
             "collateral_control": totals.get("n_control_collateral", 0),
+            "b2_own_chunk_selected": totals.get("n_b2_own_chunk_selected", 0),
+            "b2_own_chunk_control": totals.get("n_b2_own_chunk_control", 0),
             "selected_unsourced_overlap_skipped": totals.get("n_source_overlap_skipped", 0),
             "control_no_occurrence": totals.get("n_control_no_occurrence", 0),
             "selection_overlap": totals.get("n_selection_overlap", 0),
@@ -787,8 +849,9 @@ def main() -> None:
         "verdict": verdict(mean_sel, boot),
         "b2_note": (
             "b2 不进主判读表（预注册 §4）：ΔNLL_b2 ≈ ΔNLL_b1 → 依赖走显式行索引；"
-            "ΔNLL_b2 ≪ ΔNLL_b1 → 依赖被 encoder 隐式混入 own-row。注意 b2 行手术"
-            "保留行存在性（长度侧信道容忍，预注册 §5.7）。"
+            "ΔNLL_b2 ≪ ΔNLL_b1 → 依赖被 encoder 隐式混入 own-row。行手术保留行存在性"
+            "（长度侧信道容忍，预注册 §5.7）；落在被置换源 chunk 内的计分位已从 b2 "
+            "分层剔除（对角自读污染，裁定 2026-09-06，b1 照常计）。"
         ),
         "timing_sec": round(time.time() - t0, 1),
     }

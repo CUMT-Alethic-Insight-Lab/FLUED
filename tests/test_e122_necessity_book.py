@@ -3,14 +3,16 @@ docs/versions/v3_7/FLUED_V3_7_E122_CROSSSEG_NECESSITY_20260906_CN.md; 仪器在
 tools/analysis/v3_6/probe_e122_necessity_book.py）。
 
 Covers: (1) b1 替换三匹配（长度/UTF-8 续字节结构/稀有表内）+ 候选域空响亮报错;
-(2) 分段漂移剔除（位级 drift 检测 + 窗级 dropped_drift）; (3) d 格累积网格
+(2) 分段漂移「重映射续计分」语义（裁定 2026-09-06: 整窗剔除废止——术后新格位
+取数对拍 + drifted 标记）; (3) d 格累积网格
 字节位→(chunk,slot) 映射代数（与 make_cumulative_retention_targets 对拍 +
 追加召回槽只装遮蔽字节的完备性）; (4) 坑 8 全键断言 loud fail; (5) 扫描器与
 密度账同源 import 断言; (6) 对照手术统计匹配（同三匹配约束 + 保护区）; (7)
 bootstrap 可复现（种子固定）; (8) 逐位 NLL 无梯度图 + fp32; (9) b2 行置换
 （行存在性保留、源行只取非源行）; (10) 选择图与 D1 _d1_build_weight_map 同
 语义对拍（合成窗）; (11) 合成冒烟: 目标位确需源 gram 的窗上 b1 ΔNLL=ln(258)
->0 且对照位 ΔNLL=0（stub 前向代数对拍, 不依赖语料/GPU/checkpoint）。
+>0 且对照位 ΔNLL=0（stub 前向代数对拍, 不依赖语料/GPU/checkpoint）; (12) b2
+源 chunk 内计分位剔除标记（对角自读污染, 裁定 2026-09-06）。
 """
 
 from __future__ import annotations
@@ -122,15 +124,19 @@ def _smoke_window():
     return bytes(raw), {g: 0, h: 1, u: 2, g2: 3, h2: 4, u2: 5}
 
 
-def _stub_forward(raw0: bytes, magic: tuple[bytes, ...], L: int = 6,
-                  chunk: int = 16, drift_from: int | None = None):
+def _stub_forward(raw0: bytes, magic: tuple[bytes, ...] = (), L: int = 6,
+                  chunk: int = 16, drift_from: int | None = None,
+                  confident_all: bool = False):
     """stub 前向（仪器级代数, 非模型行为）：
-    - 非 magic 出现处续尾的位置 → 置信预测 clean 真值（两臂逐位同 → ΔNLL=0）;
-    - magic gram 出现处的 T 个续尾位：当该 gram 更早 chunk 的源出现处**内容仍在**
-      （未被手术置换）→ 置信预测源出现处对应续尾（= 目标真值, NLL≈0）; 否则
-      均匀分布（NLL=ln258）。
-    即「目标位当且仅当源 gram 内容在」的代数化——b1 替换源后选中位（全部 T 个
-    续尾）塌到均匀, 对照位（非续尾）两臂同为置信, ΔNLL 恒 0。"""
+    - 默认：非 magic 出现处续尾的位置 → 置信预测 clean 真值（两臂逐位同 →
+      ΔNLL=0）; magic gram 出现处的 T 个续尾位：当该 gram 更早 chunk 的源出现
+      处**内容仍在**（未被手术置换）→ 置信预测源出现处对应续尾（= 目标真值,
+      NLL≈0）; 否则均匀分布（NLL=ln258）。即「目标位当且仅当源 gram 内容在」
+      的代数化——b1 替换源后选中位（全部 T 个续尾）塌到均匀, 对照位（非续尾）
+      两臂同为置信, ΔNLL 恒 0。
+    - confident_all=True：全部位置置信（配 drift_from 用, 专测术后格位取数）。
+    置信 logit 恒打在 stub 自己返回网格的 (chunk_ids[t], offsets[t]) 上——术后
+    分段漂移时即新格位; 探针若错读术前格位会拿到全零 logits（NLL=ln258）。"""
 
     def forward(model, source, ns):
         raw = bytes(int(x) - 1 for x in source[0].tolist())
@@ -140,26 +146,30 @@ def _stub_forward(raw0: bytes, magic: tuple[bytes, ...], L: int = 6,
         s_max = int(chunks.offsets.max()) + 1
         logits = torch.zeros(1, c_max, s_max, 258)
         uniform = set()  # 均匀分布位（源内容不在的续尾位）
-        for m in magic:
-            first0 = raw0.find(m)
-            occs = []
-            pos = 0
-            while True:
-                i = raw.find(m, pos)
-                if i == -1:
-                    break
-                occs.append(i)
-                pos = i + 1
-            intact = raw[first0 : first0 + len(m)] == raw0[first0 : first0 + len(m)]
-            for p in occs:
-                if not (intact and first0 // chunk < p // chunk):
-                    uniform.update(range(p + L, min(p + L + 3, t_len)))
+        if not confident_all:
+            for m in magic:
+                first0 = raw0.find(m)
+                occs = []
+                pos = 0
+                while True:
+                    i = raw.find(m, pos)
+                    if i == -1:
+                        break
+                    occs.append(i)
+                    pos = i + 1
+                intact = raw[first0 : first0 + len(m)] == raw0[first0 : first0 + len(m)]
+                for p in occs:
+                    if not (intact and first0 // chunk < p // chunk):
+                        uniform.update(range(p + L, min(p + L + 3, t_len)))
         for t in range(t_len):
             tgt = raw0[t] + 1
-            c, sl = t // chunk, t % chunk
+            c = int(chunks.chunk_ids[0, t])  # stub 自己的术后网格坐标
+            sl = int(chunks.offsets[0, t])
             if t not in uniform:
                 logits[0, c, sl, tgt] = 30.0
-        return {"logits_direct": logits, "chunks": chunks}
+        # b2 读数面=backbone（探针裁定 2026-09-06：direct 面对非源 chunk 行手术
+        # 恒等 0）——stub 同张量充当两面（confident_all 下 ΔNLL_b2≡0 符合预期）
+        return {"logits_direct": logits, "logits_backbone": logits, "chunks": chunks}
 
     return forward
 
@@ -197,23 +207,93 @@ def test_algebra_smoke_stub_b1_positive_control_zero(seed):
     assert s["sel_d_b1"] / s["n_sel"] == pytest.approx(LN_VOCAB, abs=1e-6)
 
 
-def test_window_level_drift_drop():
-    """b1 手术引发目标位上游分段漂移 → 整窗剔除（预注册 §3 卫生）。"""
+def test_drift_remap_scores_at_post_grid():
+    """漂移门（裁定 2026-09-06：重映射续计分, 整窗剔除废止）：分段漂移窗不剔除,
+    逐位 drifted 标记正确, 且 NLL 在**术后新格位**取数——置信 logit 打在 stub
+    术后网格坐标上, 探针若错读术前格位会拿到全零 logits（NLL=ln258）。"""
     raw0, table = _smoke_window()
     idx = e122.build_pattern_index(table)
     clean = torch.tensor([[b + 1 for b in raw0]], dtype=torch.long)
     zero_mask = torch.zeros(1, len(raw0), dtype=torch.bool)
     ns = SimpleNamespace(max_chunks=16, max_span=16)
     scan = SimpleNamespace(ngram_len=6, tail=3, rare_quantile=1.0, strong_line=1.0)
-    fwd = _stub_forward(raw0, (bytes([10] * 6), bytes([11] * 6)), drift_from=40)
+    fwd = _stub_forward(raw0, confident_all=True, drift_from=40)
     rec = e122.run_window(
         model=None, ns=ns, clean_ids=clean, byte_mask=zero_mask, table=table,
         scan=scan, arms={"a", "b1"}, rng=random.Random(0), pattern_index=idx,
         window_id=0, forward_fn=fwd,
     )
-    assert rec["status"] == "dropped_drift"
-    assert rec["items"] == []
-    assert rec["counts"]["n_drift_positions"] > 0
+    assert rec["status"] == "ok"  # 不再整窗剔除
+    assert rec["items"]
+    by_pos = {it["byte_pos"]: it for it in rec["items"]}
+    assert 70 in by_pos and 102 in by_pos  # 选中位照常计分
+    for it in rec["items"]:
+        t = it["byte_pos"]
+        assert it["drifted"] is (t >= 40)  # 位 40 起 chunk_ids +1 → 格位变化
+        assert it["NLL_b1"] < 1e-6  # 术后格位上的置信读数（错格位 = ln258）
+        assert it["delta_b1"] == pytest.approx(0.0, abs=1e-6)
+    # 分层和: 本窗全部计分位 drifted, 全部进 drifted 层
+    s = rec["sums"]
+    assert s["n_sel_drift"] == s["n_sel"] and s["n_sel_nodrift"] == 0
+    assert s["n_ctl_drift"] == s["n_ctl"] and s["n_ctl_nodrift"] == 0
+
+
+def test_b2_own_chunk_exclusion_flagged():
+    """b2 污染剔除（裁定 2026-09-06）：落在被置换源 chunk 内的计分位打
+    b2_own_chunk_excluded 并从 b2 分层剔除（NLL_b2=None）, b1 照常计。
+    合成窗: g 首现 chunk 0、重复 chunk 2（续尾 38-40 落 chunk 2）; h 首现
+    chunk 2（41-46, 与 g 续尾同 chunk）、重复 chunk 4（续尾 78-80）。源 chunk
+    集 ⊇ {0, 2} → g 续尾 38-40 在被置换 chunk 2 内 = 剔除, h 续尾保留。"""
+    raw = _counter_filler(96)
+    g, h, u = bytes([10] * 6), bytes([11] * 6), bytes([12] * 6)
+    g2, h2, u2 = bytes([13] * 6), bytes([14] * 6), bytes([15] * 6)
+    raw[0:6] = g
+    raw[6:9] = b"\x20\x21\x22"       # g 首现续尾（chunk 0）
+    raw[16:22] = bytes([9] * 6)      # 一次性表内 gram 占位（无重复 → 无选中位）
+    raw[32:38] = g                   # g 重复（chunk 2）
+    raw[38:41] = b"\x20\x21\x22"     # g 续尾 38-40 → chunk 2
+    raw[41:47] = h                   # h 首现（chunk 2）
+    raw[47:50] = b"\x30\x31\x32"     # h 首现续尾
+    raw[56:62] = u                   # 对照手术落点（chunk 3, 无重复）
+    raw[72:78] = h                   # h 重复（chunk 4）
+    raw[78:81] = b"\x30\x31\x32"     # h 续尾 78-80 → chunk 4
+    raw0 = bytes(raw)
+    table = {g: 0, h: 1, u: 2, g2: 3, h2: 4, u2: 5}
+    idx = e122.build_pattern_index(table)
+    clean = torch.tensor([[b + 1 for b in raw0]], dtype=torch.long)
+    zero_mask = torch.zeros(1, len(raw0), dtype=torch.bool)
+    ns = SimpleNamespace(max_chunks=8, max_span=16)
+    scan = SimpleNamespace(ngram_len=6, tail=3, rare_quantile=1.0, strong_line=1.0)
+
+    class _PatchableModel:
+        def _slm_store_rows(self, chunks, with_views=False):
+            r = torch.zeros(1, 6, 4)
+            if with_views:
+                return r, r, torch.zeros(()), r, r, None, None
+            return r, r, torch.zeros(()), r, r
+
+    fwd = _stub_forward(raw0, confident_all=True)
+    rec = e122.run_window(
+        model=_PatchableModel(), ns=ns, clean_ids=clean, byte_mask=zero_mask,
+        table=table, scan=scan, arms={"a", "b1", "b2"}, rng=random.Random(0),
+        pattern_index=idx, window_id=0, forward_fn=fwd,
+    )
+    assert rec["status"] == "ok"
+    by_pos = {it["byte_pos"]: it for it in rec["items"]}
+    assert {it["byte_pos"] for it in rec["items"] if it["role"] == "selected"} == {38, 39, 40, 78, 79, 80}
+    for t in (38, 39, 40):  # 被置换源 chunk 2 内 → b2 剔除, b1 照常
+        it = by_pos[t]
+        assert it["b2_own_chunk_excluded"] is True
+        assert it["NLL_b2"] is None and it["delta_b2"] is None
+        assert it["NLL_b1"] is not None and it["delta_b1"] is not None
+    for t in (78, 79, 80):  # chunk 4 非源 → b2 保留
+        it = by_pos[t]
+        assert it["b2_own_chunk_excluded"] is False
+        assert it["NLL_b2"] is not None
+    assert rec["counts"]["n_b2_own_chunk_selected"] == 3
+    s = rec["sums"]
+    assert s["n_sel"] == 6 and s["n_sel_b2"] == 3  # 只有 h 续尾进 b2 分层
+    assert s["n_strong"] == 0  # confident_all stub: 两臂同为置信 → ΔNLL≡0（本测只验剔除标记）
 
 
 # --- 3. d 格累积网格映射代数 ---------------------------------------------------------
