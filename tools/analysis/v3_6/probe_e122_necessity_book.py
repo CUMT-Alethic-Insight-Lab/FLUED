@@ -411,7 +411,8 @@ def gather_nll(logits_direct: torch.Tensor, chunk_ids: torch.Tensor, offsets: to
     c = torch.tensor([int(chunk_ids[0, t]) for t in positions], dtype=torch.long)
     s = torch.tensor([int(offsets[0, t]) for t in positions], dtype=torch.long)
     picked = logits_direct[0][c, s].detach().float()  # (N, V)
-    tgt = torch.tensor(target_ids, dtype=torch.long).clamp(min=0, max=257)
+    tgt = torch.tensor(target_ids, dtype=torch.long,
+                       device=picked.device).clamp(min=0, max=257)  # CUDA 线靶同设备
     nll = F.cross_entropy(picked, tgt, reduction="none")
     return [float(x) for x in nll.tolist()]
 
