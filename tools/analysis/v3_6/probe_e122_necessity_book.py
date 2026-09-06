@@ -110,18 +110,31 @@ _MISSING = object()
 # ---------------------------------------------------------------------------
 
 
-def assert_cell_keys(ns, model_config=None) -> None:
-    """resolved_config（及装载后 model.config）逐键断言 d 格口径；键缺失或值
-    漂移一律 ValueError 响亮拒绝——build_model 的 getattr 兜底默认会把纯行为
-    静默漂移藏进读数（坑 8, 2026-08-29 冒烟事故同族）。"""
+def assert_cell_keys(ns, model_config=None, strict: bool = True) -> None:
+    """resolved_config（及装载后 model.config）逐键断言；键缺失或值漂移一律
+    ValueError 响亮拒绝——build_model 的 getattr 兜底默认会把纯行为静默漂移
+    藏进读数（坑 8, 2026-08-29 冒烟事故同族）。
+
+    strict=True（默认，d 格主基座）：五键全按 CELL_KEYS 值断言。
+    strict=False（a 格副基座，冻结预注册 §3 规定的次基座）：五键**必须显式在**
+    （缺键即拒，禁 build_model 兜底）+ 通用键（seed_source=k / backbone_mode=
+    slm）值必须对；行源三键允许世代差（a 格 = index/memory），实际值由调用方
+    进 summary 如实记录——放宽只及键值域，不放宽存在性。"""
+
+    universal = {"seed_source": CELL_KEYS["seed_source"], "backbone_mode": CELL_KEYS["backbone_mode"]}
+    enforce = CELL_KEYS if strict else universal
 
     def check(obj, where: str) -> None:
         bad = []
-        for key, want in CELL_KEYS.items():
-            got = getattr(obj, key, _MISSING)
-            shown = "<键缺失>" if got is _MISSING else repr(got)
-            if got != want:
-                bad.append(f"{where}.{key}={shown} != {want!r}")
+        for key in CELL_KEYS:  # 存在性：两档都全键必查
+            if strict or key in universal:
+                want = enforce[key]
+                got = getattr(obj, key, _MISSING)
+                shown = "<键缺失>" if got is _MISSING else repr(got)
+                if got != want:
+                    bad.append(f"{where}.{key}={shown} != {want!r}")
+            elif getattr(obj, key, _MISSING) is _MISSING:
+                bad.append(f"{where}.{key}=<键缺失>（a 格亦须显式携带，禁兜底）")
         if bad:
             raise ValueError(
                 "E122 坑8 全键断言失败（resolved_config 缺键/错值不许 build_model "
@@ -796,6 +809,9 @@ def main() -> None:
     p.add_argument("--data-path", default=None,
                    help="覆盖 resolved_config 的 data_path（远端语料路径与老 config "
                         "Windows 路径不同时用；缺省不覆盖）")
+    p.add_argument("--cell-relaxed", action="store_true",
+                   help="a 格副基座档：五键仍须显式在+通用键（seed_source/backbone_mode）"
+                        "值必须对，行源三键允许世代差并如实入 summary（默认 strict=d 格全值）")
     args = p.parse_args()
 
     arms = [a.strip() for a in args.arms.split(",") if a.strip()]
@@ -816,7 +832,8 @@ def main() -> None:
     print(f"[e122] rare table {n_table} grams（图案桶 {len(pattern_index)}）", flush=True)
 
     model, ns, step = load_model(Path(args.ckpt), device)
-    assert_cell_keys(ns, model.config)  # 坑 8：缺键/错值 loud fail，不许兜底
+    assert_cell_keys(ns, model.config, strict=not args.cell_relaxed)  # 坑 8：缺键/错值 loud fail，不许兜底
+    cell_actual = {k: getattr(ns, k, None) for k in CELL_KEYS}
     if args.data_path:
         ns.data_path = args.data_path
     if not Path(ns.data_path).exists():
@@ -938,6 +955,7 @@ def main() -> None:
         "created": time.strftime("%Y-%m-%d %H:%M:%S"),
         "device": device.type,
         "ckpt": {"run": Path(args.ckpt).name, "step": step},
+        "cell_keys_actual": cell_actual,
         "rare_table": args.rare_table,
         "params": {
             "n_windows": args.n_windows, "arms": arms, "ngram_len": args.ngram_len,

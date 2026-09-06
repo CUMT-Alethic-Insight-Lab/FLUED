@@ -657,3 +657,19 @@ def test_selection_matches_d1_weight_map():
     d1 = {(int(r[1]), int(r[2])) for r in sel_grid.nonzero().tolist()}
     assert mine == d1  # 选择图逐格同语义（D1 加权训练的同一批位点）
     assert mine == {(12, 14), (12, 15), (13, 0)}  # g5 重复 @200 → 续尾 206-208
+
+
+def test_cell_keys_relaxed_mode_a_grid():
+    """坑 8 放宽档（a 格副基座，冻结预注册 §3）：行源三键允许世代差，但五键
+    存在性+通用键（seed_source/backbone_mode）值断言不放宽。"""
+    a_grid = dict(seed_source="k", k_row_source="index", v_row_source="memory",
+                  summarizer_pool="qpool", backbone_mode="slm")
+    e122.assert_cell_keys(SimpleNamespace(**a_grid), strict=False)  # a 格通过
+    with pytest.raises(ValueError, match="k_row_source"):  # strict 档仍拒
+        e122.assert_cell_keys(SimpleNamespace(**a_grid))
+    bad_universal = dict(a_grid, seed_source="v")
+    with pytest.raises(ValueError, match="seed_source"):  # 通用键不放宽
+        e122.assert_cell_keys(SimpleNamespace(**bad_universal), strict=False)
+    missing = {k: v for k, v in a_grid.items() if k != "v_row_source"}
+    with pytest.raises(ValueError, match="键缺失"):  # 存在性不放宽
+        e122.assert_cell_keys(SimpleNamespace(**missing), strict=False)
