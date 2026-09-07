@@ -2357,7 +2357,7 @@ def _completion_target_grids(
     return targets, slot_mask, masked_slot, torch.zeros((), device=clean.device)
 
 
-def s1_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None, retrieval_metas=None, burst_metas_q15=None, store_block_override=None, need_attn: bool = False, train: bool = False, attn_block_mask: torch.Tensor | None = None) -> dict:
+def s1_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None, retrieval_metas=None, burst_metas_q15=None, store_block_override=None, need_attn: bool = False, train: bool = False, attn_block_mask: torch.Tensor | None = None, row_perm_override: list | None = None) -> dict:
     codec_final = getattr(args, "codec_final_state", False)
     if getattr(model.config, "backbone_mode", "") == "slm":
         # v3.7 (consensus §1-2): dedicated branch. codec_final / paged / draft
@@ -2374,6 +2374,7 @@ def s1_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None, re
             model, source, args, clean=clean, byte_mask=byte_mask, retrieval_metas=retrieval_metas,
             burst_metas_q15=burst_metas_q15, store_block_override=store_block_override,
             need_attn=need_attn, train=train, attn_block_mask=attn_block_mask,
+            row_perm_override=row_perm_override,
         )
     if retrieval_metas is not None or burst_metas_q15 is not None or store_block_override is not None:
         raise ValueError(
@@ -2600,7 +2601,7 @@ def s1_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None, re
     }
 
 
-def _slm_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None, retrieval_metas=None, burst_metas_q15=None, store_block_override=None, need_attn: bool = False, train: bool = False, attn_block_mask: torch.Tensor | None = None) -> dict:
+def _slm_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None, retrieval_metas=None, burst_metas_q15=None, store_block_override=None, need_attn: bool = False, train: bool = False, attn_block_mask: torch.Tensor | None = None, row_perm_override: list | None = None) -> dict:
     """v3.7 slm branch (docs/versions/v3.7/FLUED_V3_7_ARCHITECTURE_CONSENSUS_20260817_CN.md).
 
     Codec full-coverage law (consensus §2): any content task's loss covers the
@@ -2631,6 +2632,31 @@ def _slm_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None, 
     chunks = model.chunk_builder(byte_states, valid, hard_cut, confidence)
     chunks = model.bridge(chunks, byte_states, confidence, valid, utf8_cont)
     k_rows, v_rows, state_norm, memory, index, k_store, v_store = model._slm_store_rows(chunks, with_views=True)
+    if row_perm_override is not None:
+        # E123 门②批化测量（2026-09-07）：前向级逐样本行置换——perm[b][c] = 输出行
+        # c 的内容来源行（行存在性保留、内容错位，E122 b2 行手术的前向级形态）。
+        # None = 逐位不变。只置换真实行域 [0, n_real_b)，其余原样。
+        def _row_permute(t):
+            if t is None:
+                return None
+            B = t.size(0)
+            assert len(row_perm_override) == B
+            idx = torch.arange(t.size(1), device=t.device).unsqueeze(0).expand(B, -1).clone()
+            n_real_b = chunks.chunk_mask.sum(dim=1)  # (B,)
+            for b in range(B):
+                if row_perm_override[b] is None:
+                    continue  # None = 该样本恒等（基线变体）
+                nrb = int(n_real_b[b])
+                idx[b, :nrb] = torch.tensor(row_perm_override[b], dtype=torch.long,
+                                            device=t.device)[:nrb]
+            gidx = idx.view(B, -1, *([1] * (t.dim() - 2)))
+            return torch.gather(t, 1, gidx.expand_as(t))
+        k_rows = _row_permute(k_rows)
+        v_rows = _row_permute(v_rows)
+        memory = _row_permute(memory)
+        index = _row_permute(index)
+        k_store = _row_permute(k_store)
+        v_store = _row_permute(v_store)
     n_chunks = chunks.chunk_mask.size(1)
     pos = model.chunk_pos.weight.unsqueeze(0)[:, :n_chunks]
     # a+pos arm: window-relative per-chunk start byte offsets (None = off)

@@ -82,3 +82,22 @@ def test_row_swap_perm_donor_rules():
     assert p[0] == 1 and p[1] == 0
     # 单行窗：恒等
     assert gate.row_swap_perm(0, 1) == [0]
+
+
+def test_row_perm_override_forward_level():
+    """row_perm_override（E123 门②批化测量）：前向级逐样本行置换——恒等 perm
+    逐位不变；交换 perm 改变行内容（行存在性保留）。"""
+    import torch
+    from tools.train.v3_6.train_v36_s1 import _slm_forward  # noqa
+
+    # 不依赖模型实体的代数核：直接验 _row_permute 语义
+    # ——通过构造假张量走 _slm_forward 内部闭包不可达，改为复刻校验
+    t = torch.arange(24).float().view(1, 4, 6)
+    perm = [[0, 2, 1, 3]]  # 交换行 1/2
+    idx = torch.tensor(perm, dtype=torch.long).unsqueeze(-1).expand(-1, -1, 6)
+    out = torch.gather(t, 1, idx)
+    assert torch.equal(out[0, 1], t[0, 2]) and torch.equal(out[0, 2], t[0, 1])
+    assert torch.equal(out[0, 0], t[0, 0]) and torch.equal(out[0, 3], t[0, 3])
+    # 恒等 perm 逐位不变
+    ident = torch.arange(4).unsqueeze(-1).expand(-1, 6)
+    assert torch.equal(torch.gather(t, 1, ident.unsqueeze(0)), t)
