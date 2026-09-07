@@ -41,6 +41,31 @@ import tools.train.v3_6.train_v36_s1 as s1  # noqa: E402
 MAX_DIST = 2  # 依赖带（回执二直方图：k=1 占 30%、k=2 占 70%、k≥3≈0）
 
 
+def _load_trimmed(ckpt: Path, device: torch.device, max_chunks_trim: int = 64):
+    """选择器专用装载：max_chunks 构建期截断（解码网格从 1024 缩到 64，前向
+    ~15× 提速）——真实行前 n_real 读数与默认构建逐位一致（本地对拍 max|Δ|=0），
+    chunk_pos 截到前 64 行（实窗 n_real ≤ 64，截掉的全是未用 padding 槽）。
+    只用于零训练测量，不进训练臂。"""
+    import json
+    from argparse import Namespace
+    from tools.train.v3_6.train_v36 import build_model
+
+    cfg = json.loads((ckpt / "resolved_config.json").read_text(encoding="utf-8"))
+    cfg["data_manifest"] = ""
+    if device.type != "cuda":
+        cfg["kda_impl"] = "torch"
+    cfg["max_chunks"] = max_chunks_trim
+    ns = Namespace(**cfg)
+    model = build_model(ns).to(device)  # 先搬设备（漏搬=CPU 模型吃 CUDA 输入，第二次咬）
+    payload = torch.load(ckpt / "latest.pt", map_location=device, weights_only=False)
+    payload["model"]["chunk_pos.weight"] = payload["model"]["chunk_pos.weight"][:max_chunks_trim]
+    model.load_state_dict(payload["model"], strict=True)
+    for p_ in model.parameters():
+        p_.requires_grad_(False)
+    model.eval()
+    return model, ns, int(payload.get("step", 0))
+
+
 class _ForwardSlice:
     """子批前向的单变体视图（ld/lb/ca/oa）。"""
 
@@ -61,14 +86,16 @@ def measure_window(model, ns, clean, n_variants_max: int = 80) -> dict:
     T = clean.size(1)
     if n_real < 3:
         return {"masked": {}, "n_real": n_real}
+    if n_real > int(ns.max_chunks):
+        raise RuntimeError(f"窗真实 chunk 数 {n_real} > 截断网格 {ns.max_chunks}——"
+                           "截断口径不适用（负载卫检，响亮拒绝）")
     cands = list(range(min(n_real - 1, n_variants_max - 1)))  # 末 chunk 无下游
 
     # 子批化（显存护栏）：alibi 偏置 (B,H,T,T) 随 B 平方级占显存（B=65 实测 OOM
     # 24GB）；子批 ≤7 变体/前向，结果拼回。返回 outs[v] = 变体 v 的前向行。
     outs = [None] * (1 + len(cands))
     outs[0] = out0
-    SLICE = 3  # B = 1 基线 + 3 变体（alibi 偏置+全网格解码器 fp32 下 B=8 实测 OOM 24GB，
-               # B=4 ≈ 解码 logits 2.2GB+alibi 1.6GB×3 层，安全）
+    SLICE = 7  # 截断网格后解码成本消减 15×，B=8 的 alibi 偏置 ≈3.2GB 为约束
     for s0 in range(0, len(cands), SLICE):
         sub = cands[s0:s0 + SLICE]
         B = 1 + len(sub)
@@ -140,7 +167,7 @@ def main() -> None:
     device = torch.device(
         "cuda" if (args.device == "auto" and torch.cuda.is_available()) or args.device == "cuda" else "cpu"
     )
-    model, ns, step = load_model(Path(args.ckpt), device)
+    model, ns, step = _load_trimmed(Path(args.ckpt), device)
     assert_cell_keys(ns, model.config, strict=not args.cell_relaxed)
     ns.burst_prob = 0
     ns.cloze_prob = 0
