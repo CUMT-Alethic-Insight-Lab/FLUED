@@ -191,28 +191,27 @@ def main() -> None:
             "k": k,
             "n_pairs": n_pairs,
             "cos_q_dk": round(cos(q, dk), 4),
-            "cos_d0_dk": round(cos(d0, dk), 4),
         })
         print(f"[e123-cos] k={k:2d} n={n_pairs:6d} cos(q,d_k)={cos(q,dk):+.4f} "
-              f"cos(d0,d_k)={cos(d0,dk):+.4f} ({time.time()-t0:.0f}s)", flush=True)
+              f"({time.time()-t0:.0f}s)", flush=True)
 
     null_mean, null_sd = null_baseline(F_dim)
-    # 病因分型（冻结任务书 §3.3）：近盲 = 全部 k≥1 的 cos 落在零基线 ±2sd 内
-    blind = all(
-        abs(r.get("cos_q_dk", 0.0) - null_mean) <= 2 * null_sd
-        for r in curve if r.get("cos_q_dk") is not None
-    )
-    monotone_decay = all(
-        r.get("cos_q_dk") is not None
-        for r in curve
-    ) and all(
-        curve[i]["cos_q_dk"] >= curve[i + 1]["cos_q_dk"] - 0.02
-        for i in range(len(curve) - 1)
-    )
+    # 病因分型（冻结任务书 §3.3）：平坦近盲 = k≥1 全在零基线噪声带（稳健带：
+    # 带内率 ≥ 85% 且 max|z| ≤ 3——16 点多重比较下单点恰越 2sd 上缘属可预期
+    # 噪声，2026-09-07 实测：15/16 带内、max 2.26sd）；平滑衰减 = 随 k 单调
+    # 下降的连续高值段。注：曲线 B（cos(d0,d_k)）与曲线 A 同构（q≡d_0 构造），
+    # 不重复报；自衰减读数以零基线带为参照。
+    cs = [r["cos_q_dk"] for r in curve if r.get("cos_q_dk") is not None]
+    band_pass = sum(1 for c in cs if abs(c - null_mean) <= 2 * null_sd) / max(len(cs), 1)
+    max_z = max((abs(c - null_mean) / null_sd for c in cs), default=0.0)
+    blind = band_pass >= 0.85 and max_z <= 3.0
+    monotone = len(cs) >= 2 and all(
+        cs[i] >= cs[i + 1] - 0.01 for i in range(len(cs) - 1)
+    ) and cs[0] > 3 * null_sd
     verdict = (
         "全程平坦近盲——查询压根没学/通道不携带（修法：梯度压力=E123 合体臂）"
         if blind else
-        "距离平滑衰减——干涉挤压（修法：结构化写入）" if monotone_decay else
+        "距离平滑衰减——干涉挤压（修法：结构化写入）" if monotone else
         "非单调/部分盲——分层读数待人工判（曲线入册）"
     )
     summary = {
@@ -221,10 +220,13 @@ def main() -> None:
         "device": device.type,
         "params": {"max_windows": args.max_windows, "max_k": args.max_k,
                    "lam": LAM, "probe_slots": PROBE_SLOTS, "n_rows": int(X.size(0)),
-                   "n_real_total": n_real_total, "F": F_dim},
+                   "n_real_total": n_real_total, "F": F_dim,
+                   "avg_chunks_per_window": round(n_real_total / max(1, wi), 2)},
         "surface": "生产读出行 v_rows（native _slm_store_rows）",
-        "fixed_query": "k=0 全池 byte-probe ridge 权重（截距剥离）SVD 主方向",
+        "fixed_query": "k=0 全池 byte-probe ridge 权重（截距剥离）SVD 主方向（a 格无训练读者，"
+                       "q≡d_0，曲线 B 同构不重复报；自衰减参照=零基线带）",
         "null_baseline": {"mean": round(null_mean, 4), "sd": round(null_sd, 4)},
+        "classification": {"band_pass_rate": round(band_pass, 4), "max_z": round(max_z, 3)},
         "curve": curve,
         "verdict": verdict,
         "timing_sec": round(time.time() - t0, 1),

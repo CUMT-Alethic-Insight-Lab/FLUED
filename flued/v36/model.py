@@ -2377,7 +2377,12 @@ class FLUEDV36(nn.Module):
         mods = (self.byte_lookup, *self.encoder_blocks, *self.segmentor_blocks, self.segmentor_head)
         return all(not p.requires_grad for m in mods for p in m.parameters())
 
-    def _encode(self, token_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _encode(self, token_ids: torch.Tensor,
+                attn_block_mask: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """attn_block_mask（E123 遮蔽器件，条件创建）: (B, 1, 1, T) bool，True=该
+        字节对一切查询遮蔽——只抹窗内注意力键侧视野，字节流/位置/分段/valid 全
+        不动（被遮内容仍进 chunk builder→summarizer→状态通道）。None = 旧路径
+        逐位不变。"""
         valid = token_ids.ne(PAD_ID)
         # When the whole front end (byte lookup + encoder + segmentor) is frozen,
         # keep it out of the autograd graph: downstream modules only need the
@@ -2387,7 +2392,7 @@ class FLUEDV36(nn.Module):
             x = self.byte_lookup(token_ids)
             noise = x.new_zeros(token_ids.size(0))
             for block in self.encoder_blocks:
-                x = block(x, valid, noise)
+                x = block(x, valid, noise, attn_block_mask)
             byte_states = x
             for block in self.segmentor_blocks:
                 x = block(x, valid, noise)

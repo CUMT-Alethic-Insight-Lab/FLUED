@@ -2357,7 +2357,7 @@ def _completion_target_grids(
     return targets, slot_mask, masked_slot, torch.zeros((), device=clean.device)
 
 
-def s1_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None, retrieval_metas=None, burst_metas_q15=None, store_block_override=None, need_attn: bool = False, train: bool = False) -> dict:
+def s1_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None, retrieval_metas=None, burst_metas_q15=None, store_block_override=None, need_attn: bool = False, train: bool = False, attn_block_mask: torch.Tensor | None = None) -> dict:
     codec_final = getattr(args, "codec_final_state", False)
     if getattr(model.config, "backbone_mode", "") == "slm":
         # v3.7 (consensus §1-2): dedicated branch. codec_final / paged / draft
@@ -2373,7 +2373,7 @@ def s1_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None, re
         return _slm_forward(
             model, source, args, clean=clean, byte_mask=byte_mask, retrieval_metas=retrieval_metas,
             burst_metas_q15=burst_metas_q15, store_block_override=store_block_override,
-            need_attn=need_attn, train=train,
+            need_attn=need_attn, train=train, attn_block_mask=attn_block_mask,
         )
     if retrieval_metas is not None or burst_metas_q15 is not None or store_block_override is not None:
         raise ValueError(
@@ -2600,7 +2600,7 @@ def s1_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None, re
     }
 
 
-def _slm_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None, retrieval_metas=None, burst_metas_q15=None, store_block_override=None, need_attn: bool = False, train: bool = False) -> dict:
+def _slm_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None, retrieval_metas=None, burst_metas_q15=None, store_block_override=None, need_attn: bool = False, train: bool = False, attn_block_mask: torch.Tensor | None = None) -> dict:
     """v3.7 slm branch (docs/versions/v3.7/FLUED_V3_7_ARCHITECTURE_CONSENSUS_20260817_CN.md).
 
     Codec full-coverage law (consensus §2): any content task's loss covers the
@@ -2626,7 +2626,7 @@ def _slm_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None, 
     None). ``train`` 只喂 decoder 去噪臂 (任务书 2026-08-29): True 且旗标开
     时 direct 腿吃扰动副本; False (默认/eval) = 零扰动, 旧路径逐位不变。
     """
-    byte_states, confidence, valid, _ = model._encode(source)
+    byte_states, confidence, valid, _ = model._encode(source, attn_block_mask=attn_block_mask)
     hard_cut, utf8_cont, cut_overflow = model._cuts(source, confidence, valid)
     chunks = model.chunk_builder(byte_states, valid, hard_cut, confidence)
     chunks = model.bridge(chunks, byte_states, confidence, valid, utf8_cont)
