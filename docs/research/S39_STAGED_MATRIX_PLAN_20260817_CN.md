@@ -1,0 +1,334 @@
+# S39 KQV 分阶段实验矩阵计划（2026-08-17 用户批准开跑，阶段0–2）
+
+> 地位：S39 线的执行计划文档，与 `COLLISION_SCOUT_S39_ARCHIVE_QUERY_20260810_CN.md`（撞车侦察，含增补A）配套。
+> 批准口径：用户 2026-08-17 批示"直接按照当前安排跑到阶段2结束"——本文编码的是**主会话修订版分阶段方案**
+> （用户原始全因子矩阵经逐条核实后的成本压缩版），用户原始推理链全文保留在 §1 作为设计动机。
+
+## 0. 一句话
+
+病灶定位在**读出侧的 K（可寻址性），而非写入侧的 V（存储精度）**；矩阵按"病灶轴"组织，
+每阶段启动条件为上一阶段判读线，证伪即截断。全程 14 臂量级（用户原案 48–96 臂的序贯筛选压缩版）。
+
+## 1. 设计动机：用户推理链 + 逐条核实结论（2026-08-17 主会话核实）
+
+| # | 用户推理 | 核实结论 | 证据 |
+|---|---|---|---|
+| R1 | 大概率不是存储侧擦写问题，关键在读出 | **成立** | E44（s30 地址数×4 纹丝不动 / s31 逐段查询 +59pp）、E50、E57 |
+| R2 | 主干对 K 大小不敏感、对有无敏感 | **成立但需精确化**：敏感对象是"逐段查询通道之有无"，且"有无"的价值域尺度依赖（512B 冗余、4096B +1.78pp 拐点） | E56（rank32≈全秩）、E44-s30、E50、E55 |
+| R3 | decoder 能读出而主干不能 ⇒ 信息呈现形式不匹配 | **方向成立**；混淆变量"监督密度"已被 E57 排除（焊死监督退路仍 0.20 档）。内部已预演矩阵对角：decoder=K精确V精确全注意力 ≈0.8+，主干单状态=0.20 档 | v0.4/v2/v3 重建线；E57 |
+| R4 | DART 引入梯度断裂点 | **不成立（驳回）**：原文无 stop-gradient，端到端训练。DART 真问题=cache 线性增长（N/2S）、单次 SMA 无追问、Table 6 独立读出头归零 | DART 全文精读（outputs/_dart_2608.02032.txt） |
+| R5 | OverLoCK（CVPR2025 Oral, arXiv 2502.20087）回看机制可借鉴 | **部分成立**：其 top-down 是空间尺度，我们是时间/记忆维度，非同构；可借的是**分支协议**——Overview-Net 粗上下文→Focus-Net 细看，对应"gist 先读（E50 证免费）→gist 条件化追问 query" | OverLoCK 原文核实 |
+| R6 | 位置式 K：summarizer 重注入位置编码产 K，配合状态机构建索引（书的大概位置式记忆） | **最新鲜但唯一无内部数据垫底**：E56 块末键 0.06（末段主导=无位置身份）间接支持；必须先 probe 后 arm | E56 |
+| R7 | ELF（何恺明组 2026-05，连续嵌入空间扩散语言模型）佐证"语言可编码为高维流式语义" | **成立**（外部路线独立同向），我们的对应物=脉冲式段状语义 | ELF 公开资料核实 |
+
+## 2. 轴定义（语义澄清后）
+
+- **K/V 粒度轴**（核心 2×2）：K精确=逐段低秩键（summarizer 直产，形态3）；K单状态=gist 式单一全局键。
+  V精确=行集/档案（不过状态机的 memory 行）；V单状态=KDA 状态承载内容。
+- **机制轴 = 写入侧状态机选择**（KDA / GDN2 / mamba-2）。注意：该轴只在 V单状态 列是读出载体差异；
+  在 K精确V精确 列退化为写入侧组织方式差异，降为单点对照。
+- **位置编码轴**：summarizer 产 K 时是否重注入绝对位置编码（byte 级段内位置+段序）。
+- **追问轴**：无 / 追问1次 /（有效则）追问2–3次消融曲线。依赖 CUIB 反事实 harness（未建），**后置**。
+
+## 3. 已测格子（不重跑，512B 已封口）
+
+| 格子 | 512B 读数 | 证据 |
+|---|---|---|
+| V单状态（K 任意） | 终态全解 0.2033/0.2014 双宽度，n 扫描全平——保持天花板，架构本性 | E57 |
+| K单状态V精确（gist-only 0 行） | 0.7910（512B）；4096B 0.7956 | E50 / E55 |
+| K精确V精确（逐段查询+行集） | 0.797（s31）/ 0.8006（s36e 1 行） | E44 / E50 |
+
+**真正空白 = 4096B 尺度的完整 2×2**（E55 仅给 gist-only vs 25% 缓存两个点）。
+
+## 4. 阶段定义与判读线（本次 goal 覆盖阶段0–2）
+
+### 阶段0 探针（无训练臂，2–3 天）
+
+- **0a 位置注入键 probe**：复用 `tools/analysis/v3_6/probe_archive_addressing.py`（新增 v4 preset），
+  冻结库存 + 只训查询投影，加一路"位置注入键"（段序 + 段内 byte 位置重注入 summarizer 直产键）。
+  **判读线：hit@1 相对同池 0.31 基线 +5pp 为过线**；不过线则位置编码轴取消（阶段3 不发生）。
+  与 v1/v2/v3 同文档池同 seed（1042），配对可比。
+  **结果（2026-08-17，E58）：不过线 → 位置编码轴取消。** hit@1 差分（注入−锚）D=4 −18.75pp
+  （明确回退，hit@5 0.94→0.12 同步崩）、D=16/64 各 +6.25pp（CI ±12pp 内不足为凭）、三档均值
+  −2.5pp；唯一强信号 D=64 hit@5 +25pp（0.06→0.31，噪声内，立此存照）。锚重跑与 v2 逐点一致
+  （配对完整性校验过）。含义：冻结库存上外挂位置身份对键寻址无增益——E56"末段主导"病不因
+  外加位置编码而愈；位置身份若要起效，须在端到端训练中与内容键共学。
+  **用户裁定（2026-08-17 修订）：探针死刑只覆盖"冻结库存外挂"变体；为排除"位置编码水土不服/
+  外挂干扰索引存储"的假死可能，阶段1 增设端到端臂"索引直读+内容直读·位置注入键版"
+  （见阶段1 臂表）——位置编码轴的最终生死由该臂裁定。**
+- **0b mamba-2 移植可行性评估**（只评估不移植）：`flued/v36/` 换写状态机的接口面清单 +
+  成本估算；产出备忘录附本文附录。
+  **结果（2026-08-17，见附录 A）**：接口面=一个 gates dict + chunk_mask + 六个方法
+  （`flued/v36/model.py:240-580`）；主线训练只走 fla Triton chunk_kda，FlashKDA CUDA 核零耦合；
+  **GDN2=小偏中（1-2 天，WriteHead 加一路门+4 调用点，单变量=擦写解耦，fla 0.5.2 现成）**；
+  mamba-2=中偏大（3-5 天）且 KDA→mamba-2 同换四变量（擦除消失/衰减静态→动态耦合/逐通道→
+  逐头标量/门控代数），臂间差异无法归因到"擦写强度"——机制轴判别力受损，**不建议仅为消融
+  严谨性提前自测**；阶段2 只跑 GDN2、打平即闭环裁 mamba-2 的既定路线获工程背书。
+
+### 阶段0c 前置配方修复（阶段1 的硬闸门，用户 2026-08-17 指令）
+
+**问题**（fork 审计+主会话代码核实，TODO §0.3）：S1.0 三任务保持训练信号精确为零——
+direct 趁新读（`train_v36_s1.py:199`）、补全 targets/slot_mask 按段独立构造（:429-439，
+第 i 行只还原本段）、预测一步且 latent target detach（:505-514）。在此配方下跑阶段1，
+interpreter/状态机无任何保留旧段的梯度激励，2×2 全矩阵被已知缺陷污染（E40/E44/翻页探针
+的"遗忘"结论全部是在零保持配方下测得的前科）。
+
+**修复（最小改动，照 fork 登记口径）**：补全任务改为**第 i 行还原 0…i 段的遮蔽内容**
+（累积保持），direct 保持趁新读（codec 锚角色不变）、predict 保持一步（预测角色不变）。
+旧配方保留为消融开关（新开关默认开=修复后口径），config 版本号随 canonical 升级。
+**判读/验收**：目标构造单测通过（第 i 行 target 恰含 0…i 段遮蔽位）+ 短程 sanity run
+（数百步无 NaN、损失下行）；阶段1 全部臂**从零**用修复后配方训练（用户既定纪律：
+除 segmentor 从已有 3k 快照外一律从头，不半路起家）。
+
+**附注**：阶段0a 探针跑在旧配方冻结库存上，读数性质=下界（E56 同口径），不受影响；
+E57 已在"保持损失主导"配方下封过 512B 单状态天花板（0.20 档），本次修复不重开该判词，
+修复的意义在于保证阶段1 各格的 K/V 查询机制得到保持激励、且主线指标口径对外干净。
+
+### 阶段1 分类学 2×2 @ 4096B（KDA 固定，batch 标定参考 CURRENT_STATE Q6：4096=max_chunks 1024/stride 2048）
+
+| 臂 | 格子（全名） | 预算 | 性质 |
+|---|---|---|---|
+| a | **索引直读+内容直读**（K精确V精确，形态3主线） | 20K | 主结果 |
+| b | **索引过状态机+内容直读**（K单状态V精确，"状态当索引、行集当内容"，全新形态） | 20K | 新形态主臂 |
+| c | **索引直读+内容过状态机**（K精确V单状态） | 20K | 分类学对照 |
+| d | **索引内容双过状态机**（K单状态V单状态） | 20K | 对照（s38d 旧配方锚 0.7956 在册） |
+| a+pos | **索引直读·位置注入键版+内容直读**（用户 2026-08-17 裁定增设：检验 0a 探针失败是否"冻结库存水土不服"假死） | 20K | 位置编码轴最终生死臂 |
+
+（预算沿革注记：初版 c/d 曾列 10K 降预算确认臂，v3 口径裁定后四格全活、统一 20K——
+旧版"判死预测"混淆了查询粒度轴与存储组织轴，见下附修订注记。）
+
+**判读线（v3 全名版）**：
+- **a−b = 索引过状态机的代价**（寻址精度值多少钱）；**a−c = 内容过状态机的代价**（保真度值多少钱）——两个差分即 KQV 分类学的核心定量证据（正交性的直接测量）。
+- b vs d = 索引同为状态寻址时，内容直读的价值；c vs d = 内容同为状态读出时，索引精确的价值。
+- a+pos vs a：差分 >2pp（超噪声带）⇒ 位置编码端到端有效、0a 系假死，轴复活并进入胜者格子的优化项；噪声带内或更差 ⇒ 轴彻底判死（探针+端到端双死刑）。
+- 先验锚：a−d 在旧配方 4096 已测 ≈+1.78pp（s36g2 0.8134 vs s38d 0.7956，E55）——新配方下重测此差分同时充当桥接校验。
+- **判读注意（2026-08-17 主会话读码确认，`train_v36_s1.py:325-331,459-460,494,500`）**：补全梯度回
+  summarizer 有两条通路——Q 侧经 content 过状态机，K/V 侧直打 memory 行（不过状态机）；
+  decoder 从不直接吃 memory 行（direct 吃 content、补全吃 backbone_out，二者唯一共同食材是
+  content）。因此 b/d 格把 K 侧换成状态读出时，**改的不只是寻址几何，也动了补全梯度的直达
+  通路**——a−b 差分 = 寻址精度代价 + 监督通路差异的合项，解读时须摊开说明，不归因纯几何。
+- 胜者格子进入阶段2。**附带臂（锥形猜想生死线）**：胜者格子上 backbone 宽度 ×2 单臂（20K）——
+宽度翻倍不动指标 ⇒ 锥形猜想首份硬证据；动了 ⇒ 猜想部分误伤。
+**桥接臂（512B，20K）**：s36e 同配置在新配方下从零重跑——量化零保持旧配方的污染幅度，
+桥接 E44–E56 旧口径数字与阶段1 新口径（若桥接臂对 s36e 0.8006 显著偏离，旧 E 编号相关
+结论需在证据表内加注"零保持配方下读数"限定语，按 TODO §0.3 解读注意执行）。
+
+> **形态升级锚（2026-08-17 用户裁定，v3.7）**：阶段1 四格的轴语义与判读线不变，
+> 承载形态升级为 v3.7 架构共识——summarizer 内化 K/V 生产、interpreter 降格为
+> 可选分通道加工器、主干 = 标准 SLM 自备 Q、decoder 与主干同一套 V、codec 全覆盖律。
+> 正本：`docs/versions/v3.7/FLUED_V3_7_ARCHITECTURE_CONSENSUS_20260817_CN.md`。
+> v36.8 的 a 格试跑已杀止损（~5.9k 步作废：direct/predict 锚失配，与 0c 同族）；
+> 四格重发在 v3.7 实现落地后进行，本节"实现规格"段（k/v_row_source 两开关形态）
+> 被 v3.7 的"summarizer 直产 K/V + 通道选路"形态取代。
+
+### 阶段1 附：格子 → FLUED 实现映射（开跑前的形态钉死，2026-08-17；同日 v2 修订 + v3 用户口径裁定）
+
+**轴语义（v3，用户 2026-08-17 裁定口径，取代 v2）**：
+**精确 = 主干直读 summarizer 产的 memory 行（作 K 或 V）；单状态 = K/V 过 KDA/GDN2 状态机，
+主干读相应的状态矩阵。** Q 侧（主干逐段查询接口，E50 确立）在四格中恒定存在、不是变量。
+**共同基础与范围护栏（用户 2026-08-17 同上裁定）：一切改动的前提是 summarizer 本来就产 K 和 V，
+格子间唯一的变量是"过不过状态机"；主干的注意力机制不动，主干的解读能力不做非线性增强。**
+（锥形宽度附带臂只是容量缩放、机制不变，不违反此护栏。）
+历史修订注记：初版误把查询粒度轴（k=1 单终态，E38/E57 另行判死）混为本矩阵的格；
+v2 误把"单状态"窄化为"仅存 gist"——v3 按用户口径正本：单状态 = 该侧过状态机。
+
+| 格 | K/V 来源通道（Q=主干逐段查询，恒定） | 最近邻实测 | 代码增量 |
+|---|---|---|---|
+| a：索引直读+内容直读（K精确V精确） | K=memory 行直读（与 V 同源——DART Table 6 教训）；V=memory 行集直读 | s36g2 4096=0.8134（25% 行，键=行本体全秩）/ s36e、s31 | 无（s31 全行形态 @4096 现成；低秩键头=E56 证的免费优化项，不进阶段1 主臂，变量纯净优先）。位置注入键=独立臂 a+pos（用户 2026-08-17 裁定） |
+| b：索引过状态机+内容直读（K单状态V精确） | **K 过状态机**：寻址由状态矩阵承担（q·S 读状态得键侧/寻址向量）；**V 精确**：memory 行集直读——"状态当索引、行集当内容"，档案馆查询精髓形态 | 无直接臂（新形态） | 状态寻址→行选择的两跳通道（S 读出寻址向量 → 选行 → 行内容精确返回）；增量中等 |
+| c：索引直读+内容过状态机（K精确V单状态） | K=memory 行直读（逐段键，寻址精确）；**V 过状态机**：值=状态矩阵读出（内容有损） | s17/s22 系（值=状态读出）：s17 512B=0.799、s22 /4=0.267（读出密度税） | 键精确寻址 + 值取状态读出（与 a 同族） |
+| d：索引内容双过状态机（K单状态V单状态） | K/V 双过状态机（状态读出双侧） | **s36h 512B=0.791 / s38d 4096=0.7956（gist 退化版，旧配方已实测）** | 见实现规格注（全量逐段版 vs gist 退化版的取舍） |
+
+**判读线：见上节臂表（v3 全名版），此处不重复。** 四格全是活格，预算统一 20K@4096
+（用户既定"必须 20K"口径）。
+
+**实现规格（2026-08-17 主会话读码钉死，`XAttnBackbone.forward` `flued/v36/model.py:661-737`）**：
+store 侧的 K 与 V 在现有代码里本就是两张可分离的源张量（s31 路径 K/V=k_proj/v_proj(memory)，
+:681-682；Q=content 逐段状态读出，:678）。四格落地为两个配置开关——
+`k_source ∈ {memory, state}` × `v_source ∈ {memory, state}`（"过不过状态机"= K/V 投影吃
+memory 行直读还是逐段状态读出 content），映射：a=(memory,memory) 即 s31 全行形态 @4096；
+b=(state,memory)＝键侧吃状态读出、值侧吃 memory 行——"状态当索引、行集当内容"的最小实现；
+c=(memory,state)；d=(state,state)。低秩键头（E56 证 rank32≈全秩的扫描经济账）作为 a 格
+后续优化项，不进阶段1 主臂（变量纯净优先）。主干注意力机制零改动，改动面=投影源选择+
+config 两键+单测四格，符合"summarizer 产 K/V、只变过不过状态机"的范围护栏。
+注意 d=(state,state) 与 s38d gist-only 的关系：s38d 是 d 的 gist 退化版（store 只剩一条
+gist 项）；阶段1 的 d 用 (state,state) 全量逐段版还是 gist 退化版，开跑前按"与 a/b/c 同
+store 规模可比"原则取**全量逐段版**，s38d 锚留作参照。
+
+### 阶段2 机制甄别（胜者格子，2 臂封顶）
+
+- GDN2 换 KDA（delta 族近亲，移植成本低）⇒ 检验"擦写强度是否影响"。
+- **GDN2 与 KDA 打平 ⇒"存储侧不是问题"闭环，mamba-2 永久裁掉**（DART 已在 mamba-2 上做 K 侧修复
+  且 NIAH-4096 残余失败，可作 mamba-2 格子的外部数据点，防守靠引用而非自测）。
+- 两者显著差异 ⇒ mamba-2 补臂再议（回队列重新裁定）。
+
+### 阶段3/4（不在本次 goal 范围，立案备查）
+
+- ~~阶段3：位置编码轴 ×2（前提是阶段0a 过线）~~ **已取消（2026-08-17，0a 未过判读线，E58）**。
+- 阶段4：追问 harness（CUIB 反事实，gist 条件化 query，奖励=下游改进−率成本，追问选择权交主干+预算封顶；
+  捷径防护：恒追问被率成本惩罚、不追问无增益）→ 无追问 vs 追问1次，有效再补 2/3 次曲线。
+
+## 附录 A：阶段0b mamba-2/GDN2 移植可行性备忘录（2026-08-17，explore subagent 实测）
+
+**环境实测**：kda-kernels 环境（torch 2.13.0+cu130/triton 3.7.1）fla 0.5.2、mamba_ssm 2.3.2.post1、
+causal_conv1d 已装；Mamba2 模块与 `mamba_chunk_scan_combined`（Triton SSD）前向+反向 GPU 冒烟通过
+——mamba-2 不需要新编译内核（训练走 mamba_ssm Triton SSD 路径，与 fla chunk_kda 同类）。
+
+**接口面**（`flued/v36/model.py`）：状态机边界=一个 gates dict + 一个 chunk_mask，集中在两类——
+`WriteHead`（:240-262，出 k/v/beta/alpha 四门）与 `KDAStateMachine`（:265-580，六方法：
+forward/read_all_final/read_supplementary/read_residual/init_stream_state/stream_step）；
+状态 (B,4,128,256) fp32=131K 标量/样本；输出 package 经 realign，消费点 `model.py:1176`、
+`train_v36_s1.py:207-221`。替换机制满足同一契约即可挂入。
+
+**FlashKDA 耦合=零**：主线训练/推理全走 fla Triton chunk_kda（`model.py:33,540`）；FlashKDA CUDA
+核是推理专用后端（无梯度/bf16/K=V=128 限制，训练全部不满足）。换 mamba-2 只需重写 4 处内核调用点
+（:308/:356/:463/:549）+ 3 段 torch 参考循环。
+
+**GDN2=小偏中（1-2 天）**：fla 0.5.2 现成 `chunk_gdn2(q,k,v,g,b,w)` 与 chunk_kda 签名同构；
+机制差异仅一处——擦写门控解耦（KDA 标量 beta 同缩放擦除与写入；GDN2 擦除门 b 逐 K 通道、写入门 w
+逐 V 通道）。改动=WriteHead 多一路门（+1.6M 参数）+4 调用点+torch 参考改写+单测孪生；
+**单变量性质成立**（通道衰减与 delta 擦除形式保留），状态布局与 131K 预算口径不变。
+**2026-08-17 追测**：训练实际使用的 soulvlm 环境（fla 0.5.1）同有 `chunk_gdn2`，签名逐参
+比对同构（唯一结构差=b/w 双门张量，与"WriteHead 加一路门"估计一致）——阶段2 无需切换环境。
+
+**mamba-2=中偏大（3-5 天+一臂训练）**：成本三处——① 语义不可 1:1 映射（SSD 的 dt 同时进衰减与
+写入，与 KDA 静态 alpha+动态 beta 解耦不同构，WriteHead 输出语义须重设计）；② 新 torch 参考+
+约 10 个状态机单测孪生；③ state_norm 健康判据（8-16 健康/0.3 崩塌/270 爆炸是 KDA 专属知识）
+与吞吐标定须重建。**归因洁净度为最大风险：KDA→mamba-2 同换四变量（擦除项消失/衰减静态→动态
+耦合/逐通道→逐头标量衰减/门控代数），臂间差异无法归因到"擦写强度"**——它的机制差异恰好不是
+机制轴想隔离的变量。次要风险：C=23~165 段短扫描尺度上 SSD chunk scan 可能反慢于 torch 参考
+（fla chunk_kda 在 23 段实测 +15% steps/s，`model.py:92`）；131K 预算换算要求 headdim=256/
+dstate=128 类非常规形状；20K 步长训无先例。
+
+**工程意见（采纳）**：阶段2 只跑 GDN2；GDN2 与 KDA 打平即"存储侧不是问题"闭环、mamba-2 永久
+裁掉（防守靠 DART 外部数据点）；仅当显著差异时补 mamba-2 且把多变量更换的归因折扣写进判读线。
+
+## 附录 B：阶段1 发射命令模板（2026-08-17 主会话；CLI 名已于 agent-61 交付前经 `--help` 实测封版）
+
+**公共底座**（逐臂仅改 run-id/out-dir 与格子的两个开关）：
+
+```bash
+export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 KMP_DUPLICATE_LIB_OK=TRUE PYTHONUTF8=1
+python -X utf8 tools/train/v3_6/train_v36_s1.py \
+  --config configs/canonical_v36.json \
+  --data-path "P:\FLUED_corpus\corpus_v3\corpus_v3.txt" \
+  --backbone-mode xattn \
+  --seq-len 4096 --stride 2048 --max-chunks 1024 --batch-size 1 \
+  --max-steps 20000 \
+  --k-row-source <memory|state> --v-row-source <memory|state> \
+  --run-id <run_id> --out-dir checkpoints/<run_id> \
+  > checkpoints/<run_id>_stdout.log 2>&1
+```
+
+- 配方：canonical v36.8（累积保持默认开）；`--config` 已带 `init_checkpoint`（K: 的 S0′′ 快照，
+  segmentor 冻结接管）——除该快照外全部从零，符合用户既定纪律。
+- 4096 标定采用 Q6 实测值：max_chunks 1024 / stride 2048 / **batch 1**（峰值 12.2GB、~2.3 step/s、
+  20K≈2.4h）。s38d 的 batch 4 是 gist-only（store 一行）的轻载特例，不作四格全行 store 的默认值；
+  单臂稳定后可逐格上探 batch（红线：峰值 <15.9GB 分配器抖动线，守卫 cut_capacity_overflow=0 且
+  truncated_tokens=0，同 E52 口径）。
+- store 规模四格统一全行（`--xcache-frac` 默认 1.0，不加 `--xcache-gist`）——"同 store 规模可比"
+  原则（§4 实现规格注）。桥接臂的 `--xcache-frac 0.04 --xcache-gist` 是复刻 s36e 专用，不外溢。
+- CLI 开关名已封版（2026-08-17 `--help` 实测）：`--k-row-source {memory,state}` /
+  `--v-row-source {memory,state}`（config 键 `k_row_source`/`v_row_source`，
+  `train_v36_s1.py:820-825` 复用 `train_v36.build_parser`，一处加旗两处生效）。
+
+**臂次与 run-id**（GPU 串行，一臂一跑，点火前 `nvidia-smi` 查重）：
+
+| 序 | 臂 | k-row-source | v-row-source | run-id |
+|---|---|---|---|---|
+| 1 | a 索引直读+内容直读 | memory | memory | s39_a_mm_v368_20k_ctx4096_20260817 |
+| 2 | d 双过状态机 | state | state | s39_d_ss_v368_20k_ctx4096_20260817 |
+| 3 | b 索引过状态机+内容直读 | state | memory | s39_b_sm_v368_20k_ctx4096_20260817 |
+| 4 | c 索引直读+内容过状态机 | memory | state | s39_c_ms_v368_20k_ctx4096_20260817 |
+| 5 | a+pos 位置注入键版 | memory(+pos) | memory | s39_apos_mm_v368_20k_ctx4096_20260817 |
+| 6 | 锥形宽度附带臂 | 同胜者格子 | 同胜者格子 | s39_w2_<cell>_v368_20k_ctx4096_20260817 |
+
+（a+pos 的位置注入实现为 agent-61 交付后的追加增量；宽度臂在胜者格子判出后定 `--d-backbone`/
+`--backbone-*` 翻倍参数。）每臂终评 backbone_acc 原地入 CURRENT_STATE 证据表（E 连续），
+a−b/a−c 差分按 §4 判读线裁定，桥接臂（bash-pv602s03，在跑）终评对 s36e 0.8006 的偏离幅度
+同表登记。
+
+> **2026-08-17 作废声明**：本附录模板为 v36.8/legacy（xattn + CrossReadBackbone）口径，
+> 已于 v3.7 共识形态落地（commit bc655e0）后被附录 B′ 取代，仅保留备查。格子语义与判读线
+> 不变，承载形态与开关值域以 B′ 为准。
+
+## 附录 B′：阶段1 发射命令模板 v37 版（2026-08-17 主会话封版，实现 bc655e0）
+
+**形态变更**：四格承载形态由 xattn legacy 切换为 **v3.7 共识形态**（正本
+`docs/versions/v3.7/FLUED_V3_7_ARCHITECTURE_CONSENSUS_20260817_CN.md`）：summarizer 直产
+index（K）与 memory（V 标准实现），interpreter 降为可选分通道状态机加工器，主干为标准 SLM
+（第一层 cross-attn 读预算 K/V，深层标准自注意力）。格子语义不变，开关值域扩展为
+`--k-row-source {index,state}` / `--v-row-source {memory,state}`（index=summarizer 直产键
+直读；state=过 interpreter 状态机加工）。codec 全覆盖律已由 v36.8 累积口径 + v37 slm 网格
+分形共同落地（任何内容任务覆盖 1..i 全前缀）。
+
+**公共底座**（逐臂仅改 run-id/out-dir 与格子的两个开关）：
+
+```bash
+export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 KMP_DUPLICATE_LIB_OK=TRUE PYTHONUTF8=1
+/c/Users/74090/Miniconda3/envs/soulvlm/python.exe -X utf8 tools/train/v3_6/train_v36_s1.py \
+  --config configs/canonical_v37.json \
+  --data-path "P:\FLUED_corpus\corpus_v3\corpus_v3.txt" \
+  --seq-len 4096 --stride 2048 --max-chunks 1024 --batch-size 1 \
+  --max-steps 20000 \
+  --k-row-source <index|state> --v-row-source <memory|state> \
+  --run-id <run_id> --out-dir checkpoints/<run_id> \
+  > checkpoints/<run_id>_stdout.log 2>&1
+```
+
+- 配方：canonical v37.1（`backbone_mode=slm`，累积保持口径继承）；`--config` 已带
+  `init_checkpoint`（K: 的 S0″ 快照，segmentor 冻结接管）——除该快照外全部从零。
+- 4096 标定同 Q6 实测值（max_chunks 1024 / stride 2048 / batch 1，实测 ~2.69 step/s、
+  峰值 ~9.7GB、20K≈2.0h）；守卫口径不变（cut_capacity_overflow=0 且 truncated_tokens=0）。
+- a 格不需要任何开关（config 默认即 index/memory）；a+pos = a 格加 `--k-pos-inject`
+  （⭐4 加严守卫：仅允许 k=index **且** v=memory，model 层直接 raise）。
+- GPU 串行一臂一跑，点火前 `nvidia-smi` 查重 + 确认无 train_v36 进程残留。
+
+**臂次与 run-id**（命名：v37_<格>_<kv>_v371_20k_ctx4096_20260817，i=index/m=memory/s=state）：
+
+| 序 | 臂 | k-row-source | v-row-source | run-id |
+|---|---|---|---|---|
+| 1 | a 索引直读+内容直读 | index | memory | v37_a_im_v371_20k_ctx4096_20260817（2026-08-17 09:36 点火，bash-vchx9r9n） |
+| 2 | d 双过状态机 | state | state | v37_d_ss_v371_20k_ctx4096_20260817 |
+| 3 | b 索引过状态机+内容直读 | state | memory | v37_b_sm_v371_20k_ctx4096_20260817 |
+| 4 | c 索引直读+内容过状态机 | index | state | v37_c_is_v371_20k_ctx4096_20260817 |
+| 5 | a+pos 位置注入键版 | index(+pos) | memory | v37_apos_im_v371_20k_ctx4096_20260817 |
+| 6 | 锥形宽度附带臂 | 同胜者格子 | 同胜者格子 | v37_w2_<cell>_v371_20k_ctx4096_20260817 |
+
+每格收官流程：读 `checkpoints/<run_id>/summary.json` 的 eval_* 键 → 原地入 CURRENT_STATE
+证据表（E60 起连续，编辑后必核编号连续性）→ commit+push → 点火下一格。阶段2 胜者格子上
+GDN2 换 KDA 的实施清单见附录 A。
+
+## 附录 C：a+pos 位置注入键实现规格（2026-08-17 主会话钉死，与 0a 探针同语义）
+
+**探针侧原型**（`tools/analysis/v3_6/probe_archive_addressing.py:457-499`，E58 实测件）：
+`position_features` = 每键行两个绝对位置标量的正弦特征——段序（0..n-1）与段起始 byte 偏移
+（各 16 频率 × sin/cos，max period 1e4，`POS_FEAT_DIM=64`）；注入形式 =
+键先 L2 归一，再加 `pos_gate（零初始化标量）* pos_proj(pos_feat)`（`Linear(64, d_key)`），
+再归一。零门控使 step-0 恰等于无注入锚。
+
+**端到端臂映射**（挂在 agent-61 的双开关之上，`CrossReadBackbone`）：
+
+- 特征：与探针同式 64 维正弦特征；段序=行索引（0..n-1，padding 行由 chunk_mask 遮蔽），
+  段起始偏移=**窗口内**累积 byte 起点（由 token_mask 逐段 byte 数累积推得，作为新可选入参
+  `chunk_byte_off` 传入 backbone；探针用文档级偏移，训练窗内相对偏移携带同等的段间距信息，
+  差异立此存照）。
+- 注入点：`k = k_proj(k_in) + pos_proj(pos_feat)`（`pos_proj: Linear(64, d_backbone)`，
+  在 head reshape 前加，全头共享同一位置身份）；**保留零初始化标量门**（从零训练虽不必需，
+  但与探针同构且门值本身是诊断读数：20K 后仍 ≈0 ⇒ 位置端到端也无人要，判词更硬）。
+- 开关：`k_pos_inject`（config 同键，CLI `--k-pos-inject`）；仅允许与
+  `k_row_source=memory` 组合（与 state 组合直接 raise——a+pos 是 a 格的 K 侧单变量臂，
+  组合放开会污染归因）。
+- 覆盖路径：legacy 全行路径与 cache 选择路径都要注入（cache 路径用 cache_idx 的真实段索引
+  取特征行）。路径归属已实测封版（2026-08-17）：`xcache_frac=1.0` 且不开 gist 时
+  `cache_idx=None`（`model.py:1229-1238` 与 `train_v36_s1.py:388-411` 同语义）——
+  **四格与 a+pos 实际走 legacy 路径**，cache 路径分支仅由单测覆盖。
+- 单测：特征形状/窗口内偏移累积正确性、门零初始化时与 a 格逐点一致、非法组合 raise；
+  验收线照 §4 判读线（a+pos−a 差分 >2pp 轴复活，否则探针+端到端双死刑）。
+
+## 5. 纪律约束
+
+- 全程单 seed 工程口径起步；主结果臂（1a）出数后评估是否补 seed。
+- 每臂结束原地入 CURRENT_STATE 证据表（E 编号连续），判读线触发/未触发均登记。
+- checkpoint 删除禁通配符；训练启动前查重进程；4096B 臂按 Q6 标定防显存溢出。
+- DART 批评口径只用三点（cache 线性/单次读出/独立读出头归零），不用"梯度断裂"（原文不支持）。

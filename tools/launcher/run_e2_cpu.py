@@ -77,7 +77,7 @@ results["flued"] = flued
 # ═══════════════════════════════════════════════════════════════
 print("\n=== BLT (40k steps) ===")
 t0 = time.time()
-from blt_baseline.model import BLTAutoencoder
+from tools.baselines.blt_baseline.model import BLTAutoencoder
 
 blt_model = BLTAutoencoder(
     vocab_size=257, d_model=1024, nhead=16,
@@ -122,7 +122,7 @@ results["blt"] = blt
 # ═══════════════════════════════════════════════════════════════
 print("\n=== BPE (40k steps) ===")
 t0 = time.time()
-from bpe_baseline.model import BPETransformerAutoencoder
+from tools.baselines.bpe_baseline.model import BPETransformerAutoencoder
 from tokenizers import Tokenizer
 
 tokenizer = Tokenizer.from_file("checkpoints/bpe_tokenizer/tokenizer.json")

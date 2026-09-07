@@ -73,6 +73,15 @@ Usage:
          readout projection) + W_q, keys recomputed from the stored pre-realign
          reads every step; the checkpoint itself is never thawed. All configs share
          the v1/v2 doc pool and seed (1042).
+  v4 (position-injection keys, S39 stage 0a pre-registered 2026-08-17, K side only):
+         python tools/analysis/v3_6/probe_archive_addressing.py --side k --preset v4 \
+             --report-name report_v4.json
+         Two paired configs on the shared doc pool with seed 1042: memrow/g1 keys
+         with absolute-position re-injection (sinusoidal features of the segment
+         order in the document + the segment's start byte offset, projected to
+         d_mem and added to the L2-normalized key through a zero-init scalar
+         gate, so step 0 == the anchor exactly) and the plain memrow/g1 anchor
+         rerun (v2 config verbatim). Decision line: posinj hit@1 >= anchor + 5pp.
 """
 
 from __future__ import annotations
@@ -80,6 +89,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import math
 import random
 import sys
 import time
@@ -291,6 +301,7 @@ def encode_document(model, ns, doc: bytes, entries: list, window: int, device: t
         # itself is never thawed).
         raw_handle = model.state_machine.realign.register_forward_pre_hook(_raw_hook(raw_rows))
     chunk_offset = 0
+    byte_off_cols: list = []  # per-chunk doc-level start byte offset (v4 posinj features)
     try:
         for w in range(n_pages):
             if not carry_state:
@@ -326,6 +337,10 @@ def encode_document(model, ns, doc: bytes, entries: list, window: int, device: t
             content_w, state = ph._stream_window(model, gates, memory.size(1), n_real, state)
             cols.append(content_w[0].to(torch.bfloat16))  # (n_real, d_pack)
             mem_cols.append(memory[0, :n_real].to(torch.bfloat16))  # (n_real, d_mem) — pre-state summarizer rows
+            # doc-level start byte of each chunk = page base + exclusive cumsum
+            # of per-chunk byte lengths (token_mask rows); v4 position features.
+            lens = chunks.token_mask[0, :n_real].cpu().sum(dim=1).to(torch.long)
+            byte_off_cols.append(w * window + torch.cumsum(lens, 0) - lens)
             if touched:
                 metas[w] = {
                     "offset": chunk_offset,
@@ -370,6 +385,7 @@ def encode_document(model, ns, doc: bytes, entries: list, window: int, device: t
     enc = {
         "content": content,
         "memory": torch.cat(mem_cols, dim=0),  # (G, d_mem) bf16 — form-3 key source
+        "chunk_byte_off": torch.cat(byte_off_cols, dim=0),  # (G,) long, cpu — doc-level chunk start byte
         "g_total": chunk_offset,
         "n_pages": n_pages,
         "window": window,
@@ -438,26 +454,54 @@ def extract_keys(enc: dict, cfg: dict) -> torch.Tensor:
     return enc["content"][enc["kidx"][cfg["gran"]]]
 
 
+POS_FEAT_DIM = 64  # 16 frequencies x (sin, cos) x 2 scalars (segment order, start byte)
+
+
+def position_features(n_keys: int, byte_off: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """v4: per-key-row sinusoidal features of the two absolute-position scalars
+    pre-registered for the posinj arm — the segment order in the document
+    (0..n_keys-1; document-level, so page/within-page indices are implicit) and
+    the segment's start byte offset (document-level). Standard 1e4 max period."""
+
+    def sincos(x: torch.Tensor) -> torch.Tensor:
+        freqs = torch.exp(-math.log(1e4) * torch.arange(16, dtype=torch.float32, device=device) / 16)
+        ang = x.to(device).float().unsqueeze(-1) * freqs
+        return torch.cat([ang.sin(), ang.cos()], dim=-1)
+
+    seg_ord = torch.arange(n_keys, dtype=torch.float32)
+    return torch.cat([sincos(seg_ord), sincos(byte_off[:n_keys])], dim=-1)  # (n_keys, POS_FEAT_DIM)
+
+
 class Retriever(nn.Module):
     """Query projection (+ key projection for the low-rank arm); cosine scores.
     Query space is always d_pack (the question's final state readout); the key
-    space is d_pack for readout keys, d_mem for memrow keys."""
+    space is d_pack for readout keys, d_mem for memrow keys. The v4 posinj arm
+    adds a position projection and a zero-init scalar gate."""
 
-    def __init__(self, d_query: int, d_key: int, key_type: str, rank: int):
+    def __init__(self, d_query: int, d_key: int, key_type: str, rank: int, posinj: bool = False):
         super().__init__()
         self.key_type = key_type
         self.wq = nn.Linear(d_query, d_key if key_type == "full" else rank, bias=False)
         self.wk = None if key_type == "full" else nn.Linear(d_key, rank, bias=False)
+        # v4 position-injection arm: sinusoidal (segment order, segment start
+        # byte) projected into the key space and added to the L2-normalized key
+        # through a zero-init scalar gate — step 0 is exactly the no-injection
+        # anchor, and the gate's nonzero gradient bootstraps the projection.
+        self.pos_proj = nn.Linear(POS_FEAT_DIM, d_key, bias=False) if posinj else None
+        self.pos_gate = nn.Parameter(torch.zeros(())) if posinj else None
 
-    def scores(self, query: torch.Tensor, keys: torch.Tensor) -> torch.Tensor:
+    def scores(self, query: torch.Tensor, keys: torch.Tensor, pos_feat: torch.Tensor | None = None) -> torch.Tensor:
         qv = F.normalize(self.wq(query.float()), dim=-1)
         kv = keys.float() if self.wk is None else self.wk(keys.float())
-        return F.normalize(kv, dim=-1) @ qv
+        kv = F.normalize(kv, dim=-1)  # normalize first, then inject position (v4)
+        if self.pos_proj is not None:
+            kv = F.normalize(kv + self.pos_gate * self.pos_proj(pos_feat), dim=-1)
+        return kv @ qv
 
 
 def train_retriever(cfg: dict, train_set: list, args, device: torch.device, seed: int):
     torch.manual_seed(seed)
-    retr = Retriever(cfg["d_query"], cfg["d_key"], cfg["key_type"], cfg["rank"] or 0).to(device)
+    retr = Retriever(cfg["d_query"], cfg["d_key"], cfg["key_type"], cfg["rank"] or 0, posinj=cfg.get("posinj", False)).to(device)
     opt = torch.optim.Adam(retr.parameters(), lr=args.lr)
     rng = random.Random(seed)
     log = []
@@ -466,7 +510,8 @@ def train_retriever(cfg: dict, train_set: list, args, device: torch.device, seed
         for _ in range(args.batch_docs):
             d = train_set[rng.randrange(len(train_set))]
             keys = extract_keys(d, cfg)
-            logp = F.log_softmax(retr.scores(d["query"], keys).float(), dim=0)
+            pos = position_features(keys.size(0), d["chunk_byte_off"], keys.device) if cfg.get("posinj") else None
+            logp = F.log_softmax(retr.scores(d["query"], keys, pos).float(), dim=0)
             loss = loss - logp[d["pos_code"][cfg["gran"]]].mean()
         loss = loss / args.batch_docs
         opt.zero_grad(set_to_none=True)
@@ -556,7 +601,12 @@ def eval_retriever(retr: Retriever | None, eval_set: list, cfg: dict, ks=(1, 3, 
     gran = cfg["gran"]
     rows = []
     for d in eval_set:
-        s = score_fn(d) if score_fn is not None else retr.scores(d["query"], extract_keys(d, cfg))
+        if score_fn is not None:
+            s = score_fn(d)
+        else:
+            keys = extract_keys(d, cfg)
+            pos = position_features(keys.size(0), d["chunk_byte_off"], keys.device) if cfg.get("posinj") else None
+            s = retr.scores(d["query"], keys, pos)
         order = torch.argsort(s.float(), descending=True).tolist()
         pos_code, pos_entry = set(d["pos_code"][gran].tolist()), set(d["pos_entry"][gran].tolist())
         row = {"n_keys": len(order), "n_pos": len(pos_code)}
@@ -698,11 +748,13 @@ def main() -> None:
     p.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     p.add_argument(
         "--preset",
-        choices=["standard", "v2", "v3"],
+        choices=["standard", "v2", "v3", "v4"],
         default="standard",
         help="v2 = K-side key-source variants (boundary/pooled/memrow). v3 = coarse-key ceiling: "
         "learnable W_k rank sweep on pooled/g4 {32..512} + full-rank anchors, 4x budget trajectory "
-        "on the best rank, and the semi-thawed readout-head arm (plasticity test).",
+        "on the best rank, and the semi-thawed readout-head arm (plasticity test). "
+        "v4 = stage-0a position-injection keys: memrow/g1 + sinusoidal (segment order, start byte) "
+        "re-injection through a zero-init gate, paired with the plain memrow/g1 anchor rerun.",
     )
     p.add_argument("--report-name", default="", help="report filename under out-dir (default: report.json / report_smoke.json)")
     p.add_argument("--budget-milestones", default="4000,8000,12000,16000", help="v3 axis-2 eval snapshots (steps)")
@@ -730,6 +782,14 @@ def main() -> None:
         ] + [
             {"key_type": "lowrank", "rank": r, "gran": 4, "key_src": "pooled", "seed": args.seed, "axis": "rank"}
             for r in (32, 64, 128, 256, 512)
+        ]
+    elif args.preset == "v4":
+        # stage 0a (pre-registered 2026-08-17): position-injection keys. Paired
+        # configs — same doc pool, ONE seed — so the posinj delta is attributable
+        # to position re-injection alone. Keys = memrow/g1 (the v2 form-3 source).
+        configs = [
+            {"key_type": "full", "rank": None, "gran": 1, "key_src": "memrow", "seed": args.seed, "axis": "anchor"},
+            {"key_type": "full", "rank": None, "gran": 1, "key_src": "memrow", "seed": args.seed, "axis": "posinj", "posinj": True},
         ]
     elif args.smoke:
         configs = [
@@ -795,6 +855,7 @@ def main() -> None:
                 "key_type": cfg["key_type"],
                 "key_src": cfg.get("key_src", "boundary"),
                 "axis": cfg.get("axis", "sweep"),
+                "posinj": bool(cfg.get("posinj", False)),
                 "rank": cfg["rank"],
                 "granularity": cfg["gran"],
                 "train_loss_first": loss_log[0]["loss"],
@@ -805,7 +866,7 @@ def main() -> None:
             for L in levels:
                 row["levels"][str(L)] = eval_retriever(retr, eval_sets[L], cfg)
             k_results.append(row)
-            tag = f"{cfg.get('key_src', 'boundary')}:{cfg['key_type']}{'' if cfg['rank'] is None else cfg['rank']}/g{cfg['gran']}"
+            tag = f"{cfg.get('key_src', 'boundary')}{'+pos' if cfg.get('posinj') else ''}:{cfg['key_type']}{'' if cfg['rank'] is None else cfg['rank']}/g{cfg['gran']}"
             brief = " | ".join(
                 f"D={L} hit@1/3/5={row['levels'][str(L)]['hit1']:.2f}/{row['levels'][str(L)]['hit3']:.2f}/{row['levels'][str(L)]['hit5']:.2f}(rand {row['levels'][str(L)]['rand1']:.3f})"
                 for L in levels
@@ -926,6 +987,8 @@ def main() -> None:
             "positives": "key rows covering the needle CODE digits (hit*_entry = entry-level diagnostic)",
             "key_row": "boundary = block-boundary state readout (gran=1 per-chunk; gran=4 one per 4 chunks); "
             "pooled = mean of the block's per-chunk readouts; memrow = pre-state summarizer memory row (per-chunk)",
+            "position_injection": "v4 posinj arm: key' = normalize(normalize(key) + gate * W_p sincos(segment order, "
+            "segment start byte offset)); gate scalar zero-init => step 0 == the no-injection anchor",
             "mask": "P0 mixed mask; needle AND distractor entries force-unmasked (E23)",
             "state": "K side: carried across pages (archive form); V side: fresh per page (trained single-window regime)",
         },

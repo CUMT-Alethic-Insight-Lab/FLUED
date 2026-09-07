@@ -1,6 +1,6 @@
 """Debug BLT v2 — variable-length segment broadcast."""
 import torch
-from blt_baseline.model import BLTAutoencoder
+from tools.baselines.blt_baseline.model import BLTAutoencoder
 
 for mode, theta in [("entropy", 3.5), ("entropy", 0.5), ("fixed", None)]:
     label = f"{mode}" + (f" theta={theta}" if theta else "")

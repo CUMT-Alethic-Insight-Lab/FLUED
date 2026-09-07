@@ -1,6 +1,7 @@
 """
 conftest.py — ensure project root is on sys.path so tests can import
-the flued, bpe_baseline, and blt_baseline packages without installing them.
+the flued and tools.baselines.{bpe_baseline, blt_baseline} packages
+without installing them.
 """
 
 import os

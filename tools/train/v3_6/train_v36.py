@@ -82,10 +82,28 @@ def build_model(args: Namespace) -> FLUEDV36:
             decoder_markov=getattr(args, "decoder_markov", 0),
             xcache_frac=getattr(args, "xcache_frac", 1.0),
             xcache_gist=getattr(args, "xcache_gist", False),
+            k_row_source=getattr(args, "k_row_source", "memory"),
+            v_row_source=getattr(args, "v_row_source", "memory"),
+            k_pos_inject=getattr(args, "k_pos_inject", False),
+            k_block_eval=getattr(args, "k_block_eval", False),
+            seed_source=getattr(args, "seed_source", "v"),
+            to_k_center=getattr(args, "to_k_center", False),
+            to_k_whiten=getattr(args, "to_k_whiten", False),
+            pos_prior_keys=getattr(args, "pos_prior_keys", False),
+            summarizer_pool=getattr(args, "summarizer_pool", "mean"),
+            summarizer_aux_recon=getattr(args, "summarizer_aux_recon", False),
+            summarizer_aux_weight=getattr(args, "summarizer_aux_weight", 0.1),
+            split_trunk=getattr(args, "split_trunk", False),
+            readout_views=getattr(args, "readout_views", 1),
             xcache_supp=getattr(args, "xcache_supp", 0),
             supp_source=getattr(args, "supp_source", "state"),
             residual_gate_temp=getattr(args, "residual_gate_temp", 1.0),
             paged_cache_rows=getattr(args, "paged_cache_rows", 1),
+            # Q20 多槽读出臂 (E119): 默认关 = 不创建 (条件创建纪律); getattr
+            # 兜默认, 老 resolved_config 无此键也安全 (关态)
+            multislot_readout=getattr(args, "multislot_readout", False),
+            multislot_readout_k=str(getattr(args, "multislot_readout_k", "4")),
+            e120_readout_swap=getattr(args, "e120_readout_swap", False),
             decoder_hidden=args.decoder_hidden,
             decoder_layers=args.decoder_layers,
             max_chunks=args.max_chunks,
@@ -103,6 +121,7 @@ def build_model(args: Namespace) -> FLUEDV36:
             prefix_task=args.prefix_task,
             prefix_positions=args.prefix_positions,
             kda_impl=args.kda_impl,
+            recurrence=getattr(args, "recurrence", "kda"),
             state_channel=getattr(args, "state_channel", True),
         )
     )
@@ -178,12 +197,20 @@ def evaluate(model, eval_loader, args, device):
             break
         _, metrics = step_model(model, batch, args, device, train=False)
         rows.append(metrics)
+    verify_rows = {}
+    if getattr(args, "verify_topl", 0) > 0:
+        # fork 2 forward-verification pass (default off; re-iterates the eval
+        # loader with the same reseed so the byte masks are identical)
+        from tools.eval.forward_verifier import verify_completion_eval
+
+        verify_rows = verify_completion_eval(model, eval_loader, args, device)
     model.train()
     merged = {}
     for key in rows[0]:
         merged[f"eval_{key}"] = sum(r[key] for r in rows) / len(rows)
     merged["eval_backbone_ppl"] = float(math.exp(min(merged["eval_backbone_loss"], 20.0)))
     merged["eval_direct_ppl"] = float(math.exp(min(merged["eval_direct_loss"], 20.0)))
+    merged.update(verify_rows)
     return merged
 
 
@@ -229,7 +256,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--backbone-layers", type=int, default=3)
     parser.add_argument("--backbone-nhead", type=int, default=8)
     parser.add_argument("--backbone-ffn", type=int, default=1024)
-    parser.add_argument("--backbone-mode", choices=["attn", "mlp", "xattn", "draft", "paged_xattn"], default="attn")
+    parser.add_argument("--backbone-mode", choices=["attn", "mlp", "xattn", "draft", "paged_xattn", "slm"], default="attn")
     parser.add_argument(
         "--backbone-readout",
         choices=["per_chunk", "final", "paged"],
@@ -275,6 +302,297 @@ def build_parser() -> argparse.ArgumentParser:
         "residual-gated (HOLA/HAM)",
     )
     parser.add_argument(
+        "--k-row-source",
+        choices=["memory", "state", "index"],
+        default="memory",
+        help="S39 stage-1 taxonomy: K source for the xattn store rows -- "
+        "memory = pre-state memory rows (default, existing behavior); "
+        "state = per-chunk state readouts (content) via a dedicated projection; "
+        "index = summarizer index rows (v3.7 slm mode only)",
+    )
+    parser.add_argument(
+        "--v-row-source",
+        choices=["memory", "state"],
+        default="memory",
+        help="S39 stage-1 taxonomy: V source for the xattn store rows "
+        "(same convention as --k-row-source)",
+    )
+    parser.add_argument(
+        "--k-pos-inject",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="S39 a+pos arm: add sinusoidal (segment order, window-relative "
+        "start byte) key-row features to the K side through a zero-init "
+        "scalar gate; legacy/xattn path requires --k-row-source/--v-row-source "
+        "memory; v3.7 slm path requires k=index and v=memory (model raises "
+        "otherwise)",
+    )
+    parser.add_argument(
+        "--k-block-eval",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="S39 K-block eval probe (user-ruled 2026-08-17): zero the aligned "
+        "K rows at eval so block-1 cross-attention is uniform -- tests whether "
+        "the slm backbone actually reads the index channel. Eval-time only.",
+    )
+    parser.add_argument(
+        "--seed-source",
+        choices=["v", "k"],
+        default="v",
+        help="S39 K-seed arm (user-ruled 2026-08-17): which aligned row seeds "
+        "the slm backbone hidden state -- v = V/memory row (default, "
+        "consensus §1.3); k = index row, forcing content through K/V "
+        "retrieval (index channel becomes load-bearing)",
+    )
+    parser.add_argument(
+        "--to-k-center",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="E75 key-decollapse hard constraint (2026-08-18): WriteHead "
+        "subtracts a running center (EMA 0.99, detached, BatchNorm-style cold "
+        "start) from the to_k output pre-normalization; eval uses the frozen "
+        "buffer (persistent=False -- old checkpoints load strict-clean and "
+        "stats re-estimate online from zero). Covers both WriteHead instances. "
+        "Default off = bit-preserved legacy paths.",
+    )
+    parser.add_argument(
+        "--to-k-whiten",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Q10 hard-constraint gate (user-ruled 2026-08-20): WriteHead "
+        "whitens the to_k output pre-normalization — k <- (k - EMA_mean) @ "
+        "(EMA_cov + eps I)^{-1/2} (eigh, fp32, refreshed every training "
+        "step). Superset of --to-k-center (includes de-meaning; do not stack "
+        "the two flags). E79 showed de-mean-only surgery slowly re-collapses "
+        "(mu 0.690 -> 0.811); whitening crushes pairwise |cos| toward ~0 by "
+        "construction. Same buffer discipline as --to-k-center (persistent="
+        "False; fresh eval processes start with identity whitening until a "
+        "training-mode forward warms the buffers). Default off = bit-"
+        "preserved legacy paths.",
+    )
+    parser.add_argument(
+        "--pos-prior-keys",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="recruitment-arm B (user-ruled 2026-08-22, prereg §2): write "
+        "keys = FIXED random vectors per absolute chunk position (seeded "
+        "table, content-independent strong prior) — the diagnostic arm "
+        "answering 'is position the true index?'. Values/beta stay "
+        "content-driven; only the key path is replaced. Default off = "
+        "bit-preserved legacy paths.",
+    )
+    parser.add_argument(
+        "--summarizer-pool",
+        choices=["mean", "qpool", "poswmean"],
+        default="qpool",
+        help="fork 3 F3 (user-ruled 2026-08-22, E92 position-sink evidence; "
+        "v37.3 起为默认值（2026-08-23 转正）：qpool = 4 position-anchored "
+        "attention queries (anti-slot-collapse Gaussian bias); poswmean = "
+        "zero-param position-weighted mean (F3z control); mean = v37.2 及之前"
+        "的 masked mean 旧口径（codec 读数不可与新默认混排，E100 为界）。",
+    )
+    parser.add_argument(
+        "--summarizer-aux-recon",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="fork 3 F2 (user-ruled 2026-08-21): train-time-only auxiliary "
+        "per-slot byte-reconstruction head on the summarizer's memory rows "
+        "(the H-obj arm: the tail bytes never enter the memory row, E89/E95). "
+        "Small head (2-layer MLP + slot table, ~1.9M params — scout capacity "
+        "cap against decoder explain-away); removed at inference. Verdict "
+        "lines are the probe profiles, never the aux loss. Default off = "
+        "bit-preserved legacy paths.",
+    )
+    parser.add_argument(
+        "--summarizer-aux-weight",
+        type=float,
+        default=0.1,
+        help="fork 3 F2: weight of the auxiliary reconstruction loss on top "
+        "of the main tasks (pre-registered 0.1).",
+    )
+    parser.add_argument(
+        "--split-trunk",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="E79 split-trunk (2026-08-18): WriteHead holds two independent "
+        "trunks (trunk_k -> to_k; trunk_v -> to_v/to_beta/to_b/to_w) so "
+        "to_k-side training dynamics (e.g. --to-k-center) cannot deform value "
+        "content through a shared trunk. Default off = shared trunk, "
+        "bit-preserved legacy paths. Composes with --to-k-center.",
+    )
+    parser.add_argument(
+        "--readout-views",
+        type=int,
+        default=1,
+        help="fork 2 multi-view readout (2026-08-19): m>1 expands each state "
+        "channel's backbone-store rows to m measurement rows per chunk read "
+        "with a seeded orthogonal frame (training-free, seed pinned in "
+        "flued/v36/model.py); direct/predict paths bit-untouched. Default 1 = "
+        "bit-preserved legacy behavior.",
+    )
+    parser.add_argument(
+        "--verify-topl",
+        type=int,
+        default=0,
+        help="fork 2 forward verification (2026-08-19, spec §1.2): at eval, "
+        "take the completion decoder's exact top-L per-chunk segment "
+        "candidates, replay each through the frozen write operator (original "
+        "timetable), and pick the nearest to the chunk's trained state "
+        "readout in a seeded-frame measurement space; reports "
+        "eval_verify_hit1_before/after, eval_verify_hitl and the false-peak "
+        "rate. 0 = off (default, bit-preserved legacy eval). Wired in "
+        "train_v36.py evaluate() only; slm + --v-row-source state grids.",
+    )
+    parser.add_argument(
+        "--cloze-prob",
+        type=float,
+        default=0.0,
+        help="v3.7 slm cloze 检索回执 (user-ruled 2026-08-17): per-window "
+        "probability of splicing one --cloze-bank passage into the window's "
+        "first 60%% (UTF-8-snapped offset) and appending "
+        "'\\n'+query+'\\n答案是：'+answer at the tail; the passage answer is "
+        "force-UNMASKED (E23), the echo answer force-MASKED, byte CE on the "
+        "echo slots rides the completion conditioning. Wired in "
+        "train_v36_s1.py only, slm mode only; default 0.0 = off, "
+        "bitwise-identical legacy path.",
+    )
+    parser.add_argument(
+        "--cloze-weight",
+        type=float,
+        default=0.3,
+        help="loss weight of the cloze task; added ON TOP of the three main "
+        "tasks (their weights are untouched)",
+    )
+    parser.add_argument(
+        "--cloze-bank",
+        type=str,
+        default="",
+        help="cloze bank JSONL ({\"id\",\"passage\",\"answer\",\"query\",\"answer_bytes\"}; "
+        "tools/data/mine_cloze_bank.py contract); required when --cloze-prob>0",
+    )
+    parser.add_argument(
+        "--retrieval-prob",
+        type=float,
+        default=0.0,
+        help="v3.7 自然检索任务 (招募臂, prereg "
+        "docs/versions/v3.7/FLUED_V3_7_RECRUITMENT_ARM_NATURAL_RETRIEVAL_20260821_CN.md): "
+        "per-window probability of picking one 32-64B in-window fragment, "
+        "blanking one ASCII word W in the tail question "
+        "('前文'<F with W -> ___>'空格处是什么？') and appending "
+        "'答案是：'+W as the echo; the echo is force-MASKED, the source W "
+        "force-UNMASKED (it must enter the state), byte CE on the echo slots "
+        "rides the completion conditioning. Wired in train_v36_s1.py only, "
+        "slm mode only, mutually exclusive with --cloze-prob>0; default 0.0 "
+        "= off, bitwise-identical legacy path.",
+    )
+    parser.add_argument(
+        "--retrieval-weight",
+        type=float,
+        default=1.0,
+        help="loss weight of the natural retrieval task; added ON TOP of the "
+        "three main tasks (their weights are untouched)",
+    )
+    parser.add_argument(
+        "--retrieval-block-prob",
+        type=float,
+        default=0.0,
+        help="r = 档 a 掩码级剔除比例 (prereg §4): per spliced sample, "
+        "probability of excising the source fragment's store rows from every "
+        "query position at/after the question's first chunk (store_block "
+        "thread, SLMBackbone), forcing K->state->readout. Must lie in [0, 1]; "
+        "preregistered ramp {0 -> 0.5 -> 1.0}.",
+    )
+    parser.add_argument(
+        "--retrieval-answer-mode",
+        choices=["cjk", "ascii"],
+        default="cjk",
+        help="Q11 v2 (user-ruled 2026-08-21): answer granularity — cjk = "
+        "2–4 char small segment from non-boundary runs (main arm, activation "
+        "~1.0); ascii = maximal [A-Za-z]{3,10} word (control/replication arm). "
+        "Both retry fragment draws up to N=8 before marking the row inactive.",
+    )
+    parser.add_argument(
+        "--retrieval-block-ramp",
+        type=str,
+        default="",
+        help="Q11 r 爬坡 (prereg §4): 'r:step,r:step,...' schedule, e.g. "
+        "'0:0,0.5:5000,1.0:10000' — r applies from its step onward (each tier "
+        ">=5K steps per prereg). Empty = fixed --retrieval-block-prob.",
+    )
+    parser.add_argument(
+        "--retrieval-examples",
+        type=int,
+        default=0,
+        help="Q12 示例密集型招募臂 (修订案 v3, 2026-08-22 冻结): 2–4 = per "
+        "sample prepend that many COMPLETE examples (same 前文/答案是 format, "
+        "answer visible + force-unmasked) before the one masked-answer query; "
+        "example/query roles randomized, query answer never a byte-substring "
+        "of any example, example source spans/contents distinct from the "
+        "query's (violations redraw up to N=8, then inactive); window budget "
+        "(A2②): source/query never truncated, overflow drops the earliest "
+        "examples first (retrieval_drop_rate), query pushed off the chunk "
+        "grid = construction defect (retrieval_defect); per-batch occupancy "
+        "logged as retrieval_budget_ratio. 0 = the example-free form, "
+        "bitwise-identical. Requires --retrieval-prob>0; same slm-only and "
+        "cloze-mutex rules.",
+    )
+    parser.add_argument(
+        "--burst-prob",
+        type=float,
+        default=0.0,
+        help="Q13 突发性注入臂 (prereg "
+        "docs/versions/v3_7/FLUED_V3_7_Q13_BURSTINESS_INJECTION_20260822_CN.md, "
+        "frozen 2026-08-22): per-window probability of inserting ONE fresh "
+        "32-64B corpus segment (random file offset, 防背护栏: (偏移,长度) "
+        "进程级登记, 同 epoch 重复采中重抽 N=8 后响亮报错, 严禁固定段库) "
+        "verbatim at R=3 random in-window positions; the last occurrence's "
+        "trailing 2-4 CJK chars are force-MASKED, the R-1 earlier "
+        "occurrences force-UNMASKED. No new loss term (注入只改数据分布); "
+        "metrics burst_tail_byte_acc/burst_tail_exact/burst_count/"
+        "burst_tail_chars. Wired in train_v36_s1.py only, slm mode only, "
+        "mutually exclusive with --cloze-prob>0 and --retrieval-prob>0; "
+        "default 0.0 = off, bitwise-identical legacy path.",
+    )
+    parser.add_argument(
+        "--burst-repeat",
+        type=int,
+        default=3,
+        help="Q13 frozen value R=3 (prereg §2 逐字重复插入 3 次) — "
+        "parser-visible for logging, any other value fails loudly.",
+    )
+    parser.add_argument(
+        "--burst-tail-max-chars",
+        type=int,
+        default=4,
+        help="Q13 frozen range: masked tail = last 2-4 CJK chars of the R-th "
+        "occurrence (per-sample draw); out-of-[2,4] values fail loudly.",
+    )
+    parser.add_argument(
+        "--burst-prior-sieve",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Q14 需求侧先验筛 (修订案 2026-08-23 冻结, "
+        "docs/versions/v3.7/FLUED_V3_7_Q14_PRIOR_SIEVED_DEMAND_20260823_CN.md): "
+        "on = 候选段构造期过裸猜筛 (参考模型固定在开工 checkpoint, 段单独成文档 "
+        "测段尾遮蔽 byte_acc, <0.05 才录用, 重抽 N=8 沿用, 全程不重筛); "
+        "burst_sieve_reject_rate / burst_yield 随行入册, 产出率 <70%% 日志报警 "
+        "(不静默放宽); 臂中点 (max_steps//2) 对在训片段滚动 ledger 复测裸猜率, "
+        "均值漂移 >0.02 登记先验侵蚀 (out_dir/prior_erosion_midpoint.json). "
+        "只在 --burst-prob>0 时有意义 (否则响亮报错); 默认关 = Q13 形态逐比特不变.",
+    )
+    parser.add_argument(
+        "--q15-circuit-rearing",
+        action="store_true",
+        help="Q15 回路养成臂 (任务书 2026-08-25 冻结, "
+        "docs/versions/v3_7/FLUED_V3_7_Q15_CIRCUIT_REARING_20260825_CN.md): "
+        "过程奖励三件套 (L_attend 注意力引导 + sg(g) 门控结果损失 + L_couple "
+        "反作弊孪生铰链) + 压缩区档 a 剔除 (r 恒 1.0) + codec 回调线 "
+        "(steps 800-1000 臂内自锚, 退步 >2pp 三 λ 各 x0.5, 下限 x0.25). "
+        "要求 --burst-prob>0 + --burst-prior-sieve + slm + d 格 "
+        "(k_row_source=state 且 v_row_source=state) + --seed-source k + "
+        "readout_views==1, 缺任一项响亮报错. Wired in train_v36_s1.py only.",
+    )
+    parser.add_argument(
         "--xcache-supp",
         type=int,
         default=0,
@@ -301,6 +619,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prefix-positions", type=int, default=4)
     parser.add_argument("--kda-impl", choices=["torch", "fla"], default="fla")
     parser.add_argument(
+        "--recurrence",
+        choices=["kda", "gdn2"],
+        default="kda",
+        help="state-machine write rule: kda = shared scalar beta gates both "
+        "erase and write (default, canonical); gdn2 = erase/write gate "
+        "decoupling (per-K-channel erase gate b + per-V-channel write gate w "
+        "replace beta; decay and delta form unchanged) -- S39 stage-2 "
+        "single-variable arm (S39_STAGED_MATRIX_PLAN_20260817 appendix A)",
+    )
+    parser.add_argument(
         "--state-channel",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -317,6 +645,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--optimizer", default="fused_adamw")
     parser.add_argument("--warmup-steps", type=int, default=200)
+    parser.add_argument(
+        "--lr-const-after-resume",
+        type=float,
+        default=0.0,
+        help="Q12 40K 延长臂（用户冻结 2026-08-22）：resume 后不复用旧 cosine "
+        "尾段——重置 base lr 后 re-warmup --lr-rewarmup 步、随后恒定本值至 "
+        "max-steps。0 = 常规 cosine 调度。",
+    )
+    parser.add_argument(
+        "--lr-rewarmup",
+        type=int,
+        default=200,
+        help="--lr-const-after-resume 的 re-warmup 步数（冻结 200）。",
+    )
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--log-every", type=int, default=20)
     parser.add_argument("--ckpt-every", type=int, default=1000)
@@ -337,6 +679,28 @@ def main() -> None:
     if pre_args.config:
         parser.set_defaults(**json.loads(Path(pre_args.config).read_text(encoding="utf-8")))
     args = parser.parse_args()
+    if getattr(args, "cloze_prob", 0.0) > 0:
+        raise SystemExit(
+            "--cloze-prob>0 is wired in the S1 trainer only: run "
+            "tools/train/v3_6/train_v36_s1.py (v3.7 slm cloze 检索回执, "
+            "user-ruled 2026-08-17)"
+        )
+    if getattr(args, "retrieval_prob", 0.0) > 0:
+        raise SystemExit(
+            "--retrieval-prob>0 is wired in the S1 trainer only: run "
+            "tools/train/v3_6/train_v36_s1.py (v3.7 自然检索任务, 招募臂 "
+            "prereg 2026-08-21)"
+        )
+    if getattr(args, "burst_prob", 0.0) > 0:
+        raise SystemExit(
+            "--burst-prob>0 is wired in the S1 trainer only: run "
+            "tools/train/v3_6/train_v36_s1.py (Q13 突发性注入臂, prereg 2026-08-22)"
+        )
+    if getattr(args, "q15_circuit_rearing", False):
+        raise SystemExit(
+            "--q15-circuit-rearing is wired in the S1 trainer only: run "
+            "tools/train/v3_6/train_v36_s1.py (Q15 回路养成臂, 任务书 2026-08-25)"
+        )
 
     device = torch.device(args.device if args.device == "cpu" or torch.cuda.is_available() else "cpu")
     torch.manual_seed(args.seed)

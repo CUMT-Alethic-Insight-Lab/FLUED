@@ -102,7 +102,11 @@ class ParallelAttention(nn.Module):
         self.qkv = nn.Linear(dim, dim * 3, bias=False)
         self.out = nn.Linear(dim, dim, bias=False)
 
-    def forward(self, x: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, valid: torch.Tensor,
+                block_mask: torch.Tensor | None = None) -> torch.Tensor:
+        """block_mask（E123 遮蔽器件，条件创建）: (B, 1, 1, seq) bool，True=该键
+        对一切查询遮蔽——被遮字节仍参与自身状态更新与分段（hidden 不清零、valid
+        不动），只从窗内注意力的键侧视野抹除；None = 旧路径逐位不变。"""
         bsz, seq, _ = x.shape
         q, k, v = self.qkv(x).chunk(3, dim=-1)
         q = q.view(bsz, seq, self.nhead, self.head_dim).transpose(1, 2)
@@ -115,8 +119,12 @@ class ParallelAttention(nn.Module):
         if self.use_alibi:
             mask = _bidirectional_alibi_bias(seq, self.nhead, x.device, q.dtype).unsqueeze(0)
             mask = mask.masked_fill(~valid[:, None, None, :], float("-inf"))
+            if block_mask is not None:
+                mask = mask.masked_fill(block_mask, float("-inf"))
         else:
             mask = valid[:, None, None, :]
+            if block_mask is not None:
+                mask = mask & ~block_mask
         y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
         y = y.transpose(1, 2).reshape(bsz, seq, self.dim)
         return self.out(y) * valid.unsqueeze(-1).to(y.dtype)
@@ -148,9 +156,10 @@ class DiTStyleBlock(nn.Module):
         self.attn_scale = nn.Parameter(torch.tensor(0.1))
         self.ff_scale = nn.Parameter(torch.tensor(0.1))
 
-    def forward(self, x: torch.Tensor, valid: torch.Tensor, noise_level: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, valid: torch.Tensor, noise_level: torch.Tensor,
+                block_mask: torch.Tensor | None = None) -> torch.Tensor:
         cond = self.noise_cond(noise_level.view(-1, 1)).unsqueeze(1).to(x.dtype)
-        x = x + self.attn_scale.to(x.dtype) * self.attn(self.norm1(x + cond), valid)
+        x = x + self.attn_scale.to(x.dtype) * self.attn(self.norm1(x + cond), valid, block_mask)
         ff_gate, ff_value = self.ff_in(self.norm2(x + cond)).chunk(2, dim=-1)
         ff = self.ff_out(F.silu(ff_gate) * ff_value)
         x = x + self.ff_scale.to(x.dtype) * ff

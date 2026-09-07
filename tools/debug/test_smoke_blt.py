@@ -1,6 +1,6 @@
 """Quick smoke tests for BLT model and training script."""
 import torch
-from blt_baseline.model import BLTAutoencoder, EntropyPatcher, FixedPatcher
+from tools.baselines.blt_baseline.model import BLTAutoencoder, EntropyPatcher, FixedPatcher
 
 def test_entropy_patcher():
     print("=== Test 1: Entropy Patcher ===")

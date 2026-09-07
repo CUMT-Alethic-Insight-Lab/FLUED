@@ -34,7 +34,7 @@ from flued.config import ModelConfig
 RESULTS_FILE = "checkpoints/e2_compare_results.json"
 DATA_PATH = r"data/corpus.txt"
 FLUED_CKPT = "checkpoints/e1_step50000.pt"
-BPE_CKPT = "bpe_baseline_standalone/checkpoints/bpe_latest.pt"
+BPE_CKPT = "tools/baselines/bpe_baseline_standalone/checkpoints/bpe_latest.pt"
 BLT_CKPT = "checkpoints/blt_latest.pt"
 
 SEED = 42
@@ -138,7 +138,7 @@ print("BPE Baseline")
 print("=" * 60)
 
 try:
-    from bpe_baseline.model import BPETransformerAutoencoder
+    from tools.baselines.bpe_baseline.model import BPETransformerAutoencoder
     from tokenizers import Tokenizer
 
     bpe_tokenizer = Tokenizer.from_file("checkpoints/bpe_tokenizer/tokenizer.json")
@@ -236,7 +236,7 @@ print("BLT Baseline")
 print("=" * 60)
 
 try:
-    from blt_baseline.model import BLTAutoencoder
+    from tools.baselines.blt_baseline.model import BLTAutoencoder
 
     blt_model = BLTAutoencoder(
         vocab_size=257, d_model=1024, nhead=16,

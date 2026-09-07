@@ -12,6 +12,7 @@ integration is a later acceleration step).
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 import warnings
 
 import torch
@@ -33,6 +34,10 @@ try:
     from fla.ops.kda import chunk_kda as _fla_chunk_kda
 except Exception:  # fla is optional (tests / non-GPU environments)
     _fla_chunk_kda = None
+try:
+    from fla.ops.gdn2 import chunk_gdn2 as _fla_chunk_gdn2
+except Exception:  # fla < gdn2 build: the torch recurrence remains the fallback
+    _fla_chunk_gdn2 = None
 
 
 @dataclass
@@ -90,6 +95,14 @@ class V36Config:
     prefix_task: bool = False
     prefix_positions: int = 4
     kda_impl: str = "fla"  # fla chunk_kda fused kernel (default since v36.6: +15% steps/s at 23 chunks, parity-verified; essential at byte-level lengths for R0). "torch" serial loop retained as fallback.
+    # S39 stage-2 write-rule axis (S39_STAGED_MATRIX_PLAN_20260817_CN appendix A):
+    # "kda" (default; bit-identical to every historical arm) uses the shared
+    # scalar beta for erase+write; "gdn2" decouples them -- a per-K-channel
+    # erase gate b and a per-V-channel write gate w replace beta (Gated
+    # DeltaNet 2, fla chunk_gdn2). The channel decay (log alpha) and the delta
+    # erase form are unchanged: the ONLY mechanism delta is the erase/write
+    # gate decoupling (single-variable arm).
+    recurrence: str = "kda"
     # R1 relative baseline (spec section 4): when False, each chunk's readout
     # comes straight from its own write (same write head, same realign, same
     # transmitted-scalar budget) -- the serial KDA recurrence is bypassed, so
@@ -142,6 +155,144 @@ class V36Config:
     # rows (= s31 with optional gist token -- the sanity arm).
     xcache_frac: float = 1.0
     xcache_gist: bool = False
+    # S39 stage-1 taxonomy 2x2 (S39_STAGED_MATRIX_PLAN_20260817_CN §4, v3 axis
+    # semantics): per-side K/V source switches for the xattn backbone store
+    # rows. "memory" (default) = project the pre-state memory rows (existing
+    # behavior); "state" = project the per-chunk state readouts (content,
+    # d_pack wide) through dedicated projections, created only when selected
+    # so old checkpoints keep loading strict-clean. Grid mapping:
+    # a=(memory,memory) b=(state,memory) c=(memory,state) d=(state,state).
+    k_row_source: str = "memory"
+    v_row_source: str = "memory"
+    # S39 a+pos arm (same plan, appendix C): position-injected keys on the
+    # xattn K side -- per key row, sinusoidal features of (segment order,
+    # window-relative start byte offset) projected by pos_proj (POS_FEAT_DIM
+    # -> d_backbone) and added through a zero-init scalar gate pos_gate, so
+    # step 0 is exactly the a-grid anchor and the gate value is itself the
+    # diagnostic readout. Memory-source only (k/v_row_source must both be
+    # "memory"; the state combination is rejected to protect attribution).
+    k_pos_inject: bool = False
+    # S39 K-block eval probe (user-ruled 2026-08-17): eval-time-only ablation
+    # switch -- zero the aligned K rows so block-1 cross-attention goes uniform
+    # (the index channel carries zero information). Tests whether the slm
+    # behavioral-only eval probe -- no parameters, checkpoints unaffected.
+    k_block_eval: bool = False
+    # S39 K-seed arm (user-ruled 2026-08-17): which aligned row seeds the slm
+    # backbone hidden state. "v" (default) = seed from the V/memory row
+    # (consensus §1.3, bit-preserved); "k" = seed from the INDEX row, so the
+    # hidden state starts address-only and content must be retrieved through
+    # the K/V store -- the index channel becomes load-bearing (the K-block
+    # probe showed it is decorative under "v").
+    seed_source: str = "v"
+    # E75 key-decollapse hard constraint (user-ruled 2026-08-18; evidence line
+    # E73 oracle verdict / E74 key-collapse survey / E75 layerwise
+    # decomposition): the write keys' collapse (mean pairwise |cos| ~0.93,
+    # Tropp threshold => no addressability from N=2) localizes to a SINGLE
+    # shared direction in the to_k output (de-meaning drops mu 0.935 -> 0.307;
+    # bias/saturation/dead-dims/weight-rank all cleared). When on, WriteHead
+    # subtracts a running center from the to_k output (pre-normalization):
+    # training mode keeps an EMA (momentum 0.99, detached) of the batch mean,
+    # cold-starting from the first batch (BatchNorm convention); eval mode uses
+    # the frozen buffer. The buffer is persistent=False BY RULING: old
+    # checkpoints keep loading strict-clean, and the statistic is re-estimated
+    # online from zero whenever training (re)starts. Operational caveat of that
+    # ruling: a FRESH eval process on a to_k_center-trained checkpoint starts
+    # with a zero buffer (centering off until a training-mode forward warms
+    # it) — in-training eval on the live model is unaffected. Default False =
+    # every legacy path bit-preserved. Covers BOTH WriteHead instances (K and V
+    # channels); the a grid has no WriteHead and is unaffected.
+    to_k_center: bool = False
+    # Hard-constraint gate arm (Q10, user-ruled 2026-08-20; E79 mu-trajectory
+    # showed the de-mean-only surgery's residual coherence slowly re-collapses
+    # 0.690 -> 0.811 under training — soft repair re-collapses, so the gate
+    # upgrades centering to full whitening): WriteHead applies
+    # k <- (k - EMA_mean) @ W_pre with W_pre = (EMA_cov + eps*I)^{-1/2}
+    # (eigh, fp32, recomputed every training step; 512x512 is sub-ms), pushing
+    # the pre-normalization key covariance to identity — pairwise |cos| is
+    # crushed toward ~0 by construction instead of being negotiated with the
+    # loss. Same buffer discipline as to_k_center (EMA 0.99, detached,
+    # BatchNorm-style cold start, persistent=False; eval uses the frozen
+    # buffers, so a FRESH eval process starts with identity whitening until a
+    # training-mode forward warms the buffers — measurement protocols must
+    # warm up first). Superset of to_k_center: when on, the centering branch
+    # is subsumed (whitening includes de-meaning); do not stack the flags.
+    # Default False = every legacy path bit-preserved.
+    to_k_whiten: bool = False
+    # fork 3 F2 (user-ruled 2026-08-21; spec docs/versions/v3.7/
+    # FLUED_V3_7_FORK3_SUMMARIZER_FIDELITY_20260820_CN.md): train-time-only
+    # auxiliary per-slot byte-reconstruction loss on the summarizer's memory
+    # rows (the H-obj arm — "pressure insufficiency": the tail bytes never
+    # enter the memory row, E89/E95). The aux head is small (2-layer MLP +
+    # slot table, ~1.9M params — scout capacity cap against decoder
+    # explain-away) and is REMOVED at inference (conditional creation; the
+    # deployment form is unchanged). Verdict lines are the probe profiles
+    # (E89/E92 protocol), never the aux loss itself. Default False = every
+    # legacy path bit-preserved.
+    # fork 3 F3 (user-ruled 2026-08-22; spec docs/versions/v3.7/
+    # FLUED_V3_7_FORK3_SUMMARIZER_FIDELITY_20260820_CN.md, E92 position-sink
+    # evidence): pooling form of the DiT summarizer. "mean" = masked mean
+    # pool (bit-preserved legacy). "qpool" = F3: 4 learned queries attention-
+    # pool the span, each bound to a fixed position anchor (Gaussian bias
+    # toward its span quartile — scout anti-slot-collapse guardrail), concat
+    # 4×d_byte -> FFN (the FFN/index_ffn input width changes: qpool
+    # checkpoints do NOT load into mean-pool builds — loud by design).
+    # "poswmean" = F3z zero-param control: position-weighted mean
+    # (w_t ∝ t+1, SGPT family), no new parameters.
+    # Recruitment-arm B (user-ruled 2026-08-22; prereg
+    # FLUED_V3_7_RECRUITMENT_ARM_NATURAL_RETRIEVAL_20260821_CN.md §2):
+    # positional-prior keys — the write key is a FIXED random vector per
+    # absolute chunk position (seeded table, content-independent), the
+    # strong-prior diagnostic arm answering "is position the true index?".
+    # Values/beta/alpha stay content-driven; only the key path is replaced.
+    # Default False = bit-preserved legacy paths. Applies to whichever
+    # WriteHead instances exist (same convention as to_k_center).
+    pos_prior_keys: bool = False
+    summarizer_pool: str = "qpool"  # v37.3 default (2026-08-23 转正, E100); "mean" = v37.2-and-earlier legacy (codec readings not mixable across the E100 boundary)
+    summarizer_aux_recon: bool = False
+    summarizer_aux_weight: float = 0.1
+    # fork 2 (user-ruled 2026-08-19; spec docs/versions/v3.7/
+    # FLUED_V3_7_FORK2_MULTIVIEW_READOUT_20260819_CN.md): multi-view readout.
+    # readout_views=m>1 expands the backbone STORE side of each state channel
+    # from one readout row per chunk to m measurement rows per chunk, read with
+    # a SEEDED RANDOM ORTHOGONAL FRAME (probe_frame, seed PROBE_FRAME_SEED,
+    # training-free by ruling: learned probes degenerate to decoration, E66)
+    # rotated once per segment index (frame_rotations table). The direct and
+    # predict paths keep the classic single trained readout_query row
+    # (bit-untouched, fork 2 §1.3); only the completion/readout path's store
+    # is widened. Interface form choice (§4 allows widening realign/decoder_in
+    # inputs OR m-way shared weights): SHARED realign/align weights over m
+    # store entries per chunk ("m 路共享") — zero new parameters, so m>1
+    # checkpoints strict-load into m=1 builds and vice versa, and the
+    # backbone/decoder/loss machinery is unchanged (the m expansion lives
+    # entirely in the store's causal mask). Default 1 = bit-preserved.
+    readout_views: int = 1
+    # E79 split-trunk (user-ruled 2026-08-18; evidence M3 write-value probe):
+    # the WriteHead trunk was shared by to_k/to_v(/to_beta/to_b/to_w), so the
+    # to_k_center surgery's training dynamics deformed to_v's value content
+    # through the shared trunk (the b-grid K channel lost ~half its linearly
+    # decodable byte content, 0.56->0.23 slot0). When on, the WriteHead holds
+    # TWO independent trunks (trunk_k feeds to_k; trunk_v feeds the value/gate
+    # heads). Default off = the shared `trunk` and every legacy path
+    # bit-preserved (old checkpoints load strict-clean; a split-trunk model
+    # does NOT strict-load a shared-trunk state dict — by design, loud).
+    # Composes with to_k_center (centering applies to the to_k branch only).
+    split_trunk: bool = False
+    # v3.7 mode (docs/versions/v3.7/FLUED_V3_7_ARCHITECTURE_CONSENSUS_20260817_CN.md,
+    # user-ruled 2026-08-17): backbone_mode="slm" -- fully config-gated; the
+    # default stays "attn" and every v36 path is bit-preserved. In slm mode the
+    # summarizer owns the K/V interface (§1.1): DiTChunkSummarizer grows a
+    # second head producing one index vector per chunk (the K side; the memory
+    # row itself IS the standard V). The backbone is a standard small LM
+    # (SLMBackbone): block 1 cross-reads the precomputed store rows causally,
+    # deeper blocks are standard causal self-attention; Q is self-produced from
+    # the backbone hidden state and the seed at position i is align_V(V_i)+pos
+    # ("each chunk asks with its own V", §1.3). The interpreter (§1.2) becomes
+    # an OPTIONAL per-channel processor: k_row_source in {"index", "state"}
+    # ("memory" is ILLEGAL for K in slm mode), v_row_source in {"memory",
+    # "state"}; each "state" channel gets its own WriteHead+KDAStateMachine
+    # pair (K eats the index rows, V the memory rows). Grid (§3):
+    # a=(index,memory) b=(state,memory) c=(index,state) d=(state,state);
+    # a+pos=(index+pos,memory) via k_pos_inject (k_row_source="index" only).
     # S38 (user-ruled 2026-08-09): supplementary content-conditioned readouts
     # for the top-N hardest chunks that were NOT cached -- a second, targeted
     # slice of the state per hard chunk (query generated from the chunk's own
@@ -163,13 +314,32 @@ class V36Config:
     # decoder conditions each chunk on its page's output row. Needs targets
     # for the residual criterion (S1 trainer path only).
     paged_cache_rows: int = 1
+    # Q20 多槽读出 (multi-slot readout, E119; 任务书冻结 v1 2026-08-29:
+    # docs/versions/v3.7/FLUED_V3_7_Q20_MULTISLOT_READOUT_20260829_CN.md):
+    # b 格 K 通道压缩状态 → decoder direct 口的读出端扩宽——k 个可学习槽位
+    # 查询逐段读 K 通道 post-state、拼接后单层 Linear 投影回 d_mem (decoder
+    # 入口宽度); multislot_readout_k="cg" = CG 对照臂 (段1 由 T=8 步可微 CG
+    # 迭代逼 Gram 正规方程闭式解, 段2 可学投影, 无 k 轴)。独立成件
+    # (model.multislot_readout), 不动 KDAStateMachine.readout_query/realign
+    # (那是 backbone store 的生产读出)。默认关 = 旧路径逐位不变, 老 ckpt
+    # strict-load 干净 (条件创建纪律同 decoder_in_mem/aux_recon 先例)。
+    multislot_readout: bool = False
+    multislot_readout_k: str = "4"  # 预注册槽位扫描档 "1"|"4"|"8" | "cg" (CG 对照臂)
+    # E120 端到端点燃臂 (任务书冻结 v1+修订 v2 2026-09-03: docs/versions/v3.7/
+    # FLUED_V3_7_E120_END_TO_END_IGNITION_20260903_CN.md): d 格 V 通道生产读出
+    # 替换——k=1 温启动读出件 (E119 定型档: ridge 段 1 主方向 + 部署桥) 读 V 通道
+    # post-state, 投影回生产读出行空间 d_pack; _slm_store_rows 的 v_rows 整行
+    # 换源 (backbone store 与 decoder direct 的同一行源, 三任务一个 V §1.4)。
+    # 默认关 = 旧路径逐位不变, 老 ckpt strict-load 干净 (条件创建纪律同
+    # multislot_readout 先例)。温启动装载在训练器 _e120_warm_start (loud-fail)。
+    e120_readout_swap: bool = False
 
 
 @dataclass
 class V36Output:
     logits_direct: torch.Tensor
     logits_backbone: torch.Tensor
-    package: torch.Tensor
+    package: torch.Tensor | None  # None in slm mode (the content channel is retired there, consensus §4)
     backbone_out: torch.Tensor
     chunks: ChunkBatch
     boundary_confidence: torch.Tensor
@@ -211,21 +381,46 @@ class DiTChunkSummarizer(nn.Module):
     span (chunks processed in parallel and independently), masked mean pool,
     FFN to one memory vector per chunk. Matches the user's original mental
     model; `slot` (ChunkSummarizer) remains the canonical default.
+
+    fork 3 F3 (V36Config.summarizer_pool): "qpool" swaps the mean pool for 4
+    position-anchored attention queries (E92: the head-concentration is a
+    POSITIONAL sink, so pooling must become position-aware); "poswmean" is
+    the zero-param SGPT-family control (w_t ∝ t+1).
     """
+
+    QPOOL_QUERIES = 4
+    QPOOL_ANCHOR_TEMP = 16.0  # fixed Gaussian sharpness (zero learned params beyond the queries)
 
     def __init__(self, c: V36Config) -> None:
         super().__init__()
         self.blocks = nn.ModuleList(
             [DiTStyleBlock(c.d_byte, c.nhead, c.ffn_dim, True, False) for _ in range(c.summarizer_dit_layers)]
         )
+        self.pool_mode = getattr(c, "summarizer_pool", "mean")
+        if self.pool_mode not in ("mean", "qpool", "poswmean"):
+            raise ValueError(f"summarizer_pool must be mean|qpool|poswmean, got {self.pool_mode!r}")
+        pool_width = c.d_byte * (self.QPOOL_QUERIES if self.pool_mode == "qpool" else 1)
+        if self.pool_mode == "qpool":
+            self.pool_queries = nn.Parameter(torch.empty(self.QPOOL_QUERIES, c.d_byte))
+            nn.init.trunc_normal_(self.pool_queries, std=0.02)
         self.ffn = nn.Sequential(
-            nn.LayerNorm(c.d_byte),
-            nn.Linear(c.d_byte, c.summarizer_hidden),
+            nn.LayerNorm(pool_width),
+            nn.Linear(pool_width, c.summarizer_hidden),
             nn.SiLU(),
             nn.Linear(c.summarizer_hidden, c.d_mem),
         )
+        # v3.7 (consensus §1.1): the summarizer owns the K interface -- one
+        # index vector per chunk, same width as memory (d_mem). Created ONLY in
+        # slm mode so pre-v3.7 checkpoints keep loading strict-clean.
+        if getattr(c, "backbone_mode", "") == "slm":
+            self.index_ffn = nn.Sequential(
+                nn.LayerNorm(pool_width),
+                nn.Linear(pool_width, c.summarizer_hidden),
+                nn.SiLU(),
+                nn.Linear(c.summarizer_hidden, c.d_mem),
+            )
 
-    def forward(self, spans: torch.Tensor, token_mask: torch.Tensor) -> torch.Tensor:
+    def _pool(self, spans: torch.Tensor, token_mask: torch.Tensor) -> torch.Tensor:
         bsz, chunks, span, dim = spans.shape
         h = spans.reshape(bsz * chunks, span, dim)
         valid = token_mask.reshape(bsz * chunks, span)
@@ -233,8 +428,39 @@ class DiTChunkSummarizer(nn.Module):
         for block in self.blocks:
             h = block(h, valid, noise)
         denom = valid.sum(dim=1, keepdim=False).clamp(min=1).unsqueeze(-1).to(h.dtype)
-        pooled = (h * valid.unsqueeze(-1).to(h.dtype)).sum(dim=1) / denom
-        return self.ffn(pooled).view(bsz, chunks, -1)
+        if self.pool_mode == "poswmean":
+            # F3z zero-param control: position-weighted mean (w_t ∝ t+1)
+            w = torch.arange(1, span + 1, device=h.device, dtype=h.dtype).unsqueeze(0)
+            w = w * valid.to(h.dtype)
+            wsum = w.sum(dim=1, keepdim=True).clamp(min=1.0)
+            return (h * (w / wsum).unsqueeze(-1)).sum(dim=1)  # (B*C, d_byte)
+        if self.pool_mode == "qpool":
+            # F3: 4 learned queries, each anchored to its span quartile by a
+            # fixed Gaussian position bias (scout anti-slot-collapse ruling).
+            q = self.pool_queries  # (Q, d)
+            score = torch.einsum("qd,bsd->qbs", q.float(), h.float()) / (dim ** 0.5)
+            lens = valid.sum(dim=1, keepdim=True).clamp(min=1).float()  # (B*C, 1)
+            pos = torch.arange(span, device=h.device, dtype=torch.float32).unsqueeze(0) / (lens - 1).clamp(min=1)
+            anchors = (torch.arange(self.QPOOL_QUERIES, device=h.device, dtype=torch.float32) + 0.5) / self.QPOOL_QUERIES
+            bias = -self.QPOOL_ANCHOR_TEMP * (pos.unsqueeze(0) - anchors.view(-1, 1, 1)).square()  # (Q, B*C, span)
+            score = (score + bias).masked_fill(~valid.unsqueeze(0), -1.0e4)
+            attn = score.softmax(dim=-1)
+            pooled = torch.einsum("qbs,bsd->bqd", attn, h.float())  # (B*C, Q, d)
+            return pooled.reshape(bsz * chunks, -1).to(h.dtype)  # (B*C, Q*d_byte)
+        return (h * valid.unsqueeze(-1).to(h.dtype)).sum(dim=1) / denom  # (B*C, d_byte)
+
+    def forward(self, spans: torch.Tensor, token_mask: torch.Tensor) -> torch.Tensor:
+        bsz, chunks = spans.shape[0], spans.shape[1]
+        return self.ffn(self._pool(spans, token_mask)).view(bsz, chunks, -1)
+
+    def forward_with_index(self, spans: torch.Tensor, token_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """v3.7 slm mode: shared DiT stack + pooling, two heads -- memory (the
+        V rows) and index (the K rows), one vector per chunk each."""
+        bsz, chunks = spans.shape[0], spans.shape[1]
+        pooled = self._pool(spans, token_mask)
+        memory = self.ffn(pooled).view(bsz, chunks, -1)
+        index = self.index_ffn(pooled).view(bsz, chunks, -1)
+        return memory, index
 
 
 class WriteHead(nn.Module):
@@ -242,30 +468,165 @@ class WriteHead(nn.Module):
         super().__init__()
         h, hk, hv = c.kda_heads, c.kda_head_k, c.kda_head_v
         self.heads, self.hk, self.hv = h, hk, hv
-        self.trunk = nn.Sequential(nn.LayerNorm(c.d_mem), nn.Linear(c.d_mem, c.write_hidden), nn.SiLU())
+        self.recurrence = getattr(c, "recurrence", "kda")
+        if self.recurrence not in ("kda", "gdn2"):
+            raise ValueError(f"recurrence must be 'kda' or 'gdn2', got {self.recurrence!r}")
+        # E79 split-trunk (see V36Config.split_trunk): two independent trunks
+        # when on (trunk_k -> to_k; trunk_v -> to_v/to_beta/to_b/to_w), so the
+        # to_k-side training dynamics cannot deform the value content through
+        # a shared trunk. Default off = the shared `trunk` (bit-preserved).
+        self.split_trunk = getattr(c, "split_trunk", False)
+        if self.split_trunk:
+            self.trunk_k = nn.Sequential(nn.LayerNorm(c.d_mem), nn.Linear(c.d_mem, c.write_hidden), nn.SiLU())
+            self.trunk_v = nn.Sequential(nn.LayerNorm(c.d_mem), nn.Linear(c.d_mem, c.write_hidden), nn.SiLU())
+        else:
+            self.trunk = nn.Sequential(nn.LayerNorm(c.d_mem), nn.Linear(c.d_mem, c.write_hidden), nn.SiLU())
         self.to_k = nn.Linear(c.write_hidden, h * hk)
         self.to_v = nn.Linear(c.write_hidden, h * hv)
+        # E75 key-decollapse hard constraint (see V36Config.to_k_center):
+        # subtract the running center from the to_k output, pre-normalization.
+        self.to_k_center = getattr(c, "to_k_center", False)
+        self.to_k_whiten = getattr(c, "to_k_whiten", False)
+        # Recruitment-arm B (see V36Config.pos_prior_keys): fixed random key
+        # per absolute chunk position, content-independent. Seeded table,
+        # persistent=False (rebuilt from the pinned seed at construction —
+        # every checkpoint loads strict-clean either way).
+        self.pos_prior_keys = getattr(c, "pos_prior_keys", False)
+        if self.pos_prior_keys:
+            gen = torch.Generator().manual_seed(20260822)
+            table = torch.randn(c.max_chunks, h * hk, generator=gen)
+            self.register_buffer("pos_key_table", table, persistent=False)
+        if self.to_k_center or self.to_k_whiten:
+            self.register_buffer("k_center", torch.zeros(h * hk), persistent=False)
+        if self.to_k_whiten:
+            # Q10 gate (see V36Config.to_k_whiten): full whitening superset of
+            # centering. k_cov = EMA of the pre-normalization key covariance;
+            # k_white = (k_cov + eps I)^{-1/2} refreshed every training step.
+            self.register_buffer("k_cov", torch.zeros(h * hk, h * hk), persistent=False)
+            self.register_buffer("k_white", torch.eye(h * hk), persistent=False)
         tau = torch.exp(
             torch.linspace(0.0, 1.0, h * hk) * (torch.log(torch.tensor(c.kda_tau_max)))
         ).clamp(min=1.0 + 1e-3)
         self.alpha_logit = nn.Parameter(torch.log(tau - 1.0))
         self.to_beta = nn.Linear(c.write_hidden, h)
         nn.init.constant_(self.to_beta.bias, -2.0)
+        if self.recurrence == "gdn2":
+            # S39 stage-2: erase/write gate decoupling -- b (per K channel)
+            # takes over beta's erase role, w (per V channel) its write role.
+            # Created only in gdn2 mode so older checkpoints keep loading
+            # strict-clean (the xcache_supp conditional-creation precedent);
+            # the same -2.0 bias init as to_beta (sigmoid(-2) ~= 0.12).
+            self.to_b = nn.Linear(c.write_hidden, h * hk)
+            self.to_w = nn.Linear(c.write_hidden, h * hv)
+            nn.init.constant_(self.to_b.bias, -2.0)
+            nn.init.constant_(self.to_w.bias, -2.0)
 
     def forward(self, memory: torch.Tensor) -> dict[str, torch.Tensor]:
         bsz, chunks, _ = memory.shape
-        h = self.trunk(memory)
-        k = F.normalize(self.to_k(h).view(bsz, chunks, self.heads, self.hk), dim=-1)
-        v = self.to_v(h).view(bsz, chunks, self.heads, self.hv)
-        beta = torch.sigmoid(self.to_beta(h))
+        if self.split_trunk:
+            h_k = self.trunk_k(memory)
+            h_v = self.trunk_v(memory)
+        else:
+            h_k = h_v = self.trunk(memory)
+        if self.pos_prior_keys:
+            # Recruitment-arm B: key = fixed random vector per absolute chunk
+            # position (content-independent strong prior); the content path
+            # below (to_k/center/whiten) is bypassed for the key only.
+            k = self.pos_key_table[:chunks].to(memory.dtype).unsqueeze(0).expand(bsz, -1, -1)
+            return self._gates_from_k(k, h_v, bsz, chunks)
+        k = self.to_k(h_k)
+        if self.to_k_whiten:
+            # Q10 gate: whiten = de-mean + decorrelate + equalize variance
+            # (superset of the centering branch). EMA momentum 0.99, detached —
+            # the gradient path to to_k stays live. Eval uses the frozen
+            # buffers (zero center + identity white = no-op until warmed, same
+            # caveat as to_k_center).
+            if self.training:
+                with torch.no_grad():
+                    kd = k.detach().float()
+                    m = kd.mean(dim=(0, 1))
+                    xc = kd.reshape(-1, kd.size(-1)) - m
+                    cov = (xc.T @ xc) / max(xc.size(0), 1)
+                    if not bool(self.k_center.any()):
+                        self.k_center.copy_(m)
+                        self.k_cov.copy_(cov)
+                    else:
+                        self.k_center.mul_(0.99).add_(m, alpha=0.01)
+                        self.k_cov.mul_(0.99).add_(cov, alpha=0.01)
+                    d = kd.size(-1)
+                    eps = (self.k_cov.diagonal().mean() * 1e-3).clamp_min(1e-8)
+                    evals, evecs = torch.linalg.eigh(
+                        self.k_cov + eps * torch.eye(d, device=self.k_cov.device, dtype=self.k_cov.dtype)
+                    )
+                    self.k_white.copy_(
+                        (evecs * evals.clamp_min(1e-12).rsqrt()) @ evecs.T
+                    )
+            k = ((k.float() - self.k_center) @ self.k_white).to(k.dtype)
+        elif self.to_k_center:
+            # E75: subtract the running center (EMA momentum 0.99, detached —
+            # the gradient path to to_k stays live; cold start initializes from
+            # the first batch, BatchNorm convention). Eval uses the frozen
+            # buffer (a zero buffer is a no-op — see the config docstring).
+            if self.training:
+                with torch.no_grad():
+                    m = k.detach().float().mean(dim=(0, 1))
+                    if not bool(self.k_center.any()):
+                        self.k_center.copy_(m)
+                    else:
+                        self.k_center.mul_(0.99).add_(m, alpha=0.01)
+            k = k - self.k_center.to(k.dtype)
+        return self._gates_from_k(k, h_v, bsz, chunks)
+
+    def _gates_from_k(self, k: torch.Tensor, h_v: torch.Tensor, bsz: int, chunks: int) -> dict[str, torch.Tensor]:
+        """Shared post-key path (normalize k, produce v/alpha/beta|b,w)."""
+        k = F.normalize(k.reshape(bsz, chunks, self.heads, self.hk), dim=-1)
+        v = self.to_v(h_v).view(bsz, chunks, self.heads, self.hv)
         alpha = torch.sigmoid(self.alpha_logit).view(1, 1, self.heads, self.hk)
+        if self.recurrence == "gdn2":
+            b = torch.sigmoid(self.to_b(h_v)).view(bsz, chunks, self.heads, self.hk)
+            w = torch.sigmoid(self.to_w(h_v)).view(bsz, chunks, self.heads, self.hv)
+            return {"k": k, "v": v, "b": b, "w": w, "alpha": alpha}
+        beta = torch.sigmoid(self.to_beta(h_v))
         return {"k": k, "v": v, "beta": beta, "alpha": alpha}
+
+
+PROBE_FRAME_SEED = 20260819  # fork 2 measurement frame seed (pinned in the spec)
+PROBE_FRAME_ROTS = 64  # per-segment rotation table size (segment i uses table[i % 64])
+
+
+def probe_frame(m: int, heads: int, hk: int, seed: int = PROBE_FRAME_SEED) -> torch.Tensor:
+    """fork 2 §1.1: seeded random orthogonal probe frame — m orthonormal probe
+    directions per head, (H, m, hk), training-free. Deterministic under the
+    pinned seed (same frame in every process, training and eval alike)."""
+    gen = torch.Generator().manual_seed(seed)
+    frames = []
+    for _h in range(heads):
+        q, _r = torch.linalg.qr(torch.randn(hk, m, generator=gen))  # (hk, m) orthonormal columns
+        frames.append(q.T.contiguous())  # (m, hk) orthonormal rows
+    return torch.stack(frames)
+
+
+def frame_rotations(count: int, hk: int, seed: int = PROBE_FRAME_SEED + 1) -> torch.Tensor:
+    """fork 2 §1.1 "按段索引旋转一次": a seeded table of `count` orthogonal
+    (hk, hk) rotations; segment i reads the state with frame @ table[i % count]
+    so the measurement directions are not shared across segments."""
+    gen = torch.Generator().manual_seed(seed)
+    rots = []
+    for _i in range(count):
+        q, _r = torch.linalg.qr(torch.randn(hk, hk, generator=gen))
+        rots.append(q.contiguous())
+    return torch.stack(rots)
 
 
 class KDAStateMachine(nn.Module):
     def __init__(self, c: V36Config) -> None:
         super().__init__()
         self.c = c
+        # S39 stage-2: "gdn2" swaps the shared scalar beta for decoupled
+        # per-K-channel erase (b) / per-V-channel write (w) gates; every
+        # readout below branches on this flag, torch reference and fla kernel
+        # alike. The decay gate and delta form are unchanged.
+        self.gdn2 = getattr(c, "recurrence", "kda") == "gdn2"
         self.readout_query = nn.Parameter(torch.empty(c.readout_queries, c.kda_heads, c.kda_head_k))
         nn.init.trunc_normal_(self.readout_query, std=0.02)
         self.realign = nn.Sequential(
@@ -280,6 +641,83 @@ class KDAStateMachine(nn.Module):
         if getattr(c, "xcache_supp", 0) > 0:
             self.supp_q = nn.Linear(c.d_pack, c.kda_heads * c.kda_head_k, bias=False)
             self.supp_out = nn.Linear(c.kda_heads * c.kda_head_v, c.d_pack, bias=False)
+        # fork 2 multi-view readout (see V36Config.readout_views): seeded
+        # orthogonal probe frame + per-segment rotation table. Buffers are
+        # persistent=False BY RULING: no new parameters/state, so every
+        # checkpoint loads strict-clean either way and the frames are rebuilt
+        # from the pinned seed at construction.
+        self.readout_views = getattr(c, "readout_views", 1)
+        if self.readout_views > 1:
+            self.register_buffer(
+                "view_frame", probe_frame(self.readout_views, c.kda_heads, c.kda_head_k), persistent=False
+            )
+            self.register_buffer(
+                "view_rots", frame_rotations(PROBE_FRAME_ROTS, c.kda_head_k), persistent=False
+            )
+
+    def forward_views(self, gates: dict[str, torch.Tensor], chunk_mask: torch.Tensor) -> torch.Tensor:
+        """fork 2 §1.1: per-chunk m measurement rows. Segment i is read with
+        the seeded frame rotated by table[i % P]; each view's read passes the
+        SHARED realign (m 路共享 — no new parameters). Returns (B, C, m,
+        d_pack); padded chunk rows are garbage-but-masked exactly like the
+        main path. Only the kda recurrence is wired (gdn2 raises loudly —
+        out of fork-2 scope)."""
+        if self.gdn2:
+            raise ValueError("forward_views (readout_views>1) supports recurrence='kda' only")
+        m = self.readout_views
+        if m <= 1:
+            raise ValueError("forward_views requires readout_views > 1")
+        k, v, alpha = gates["k"], gates["v"], gates["alpha"]
+        beta = gates["beta"]
+        keep = chunk_mask.unsqueeze(-1).unsqueeze(-1).to(k.dtype)
+        k = k * keep
+        v = v * keep
+        bsz, chunks, heads, dk = k.shape
+        dv = v.size(-1)
+        beta = beta * chunk_mask.unsqueeze(-1).to(beta.dtype)
+        g = torch.log(alpha.clamp_min(1.0e-6)).to(k.dtype) * keep
+        # per-chunk rotated queries: q[c, h, r] = frame[h, r] @ rots[c % P].
+        # NOTE: einsum is autocast-managed and would run bf16 here while the
+        # kernel's other operands are fp32 (normalize/sigmoid promote) — the
+        # bwd kernel demands uniform dtypes, so compute q outside autocast.
+        idx = torch.arange(chunks, device=k.device) % self.view_rots.size(0)
+        with torch.autocast(k.device.type, enabled=False):
+            q_all = torch.einsum(
+                "hro,cok->chrk", self.view_frame.float(), self.view_rots[idx].float()
+            ).to(k.dtype)
+        outs = []
+        if self.c.kda_impl == "fla" and _fla_chunk_kda is not None:
+            for r in range(m):
+                q_r = q_all[:, :, r].unsqueeze(0).expand(bsz, -1, -1, -1).contiguous()  # (B, C, H, hk)
+                o, _ = _fla_chunk_kda(
+                    q=q_r, k=k, v=v,
+                    g=g.expand(bsz, chunks, -1, -1).contiguous(),
+                    beta=beta, scale=1.0, use_qk_l2norm_in_kernel=False,
+                    output_final_state=False,
+                )
+                outs.append(o)  # (B, C, H, hv)
+        else:
+            # torch reference: serial recurrence, per-chunk rotated reads
+            state = k.new_zeros(bsz, heads, dk, dv, dtype=torch.float32)
+            kf, vf = k.float(), v.float()
+            alpha_eff = 1.0 - chunk_mask.float().view(bsz, chunks, 1, 1, 1) + chunk_mask.float().view(
+                bsz, chunks, 1, 1, 1
+            ) * gates["alpha"][0].float().unsqueeze(0).unsqueeze(-1)
+            bf = beta.float()
+            qf = q_all.float()  # (C, H, m, hk)
+            per_chunk = []
+            for i in range(chunks):
+                ki, vi, bi, ai = kf[:, i], vf[:, i], bf[:, i], alpha_eff[:, i]
+                state = ai * state
+                kTs = torch.einsum("bhk,bhkv->bhv", ki, state)
+                state = state - bi.view(bsz, heads, 1, 1) * ki.unsqueeze(-1) * kTs.unsqueeze(-2)
+                state = state + bi.view(bsz, heads, 1, 1) * ki.unsqueeze(-1) * vi.unsqueeze(-2)
+                per_chunk.append(torch.einsum("hrk,bhkv->bhrv", qf[i], state))  # (B, H, m, hv)
+            o = torch.stack(per_chunk, dim=1)  # (B, C, H, m, hv)
+            outs = [o[:, :, :, r] for r in range(m)]  # each (B, C, H, hv)
+        read = torch.stack(outs, dim=2)  # (B, C, m, H, hv)
+        read = read.reshape(bsz, chunks, m, heads * dv).to(k.dtype)
+        return self.realign(read)
 
     def read_residual(
         self,
@@ -295,43 +733,74 @@ class KDAStateMachine(nn.Module):
         Readout reuses the content-conditioned supp projections (independent
         from the main state's fixed readout query)."""
         c = self.c
-        k, v, beta, alpha = gates["k"], gates["v"], gates["beta"], gates["alpha"]
+        k, v, alpha = gates["k"], gates["v"], gates["alpha"]
+        beta = None if self.gdn2 else gates["beta"]
         keep = chunk_mask.unsqueeze(-1).unsqueeze(-1).to(k.dtype)
         bsz, chunks, heads, dk = k.shape
         q = F.normalize(self.supp_q(content).view(bsz, chunks, heads, dk).float(), dim=-1).to(k.dtype)
-        w = write_w.unsqueeze(-1).to(beta.dtype)  # (B, C, 1)
-        if c.kda_impl == "fla" and _fla_chunk_kda is not None:
+        w = write_w.unsqueeze(-1).to(k.dtype)  # (B, C, 1) -- beta shares k's dtype
+        kernel = _fla_chunk_gdn2 if self.gdn2 else _fla_chunk_kda
+        if c.kda_impl == "fla" and kernel is not None:
             kk = k * keep
             vv = v * keep
-            bb = beta * w * chunk_mask.unsqueeze(-1).to(beta.dtype)
             g = torch.log(alpha.clamp_min(1.0e-6)).to(k.dtype) * keep
-            o, _ = _fla_chunk_kda(
-                q=q.contiguous(),
-                k=kk,
-                v=vv,
-                g=g.expand(bsz, chunks, -1, -1).contiguous(),
-                beta=bb,
-                scale=1.0,
-                use_qk_l2norm_in_kernel=False,
-                output_final_state=False,
-            )
+            if self.gdn2:
+                # gdn2: the detached CUIB weight modulates BOTH decoupled gates
+                # (collapses to kda's beta*w when b == w == beta).
+                mod = (w * chunk_mask.unsqueeze(-1).to(k.dtype)).unsqueeze(-1)  # (B, C, 1, 1)
+                o, _ = _fla_chunk_gdn2(
+                    q=q.contiguous(),
+                    k=kk,
+                    v=vv,
+                    g=g.expand(bsz, chunks, -1, -1).contiguous(),
+                    b=(gates["b"] * mod).contiguous(),
+                    w=(gates["w"] * mod).contiguous(),
+                    scale=1.0,
+                    use_qk_l2norm_in_kernel=False,
+                    output_final_state=False,
+                )
+            else:
+                bb = beta * w * chunk_mask.unsqueeze(-1).to(beta.dtype)
+                o, _ = _fla_chunk_kda(
+                    q=q.contiguous(),
+                    k=kk,
+                    v=vv,
+                    g=g.expand(bsz, chunks, -1, -1).contiguous(),
+                    beta=bb,
+                    scale=1.0,
+                    use_qk_l2norm_in_kernel=False,
+                    output_final_state=False,
+                )
             read = o.reshape(bsz, chunks, heads * v.size(-1))
         else:
             kf, vf = (k * keep).float(), (v * keep).float()
-            bf = beta.float() * w.float() * chunk_mask.float().unsqueeze(-1)
             alpha_eff = 1.0 - chunk_mask.float().view(bsz, chunks, 1, 1, 1) + chunk_mask.float().view(
                 bsz, chunks, 1, 1, 1
             ) * gates["alpha"][0].float().unsqueeze(0).unsqueeze(-1)
             state = k.new_zeros(bsz, heads, dk, v.size(-1), dtype=torch.float32)
             reads = []
             qf = q.float()
-            for i in range(chunks):
-                ki, vi, bi, ai = kf[:, i], vf[:, i], bf[:, i], alpha_eff[:, i]
-                state = ai * state
-                kTs = torch.einsum("bhk,bhkv->bhv", ki, state)
-                state = state - bi.view(bsz, heads, 1, 1) * ki.unsqueeze(-1) * kTs.unsqueeze(-2)
-                state = state + bi.view(bsz, heads, 1, 1) * ki.unsqueeze(-1) * vi.unsqueeze(-2)
-                reads.append(torch.einsum("bhk,bhkv->bhv", qf[:, i], state))
+            if self.gdn2:
+                mod5 = (write_w.float() * chunk_mask.float()).view(bsz, chunks, 1, 1)
+                bf = gates["b"].float() * mod5
+                wf = gates["w"].float() * mod5
+                for i in range(chunks):
+                    ki, vi, bi, wi, ai = kf[:, i], vf[:, i], bf[:, i], wf[:, i], alpha_eff[:, i]
+                    state = ai * state
+                    # gdn2 step: erase along (b * k), commit (w * v) minus the erased read
+                    erase = torch.einsum("bhk,bhkv->bhv", bi * ki, state)
+                    v_new = wi * vi - erase
+                    state = state + ki.unsqueeze(-1) * v_new.unsqueeze(-2)
+                    reads.append(torch.einsum("bhk,bhkv->bhv", qf[:, i], state))
+            else:
+                bf = beta.float() * w.float() * chunk_mask.float().unsqueeze(-1)
+                for i in range(chunks):
+                    ki, vi, bi, ai = kf[:, i], vf[:, i], bf[:, i], alpha_eff[:, i]
+                    state = ai * state
+                    kTs = torch.einsum("bhk,bhkv->bhv", ki, state)
+                    state = state - bi.view(bsz, heads, 1, 1) * ki.unsqueeze(-1) * kTs.unsqueeze(-2)
+                    state = state + bi.view(bsz, heads, 1, 1) * ki.unsqueeze(-1) * vi.unsqueeze(-2)
+                    reads.append(torch.einsum("bhk,bhkv->bhv", qf[:, i], state))
             read = torch.stack(reads, dim=1).reshape(bsz, chunks, heads * v.size(-1))
         return self.supp_out(read.to(k.dtype))
 
@@ -342,44 +811,71 @@ class KDAStateMachine(nn.Module):
         supp_i = normalize(W_q content[i]) . S_i -- a targeted extra slice of
         the state right after chunk i. One extra kernel call."""
         c = self.c
-        k, v, beta, alpha = gates["k"], gates["v"], gates["beta"], gates["alpha"]
+        k, v, alpha = gates["k"], gates["v"], gates["alpha"]
+        beta = None if self.gdn2 else gates["beta"]
         keep = chunk_mask.unsqueeze(-1).unsqueeze(-1).to(k.dtype)
         bsz, chunks, heads, dk = k.shape
         q = F.normalize(
             self.supp_q(content).view(bsz, chunks, heads, dk).float(), dim=-1
         ).to(k.dtype)
-        if c.kda_impl == "fla" and _fla_chunk_kda is not None:
+        kernel = _fla_chunk_gdn2 if self.gdn2 else _fla_chunk_kda
+        if c.kda_impl == "fla" and kernel is not None:
             kk = k * keep
             vv = v * keep
-            bb = beta * chunk_mask.unsqueeze(-1).to(beta.dtype)
             g = torch.log(alpha.clamp_min(1.0e-6)).to(k.dtype) * keep
-            o, _ = _fla_chunk_kda(
-                q=q.contiguous(),
-                k=kk,
-                v=vv,
-                g=g.expand(bsz, chunks, -1, -1).contiguous(),
-                beta=bb,
-                scale=1.0,
-                use_qk_l2norm_in_kernel=False,
-                output_final_state=False,
-            )
+            if self.gdn2:
+                o, _ = _fla_chunk_gdn2(
+                    q=q.contiguous(),
+                    k=kk,
+                    v=vv,
+                    g=g.expand(bsz, chunks, -1, -1).contiguous(),
+                    b=(gates["b"] * keep).contiguous(),
+                    w=(gates["w"] * keep).contiguous(),
+                    scale=1.0,
+                    use_qk_l2norm_in_kernel=False,
+                    output_final_state=False,
+                )
+            else:
+                bb = beta * chunk_mask.unsqueeze(-1).to(beta.dtype)
+                o, _ = _fla_chunk_kda(
+                    q=q.contiguous(),
+                    k=kk,
+                    v=vv,
+                    g=g.expand(bsz, chunks, -1, -1).contiguous(),
+                    beta=bb,
+                    scale=1.0,
+                    use_qk_l2norm_in_kernel=False,
+                    output_final_state=False,
+                )
             read = o.reshape(bsz, chunks, heads * v.size(-1))
         else:
             kf, vf = (k * keep).float(), (v * keep).float()
-            bf = beta.float() * chunk_mask.float().unsqueeze(-1)
             alpha_eff = 1.0 - chunk_mask.float().view(bsz, chunks, 1, 1, 1) + chunk_mask.float().view(
                 bsz, chunks, 1, 1, 1
             ) * gates["alpha"][0].float().unsqueeze(0).unsqueeze(-1)
             state = k.new_zeros(bsz, heads, dk, v.size(-1), dtype=torch.float32)
             reads = []
             qf = q.float()
-            for i in range(chunks):
-                ki, vi, bi, ai = kf[:, i], vf[:, i], bf[:, i], alpha_eff[:, i]
-                state = ai * state
-                kTs = torch.einsum("bhk,bhkv->bhv", ki, state)
-                state = state - bi.view(bsz, heads, 1, 1) * ki.unsqueeze(-1) * kTs.unsqueeze(-2)
-                state = state + bi.view(bsz, heads, 1, 1) * ki.unsqueeze(-1) * vi.unsqueeze(-2)
-                reads.append(torch.einsum("bhk,bhkv->bhv", qf[:, i], state))
+            if self.gdn2:
+                mask4 = chunk_mask.float().view(bsz, chunks, 1, 1)
+                bf = gates["b"].float() * mask4
+                wf = gates["w"].float() * mask4
+                for i in range(chunks):
+                    ki, vi, bi, wi, ai = kf[:, i], vf[:, i], bf[:, i], wf[:, i], alpha_eff[:, i]
+                    state = ai * state
+                    erase = torch.einsum("bhk,bhkv->bhv", bi * ki, state)
+                    v_new = wi * vi - erase
+                    state = state + ki.unsqueeze(-1) * v_new.unsqueeze(-2)
+                    reads.append(torch.einsum("bhk,bhkv->bhv", qf[:, i], state))
+            else:
+                bf = beta.float() * chunk_mask.float().unsqueeze(-1)
+                for i in range(chunks):
+                    ki, vi, bi, ai = kf[:, i], vf[:, i], bf[:, i], alpha_eff[:, i]
+                    state = ai * state
+                    kTs = torch.einsum("bhk,bhkv->bhv", ki, state)
+                    state = state - bi.view(bsz, heads, 1, 1) * ki.unsqueeze(-1) * kTs.unsqueeze(-2)
+                    state = state + bi.view(bsz, heads, 1, 1) * ki.unsqueeze(-1) * vi.unsqueeze(-2)
+                    reads.append(torch.einsum("bhk,bhkv->bhv", qf[:, i], state))
             read = torch.stack(reads, dim=1).reshape(bsz, chunks, heads * v.size(-1))
         return self.supp_out(read.to(k.dtype))
 
@@ -404,7 +900,8 @@ class KDAStateMachine(nn.Module):
         sample."""
         if not self.c.state_channel:
             raise ValueError("read_all_final requires state_channel=True (this arm trains the state channel itself)")
-        k, v, beta = gates["k"], gates["v"], gates["beta"]
+        k, v = gates["k"], gates["v"]
+        beta = None if self.gdn2 else gates["beta"]
         keep = chunk_mask.unsqueeze(-1).unsqueeze(-1).to(k.dtype)
         k = k * keep
         v = v * keep
@@ -412,16 +909,27 @@ class KDAStateMachine(nn.Module):
         dv = v.size(-1)
         state = k.new_zeros(bsz, heads, dk, dv, dtype=torch.float32)
         kf, vf = k.float(), v.float()
-        beta = beta.float() * chunk_mask.float().unsqueeze(-1)
         alpha = gates["alpha"][0].unsqueeze(0).unsqueeze(-1)
         mask5 = chunk_mask.float().view(bsz, chunks, 1, 1, 1)
         alpha_eff = 1.0 - mask5 + mask5 * alpha
-        for i in range(chunks):
-            ki, vi, bi, ai = kf[:, i], vf[:, i], beta[:, i], alpha_eff[:, i]
-            state = ai * state
-            kTs = torch.einsum("bhk,bhkv->bhv", ki, state)
-            state = state - bi.view(bsz, heads, 1, 1) * ki.unsqueeze(-1) * kTs.unsqueeze(-2)
-            state = state + bi.view(bsz, heads, 1, 1) * ki.unsqueeze(-1) * vi.unsqueeze(-2)
+        if self.gdn2:
+            mask4 = chunk_mask.float().view(bsz, chunks, 1, 1)
+            bf = gates["b"].float() * mask4
+            wf = gates["w"].float() * mask4
+            for i in range(chunks):
+                ki, vi, bi, wi, ai = kf[:, i], vf[:, i], bf[:, i], wf[:, i], alpha_eff[:, i]
+                state = ai * state
+                erase = torch.einsum("bhk,bhkv->bhv", bi * ki, state)
+                v_new = wi * vi - erase
+                state = state + ki.unsqueeze(-1) * v_new.unsqueeze(-2)
+        else:
+            beta = beta.float() * chunk_mask.float().unsqueeze(-1)
+            for i in range(chunks):
+                ki, vi, bi, ai = kf[:, i], vf[:, i], beta[:, i], alpha_eff[:, i]
+                state = ai * state
+                kTs = torch.einsum("bhk,bhkv->bhv", ki, state)
+                state = state - bi.view(bsz, heads, 1, 1) * ki.unsqueeze(-1) * kTs.unsqueeze(-2)
+                state = state + bi.view(bsz, heads, 1, 1) * ki.unsqueeze(-1) * vi.unsqueeze(-2)
         q = self.readout_query.float()
         read = torch.einsum("qhk,bhkv->bqhv", q, state)
         read = read.reshape(bsz, q.size(0), heads * dv).to(k.dtype)
@@ -438,7 +946,8 @@ class KDAStateMachine(nn.Module):
             read = v.reshape(v.size(0), v.size(1), 1, self.c.kda_heads * self.c.kda_head_v)
             return self.realign(read), v.new_zeros((), dtype=torch.float32)
         if self.c.kda_impl == "fla":
-            if _fla_chunk_kda is None:
+            kernel = _fla_chunk_gdn2 if self.gdn2 else _fla_chunk_kda
+            if kernel is None:
                 warnings.warn(
                     "kda_impl='fla' but fla is unavailable; falling back to the torch recurrence",
                     stacklevel=2,
@@ -448,28 +957,43 @@ class KDAStateMachine(nn.Module):
         return self._forward_torch(gates, chunk_mask)
 
     def _forward_fla(self, gates: dict[str, torch.Tensor], chunk_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        k, v, beta, alpha = gates["k"], gates["v"], gates["beta"], gates["alpha"]
+        k, v, alpha = gates["k"], gates["v"], gates["alpha"]
+        beta = None if self.gdn2 else gates["beta"]
         keep = chunk_mask.unsqueeze(-1).unsqueeze(-1).to(k.dtype)
         k = k * keep
         v = v * keep
         bsz, chunks, heads, dk = k.shape
-        beta = beta * chunk_mask.unsqueeze(-1).to(beta.dtype)
+        if not self.gdn2:
+            beta = beta * chunk_mask.unsqueeze(-1).to(beta.dtype)
         # g in log space; zero at padded chunks -> decay exp(0)=1 (identity step)
         g = torch.log(alpha.clamp_min(1.0e-6)).to(k.dtype) * keep
         q = self.readout_query
         outs = []
         final_state = None
         for qi in range(q.size(0)):
-            o, final_state = _fla_chunk_kda(
-                q=q[qi].to(k.dtype).unsqueeze(0).unsqueeze(0).expand(bsz, chunks, -1, -1).contiguous(),
-                k=k,
-                v=v,
-                g=g.expand(bsz, chunks, -1, -1).contiguous(),
-                beta=beta,
-                scale=1.0,
-                use_qk_l2norm_in_kernel=False,
-                output_final_state=True,
-            )
+            if self.gdn2:
+                o, final_state = _fla_chunk_gdn2(
+                    q=q[qi].to(k.dtype).unsqueeze(0).unsqueeze(0).expand(bsz, chunks, -1, -1).contiguous(),
+                    k=k,
+                    v=v,
+                    g=g.expand(bsz, chunks, -1, -1).contiguous(),
+                    b=(gates["b"] * keep).contiguous(),
+                    w=(gates["w"] * keep).contiguous(),
+                    scale=1.0,
+                    use_qk_l2norm_in_kernel=False,
+                    output_final_state=True,
+                )
+            else:
+                o, final_state = _fla_chunk_kda(
+                    q=q[qi].to(k.dtype).unsqueeze(0).unsqueeze(0).expand(bsz, chunks, -1, -1).contiguous(),
+                    k=k,
+                    v=v,
+                    g=g.expand(bsz, chunks, -1, -1).contiguous(),
+                    beta=beta,
+                    scale=1.0,
+                    use_qk_l2norm_in_kernel=False,
+                    output_final_state=True,
+                )
             outs.append(o)
         o = torch.stack(outs, dim=2)  # (B, C, nq, H, V)
         read = o.reshape(bsz, chunks, q.size(0), heads * v.size(-1))
@@ -480,7 +1004,8 @@ class KDAStateMachine(nn.Module):
         return package, final_state.float().norm(dim=(-2, -1)).mean()
 
     def _forward_torch(self, gates: dict[str, torch.Tensor], chunk_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        k, v, beta, alpha = gates["k"], gates["v"], gates["beta"], gates["alpha"]
+        k, v, alpha = gates["k"], gates["v"], gates["alpha"]
+        beta = None if self.gdn2 else gates["beta"]
         keep = chunk_mask.unsqueeze(-1).unsqueeze(-1).to(k.dtype)
         k = k * keep
         v = v * keep
@@ -488,22 +1013,37 @@ class KDAStateMachine(nn.Module):
         dv = v.size(-1)
         state = k.new_zeros(bsz, heads, dk, dv, dtype=torch.float32)
         kf, vf = k.float(), v.float()
-        beta = beta.float() * chunk_mask.float().unsqueeze(-1)
         alpha = gates["alpha"][0].unsqueeze(0).unsqueeze(-1)
         mask5 = chunk_mask.float().view(bsz, chunks, 1, 1, 1)
         alpha_eff = 1.0 - mask5 + mask5 * alpha
         q = self.readout_query.float()
         per_chunk_reads = []
-        for i in range(chunks):
-            ki, vi, bi, ai = kf[:, i], vf[:, i], beta[:, i], alpha_eff[:, i]
-            state = ai * state
-            kTs = torch.einsum("bhk,bhkv->bhv", ki, state)
-            state = state - bi.view(bsz, heads, 1, 1) * ki.unsqueeze(-1) * kTs.unsqueeze(-2)
-            state = state + bi.view(bsz, heads, 1, 1) * ki.unsqueeze(-1) * vi.unsqueeze(-2)
-            if self.c.per_chunk_readout:
-                # Read the state right after consuming chunk i: each chunk gets
-                # its own conditioning vector instead of the whole-prompt mean.
-                per_chunk_reads.append(torch.einsum("qhk,bhkv->bqhv", q, state))
+        if self.gdn2:
+            mask4 = chunk_mask.float().view(bsz, chunks, 1, 1)
+            bf = gates["b"].float() * mask4
+            wf = gates["w"].float() * mask4
+            for i in range(chunks):
+                ki, vi, bi, wi, ai = kf[:, i], vf[:, i], bf[:, i], wf[:, i], alpha_eff[:, i]
+                state = ai * state
+                erase = torch.einsum("bhk,bhkv->bhv", bi * ki, state)
+                v_new = wi * vi - erase
+                state = state + ki.unsqueeze(-1) * v_new.unsqueeze(-2)
+                if self.c.per_chunk_readout:
+                    # Read the state right after consuming chunk i: each chunk gets
+                    # its own conditioning vector instead of the whole-prompt mean.
+                    per_chunk_reads.append(torch.einsum("qhk,bhkv->bqhv", q, state))
+        else:
+            beta = beta.float() * chunk_mask.float().unsqueeze(-1)
+            for i in range(chunks):
+                ki, vi, bi, ai = kf[:, i], vf[:, i], beta[:, i], alpha_eff[:, i]
+                state = ai * state
+                kTs = torch.einsum("bhk,bhkv->bhv", ki, state)
+                state = state - bi.view(bsz, heads, 1, 1) * ki.unsqueeze(-1) * kTs.unsqueeze(-2)
+                state = state + bi.view(bsz, heads, 1, 1) * ki.unsqueeze(-1) * vi.unsqueeze(-2)
+                if self.c.per_chunk_readout:
+                    # Read the state right after consuming chunk i: each chunk gets
+                    # its own conditioning vector instead of the whole-prompt mean.
+                    per_chunk_reads.append(torch.einsum("qhk,bhkv->bqhv", q, state))
         if self.c.per_chunk_readout:
             read = torch.stack(per_chunk_reads, dim=1)  # (B, C, q, heads*dv)
             read = read.reshape(bsz, chunks, q.size(0), heads * dv).to(k.dtype)
@@ -536,48 +1076,275 @@ class KDAStateMachine(nn.Module):
         pure-torch update when fla is unavailable).
         """
         c = self.c
-        if c.kda_impl == "fla" and _fla_chunk_kda is not None:
-            from fla.ops.kda import fused_recurrent_kda
-
-            k, v, beta, alpha = gates_i["k"], gates_i["v"], gates_i["beta"], gates_i["alpha"]
+        kernel = _fla_chunk_gdn2 if self.gdn2 else _fla_chunk_kda
+        if c.kda_impl == "fla" and kernel is not None:
+            k, v, alpha = gates_i["k"], gates_i["v"], gates_i["alpha"]
             bsz = k.size(0)
             g = torch.log(alpha.clamp_min(1.0e-6)).to(k.dtype).expand(bsz, 1, -1, -1).contiguous()
             q = self.readout_query
             outs = []
             new_state = state
-            for qi in range(q.size(0)):
-                o, new_state = fused_recurrent_kda(
-                    q=q[qi].to(k.dtype).unsqueeze(0).unsqueeze(0).expand(bsz, 1, -1, -1).contiguous(),
-                    k=k,
-                    v=v,
-                    g=g,
-                    beta=beta,
-                    scale=1.0,
-                    initial_state=state,
-                    output_final_state=True,
-                    use_qk_l2norm_in_kernel=False,
-                )
-                outs.append(o)
+            if self.gdn2:
+                from fla.ops.gdn2 import fused_recurrent_gdn2
+
+                for qi in range(q.size(0)):
+                    o, new_state = fused_recurrent_gdn2(
+                        q=q[qi].to(k.dtype).unsqueeze(0).unsqueeze(0).expand(bsz, 1, -1, -1).contiguous(),
+                        k=k,
+                        v=v,
+                        g=g,
+                        b=gates_i["b"],
+                        w=gates_i["w"],
+                        scale=1.0,
+                        initial_state=state,
+                        output_final_state=True,
+                        use_qk_l2norm_in_kernel=False,
+                    )
+                    outs.append(o)
+            else:
+                from fla.ops.kda import fused_recurrent_kda
+
+                for qi in range(q.size(0)):
+                    o, new_state = fused_recurrent_kda(
+                        q=q[qi].to(k.dtype).unsqueeze(0).unsqueeze(0).expand(bsz, 1, -1, -1).contiguous(),
+                        k=k,
+                        v=v,
+                        g=g,
+                        beta=gates_i["beta"],
+                        scale=1.0,
+                        initial_state=state,
+                        output_final_state=True,
+                        use_qk_l2norm_in_kernel=False,
+                    )
+                    outs.append(o)
             o = torch.stack(outs, dim=2)  # (B, 1, nq, H, V)
             read = o.reshape(bsz, 1, q.size(0), c.kda_heads * c.kda_head_v)
             return self.realign(read), new_state
 
         # Pure-torch fallback: same update math as _forward_torch, one chunk.
-        k, v, beta = gates_i["k"], gates_i["v"], gates_i["beta"]
+        k, v = gates_i["k"], gates_i["v"]
         bsz = k.size(0)
         heads, dv = c.kda_heads, c.kda_head_v
         kf, vf = k.float(), v.float()
-        bi = beta.float()[:, 0]  # (B, H) — a real chunk, mask == 1
         ai = gates_i["alpha"][0].float().unsqueeze(-1)  # (1, H, K, 1)
         ki, vi = kf[:, 0], vf[:, 0]
         state = ai * state
-        kTs = torch.einsum("bhk,bhkv->bhv", ki, state)
-        state = state - bi.view(bsz, heads, 1, 1) * ki.unsqueeze(-1) * kTs.unsqueeze(-2)
-        state = state + bi.view(bsz, heads, 1, 1) * ki.unsqueeze(-1) * vi.unsqueeze(-2)
+        if self.gdn2:
+            bi = gates_i["b"].float()[:, 0]  # (B, H, K) — a real chunk, mask == 1
+            wi = gates_i["w"].float()[:, 0]  # (B, H, V)
+            erase = torch.einsum("bhk,bhkv->bhv", bi * ki, state)
+            v_new = wi * vi - erase
+            state = state + ki.unsqueeze(-1) * v_new.unsqueeze(-2)
+        else:
+            bi = gates_i["beta"].float()[:, 0]  # (B, H) — a real chunk, mask == 1
+            kTs = torch.einsum("bhk,bhkv->bhv", ki, state)
+            state = state - bi.view(bsz, heads, 1, 1) * ki.unsqueeze(-1) * kTs.unsqueeze(-2)
+            state = state + bi.view(bsz, heads, 1, 1) * ki.unsqueeze(-1) * vi.unsqueeze(-2)
         q = self.readout_query.float()
         read = torch.einsum("qhk,bhkv->bqhv", q, state)
         read = read.reshape(bsz, 1, q.size(0), heads * dv).to(k.dtype)
         return self.realign(read), state
+
+
+# ---------------------------------------------------------------------------
+# Q20 多槽读出 (multi-slot readout, E119; 任务书冻结 v1 2026-08-29:
+# docs/versions/v3.7/FLUED_V3_7_Q20_MULTISLOT_READOUT_20260829_CN.md)
+# ---------------------------------------------------------------------------
+
+Q20_CG_ITERS = 8  # CG 臂迭代深度 T (任务书 §1 冻结: 固定不扫——迭代深度≠读出宽度)
+Q20_CG_LAM = 0.01  # CG 臂 Gram 正规方程 λ——修订 v1（2026-09-02，点火前校准）：=fuzz_id 段1 解混 λ_unmix=0.01（CG 结构化的参照对象）；任务书原文"λ=λopt=1.0 部署桥口径"混同两处 λ（λopt=1.0 属段 2 桥），零变化律冒烟拒发（q20_k=0.2992<0.427）后修正
+
+
+def _kda_scan_post_states(gates: dict[str, torch.Tensor], chunk_mask: torch.Tensor) -> torch.Tensor:
+    """逐段 KDA post-state 轨迹: S_i = 吃完 chunk i 后的状态 (fp32 torch 串行
+    扫描, 更新律同 KDAStateMachine._forward_torch; padded 行 = 恒等步, 与
+    probe_oracle_write_verdict.trained_states 同形)。Returns (B, C, H, hk, hv)。
+    仅 kda 递推 (gdn2 不在 Q20 作用域, 配置层已响亮拒绝)。"""
+    k, v = gates["k"], gates["v"]
+    keep = chunk_mask.unsqueeze(-1).unsqueeze(-1).to(k.dtype)
+    k = k * keep
+    v = v * keep
+    bsz, chunks, heads, dk = k.shape
+    dv = v.size(-1)
+    state = k.new_zeros(bsz, heads, dk, dv, dtype=torch.float32)
+    kf, vf = k.float(), v.float()
+    alpha = gates["alpha"][0].unsqueeze(0).unsqueeze(-1)
+    mask5 = chunk_mask.float().view(bsz, chunks, 1, 1, 1)
+    alpha_eff = 1.0 - mask5 + mask5 * alpha
+    beta = gates["beta"].float() * chunk_mask.float().unsqueeze(-1)
+    states = []
+    for i in range(chunks):
+        ki, vi, bi, ai = kf[:, i], vf[:, i], beta[:, i], alpha_eff[:, i]
+        state = ai * state
+        kTs = torch.einsum("bhk,bhkv->bhv", ki, state)
+        state = state - bi.view(bsz, heads, 1, 1) * ki.unsqueeze(-1) * kTs.unsqueeze(-2)
+        state = state + bi.view(bsz, heads, 1, 1) * ki.unsqueeze(-1) * vi.unsqueeze(-2)
+        states.append(state)
+    return torch.stack(states, dim=1)
+
+
+class MultiSlotReadout(nn.Module):
+    """Q20 多槽读出件 (multi-slot readout) 的 k 槽查询臂 (预注册 k∈{1,4,8})。
+
+    k 个可学习槽位查询 (k, H, hk) 逐段读 K 通道 post-state (每段吃完该
+    chunk 后的状态 S_i), k 根读出拼接 (k×H×hv) 经单层 Linear 投影回 d_mem
+    (decoder 入口宽度), 喂冻结的 decoder_in_mem → decoder。独立成件——不动
+    KDAStateMachine.readout_query/realign (那是 backbone store 的生产读出)。
+    读状态走 _fla_chunk_kda 任意 q 展开 (KDAStateMachine._forward_fla 的
+    readout_queries 循环先例); torch 串行扫描为回落/参考路径 (同
+    _forward_torch 更新律, fp32)。padded 行垃圾但下游掩码, 与主路径同约定。
+    """
+
+    def __init__(self, c: V36Config, k: int) -> None:
+        super().__init__()
+        self.c = c
+        self.k = k
+        self.slot_query = nn.Parameter(torch.empty(k, c.kda_heads, c.kda_head_k))
+        nn.init.trunc_normal_(self.slot_query, std=0.02)
+        self.proj = nn.Linear(k * c.kda_heads * c.kda_head_v, c.d_mem)
+
+    def forward(self, gates: dict[str, torch.Tensor], chunk_mask: torch.Tensor) -> torch.Tensor:
+        """gates = write_head_k(index) 的 K 通道生产写门。Returns (B, C, d_mem)
+        fp32 读出行 (逐段, 与 v_rows 同网格)。"""
+        if self.c.kda_impl == "fla" and _fla_chunk_kda is not None:
+            return self._forward_fla(gates, chunk_mask)
+        return self._forward_torch(gates, chunk_mask)
+
+    def _forward_fla(self, gates: dict[str, torch.Tensor], chunk_mask: torch.Tensor) -> torch.Tensor:
+        k, v, alpha = gates["k"], gates["v"], gates["alpha"]
+        beta = gates["beta"]
+        keep = chunk_mask.unsqueeze(-1).unsqueeze(-1).to(k.dtype)
+        k = k * keep
+        v = v * keep
+        beta = beta * chunk_mask.unsqueeze(-1).to(beta.dtype)
+        g = torch.log(alpha.clamp_min(1.0e-6)).to(k.dtype) * keep
+        bsz, chunks = k.size(0), k.size(1)
+        outs = []
+        for s in range(self.k):  # 任意 q 展开: readout_queries 循环先例 (_forward_fla)
+            o, _ = _fla_chunk_kda(
+                q=self.slot_query[s].to(k.dtype).unsqueeze(0).unsqueeze(0).expand(bsz, chunks, -1, -1).contiguous(),
+                k=k,
+                v=v,
+                g=g.expand(bsz, chunks, -1, -1).contiguous(),
+                beta=beta,
+                scale=1.0,
+                use_qk_l2norm_in_kernel=False,
+                output_final_state=False,
+            )
+            outs.append(o)  # (B, C, H, hv)
+        read = torch.stack(outs, dim=2).reshape(bsz, chunks, self.k * self.c.kda_heads * self.c.kda_head_v)
+        return self.proj(read.float())
+
+    def _forward_torch(self, gates: dict[str, torch.Tensor], chunk_mask: torch.Tensor) -> torch.Tensor:
+        c = self.c
+        states = _kda_scan_post_states(gates, chunk_mask)  # (B, C, H, hk, hv) fp32
+        q = self.slot_query.float()  # (k, H, hk)
+        read = torch.einsum("qhk,bchkv->bcqhv", q, states)  # (B, C, k, H, hv)
+        read = read.reshape(states.size(0), states.size(1), self.k * c.kda_heads * c.kda_head_v)
+        return self.proj(read)
+
+
+class CGRidgeReadout(nn.Module):
+    """Q20 CG 对照臂 (结构内化, MesaNet 模板, 无 k 轴): 段 1 解混不前馈学习,
+    由 T=Q20_CG_ITERS 步可微 CG 迭代逼闭式解——逐段对窗内写入键的 Gram 正规
+    方程 (K_iᵀK_i + λI) c_i = k_i (ridge 段1 own-chunk 回收方向
+    c_i = K_iᵀ(K_iK_iᵀ+λI)⁻¹e_i 的键空间等价形, λ=Q20_CG_LAM 部署桥口径),
+    v̂_i = c_iᵀ S_i; 段 2 = 可学投影 (H*hv → d_mem)。T 固定不扫 (迭代深度≠
+    读出宽度)。CG 迭代全部可微 (matmul/加法展开), 梯度可穿迭代件落写入门——
+    本臂冻结纪律下写侧无梯度, 可训的只有段 2 投影。全 fp32 torch 路径 (逐段
+    post-state 轨迹只有串行扫描生产, CG 臂迭代税已预注册 +25%)。"""
+
+    def __init__(self, c: V36Config) -> None:
+        super().__init__()
+        self.c = c
+        self.proj = nn.Linear(c.kda_heads * c.kda_head_v, c.d_mem)
+
+    def forward(self, gates: dict[str, torch.Tensor], chunk_mask: torch.Tensor) -> torch.Tensor:
+        """gates = write_head_k(index) 的 K 通道生产写门。Returns (B, C, d_mem)
+        fp32 读出行 (逐段, 与 v_rows 同网格)。"""
+        c = self.c
+        k = gates["k"]
+        keep = chunk_mask.unsqueeze(-1).unsqueeze(-1).to(k.dtype)
+        kf = (k * keep).float()  # padded 键置零: 零外积不进 Gram, b=0 行解出 c=0
+        bsz, chunks, heads, dk = kf.shape
+        states = _kda_scan_post_states(gates, chunk_mask)  # (B, C, H, hk, hv) fp32
+        # 段 1: 逐段 Gram 正规方程 (K_iᵀK_i + λI) c_i = k_i, K_i = 前 i+1 个
+        # 写入键 (cumsum 累计); T 步可微 CG 逼闭式解
+        kh = kf.permute(0, 2, 1, 3)  # (B, H, C, hk)
+        outer = torch.einsum("bhci,bhcj->bhcij", kh, kh)
+        A = outer.cumsum(dim=2) + Q20_CG_LAM * torch.eye(dk, device=kh.device, dtype=torch.float32)
+        x = torch.zeros_like(kh)
+        r = kh.clone()
+        p = r.clone()
+        for _ in range(Q20_CG_ITERS):
+            Ap = torch.einsum("bhcij,bhcj->bhci", A, p)
+            rr = (r * r).sum(dim=-1)
+            alpha_cg = rr / (p * Ap).sum(dim=-1).clamp_min(1e-12)
+            x = x + alpha_cg.unsqueeze(-1) * p
+            r = r - alpha_cg.unsqueeze(-1) * Ap
+            rr_new = (r * r).sum(dim=-1)
+            p = r + (rr_new / rr.clamp_min(1e-12)).unsqueeze(-1) * p
+        # v̂_i = c_iᵀ S_i (逐头), 拼接 H*hv → 段 2 可学投影
+        vh = torch.einsum("bhcj,bchjv->bchv", x, states)  # (B, C, H, hv)
+        read = vh.reshape(bsz, chunks, heads * c.kda_head_v)
+        return self.proj(read)
+
+
+class E120WarmReadout(nn.Module):
+    """E120 端到端点燃臂读出件 (任务书冻结 v1+修订 v2 2026-09-03): k=1 槽查询
+    读 d 格 V 通道 post-state (每段吃完该 chunk 后的 KDA 自然态 S_i), 单层
+    Linear 投影回生产读出行空间 d_pack——替换 _slm_store_rows 的 v_rows 产源
+    (backbone store 与 decoder direct 的同一行源, 三任务一个 V §1.4)。
+    温启动装载 = 训练器 _e120_warm_start (bridge_deploy.npz 的 W/scale 折叠 +
+    截距行 → proj; q_ridge_dir.npz 的 q_ridge (H, hk) → slot_query), t=0 即
+    E119 定型档。不动 KDAStateMachine.readout_query/realign (被替换的生产
+    读出保留原地、旗标关时零路径差; 开时照跑只产 state_norm 诊断)。读状态
+    走 _fla_chunk_kda 任意 q 展开 (readout_queries 循环先例); torch 串行扫描
+    为回落/参考路径 (同 _forward_torch 更新律, fp32)。gdn2 不在作用域
+    (配置层响亮拒绝)。"""
+
+    def __init__(self, c: V36Config) -> None:
+        super().__init__()
+        self.c = c
+        self.slot_query = nn.Parameter(torch.empty(1, c.kda_heads, c.kda_head_k))
+        nn.init.trunc_normal_(self.slot_query, std=0.02)
+        self.proj = nn.Linear(c.kda_heads * c.kda_head_v, c.d_pack)
+
+    def forward(self, gates: dict[str, torch.Tensor], chunk_mask: torch.Tensor) -> torch.Tensor:
+        """gates = write_head(memory) 的 V 通道生产写门。Returns (B, C, d_pack)
+        fp32 读出行 (逐段, 与被替换的 v_rows 同网格同宽)。"""
+        if self.c.kda_impl == "fla" and _fla_chunk_kda is not None:
+            return self._forward_fla(gates, chunk_mask)
+        return self._forward_torch(gates, chunk_mask)
+
+    def _forward_fla(self, gates: dict[str, torch.Tensor], chunk_mask: torch.Tensor) -> torch.Tensor:
+        k, v, alpha = gates["k"], gates["v"], gates["alpha"]
+        beta = gates["beta"]
+        keep = chunk_mask.unsqueeze(-1).unsqueeze(-1).to(k.dtype)
+        k = k * keep
+        v = v * keep
+        beta = beta * chunk_mask.unsqueeze(-1).to(beta.dtype)
+        g = torch.log(alpha.clamp_min(1.0e-6)).to(k.dtype) * keep
+        bsz, chunks = k.size(0), k.size(1)
+        o, _ = _fla_chunk_kda(
+            q=self.slot_query[0].to(k.dtype).unsqueeze(0).unsqueeze(0).expand(bsz, chunks, -1, -1).contiguous(),
+            k=k,
+            v=v,
+            g=g.expand(bsz, chunks, -1, -1).contiguous(),
+            beta=beta,
+            scale=1.0,
+            use_qk_l2norm_in_kernel=False,
+            output_final_state=False,
+        )
+        read = o.reshape(bsz, chunks, self.c.kda_heads * self.c.kda_head_v)
+        return self.proj(read.float())
+
+    def _forward_torch(self, gates: dict[str, torch.Tensor], chunk_mask: torch.Tensor) -> torch.Tensor:
+        c = self.c
+        states = _kda_scan_post_states(gates, chunk_mask)  # (B, C, H, hk, hv) fp32
+        read = torch.einsum("qhk,bchkv->bcqhv", self.slot_query.float(), states)  # (B, C, 1, H, hv)
+        read = read.reshape(states.size(0), states.size(1), c.kda_heads * c.kda_head_v)
+        return self.proj(read)
 
 
 def _xcache_select(scores: torch.Tensor, chunk_mask: torch.Tensor, frac: float) -> torch.Tensor:
@@ -597,6 +1364,33 @@ def _xcache_select(scores: torch.Tensor, chunk_mask: torch.Tensor, frac: float) 
     rank = torch.arange(n, device=chunk_mask.device).unsqueeze(0)
     cache_idx = torch.where(rank < k_keep.unsqueeze(1), order, torch.full_like(order, -1))
     return cache_idx.sort(dim=1).values  # -1 sinks first; masked downstream
+
+
+POS_FEAT_DIM = 64  # 16 frequencies x (sin, cos) x 2 scalars (segment order, start byte)
+
+
+def chunk_byte_offsets(token_mask: torch.Tensor) -> torch.Tensor:
+    """Window-relative per-chunk start byte offsets (S39 a+pos): exclusive
+    cumsum of the per-chunk byte counts derived from token_mask (B, C, S);
+    returns (B, C) long. Padded chunks (zero bytes) inherit the running
+    offset; they are masked downstream."""
+    clen = token_mask.long().sum(dim=2)
+    return clen.cumsum(dim=1) - clen
+
+
+def _pos_features(seg_idx: torch.Tensor, byte_off: torch.Tensor) -> torch.Tensor:
+    """Sinusoidal key-row position features (S39 a+pos, same form as the 0a
+    probe's position_features): per key row, 16 frequencies x (sin, cos) for
+    each of two absolute-position scalars -- the segment order (row index)
+    and the segment's window-relative start byte offset; max period 1e4.
+    seg_idx/byte_off: (B, n) -> (B, n, POS_FEAT_DIM)."""
+
+    def sincos(x: torch.Tensor) -> torch.Tensor:
+        freqs = torch.exp(-math.log(1e4) * torch.arange(16, dtype=torch.float32, device=x.device) / 16)
+        ang = x.float().unsqueeze(-1) * freqs
+        return torch.cat([ang.sin(), ang.cos()], dim=-1)
+
+    return torch.cat([sincos(seg_idx), sincos(byte_off)], dim=-1)
 
 
 def paged_boundaries(chunk_mask: torch.Tensor, n: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -645,6 +1439,37 @@ class CrossReadBackbone(nn.Module):
         if getattr(c, "xcache_gist", False) or getattr(c, "backbone_mode", "") == "paged_xattn":
             self.gist_k = nn.Linear(c.d_pack, c.d_backbone, bias=False)
             self.gist_v = nn.Linear(c.d_pack, c.d_backbone, bias=False)
+        # S39 stage-1 taxonomy 2x2: dedicated d_pack -> d_backbone projections
+        # for the "state" K/V source (per-chunk state readouts); created only
+        # when selected so (memory,memory) checkpoints keep loading
+        # strict-clean (same precedent as gist_k/gist_v above).
+        k_src = getattr(c, "k_row_source", "memory")
+        v_src = getattr(c, "v_row_source", "memory")
+        if k_src not in ("memory", "state") or v_src not in ("memory", "state"):
+            raise ValueError(f"k/v_row_source must be 'memory' or 'state', got {k_src!r}/{v_src!r}")
+        if (k_src == "state" or v_src == "state") and getattr(c, "backbone_mode", "") == "paged_xattn":
+            raise ValueError("k/v_row_source='state' is undefined for paged_xattn (content rows are page-level there)")
+        self.k_from_state = k_src == "state"
+        self.v_from_state = v_src == "state"
+        if self.k_from_state:
+            self.k_proj_state = nn.Linear(c.d_pack, c.d_backbone, bias=False)
+        if self.v_from_state:
+            self.v_proj_state = nn.Linear(c.d_pack, c.d_backbone, bias=False)
+        # S39 a+pos arm (appendix C): position-injected keys -- pos_proj maps
+        # the sinusoidal (segment order, window-relative start byte) features
+        # into the key space, added through the zero-init scalar gate
+        # pos_gate (step 0 == the a-grid anchor; the gate value is itself the
+        # diagnostic readout). Memory-source only; created only when enabled
+        # so old checkpoints keep loading strict-clean.
+        self.k_pos_inject = getattr(c, "k_pos_inject", False)
+        if self.k_pos_inject:
+            if k_src != "memory" or v_src != "memory":
+                raise ValueError(
+                    "k_pos_inject requires k/v_row_source='memory' "
+                    "(a+pos is the a-grid K-side single-variable arm)"
+                )
+            self.pos_proj = nn.Linear(POS_FEAT_DIM, c.d_backbone, bias=False)
+            self.pos_gate = nn.Parameter(torch.zeros(()))
         self.blocks = nn.ModuleList(
             [
                 nn.Sequential(
@@ -670,6 +1495,7 @@ class CrossReadBackbone(nn.Module):
         gist_pos: torch.Tensor | None = None,
         supp: torch.Tensor | None = None,
         supp_idx: torch.Tensor | None = None,
+        chunk_byte_off: torch.Tensor | None = None,
     ) -> torch.Tensor:
         bsz, n, _ = content.shape
         h = self.in_proj(content)
@@ -677,9 +1503,23 @@ class CrossReadBackbone(nn.Module):
         hd = h.size(-1) // nh
         q = (self.q_proj(h) + pos).view(bsz, n, nh, hd).transpose(1, 2)
         if cache_idx is None and gist is None:
-            # legacy s31 path: causal over all real memory rows
-            k = self.k_proj(memory).view(bsz, n, nh, hd).transpose(1, 2)
-            v = self.v_proj(memory).view(bsz, n, nh, hd).transpose(1, 2)
+            # legacy s31 path: causal over all real rows; the S39 source
+            # switches pick the K/V source tensor per side (memory rows by
+            # default, the per-chunk state readouts when "state")
+            k_proj = self.k_proj_state if self.k_from_state else self.k_proj
+            v_proj = self.v_proj_state if self.v_from_state else self.v_proj
+            k_in = content if self.k_from_state else memory
+            v_in = content if self.v_from_state else memory
+            k_flat = k_proj(k_in)
+            if self.k_pos_inject:
+                # a+pos: add the sinusoidal key-row features through the
+                # zero-init gate, before the head reshape (shared by all heads)
+                if chunk_byte_off is None:
+                    raise ValueError("k_pos_inject requires chunk_byte_off (window-relative per-chunk start byte offsets)")
+                seg_idx = torch.arange(n, device=content.device).unsqueeze(0).expand(bsz, n)
+                k_flat = k_flat + self.pos_gate * self.pos_proj(_pos_features(seg_idx, chunk_byte_off))
+            k = k_flat.view(bsz, n, nh, hd).transpose(1, 2)
+            v = v_proj(v_in).view(bsz, n, nh, hd).transpose(1, 2)
             future = torch.triu(torch.ones(n, n, dtype=torch.bool, device=content.device), diagonal=1)
             allowed = (~future).view(1, 1, n, n) & chunk_mask.view(bsz, 1, 1, n)
             # keep the diagonal even on padded rows: a fully-masked SDPA row yields
@@ -709,9 +1549,25 @@ class CrossReadBackbone(nn.Module):
                 allowed_g = gist_pos.view(bsz, 1, gsz) <= query_pos.view(bsz, n, 1)
             allowed_parts = [allowed_g]
             kk = cache_idx.size(1)
-            sel_mem = memory.gather(1, cache_idx.clamp(min=0).unsqueeze(-1).expand(-1, -1, memory.size(-1)))
-            ks.append(self.k_proj(sel_mem))
-            vs.append(self.v_proj(sel_mem))
+            gidx = cache_idx.clamp(min=0).unsqueeze(-1)
+            # S39 source switches: the selected store entries take their K/V
+            # side inputs from the state readouts (content) when "state" is
+            # selected, else from the pre-state memory rows (default)
+            if self.k_from_state or self.v_from_state:
+                sel_state = content.gather(1, gidx.expand(-1, -1, content.size(-1)))
+            if not (self.k_from_state and self.v_from_state):
+                sel_mem = memory.gather(1, gidx.expand(-1, -1, memory.size(-1)))
+            k_rows = self.k_proj_state(sel_state) if self.k_from_state else self.k_proj(sel_mem)
+            if self.k_pos_inject:
+                # a+pos: features taken at the selected rows' real chunk indices
+                if chunk_byte_off is None:
+                    raise ValueError("k_pos_inject requires chunk_byte_off (window-relative per-chunk start byte offsets)")
+                sel_idx = cache_idx.clamp(min=0)
+                k_rows = k_rows + self.pos_gate * self.pos_proj(
+                    _pos_features(sel_idx, chunk_byte_off.gather(1, sel_idx))
+                )
+            ks.append(k_rows)
+            vs.append(self.v_proj_state(sel_state) if self.v_from_state else self.v_proj(sel_mem))
             valid_cache = chunk_mask.gather(1, cache_idx.clamp(min=0)) & (cache_idx >= 0)  # (B, K)
             causal = cache_idx.view(bsz, 1, kk) <= query_pos.view(bsz, n, 1)
             allowed_parts.append(causal & valid_cache.view(bsz, 1, kk))
@@ -734,6 +1590,285 @@ class CrossReadBackbone(nn.Module):
         h = h + self.o_proj(o)
         for block in self.blocks:
             h = h + block(h)
+        return self.norm(h)
+
+
+class SLMBackbone(nn.Module):
+    """v3.7 SLM backbone (consensus §1.3, user-ruled 2026-08-17): a standard
+    small LM in the traditional decoder-only shape.
+
+    - Block 1 is a causal cross-attention over the PRECOMPUTED store rows
+      (Q = each position's hidden state, K/V = the store rows) + FFN; blocks
+      2..L are standard causal self-attention + FFN (pre-norm, residual).
+    - Seed: the initial hidden state at position i is align_V(V source row_i)
+      + chunk_pos[i] -- "each chunk asks with its own V", isomorphic to
+      h_i^0 = embedding_i in a traditional LM. The store's V side and the
+      seeds share the SAME align_V (one interface).
+    - align_K/align_V are PURE dimensional alignments (d_mem or d_pack ->
+      d_backbone), NOT content parsers -- content parsing is internalized in
+      the summarizer (consensus §1.1).
+    - Q is entirely self-produced by the backbone hidden state (q = W_q(h)
+      every layer, use-and-discard; "the backbone itself is Q"): in slm mode
+      there is no Q-side content channel.
+    - Position i sees store rows 0..i only (causal mask with the
+      diagonal-keep padding-NaN guard, same pattern as CrossReadBackbone).
+    - k_pos_inject (the a+pos arm, consensus §3): pos_gate * pos_proj of the
+      sinusoidal (segment order, window-relative start byte) features is added
+      to the aligned fine-grained index K rows; zero-init scalar gate, so
+      step 0 is exactly the a grid. Legal only for k_row_source="index".
+    """
+
+    def __init__(self, c: V36Config) -> None:
+        super().__init__()
+        d = c.d_backbone
+        self.nhead = c.backbone_nhead
+        k_src = getattr(c, "k_row_source", "index")
+        v_src = getattr(c, "v_row_source", "memory")
+        if k_src not in ("index", "state"):
+            raise ValueError(
+                f"slm k_row_source must be 'index' or 'state', got {k_src!r} "
+                "('memory' is illegal for the K channel in slm mode: the memory row is the V standard, consensus §3)"
+            )
+        if v_src not in ("memory", "state"):
+            raise ValueError(f"slm v_row_source must be 'memory' or 'state', got {v_src!r}")
+        self.k_from_state = k_src == "state"
+        self.v_from_state = v_src == "state"
+        k_dim = c.d_pack if self.k_from_state else c.d_mem
+        v_dim = c.d_pack if self.v_from_state else c.d_mem
+        self.align_k = nn.Linear(k_dim, d, bias=False)
+        self.align_v = nn.Linear(v_dim, d, bias=False)
+        # block 1: causal cross-attention over the store + FFN
+        self.q_proj = nn.Linear(d, d, bias=False)
+        self.o_proj = nn.Linear(d, d, bias=False)
+        self.ln_ffn1 = nn.LayerNorm(d)
+        self.ffn1 = nn.Sequential(nn.Linear(d, c.backbone_ffn), nn.GELU(), nn.Linear(c.backbone_ffn, d))
+        # blocks 2..L: standard causal self-attention + FFN (pre-norm)
+        self.self_blocks = nn.ModuleList(
+            [
+                nn.ModuleDict(
+                    {
+                        "ln_s": nn.LayerNorm(d),
+                        "q": nn.Linear(d, d, bias=False),
+                        "k": nn.Linear(d, d, bias=False),
+                        "v": nn.Linear(d, d, bias=False),
+                        "o": nn.Linear(d, d, bias=False),
+                        "ln_f": nn.LayerNorm(d),
+                        "ffn": nn.Sequential(
+                            nn.Linear(d, c.backbone_ffn), nn.GELU(), nn.Linear(c.backbone_ffn, d)
+                        ),
+                    }
+                )
+                for _ in range(max(c.backbone_layers - 1, 0))
+            ]
+        )
+        self.norm = nn.LayerNorm(d)
+        # a+pos arm: position-injected keys on the fine-grained index rows
+        # (zero-init gate -> step 0 bitwise-equals the a grid)
+        self.k_pos_inject = getattr(c, "k_pos_inject", False)
+        # S39 K-block eval probe: eval-time K-channel ablation (zero keys)
+        self.k_block_eval = getattr(c, "k_block_eval", False)
+        # S39 K-seed arm: seed the hidden state from the index row (K becomes
+        # load-bearing) instead of the V row
+        self.seed_source = getattr(c, "seed_source", "v")
+        if self.seed_source not in ("v", "k"):
+            raise ValueError(f"slm seed_source must be 'v' or 'k', got {self.seed_source!r}")
+        if self.k_pos_inject:
+            if k_src != "index":
+                raise ValueError(
+                    "slm k_pos_inject requires k_row_source='index' "
+                    "(a+pos = (index+pos, memory), the a-grid K-side single-variable arm, consensus §3)"
+                )
+            if v_src != "memory":
+                raise ValueError(
+                    "slm k_pos_inject requires v_row_source='memory' "
+                    "(a+pos is the a-grid K-side SINGLE-VARIABLE arm; "
+                    "(index+pos, state) would confound attribution, consensus §3)"
+                )
+            self.pos_proj = nn.Linear(POS_FEAT_DIM, d, bias=False)
+            self.pos_gate = nn.Parameter(torch.zeros(()))
+        # Q15 need_attn (任务书 2026-08-25 §7.1): block-1 cross-attention 概率
+        # 寄存槽 (B, H, C, C, 保留梯度 -- L_attend 经它回传); None = 关态
+        # (legacy SDPA 路径, 逐位不动). Q16 (任务书 §1 施工事实): 同模式加
+        # last_block1_ov (pre-o_proj 加权输出) / last_block1_h (block-1 完成
+        # 后隐藏态) 两个捕获槽, 关态 None.
+        self.last_block1_attn = None
+        self.last_block1_ov = None
+        self.last_block1_h = None
+
+    def forward(
+        self,
+        k_rows: torch.Tensor,
+        v_rows: torch.Tensor,
+        chunk_mask: torch.Tensor,
+        pos: torch.Tensor,
+        chunk_byte_off: torch.Tensor | None = None,
+        store_block: torch.Tensor | None = None,
+        need_attn: bool = False,
+    ) -> torch.Tensor:
+        """k_rows: (B, C, d_mem|d_pack) K source rows (index or K~);
+        v_rows: (B, C, d_mem|d_pack) V source rows (memory or V~);
+        pos: (1, C, d_backbone) chunk position embedding. fork 2: a 4-dim
+        (B, C, m, d) k_rows/v_rows routes to the multi-view store path.
+        store_block: optional (B, n_q, n_kv_chunk) bool — True = the store
+        row is EXCISED for that query (recruitment arm 档 a mask-level
+        excision, user-ruled 2026-08-21: the only bypass needing removal —
+        direct path is per-chunk leak-free by construction). Applied before
+        the diagonal-keep so no query row ever goes fully masked.
+        need_attn (Q15 回路养成臂, 任务书 §7.1): on = block-1 takes the manual
+        attention path (scores = q@kᵀ/√hd, masked positions -inf, softmax in
+        float32, then @v) and the probabilities land in
+        ``self.last_block1_attn`` with gradient kept (L_attend 经它回传);
+        off = legacy SDPA path, bitwise untouched."""
+        bsz, n = chunk_mask.shape
+        # 捕获槽默认关态 (views 路径提前返回也保持 None; Q16: ov/h 同模式)
+        self.last_block1_attn = None
+        self.last_block1_ov = None
+        self.last_block1_h = None
+        kv = k_rows.size(2) if k_rows.dim() == 4 else 1
+        vv = v_rows.size(2) if v_rows.dim() == 4 else 1
+        if max(kv, vv) > 1:
+            if need_attn:
+                # Q15 校验 readout_views==1: views 路径不支持手工注意力, 响亮报错
+                raise ValueError(
+                    "need_attn=True is N/A on the multi-view store path "
+                    "(Q15 requires readout_views==1; the views path has no manual-attention form)"
+                )
+            return self._forward_views(k_rows, v_rows, chunk_mask, pos, chunk_byte_off, max(kv, vv), store_block)
+        nh = self.nhead
+        hd = pos.size(-1) // nh
+        store_v = self.align_v(v_rows)  # (B, C, d) -- shared: store V side AND seeds
+        k_flat = self.align_k(k_rows)
+        # position seed: default each chunk asks with its own V (consensus
+        # §1.3); S39 K-seed arm (user-ruled 2026-08-17) seeds from the INDEX
+        # row instead, forcing content to flow through K/V retrieval -- the
+        # index channel becomes load-bearing. The seed always uses the plain
+        # aligned K rows (pos-injection/k-block below touch attention keys
+        # only, never the seed).
+        seed = k_flat if self.seed_source == "k" else store_v
+        h = seed + pos.to(seed.dtype)
+        if self.k_pos_inject:
+            # a+pos: sinusoidal key-row features through the zero-init gate
+            if chunk_byte_off is None:
+                raise ValueError("k_pos_inject requires chunk_byte_off (window-relative per-chunk start byte offsets)")
+            seg_idx = torch.arange(n, device=k_rows.device).unsqueeze(0).expand(bsz, n)
+            k_flat = k_flat + self.pos_gate * self.pos_proj(_pos_features(seg_idx, chunk_byte_off))
+        if self.k_block_eval:
+            # S39 K-block probe (user-ruled 2026-08-17): zero the keys so
+            # block-1 attention is uniform -- the index channel carries zero
+            # information. Absolute: overrides any pos injection above.
+            k_flat = torch.zeros_like(k_flat)
+        k = k_flat.view(bsz, n, nh, hd).transpose(1, 2)
+        v = store_v.view(bsz, n, nh, hd).transpose(1, 2)
+        # causal over the store; keep the diagonal even on padded rows (a
+        # fully-masked SDPA row yields NaN, and 0*NaN poisons downstream)
+        future = torch.triu(torch.ones(n, n, dtype=torch.bool, device=k_rows.device), diagonal=1)
+        allowed = (~future).view(1, 1, n, n) & chunk_mask.view(bsz, 1, 1, n)
+        if store_block is not None:
+            allowed = allowed & ~store_block.view(bsz, 1, n, n)
+        allowed = allowed | torch.eye(n, dtype=torch.bool, device=k_rows.device).view(1, 1, n, n)
+        # block 1: cross-read; Q self-produced from the hidden state
+        q = self.q_proj(h).view(bsz, n, nh, hd).transpose(1, 2)
+        if need_attn:
+            # Q15 (任务书 §7.1): 手工注意力 -- scores = q@kᵀ/√hd, 掩码位置
+            # -inf, softmax 在 float32 计算, 再 @v; 概率带梯度寄存 (L_attend
+            # 的奖励靶点). allowed|eye 已保对角, 无全掩码行 NaN 风险 (同 SDPA).
+            scores = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(hd)
+            scores = scores.float().masked_fill(~allowed, float("-inf"))
+            self.last_block1_attn = torch.softmax(scores, dim=-1)  # (B, H, C, C) float32
+            o = torch.matmul(self.last_block1_attn.to(v.dtype), v)
+        else:
+            self.last_block1_attn = None
+            o = F.scaled_dot_product_attention(q, k, v, attn_mask=allowed)
+        ov = o.transpose(1, 2).reshape(bsz, n, nh * hd)  # pre-o_proj (B, C, d)
+        if need_attn:
+            # Q16 捕获槽 (任务书 §1 施工事实): 探 A2 = 注意力加权值混合 ov
+            # (pre-o_proj, 实际流下去的货), 探 B = block-1 完成后隐藏态
+            # (post o_proj+residual+FFN1). 探针 no_grad 用; 不 detach, 与
+            # last_block1_attn 同策略; 关态 None (入口统一清空).
+            self.last_block1_ov = ov
+        h = h + self.o_proj(ov)
+        h = h + self.ffn1(self.ln_ffn1(h))
+        if need_attn:
+            self.last_block1_h = h  # (B, C, d) block-1 完成后
+        # blocks 2..L: standard causal self-attention + FFN
+        for blk in self.self_blocks:
+            hn = blk["ln_s"](h)
+            q = blk["q"](hn).view(bsz, n, nh, hd).transpose(1, 2)
+            kk = blk["k"](hn).view(bsz, n, nh, hd).transpose(1, 2)
+            vv = blk["v"](hn).view(bsz, n, nh, hd).transpose(1, 2)
+            o = F.scaled_dot_product_attention(q, kk, vv, attn_mask=allowed)
+            h = h + blk["o"](o.transpose(1, 2).reshape(bsz, n, nh * hd))
+            h = h + blk["ffn"](blk["ln_f"](h))
+        return self.norm(h)
+
+    def _forward_views(
+        self,
+        k_rows: torch.Tensor,
+        v_rows: torch.Tensor,
+        chunk_mask: torch.Tensor,
+        pos: torch.Tensor,
+        chunk_byte_off: torch.Tensor | None,
+        views: int,
+        store_block: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """fork 2 multi-view store path (spec §1.1/§1.3): each chunk
+        contributes `views` store entries — its m measurement rows from the
+        seeded orthogonal frame; a direct/single-view side repeats its row.
+        Query positions stay per-chunk; position i sees all views of chunks
+        0..i. align_k/align_v/realign are SHARED across views (m 路共享,
+        zero new parameters). Seed = per-chunk canonical row (view 0 for K,
+        the view mean for V)."""
+        bsz, n = chunk_mask.shape
+        nh = self.nhead
+        hd = pos.size(-1) // nh
+        if k_rows.dim() == 3:
+            k_rows = k_rows.unsqueeze(2).expand(bsz, n, views, k_rows.size(-1))
+        if v_rows.dim() == 3:
+            v_rows = v_rows.unsqueeze(2).expand(bsz, n, views, v_rows.size(-1))
+        store_v = self.align_v(v_rows.reshape(bsz, n * views, -1))
+        k_flat = self.align_k(k_rows.reshape(bsz, n * views, -1))
+        # seed from the per-chunk canonical rows (view 0 K / view-mean V)
+        seed = self.align_k(k_rows[:, :, 0]) if self.seed_source == "k" else self.align_v(v_rows.mean(dim=2))
+        h = seed + pos.to(seed.dtype)
+        if self.k_pos_inject:
+            if chunk_byte_off is None:
+                raise ValueError("k_pos_inject requires chunk_byte_off (window-relative per-chunk start byte offsets)")
+            seg_idx = torch.arange(n, device=k_rows.device).repeat_interleave(views).unsqueeze(0).expand(bsz, -1)
+            k_flat = k_flat + self.pos_gate * self.pos_proj(
+                _pos_features(seg_idx, chunk_byte_off.repeat_interleave(views, dim=1))
+            )
+        if self.k_block_eval:
+            k_flat = torch.zeros_like(k_flat)
+        k = k_flat.view(bsz, n * views, nh, hd).transpose(1, 2)
+        v = store_v.view(bsz, n * views, nh, hd).transpose(1, 2)
+        # store mask: query chunk j sees entries of chunks 0..j (all views);
+        # diagonal-keep guard on padded rows (same NaN-poison rule as legacy)
+        store_chunk = torch.arange(n, device=k_rows.device).repeat_interleave(views)
+        qidx = torch.arange(n, device=k_rows.device)
+        causal = store_chunk.view(1, -1) <= qidx.view(-1, 1)  # (n, n*views)
+        allowed = causal.view(1, 1, n, n * views) & chunk_mask[:, store_chunk].view(bsz, 1, 1, n * views)
+        if store_block is not None:
+            # chunk-space excision replicated across each chunk's views
+            allowed = allowed & ~store_block.repeat_interleave(views, dim=2).view(bsz, 1, n, n * views)
+        first_view = (torch.arange(n * views, device=k_rows.device) % views == 0).view(1, -1)
+        diag = (store_chunk.view(1, -1) == qidx.view(-1, 1)) & first_view
+        allowed = allowed | diag.view(1, 1, n, n * views)
+        q = self.q_proj(h).view(bsz, n, nh, hd).transpose(1, 2)
+        o = F.scaled_dot_product_attention(q, k, v, attn_mask=allowed)
+        h = h + self.o_proj(o.transpose(1, 2).reshape(bsz, n, nh * hd))
+        h = h + self.ffn1(self.ln_ffn1(h))
+        # blocks 2..L: per-chunk causal self-attention (legacy mask)
+        future = torch.triu(torch.ones(n, n, dtype=torch.bool, device=k_rows.device), diagonal=1)
+        allowed_self = (~future).view(1, 1, n, n) & chunk_mask.view(bsz, 1, 1, n)
+        allowed_self = allowed_self | torch.eye(n, dtype=torch.bool, device=k_rows.device).view(1, 1, n, n)
+        for blk in self.self_blocks:
+            hn = blk["ln_s"](h)
+            q = blk["q"](hn).view(bsz, n, nh, hd).transpose(1, 2)
+            kk = blk["k"](hn).view(bsz, n, nh, hd).transpose(1, 2)
+            vv = blk["v"](hn).view(bsz, n, nh, hd).transpose(1, 2)
+            o = F.scaled_dot_product_attention(q, kk, vv, attn_mask=allowed_self)
+            h = h + blk["o"](o.transpose(1, 2).reshape(bsz, n, nh * hd))
+            h = h + blk["ffn"](blk["ln_f"](h))
         return self.norm(h)
 
 
@@ -1102,8 +2237,33 @@ class FLUEDV36(nn.Module):
         self.segmentor_head = nn.Sequential(nn.LayerNorm(c.d_byte), nn.Linear(c.d_byte, 1))
         self.chunk_builder = ChunkBuilder(c.max_chunks, c.max_span)
         self.summarizer = ChunkSummarizer(c) if c.summarizer_type == "slot" else DiTChunkSummarizer(c)
-        self.write_head = WriteHead(c)
-        self.state_machine = KDAStateMachine(c)
+        slm = c.backbone_mode == "slm"
+        if getattr(c, "recurrence", "kda") not in ("kda", "gdn2"):
+            raise ValueError(f"recurrence must be 'kda' or 'gdn2', got {c.recurrence!r}")
+        if slm:
+            # v3.7 (consensus, user-ruled 2026-08-17): loud rejections for the
+            # combinations that are N/A in the new mode -- no silent mismatch.
+            if c.summarizer_type != "dit":
+                raise ValueError(
+                    "backbone_mode='slm' requires summarizer_type='dit' "
+                    "(the K-side index head lives on DiTChunkSummarizer, consensus §1.1)"
+                )
+            if c.k_row_source == "memory":
+                raise ValueError(
+                    "backbone_mode='slm': k_row_source='memory' is illegal for the K channel "
+                    "(consensus §3: K is 'index' or 'state'; the memory row is the V standard)"
+                )
+            if not c.per_chunk_readout:
+                raise ValueError("backbone_mode='slm' requires per_chunk_readout=True")
+            if c.backbone_readout != "per_chunk":
+                raise ValueError(
+                    "backbone_mode='slm' replaces the readout interface; backbone_readout final/paged is N/A"
+                )
+            if c.prefix_task:
+                raise ValueError("prefix_task is N/A for backbone_mode='slm' (v3.7 codec full-coverage law, consensus §2)")
+        else:
+            self.write_head = WriteHead(c)
+            self.state_machine = KDAStateMachine(c)
         if c.backbone_mode == "attn":
             self.backbone = TinyBackbone(c)
         elif c.backbone_mode == "xattn":
@@ -1112,21 +2272,117 @@ class FLUEDV36(nn.Module):
             self.backbone = CrossReadBackbone(c)
         elif c.backbone_mode == "draft":
             self.backbone = DraftBackbone(c)
+        elif slm:
+            self.backbone = SLMBackbone(c)
+            # interpreter (consensus §1.2): each ENGAGED state channel is an
+            # independent WriteHead+KDAStateMachine pair -- the WriteHead as it
+            # stands IS the standard KDA write gate, reused unchanged
+            # (dimensional alignment only, no extra design). The V channel
+            # keeps the legacy attribute names (the standard implementation
+            # over the memory rows); the K channel eats the summarizer's index
+            # rows (d_mem wide, matching WriteHead's input). The a grid
+            # (index, memory) creates NEITHER pair: the interpreter is
+            # entirely off the chain there (a ruling, not an omission).
+            if c.k_row_source == "state":
+                self.write_head_k = WriteHead(c)
+                self.state_machine_k = KDAStateMachine(c)
+            if c.v_row_source == "state":
+                self.write_head = WriteHead(c)
+                self.state_machine = KDAStateMachine(c)
+            # decoder-side fine-V alignment (direct/predict condition on the
+            # memory rows); coarse-V grids use decoder_in instead, so this is
+            # created only when engaged (conditional-creation discipline)
+            if c.v_row_source == "memory":
+                self.decoder_in_mem = nn.Linear(c.d_mem, c.d_backbone)
         else:
             self.backbone = PointwiseBackbone(c)
         self.bridge = SoftBoundaryBridge(
             c.max_chunks, c.tau_cut, c.boundary_temperature, c.boundary_bridge_gradient_scale
         )
-        self.decoder_in = nn.Linear(c.d_pack, c.d_backbone) if c.d_pack != c.d_backbone else nn.Identity()
+        if not slm or c.v_row_source == "state":
+            # slm fine-V grids condition the decoder on decoder_in_mem instead;
+            # the d_pack decoder_in exists only where a coarse V readout does
+            self.decoder_in = nn.Linear(c.d_pack, c.d_backbone) if c.d_pack != c.d_backbone else nn.Identity()
         self.decoder = GlobalSpanDecoder(c, self.byte_lookup)
         self.chunk_pos = nn.Embedding(c.max_chunks, c.d_backbone)
         nn.init.trunc_normal_(self.chunk_pos.weight, std=0.02)
+        # fork 3 F2 (user-ruled 2026-08-21; spec docs/versions/v3.7/
+        # FLUED_V3_7_FORK3_SUMMARIZER_FIDELITY_20260820_CN.md): train-time-only
+        # auxiliary byte-reconstruction head on the summarizer's memory rows —
+        # the pressure path that tells the summarizer "the tail bytes must be
+        # IN the memory row" (E89/E95: the tail is absent, not unreachable).
+        # Scout capacity cap: 2 layers / ~1.9M params (防 decoder explain-away
+        # — the aux head must stay in the E89 probe class, not out-decode it).
+        # Conditional creation: default off = every legacy path bit-preserved
+        # (old checkpoints load strict-clean; an aux-trained checkpoint does
+        # NOT strict-load into a flag-off model — by design, loud).
+        if getattr(c, "summarizer_aux_recon", False):
+            h_dim = 1024
+            self.aux_slot = nn.Parameter(torch.empty(c.max_span, h_dim))
+            nn.init.trunc_normal_(self.aux_slot, std=0.02)
+            self.aux_recon = nn.Sequential(
+                nn.Linear(c.d_mem, h_dim),
+                nn.GELU(),
+                nn.Linear(h_dim, h_dim),
+                nn.GELU(),
+            )
+            self.aux_out = nn.Linear(h_dim, 258)
+        # Q20 多槽读出臂 (multi-slot readout, E119; 任务书冻结 v1 2026-08-29:
+        # docs/versions/v3.7/FLUED_V3_7_Q20_MULTISLOT_READOUT_20260829_CN.md):
+        # b 格 K 通道 post-state → decoder direct 口的读出端扩宽件。条件创建
+        # 纪律同 decoder_in_mem/aux_recon 先例: 默认关 = 不创建, 旧路径逐位
+        # 不变, 老 ckpt strict-load 干净; 旗标开且读出对象 (K 通道状态机) 与
+        # 落口 (d_mem 端口) 缺一 = 结构性 N/A, 响亮报错不静默。
+        if getattr(c, "multislot_readout", False):
+            if not (slm and c.k_row_source == "state" and c.v_row_source == "memory"):
+                raise ValueError(
+                    "multislot_readout requires backbone_mode='slm' + k_row_source='state' "
+                    "+ v_row_source='memory' (Q20 读出对象 = b 格 K 通道 post-state, "
+                    "落口 = decoder_in_mem d_mem 端口)"
+                )
+            if getattr(c, "recurrence", "kda") != "kda":
+                raise ValueError("multislot_readout supports recurrence='kda' only (gdn2 不在本臂作用域)")
+            k_spec = str(getattr(c, "multislot_readout_k", "4"))
+            if k_spec == "cg":
+                self.multislot_readout = CGRidgeReadout(c)
+            elif k_spec in ("1", "4", "8"):
+                self.multislot_readout = MultiSlotReadout(c, int(k_spec))
+            else:
+                raise ValueError(f"multislot_readout_k 非法: {k_spec!r} (预注册档位 1|4|8|cg)")
+        # E120 端到端点燃臂 (任务书 2026-09-03 冻结 v1+修订 v2): d 格 V 通道生产
+        # 读出替换件。条件创建纪律同 multislot_readout 先例: 默认关 = 不创建,
+        # 旧路径逐位不变, 老 ckpt strict-load 干净; 旗标开而 d 格 (K/V 双状态机)
+        # 缺一 = 结构性 N/A, 响亮报错不静默。
+        if getattr(c, "e120_readout_swap", False):
+            if not (slm and c.k_row_source == "state" and c.v_row_source == "state"):
+                raise ValueError(
+                    "e120_readout_swap requires backbone_mode='slm' + k_row_source='state' "
+                    "+ v_row_source='state' (d 格: 读出对象 = V 通道 post-state, "
+                    "落口 = 生产读出行空间 d_pack)"
+                )
+            if getattr(c, "recurrence", "kda") != "kda":
+                raise ValueError("e120_readout_swap supports recurrence='kda' only (gdn2 不在本臂作用域)")
+            if getattr(c, "readout_views", 1) > 1:
+                raise ValueError("e120_readout_swap 不组合 readout_views>1 (v_rows 整行换源, 多视图 store 无定义)")
+            self.e120_readout = E120WarmReadout(c)
+
+    def aux_recon_logits(self, memory: torch.Tensor) -> torch.Tensor:
+        """(B, C, d_mem) memory rows -> (B, C, max_span, 258) per-slot byte
+        logits (train-time-only F2 aux head; never used in eval/inference)."""
+        h = self.aux_recon(memory)  # (B, C, H)
+        h = h.unsqueeze(2) + self.aux_slot.view(1, 1, *self.aux_slot.shape)
+        return self.aux_out(h)
 
     def _front_end_frozen(self) -> bool:
         mods = (self.byte_lookup, *self.encoder_blocks, *self.segmentor_blocks, self.segmentor_head)
         return all(not p.requires_grad for m in mods for p in m.parameters())
 
-    def _encode(self, token_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _encode(self, token_ids: torch.Tensor,
+                attn_block_mask: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """attn_block_mask（E123 遮蔽器件，条件创建）: (B, 1, 1, T) bool，True=该
+        字节对一切查询遮蔽——只抹窗内注意力键侧视野，字节流/位置/分段/valid 全
+        不动（被遮内容仍进 chunk builder→summarizer→状态通道）。None = 旧路径
+        逐位不变。"""
         valid = token_ids.ne(PAD_ID)
         # When the whole front end (byte lookup + encoder + segmentor) is frozen,
         # keep it out of the autograd graph: downstream modules only need the
@@ -1136,7 +2392,7 @@ class FLUEDV36(nn.Module):
             x = self.byte_lookup(token_ids)
             noise = x.new_zeros(token_ids.size(0))
             for block in self.encoder_blocks:
-                x = block(x, valid, noise)
+                x = block(x, valid, noise, attn_block_mask)
             byte_states = x
             for block in self.segmentor_blocks:
                 x = block(x, valid, noise)
@@ -1166,11 +2422,111 @@ class FLUEDV36(nn.Module):
         )
         return executable, utf8_cont, overflow
 
-    def forward(self, token_ids: torch.Tensor) -> V36Output:
+    def _slm_store_rows(self, chunks: ChunkBatch, with_views: bool = False):
+        """v3.7 encoder after the segmentor (consensus §1): the summarizer
+        directly produces (memory = the V rows, index = the K rows); each
+        channel then either passes through DIRECTLY (fine granularity) or via
+        its own KDA-standard interpreter (coarse granularity). Returns
+        (k_rows, v_rows, state_norm, memory, index) -- k_rows/v_rows are the
+        backbone store source rows; state_norm averages the engaged channels'
+        norms, with a 0 placeholder when no state machine exists (the a grid,
+        per the ruling).
+
+        fork 2: with_views=True returns TWO extra elements (k_store, v_store):
+        the multi-view store rows (B, C, m, d_pack) for each ENGAGED state
+        channel, None for direct channels and when readout_views == 1. The
+        classic 5-tuple elements are bit-identical either way (direct/predict
+        keep the single trained-readout row, fork 2 §1.3)."""
+        memory, index = self.summarizer.forward_with_index(chunks.span_embeddings, chunks.token_mask)
+        views = getattr(self.config, "readout_views", 1)
+        k_store = v_store = None
+        norms = []
+        if self.config.k_row_source == "state":
+            gates_k = self.write_head_k(index)
+            package_k, sn_k = self.state_machine_k(gates_k, chunks.chunk_mask)
+            k_rows = package_k.mean(dim=2)  # K~ per chunk (B, C, d_pack)
+            if with_views and views > 1:
+                k_store = self.state_machine_k.forward_views(gates_k, chunks.chunk_mask)
+            norms.append(sn_k)
+        else:
+            k_rows = index
+        if self.config.v_row_source == "state":
+            gates_v = self.write_head(memory)
+            package_v, sn_v = self.state_machine(gates_v, chunks.chunk_mask)
+            if getattr(self.config, "e120_readout_swap", False):
+                # E120: v_rows 整行换源 (k=1 温启动读出件, 任务书 2026-09-03)。
+                # 被替换的生产读出 (readout_query/realign) 照跑但出链外——只留
+                # state_norm 诊断口径不变; package_v 本体不再进任何损失路径。
+                v_rows = self.e120_readout(gates_v, chunks.chunk_mask)
+            else:
+                v_rows = package_v.mean(dim=2)  # V~ per chunk (B, C, d_pack)
+            if with_views and views > 1:
+                v_store = self.state_machine.forward_views(gates_v, chunks.chunk_mask)
+            norms.append(sn_v)
+        else:
+            v_rows = memory
+        if norms:
+            state_norm = torch.stack([n.float() for n in norms]).mean()
+        else:
+            state_norm = memory.new_zeros((), dtype=torch.float32)
+        if with_views:
+            return k_rows, v_rows, state_norm, memory, index, k_store, v_store
+        return k_rows, v_rows, state_norm, memory, index
+
+    def _forward_slm(self, chunks: ChunkBatch, confidence: torch.Tensor, valid: torch.Tensor, hard_cut: torch.Tensor, cut_overflow: torch.Tensor, store_block: torch.Tensor | None = None) -> V36Output:
+        """v3.7 slm forward (consensus §1-2): the SLM backbone reads the
+        summarizer-owned store; the decoder conditions on the SAME V source
+        rows as the backbone store (direct), and completion reads the
+        backbone's output matrix -- three tasks, one V (§1.4)."""
+        k_rows, v_rows, state_norm, memory, _index, k_store, v_store = self._slm_store_rows(chunks, with_views=True)
+        n_chunks = chunks.chunk_mask.size(1)
+        pos = self.chunk_pos.weight.unsqueeze(0)[:, :n_chunks]
+        chunk_byte_off = (
+            chunk_byte_offsets(chunks.token_mask) if getattr(self.config, "k_pos_inject", False) else None
+        )
+        # fork 2: the store carries the multi-view rows when readout_views > 1
+        backbone_out = self.backbone(
+            k_store if k_store is not None else k_rows,
+            v_store if v_store is not None else v_rows,
+            chunks.chunk_mask, pos, chunk_byte_off=chunk_byte_off,
+            store_block=store_block,
+        )
+        cond_backbone = backbone_out + pos
+        dec_in = self.decoder_in if self.config.v_row_source == "state" else self.decoder_in_mem
+        cond_direct = dec_in(v_rows) + pos
+        logits_direct = self.decoder(cond_direct, chunks.token_mask)
+        logits_backbone = self.decoder(cond_backbone, chunks.token_mask)
+        aux = {
+            "truncated_tokens": chunks.pack_info["truncated_tokens"].float(),
+            "cut_capacity_overflow": cut_overflow.float().sum(),
+            "chunks_per_sample": chunks.chunk_mask.float().sum(dim=1),
+            "boundary_confidence_mean": confidence[valid].mean() if valid.any() else confidence.mean(),
+            "hard_cut_fraction": hard_cut.float()[valid].mean() if valid.any() else hard_cut.float().mean(),
+            "state_norm": state_norm,
+        }
+        return V36Output(
+            logits_direct=logits_direct,
+            logits_backbone=logits_backbone,
+            package=None,
+            backbone_out=backbone_out,
+            chunks=chunks,
+            boundary_confidence=confidence,
+            memory=memory,
+            state_norm=state_norm,
+            aux=aux,
+            prefix=None,
+        )
+
+    def forward(self, token_ids: torch.Tensor, store_block: torch.Tensor | None = None) -> V36Output:
         byte_states, confidence, valid, _logits = self._encode(token_ids)
         hard_cut, utf8_cont, cut_overflow = self._cuts(token_ids, confidence, valid)
         chunks = self.chunk_builder(byte_states, valid, hard_cut, confidence)
         chunks = self.bridge(chunks, byte_states, confidence, valid, utf8_cont)
+        if self.config.backbone_mode == "slm":
+            # v3.7 slm mode: dedicated path (summarizer-owned K/V + SLM
+            # backbone + decoder on the same V); the legacy content channel
+            # below is bypassed entirely.
+            return self._forward_slm(chunks, confidence, valid, hard_cut, cut_overflow, store_block=store_block)
         memory = self.summarizer(chunks.span_embeddings, chunks.token_mask)
         gates = self.write_head(memory)
         package, state_norm = self.state_machine(gates, chunks.chunk_mask)
@@ -1198,7 +2554,16 @@ class FLUEDV36(nn.Module):
                             "xcache_frac<1 requires per-chunk residuals; use the S1 trainer path"
                         )
                     cache_idx = _xcache_select(chunks.chunk_mask.float(), chunks.chunk_mask, 1.0)
-                backbone_out = self.backbone(content, memory, chunks.chunk_mask, pos, cache_idx, gist)
+                # S39 a+pos: window-relative per-chunk start byte offsets
+                # (None = feature off)
+                chunk_byte_off = (
+                    chunk_byte_offsets(chunks.token_mask)
+                    if getattr(self.config, "k_pos_inject", False)
+                    else None
+                )
+                backbone_out = self.backbone(
+                    content, memory, chunks.chunk_mask, pos, cache_idx, gist, chunk_byte_off=chunk_byte_off
+                )
                 cond_backbone = backbone_out + pos
             elif self.config.backbone_mode == "draft":
                 # three-state drafting (spec SS23): input = the k=1 final

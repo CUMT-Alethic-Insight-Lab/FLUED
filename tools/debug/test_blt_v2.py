@@ -1,6 +1,6 @@
 """Smoke test new BLT architecture (Stage 1 + Stage 2)."""
 import torch
-from blt_baseline.model import ByteLanguageModel, BLTAutoencoder
+from tools.baselines.blt_baseline.model import ByteLanguageModel, BLTAutoencoder
 
 print("=== ByteLM ===")
 lm = ByteLanguageModel(vocab_size=257, d_model=128, nhead=4, dim_feedforward=512, num_layers=2, max_len=64)

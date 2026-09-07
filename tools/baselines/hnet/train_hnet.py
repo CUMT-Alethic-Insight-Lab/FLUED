@@ -29,7 +29,7 @@ from tools.train.v3_3.train_v33 import (  # noqa: E402
     make_dataloaders,
 )
 from flued.data import PAD_ID  # noqa: E402
-from flued.hnet_repro import HNetRepro, HNetReproConfig  # noqa: E402
+from tools.baselines.hnet_repro import HNetRepro, HNetReproConfig  # noqa: E402
 
 
 from tools.train.v3_3.train_v33 import (  # noqa: E402
@@ -40,7 +40,7 @@ from tools.train.v3_3.train_v33 import (  # noqa: E402
     make_dataloaders,
 )
 from flued.data import PAD_ID  # noqa: E402
-from flued.hnet_repro import HNetRepro, HNetReproConfig  # noqa: E402
+from tools.baselines.hnet_repro import HNetRepro, HNetReproConfig  # noqa: E402
 import tools.train.v3_6.train_v36_s1 as s1  # noqa: E402
 
 MASK_ID = 257

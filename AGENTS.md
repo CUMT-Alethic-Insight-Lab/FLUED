@@ -58,7 +58,7 @@ Full project status: [README.md](README.md) · Versioned documentation: [docs/RE
 | `flued/v33/` | v3.3 codec implementation |
 | `flued/v34/` | v3.4 parallel-memory and rate/emit extension |
 | `flued/v36/` | v3.6 KDA-generation mainline model (`FLUEDV36`) |
-| `flued/hnet_repro/` | H-Net reproduction baseline (BPB 0.653 anchor) |
+| `tools/baselines/` | Baseline reproductions: `bpe_baseline/`, `blt_baseline/`, `hnet_repro/` (H-Net BPB 0.653 anchor), `hnet/` trainer |
 | `tools/train/v3_6/train_v36.py` | v3.6 train/eval entrypoint (`--config` eats `configs/canonical_v36.json`) |
 | `tools/train/v3_6/train_v36_s1.py` | v3.6 S1.0 three-task trainer (current canonical entrypoint, v36.2) |
 | `tools/train/v3_6/train_s0_segmentor.py` | S0 segmentor pretraining entrypoint |
@@ -75,6 +75,7 @@ Full project status: [README.md](README.md) · Versioned documentation: [docs/RE
 - **skip_hard**: Always pass `skip_hard=True` during training/eval. Hard segmentation is for logging only.
 - **归档盘（2026-08-06 起）**：新归档落 `K:\FLUED_archive\<run_name>`（含 SHA256SUMS）；~~存量 `L:\FLUED_archive` 只读、不迁移~~（2026-08-12 迁移修订：L: 499G 已迁 `N:\FLUED_archive_migration_20260812\`，canonical init `s0pp_pro_v4_sft_20260805` 原地保留；历史文档中的 L: 路径经 `outputs/migration_manifest_20260812.json` 映射到新位置）。
 - **存储布局（2026-08-12 用户裁定）**：代码/文档在 E: 核心区；语料在 P:（v3 由 E: 迁入、v4 原在 P:）；存档点由用户提供的两块盘单独备份；W: 内容已验证全量在 N:（fineweb 三源 265 parquet，哈希校验真失败 0）→ 格式化后承接 v3.4 及以前的存档点；X: 源盘缺席且无撤离副本，codeparrot 需用户提供盘后重新下载。
+- **存储布局（2026-08-16 用户裁定修订）**：旧 N:（623G 迁移存档）已拔盘离线保管；新换盘挂 N: 字母，`N:\FLUED_archive` = L: 全量 + K: v3.6 世代的验证副本（106 目录 SHA256 全绿，159G）。同日 v3.6 世代存档从 L: **归并迁移**至 K: 统一管理（34 目录校验后删源，逐目录显式路径；映射见 `outputs/migration_manifest_20260816.json`）；例外：`s0pp_pro_v4_sft_20260805`（canonical init）已随 `canonical_v36.json` `init_checkpoint` 翻转引用至 K: 路径，L: 原件删除。L: `FLUED_archive` 已清空（v3.4/v3.5 存档在 N: 均有验证副本；flashkda_msvc_patch 移 K:）。
 
 ## 协作协议（2026-08-06 与用户共同制定）
 
@@ -100,3 +101,7 @@ Full project status: [README.md](README.md) · Versioned documentation: [docs/RE
 6. **Versioned paths**: v3 experiment code lives under `tools/*/v3_*`; do not reintroduce pre-reorganization import paths.
 
 7. **证据表编辑序号核对（2026-08-09 两次事故的教训）**：编辑 `docs/CURRENT_STATE.md` 证据注册表后，必须立刻核对序号完整性——`grep -n "^| E[0-9]" docs/CURRENT_STATE.md` 对比编辑前后的编号清单，确认无丢行、无重号。整行替换式 Edit 的 new_string 必须显式带回原行内容（事故 1：E48 登记时 E47 行被原地替换，缺席 5 个 commit 才被发现；事故 2：E50 登记时吃掉 E49 行首）。并发会话（fork/主）同编一表时风险加倍，提交前再核一次。
+
+8. **parser 默认漂移 × 老 resolved_config（2026-08-29 冒烟事故）**：用 `--config <老 run 的 resolved_config.json>` 起老基座时，parser 现行默认值会填补老配置缺失的键（实例：`summarizer_pool` 默认已随 v37.3 转正为 qpool，吃 v37.1 老配置时 summarizer 6 个权重键被形状过滤**静默跳过**，水位塌到 0.05 才暴露）。纪律：① 点火老基座必须显式带上历史口径旗标（如 `--summarizer-pool mean`）；② 基座加载做全键全形校验、不齐 loud fail，禁止静默过滤。已知同款敞口：Q18 `_q18_base_config_defaults` 路径对 2026-08-23 前的基座。
+
+9. **条款换臂必换锚（2026-09-03/04 两次同构口径错位的教训，用户裁定为明文纪律）**：判读条款从一种臂形态套到另一种臂形态时，判读基尺必须重新锚定，否则必然漏抓或冤抓——实例 ①：E120 预跑 t=0 判读线 0.5778 的参照带量的是「逐位 ridge 解混→桥」行，部署链是「固定 q_ridge 单查询→桥」行，不同源，t=0 冒烟 0.1963 冤拒发；实例 ②：冒烟条款「干净列回落 <2pp」为冻结基座臂所写，套到全解冻臂上两列皆破（对照列 direct −16.1pp、burst_tail 归零 vs 乙列 −4.8pp），回落主凶是全解冻瞬态非换件毒性，改锚「乙列回落 ≤ 对照列回落」才是「新件是否有毒」的正确语义。实例 ③（2026-09-04，种子轴）：E119 种子加固 s1 异卷地板门破（scrambled 0.1327>0.1）——口径事实=探针考场窗流随训练 seed（seed+9999，三列异卷），用 seed42 窗集校准的门判 seed1 的卷子属同款错位；同卷复测 s1 → 0.0801 过门。纪律：任何判读条款迁移臂形态（冻结↔全解冻、t=0↔N 步、格间迁移、**种子迁移**）时，先答「这条款在原臂上量的是什么」，再定新锚；换锚只放宽对应阶段的判读，臂级收官护栏不随阶段换锚松绑。**地板门/有效性门按种子各自窗流校准；异卷破门一律先同卷复测再判**（地板门测的是臂的品性，不是卷子的难度——同一类错误已换三件马甲，不能再有第四次）。

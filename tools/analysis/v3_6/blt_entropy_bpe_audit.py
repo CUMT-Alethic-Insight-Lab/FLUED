@@ -21,7 +21,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from blt_baseline.model import ByteLanguageModel  # noqa: E402
+from tools.baselines.blt_baseline.model import ByteLanguageModel  # noqa: E402
 from tools.analysis.v3_6.boundary_bpe_subset_audit import bpe_boundary_offsets, sample_texts  # noqa: E402
 
 

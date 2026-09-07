@@ -31,7 +31,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("blt.stage2")
 
-from blt_baseline.model import BLTAutoencoder, ByteLanguageModel
+from tools.baselines.blt_baseline.model import BLTAutoencoder, ByteLanguageModel
 
 
 # ===========================================================================

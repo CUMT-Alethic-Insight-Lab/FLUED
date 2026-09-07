@@ -135,6 +135,9 @@ V36_CURATED_KEYS = (
     "stride",
     "batch_size",
     "max_steps",
+    "xcache_frac",
+    "xcache_gist",
+    "xcache_supp",
 )
 
 
@@ -172,3 +175,64 @@ def test_current_state_mentions_v36_canonical_version() -> None:
     assert canonical["canonical_version"] in text, (
         "docs/CURRENT_STATE.md does not reference the canonical_version of configs/canonical_v36.json"
     )
+
+
+# --- v3.6 S1 layer: train_v36_s1 adds its recipe flags in _add_s1_args on top
+# --- of build_parser; these defaults are behavior-critical (the v36.8 recipe
+# --- fix lives here) and must drift-guard against canonical_v36.json too.
+
+V36_S1_CURATED_KEYS = (
+    "cumulative_mask_retention",
+    "mask_mode",
+    "mask_char_frac",
+    "mask_char_span_max",
+    "predict_mode",
+    "predict_latent_weight",
+    "predict_weight",
+    "bpe_tokenizer_path",
+    "k_row_source",
+    "v_row_source",
+    "k_pos_inject",
+)
+
+
+def test_v36_s1_layer_defaults_match_canonical() -> None:
+    canonical = json.loads(CANONICAL_V36.read_text(encoding="utf-8"))
+    from tools.train.v3_6.train_v36 import build_parser
+    from tools.train.v3_6.train_v36_s1 import _add_s1_args
+
+    parser = build_parser()
+    _add_s1_args(parser)
+    defaults = vars(parser.parse_args([]))
+    mismatches = {
+        key: (defaults.get(key), canonical.get(key))
+        for key in V36_S1_CURATED_KEYS
+        if defaults.get(key) != canonical.get(key)
+    }
+    assert not mismatches, (
+        f"train_v36_s1 layer defaults drifted from canonical_v36.json: {mismatches}"
+    )
+
+
+# --- v3.7 line: canonical_v37.json must parse through the S1 trainer's
+# --- --config mechanism and resolve to the slm a-grid anchor (the v37 mode is
+# --- config-gated; v35/v36 guards above are untouched).
+
+CANONICAL_V37 = REPO_ROOT / "configs" / "canonical_v37.json"
+
+
+def test_v37_canonical_parses_to_slm_a_grid() -> None:
+    canonical = json.loads(CANONICAL_V37.read_text(encoding="utf-8"))
+    from tools.train.v3_6.train_v36 import build_parser
+    from tools.train.v3_6.train_v36_s1 import _add_s1_args
+
+    parser = build_parser()
+    _add_s1_args(parser)
+    parser.set_defaults(**canonical)
+    args = parser.parse_args([])
+    assert args.backbone_mode == "slm"
+    assert args.k_row_source == "index"
+    assert args.v_row_source == "memory"
+    assert args.seed_source == "k"  # v37.2: K-seed is the default (E66, user-ruled 2026-08-17)
+    assert args.summarizer_pool == "qpool"  # v37.3: qpool is the default (E100, user-ruled 2026-08-23)
+    assert canonical.get("canonical_version") == "v37.3-20260823"

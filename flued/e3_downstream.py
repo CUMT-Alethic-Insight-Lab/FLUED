@@ -310,7 +310,7 @@ class BLTDownstream(nn.Module):
         dropout: float = 0.0,
     ):
         super().__init__()
-        from blt_baseline.model import BLTAutoencoder, ByteLanguageModel
+        from tools.baselines.blt_baseline.model import BLTAutoencoder, ByteLanguageModel
 
         # Load frozen ByteLM
         lm_ckpt = torch.load(bytelm_ckpt, map_location="cpu", weights_only=False)

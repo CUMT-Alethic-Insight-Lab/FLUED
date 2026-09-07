@@ -265,7 +265,7 @@ def _make_flued_adapter(d_model, nhead, dim_feedforward, num_layers,
 
 def _make_blt_adapter(d_model, nhead, dim_feedforward, num_layers,
                        max_seq_len, dropout, blt_patch_size, device):
-    from blt_baseline.model import BLTAutoencoder
+    from tools.baselines.blt_baseline.model import BLTAutoencoder
     VOCAB = 257
 
     model = BLTAutoencoder(
@@ -298,7 +298,7 @@ def _make_sentencepiece_adapter(vocab_size, d_model, nhead, dim_feedforward,
     except ImportError:
         return None, None, None, "sentencepiece not installed (pip install sentencepiece)"
 
-    from bpe_baseline.model import BPETransformerAutoencoder
+    from tools.baselines.bpe_baseline.model import BPETransformerAutoencoder
 
     # Train a tiny SPM model on a temp file
     with tempfile.NamedTemporaryFile(mode="w", suffix=".txt",
@@ -357,7 +357,7 @@ def _make_tiktoken_adapter(d_model, nhead, dim_feedforward, num_layers,
     except ImportError:
         return None, None, None, "tiktoken not installed (pip install tiktoken)"
 
-    from bpe_baseline.model import BPETransformerAutoencoder
+    from tools.baselines.bpe_baseline.model import BPETransformerAutoencoder
 
     enc = tiktoken.get_encoding("cl100k_base")
     vocab_size = enc.n_vocab

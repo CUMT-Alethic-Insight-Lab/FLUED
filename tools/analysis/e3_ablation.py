@@ -180,7 +180,7 @@ def _build_flued(ab_cfg: AblationConfig, p: Dict) -> nn.Module:
 
 
 def _build_blt(ab_cfg: AblationConfig, p: Dict) -> nn.Module:
-    from blt_baseline.model import BLTAutoencoder
+    from tools.baselines.blt_baseline.model import BLTAutoencoder
     patch_mode = "entropy" if ab_cfg.model_type == "blt_entropy" else "fixed"
     return BLTAutoencoder(
         vocab_size=257, d_model=p["d_model"], nhead=p["nhead"],

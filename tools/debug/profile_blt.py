@@ -1,7 +1,7 @@
 """Profile BLT bottlenecks with CUDA events for accurate timing."""
 import time
 import torch
-from blt_baseline.model import BLTAutoencoder
+from tools.baselines.blt_baseline.model import BLTAutoencoder
 
 device = 'cuda'
 m = BLTAutoencoder(
