@@ -185,3 +185,9 @@ E121 判「不确定」，但有一个更简单的解释尚未排除：
 4. **DVNC 措辞**：原文用语是 "systematic generalization"（系统性泛化），「OOD 泛化」按原文措辞收紧；
 5. **SAM 两注**：正式发表标题为 "Scaling Memory-Augmented Neural Networks with Sparse Reads and Writes"（Rae/Hunt 等 8 人）；「跨槽泄漏」是口语化转述（原文动机=稠密软寻址复杂度崩），可接受但非原文用语。1000×/3000× 数字逐字属实；
 6. 其余（2604.18161/2606.21525/2010.02193/1610.09027/1909.00015/2508.03440/2505.15778）：arXiv 号+作者+核心 claim 三对全实。
+
+## 裁定记录补遗（2026-09-07，用户终审 E122 后）
+
+1. **环 C 降级措辞照准**：可微付 1/3（信度分配付清、探索与方差不付）；§9 自陈最弱处（机器人域证据外推到 LLM 读出链）标注在册——降级后措辞不承重，风险可控；
+2. **撞车清单增补两条照准**：Adaptively Sparse Transformers（arXiv:1909.00015）、Sparse Access Memory（arXiv:1610.09027）——挂 H-DEMAND-GATE 设计公理（可学 α-entmax）名下，该假设冻结搁置期间清单随冻；
+3. **posterior collapse/REALM 处方来源边界照准**：结构类比作处方来源用、不作判据用（第六脸规格起草时的引用纪律）。

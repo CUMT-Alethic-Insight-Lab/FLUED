@@ -673,3 +673,15 @@ def test_cell_keys_relaxed_mode_a_grid():
     missing = {k: v for k, v in a_grid.items() if k != "v_row_source"}
     with pytest.raises(ValueError, match="键缺失"):  # 存在性不放宽
         e122.assert_cell_keys(SimpleNamespace(**missing), strict=False)
+
+
+def test_verdict_ci_first_ordering():
+    """判序修正（用户裁定 2026-09-06：CI 在先）——噪声级负点估（CI 含 0）落
+    「剂量未落」不再误入反常格；显著负对比才反常。"""
+    noise_neg = {"point": -0.005, "ci_excludes_zero": False}
+    assert "剂量未落" in e122.verdict(0.007, noise_neg)
+    sig_neg = {"point": -0.17, "ci_excludes_zero": True}
+    assert "反常" in e122.verdict(0.04, sig_neg)
+    assert "强" in e122.verdict(1.2, {"point": 1.1, "ci_excludes_zero": True})
+    assert "弱" in e122.verdict(0.4, {"point": 0.3, "ci_excludes_zero": True})
+    assert e122.verdict(None, noise_neg) == "无读数"

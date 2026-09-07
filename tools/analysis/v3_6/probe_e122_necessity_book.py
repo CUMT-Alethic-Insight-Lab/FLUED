@@ -775,16 +775,19 @@ def bootstrap_contrast(window_sums: list[dict], n_boot: int = 2000, seed: int = 
 
 
 def verdict(mean_sel: float | None, contrast: dict) -> str:
-    """预注册 §4 判读表（冻结 v1.0）。"""
+    """预注册 §4 判读表（冻结 v1.0；判序修正 2026-09-06 用户裁定：CI 在先）——
+    CI 含 0 → 剂量未落（无论 point 符号）；CI 不含 0 且 point<0 → 反常；CI 不含
+    0 且非负按强/弱分档。原 point<0 先于 CI 的实现层顺序会把噪声级负点估误入
+    反常格（E122 收官实证：−0.005 CI 对称跨零），修正不回炉历史 summary。"""
     if mean_sel is None or contrast["point"] is None:
         return "无读数"
+    if not contrast["ci_excludes_zero"]:
+        return "剂量未落——E121 改判需求侧误判"
     if contrast["point"] < 0:
         return "反常（仪器 bug 或选择图口径错——停，转口径审计）"
-    if contrast["ci_excludes_zero"] and mean_sel >= STRONG_LINE_NAT:
+    if mean_sel >= STRONG_LINE_NAT:
         return "必要性实存（强）——剂量打在黑板上，E121 解释 B 成立"
-    if contrast["ci_excludes_zero"]:
-        return "必要性实存（弱）——剂量部分在板"
-    return "剂量未落——E121 改判需求侧误判"
+    return "必要性实存（弱）——剂量部分在板"
 
 
 # ---------------------------------------------------------------------------
