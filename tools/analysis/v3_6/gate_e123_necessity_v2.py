@@ -50,6 +50,7 @@ import tools.train.v3_6.train_v36_s1 as s1  # noqa: E402
 BASE_RUN = "checkpoints/v37ks_a_d1_w1_10k_ctx4096_20260904"
 OUT_DIR = "outputs/e123_gate_necessity_v2_20260907"
 N_BLOCKS = 4        # 每窗候选块数（臂剂量 1-4 上界同构）
+SCORE_DIST = 8      # 下游计分距离（chunk 单位；回执二源-汇直方图支撑）
 N_WINDOWS = 500
 BOOTSTRAP = 2000
 SEED = 42
@@ -71,9 +72,11 @@ def row_swap_perm(c: int, n_real: int) -> list[int]:
     return perm
 
 
-def run_gate_window(model, ns, clean, byte_mask, rng, wi, n_blocks=N_BLOCKS) -> dict:
-    """一窗：基线 A（共享）+ 每候选块一个双遮蔽 B 前向。返回 items（逐目标位
-    ΔNLL 两面）+ sums。"""
+def run_gate_window(model, ns, clean, byte_mask, rng, wi, n_blocks=N_BLOCKS,
+                    b_mode: str = "both") -> dict:
+    """一窗：基线 A（共享）+ 每候选块一个 B 前向。b_mode=both（注意力遮蔽+行
+    交换，=槽一完全缺席）/ mask（只注意力遮蔽——内容经编码器通道的依赖）/
+    swap（只行交换——内容经状态行身份通道的依赖；伪影拆分控制）。"""
     device = clean.device
     source_a = clean.masked_fill(byte_mask.bool(), MASK_ID)
 
@@ -99,14 +102,16 @@ def run_gate_window(model, ns, clean, byte_mask, rng, wi, n_blocks=N_BLOCKS) -> 
 
     items = []
     for c in picks:
-        # 下游目标位 = chunk c+1 的 valid 字节（网格内、非 mask 命中）
-        tgt = [t for t in range(clean.size(1))
-               if int(ca[0, t]) == c + 1
+        # 下游目标位 = chunk c+1 .. c+D 的 valid 字节（v1.2 回执二需要源-汇
+        # 距离直方图：单距离读数推不出 K_max 课程锚）
+        tgt = [(t, int(ca[0, t]))
+               for t in range(clean.size(1))
+               if int(ca[0, t]) - c in range(1, SCORE_DIST + 1)
                and 0 <= int(oa[0, t]) < int(ns.max_span)
                and not bool(byte_mask[0, t])]
         if not tgt:
             continue
-        tgt_ids = [int(clean[0, t]) for t in tgt]
+        tgt_ids = [int(clean[0, t]) for t, _c in tgt]
         mask_b = torch.zeros(1, 1, 1, clean.size(1), dtype=torch.bool, device=device)
         for t in range(clean.size(1)):
             if int(ca[0, t]) == c:
@@ -116,15 +121,29 @@ def run_gate_window(model, ns, clean, byte_mask, rng, wi, n_blocks=N_BLOCKS) -> 
         # 双遮蔽下分段不漂移的卫检（block_mask 不喂 segmentor，切点必不变）
         if not bool((cb == ca).all()):
             raise RuntimeError(f"win{wi} chunk c={c}: 双遮蔽下分段漂移（卫检失败）——仪器 bug")
-        na_d = gather_nll(out_a["logits_direct"], ca, oa, tgt, tgt_ids)
-        nb_d = gather_nll(out_b["logits_direct"], cb, ob, tgt, tgt_ids)
-        na_b = gather_nll(out_a["logits_backbone"], ca, oa, tgt, tgt_ids)
-        nb_b = gather_nll(out_b["logits_backbone"], cb, ob, tgt, tgt_ids)
-        for i, t in enumerate(tgt):
+        na_d = gather_nll(out_a["logits_direct"], ca, oa, [t for t, _c in tgt], tgt_ids)
+        nb_d = gather_nll(out_b["logits_direct"], cb, ob, [t for t, _c in tgt], tgt_ids)
+        na_b = gather_nll(out_a["logits_backbone"], ca, oa, [t for t, _c in tgt], tgt_ids)
+        nb_b = gather_nll(out_b["logits_backbone"], cb, ob, [t for t, _c in tgt], tgt_ids)
+        # 块基线 surprisal（验证性代理）：块自身 valid 字节在基线前向的 mean NLL
+        # ——若它与信息量强相关，选择器可退化为单前向 surprisal 扫描（省 4×）
+        src_pos = [t for t in range(clean.size(1))
+                   if int(ca[0, t]) == c
+                   and 0 <= int(oa[0, t]) < int(ns.max_span)
+                   and not bool(byte_mask[0, t])]
+        src_ids = [int(clean[0, t]) for t in src_pos]
+        surprisal = None
+        if src_pos:
+            na_src = gather_nll(out_a["logits_direct"], ca, oa, src_pos, src_ids)
+            surprisal = sum(na_src) / len(na_src)
+        for i, (t, sink_c) in enumerate(tgt):
             items.append({
                 "window_id": wi,
                 "chunk": c,
+                "sink_chunk": sink_c,
+                "distance": sink_c - c,
                 "byte_pos": t,
+                "block_baseline_surprisal": surprisal,  # 代理验证用
                 "d_direct": nb_d[i] - na_d[i],
                 "d_backbone": nb_b[i] - na_b[i],
                 "d_total": 0.5 * (nb_d[i] - na_d[i]) + 0.5 * (nb_b[i] - na_b[i]),
