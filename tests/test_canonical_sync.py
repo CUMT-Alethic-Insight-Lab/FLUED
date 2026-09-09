@@ -214,6 +214,28 @@ def test_v36_s1_layer_defaults_match_canonical() -> None:
     )
 
 
+# --- v3.6 坑 8 对偶 pinned 键（2026-09-09 可比性总审计行动 5，用户裁定）：
+# --- canonical_v36 早于 E100 qpool 界/v37.2 K-seed 界，summarizer_pool/seed_source
+# --- 必须显式钉死历史口径 mean/v。这两键刻意不等于现行 parser 默认（qpool/k），
+# --- 故不进 equality 清单（V36_CURATED_KEYS），由 pinned 测试守「显式在册且值未漂移」。
+
+V36_PINNED_KEYS = {
+    "summarizer_pool": "mean",
+    "seed_source": "v",
+}
+
+
+def test_v36_pinned_keys_explicit_and_undrifted() -> None:
+    canonical = json.loads(CANONICAL_V36.read_text(encoding="utf-8"))
+    for key, want in V36_PINNED_KEYS.items():
+        assert key in canonical, (
+            f"canonical_v36.json missing pinned key {key!r} (坑 8 silent-inheritance hole)"
+        )
+        assert canonical[key] == want, (
+            f"canonical_v36.json pinned key {key!r} drifted: {canonical[key]!r} != {want!r}"
+        )
+
+
 # --- v3.7 line: canonical_v37.json must parse through the S1 trainer's
 # --- --config mechanism and resolve to the slm a-grid anchor (the v37 mode is
 # --- config-gated; v35/v36 guards above are untouched).
@@ -236,3 +258,6 @@ def test_v37_canonical_parses_to_slm_a_grid() -> None:
     assert args.seed_source == "k"  # v37.2: K-seed is the default (E66, user-ruled 2026-08-17)
     assert args.summarizer_pool == "qpool"  # v37.3: qpool is the default (E100, user-ruled 2026-08-23)
     assert canonical.get("canonical_version") == "v37.3-20260823"
+    # 坑 8 pinned 对称面（行动 5）：v37 侧两键也必须显式在册，不靠 parser 默认兜底
+    assert canonical.get("summarizer_pool") == "qpool"
+    assert canonical.get("seed_source") == "k"
