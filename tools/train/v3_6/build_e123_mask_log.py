@@ -22,6 +22,12 @@
 窗流复现：StreamingReconstructionDataset(seq_len=4096, samples_per_worker=50000,
 seed=42, batch=1, num_workers=0)——与 v3_7_d1_w1.json 训练流逐项同构。
 
+E124 剂量段（2026-09-10，任务书冻结 v1.0）：E124 生产日志
+(outputs/e124_mask_log_seed42.jsonl) 用 --threshold 0.02 --max-blocks 3
+--max-chunks-trim 256 重建——τ=0.02 nat 放宽剂量下限、每窗遮蔽 ≤3 块封顶
+（按信息量降序取 top-N，平局按 chunk 序保确定性）、截断网格 64→256 承接
+4096B 窗 n_real≈173 的新体制（64 会触发负载卫检 RuntimeError）。
+
 用法：
   python tools/train/v3_6/build_e123_mask_log.py --ckpt <a-w1> --data-path ... \
       --n-windows 10000 --threshold 0.05 --out outputs/e123_mask_log_seed42.jsonl \
@@ -184,12 +190,18 @@ def main() -> None:
     p.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     p.add_argument("--max-candidates", type=int, default=80,
                    help="每窗测量变体上限（候选 chunk 数；冒烟用小值）")
+    p.add_argument("--max-blocks", type=int, default=0,
+                   help="每窗遮蔽块数封顶（0=不封顶=E123 旧口径; >0 时过阈块按信息量 "
+                        "降序取 top-N, 平局按 chunk 序保确定性——E124 剂量 3）")
+    p.add_argument("--max-chunks-trim", type=int, default=64,
+                   help="选择器专用 max_chunks 构建期截断（E123 旧口径 64; E124 新体制 "
+                        "n_real≈173 须 256, 否则负载卫检 RuntimeError）")
     p.add_argument("--cell-relaxed", action="store_true")
     args = p.parse_args()
     device = torch.device(
         "cuda" if (args.device == "auto" and torch.cuda.is_available()) or args.device == "cuda" else "cpu"
     )
-    model, ns, step = _load_trimmed(Path(args.ckpt), device)
+    model, ns, step = _load_trimmed(Path(args.ckpt), device, max_chunks_trim=args.max_chunks_trim)
     assert_cell_keys(ns, model.config, strict=not args.cell_relaxed)
     ns.burst_prob = 0
     ns.cloze_prob = 0
@@ -217,6 +229,11 @@ def main() -> None:
             clean = ids[:cut].unsqueeze(0).to(device)
             rec = measure_window(model, ns, clean, n_variants_max=args.max_candidates)
             sel = {c: s for c, s in rec["masked"].items() if s > args.threshold}
+            if args.max_blocks > 0 and len(sel) > args.max_blocks:
+                # E124 剂量封顶（--max-blocks）: 按信息量降序取 top-N, 平局
+                # 按 chunk 序（键序）保确定性
+                ranked = sorted(sel.items(), key=lambda kv: (-kv[1], kv[0]))
+                sel = dict(ranked[: args.max_blocks])
             deps = []
             for c in sorted(sel):
                 d = rec["dep_bytes"][c]

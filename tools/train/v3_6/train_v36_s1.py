@@ -2105,13 +2105,18 @@ def _e123_materialize_windows(args, n_windows: int) -> list[torch.Tensor]:
 
 
 def _e123_window_plan(model, clean: torch.Tensor, args, device):
-    """当前窗的 E123 计划：(plan, attn_mask, inject_metas)。
+    """当前窗的 E123 计划：(plan, attn_mask, inject_metas, cuts_pin)。
 
     plan 携带全量依赖对（仪表按 k 分层读全量，K_max 切档不纠缠——任务书 §5
     仪表①口径）；mask/inject 只含 distance ≤ K_max(step) 的对（§4 时间表内
     只遮蔽/监督档内块，超程块后续档自动纳入）。control 列 mask/inject 全 None
     （纯续训 + 仪表 = 地板参照）。遮蔽按 src_byte_range 字节区间（训练期分段
-    会漂移，不走选择器时的 chunk 索引——交接设计钉）。"""
+    会漂移，不走选择器时的 chunk 索引——交接设计钉）。
+
+    cuts_pin（E124 切点钉死，--e123-cuts-pin 开才取，默认 None = 旧路径逐位
+    不变）：选择器日志同批落盘的干净窗预算后切点 hard_cut（切点是窗的确定
+    函数，训练时零额外前向）。缺键/长度 ≠ clean 首行非 PAD 数一律响亮报错；
+    长度对齐后 pad-right（False）到 T 得 cuts_override 契约的 (1, T) bool。"""
     wi = int(getattr(args, "e123_window_id", 0))
     step = int(getattr(args, "e123_step", 0))
     entry = _E123_LOG.get(wi) if _E123_LOG is not None else None
@@ -2135,7 +2140,27 @@ def _e123_window_plan(model, clean: torch.Tensor, args, device):
         else:
             inject = [_e123_donor_metas(model, args, wi, kept, lam, device)]
     plan = {"wi": wi, "pairs": pairs, "kept": kept, "kmax": kmax, "lam": lam}
-    return plan, mask, inject
+    cuts = None
+    if getattr(args, "e123_cuts_pin", False):
+        # E124 切点钉死（用户裁定 2026-09-10：内容缺席、结构不动）——遮蔽
+        # 前向复用选择器落盘的干净窗切点，锁 chunk 网格。无 hard_cut 键的
+        # 旧日志（E123 三列遗产）响亮拒绝，不静默现算（现算 = 训练期前向
+        # 漂白选择器口径，且每步一次额外 _encode/_cuts 前向）。
+        if entry is None or "hard_cut" not in entry:
+            raise ValueError(
+                f"E124 cuts-pin: 窗 {wi} 的决策日志缺 hard_cut 键——"
+                "旧版选择器日志无切点字段，需用 2026-09-10 后口径重建 mask log"
+            )
+        hc = entry["hard_cut"]
+        n_nonpad = int(clean[0].ne(PAD_ID).sum())
+        if len(hc) != n_nonpad:
+            raise ValueError(
+                f"E124 cuts-pin: 窗 {wi} hard_cut 长度 {len(hc)} != 训练窗非 PAD "
+                f"字节数 {n_nonpad}——窗流对齐前提破坏（选择器与训练流须逐项同构）"
+            )
+        cuts = torch.zeros(1, T, dtype=torch.bool, device=device)
+        cuts[0, : len(hc)] = torch.tensor(hc, dtype=torch.bool, device=device)
+    return plan, mask, inject, cuts
 
 
 def _e123_donor_metas(model, args, wi: int, kept: list[dict], lam: float, device) -> list[dict]:
@@ -3155,9 +3180,9 @@ def step_model(model, batch, args, device, train: bool):
     # eval 全 None（纯续训 + 仪表 = 地板参照列；eval 形态零变化）。计划构建在
     # byte_mask 之后、前向之前——遮蔽是注意力侧器件，不进 byte_mask 流。
     e123_on = _e123_enabled(args)
-    e123_plan = e123_mask = e123_inject = None
+    e123_plan = e123_mask = e123_inject = e123_cuts = None
     if e123_on and train:
-        e123_plan, e123_mask, e123_inject = _e123_window_plan(model, clean, args, device)
+        e123_plan, e123_mask, e123_inject, e123_cuts = _e123_window_plan(model, clean, args, device)
     with torch.autocast("cuda", dtype=torch.bfloat16, enabled=args.amp and device.type == "cuda"):
         out = s1_forward(
             model, source, args, clean=clean, byte_mask=byte_mask, retrieval_metas=retrieval_metas,
@@ -3169,6 +3194,9 @@ def step_model(model, batch, args, device, train: bool):
             train=train,  # decoder 去噪臂: direct 腿扰动只在训练前向 (关态零影响)
             attn_block_mask=e123_mask,
             e123_inject=e123_inject,
+            # E124 切点钉死（--e123-cuts-pin）: 只随遮蔽窗传（未遮窗恒等,
+            # test_e124_cuts_override 证), 未遮窗保持旧调用形态逐位不变
+            cuts_override=e123_cuts if e123_mask is not None else None,
         )
     chunks = out["chunks"]
     # Per-chunk base grids: direct (encoded) and predict views keep these.
@@ -3775,6 +3803,19 @@ def step_model(model, batch, args, device, train: bool):
     metrics["e123_injected_pairs"] = torch.tensor(
         float(e123_st["pairs"]) if e123_st else 0.0, device=device
     )
+    # E124 门仪表（任务书冻结 v1.0 §5: 副仪表 A = 可学 α 轨迹; 逐查询预算
+    # 均值 k 轨迹）——门关 = 零占位（log schema 对齐本文件臂列惯例,
+    # e123_dep_stats 同款纪律）
+    e124_zero = torch.zeros((), device=device)
+    _bb = getattr(model, "backbone", None)
+    if _bb is not None and getattr(_bb, "e124_gate", False):
+        metrics["e124_alpha"] = _bb.e124_alpha_value().detach()
+        metrics["e124_k"] = (
+            _bb.last_e124_k if _bb.last_e124_k is not None else e124_zero
+        ).to(device)
+    else:
+        metrics["e124_alpha"] = e124_zero
+        metrics["e124_k"] = e124_zero.clone()
     if slm_mode:
         # E80 补充 2: resident key-geometry dashboard (slm default-on; legacy
         # paths never gain these keys)
@@ -3820,12 +3861,26 @@ def evaluate(model, eval_loader, args, device):
     _RETRIEVAL_GENERATOR.manual_seed(args.eval_mask_seed + _RETRIEVAL_SEED_OFFSET)
     # burst eval determinism: same discipline, its own stream offset.
     _BURST_GENERATOR.manual_seed(args.eval_mask_seed + _BURST_SEED_OFFSET)
-    rows = []
-    for i, batch in enumerate(eval_loader):
-        if i >= args.max_eval_batches:
-            break
-        _, metrics = step_model(model, batch, args, device, train=False)
-        rows.append({k: float(v) for k, v in metrics.items()})
+    # E124: eval 一律部署姿态（硬门 + 终点预算 k_final; 温度对硬模式无作用
+    # 但按任务书 §6 一并钉 temp_end 保读数可复演）; 退出恢复原训练姿态
+    # (try/finally——中途异常也不把部署姿态泄漏回训练循环)。
+    _e124_bb = getattr(model, "backbone", None)
+    _e124_save = None
+    if _e124_bb is not None and getattr(_e124_bb, "e124_gate", False):
+        _e124_save = (_e124_bb.e124_rt_hard, _e124_bb.e124_rt_progress, _e124_bb.e124_rt_temp)
+        _e124_bb.e124_rt_hard = True
+        _e124_bb.e124_rt_progress = 1.0
+        _e124_bb.e124_rt_temp = float(getattr(args, "e124_gate_temp_end", 0.05))
+    try:
+        rows = []
+        for i, batch in enumerate(eval_loader):
+            if i >= args.max_eval_batches:
+                break
+            _, metrics = step_model(model, batch, args, device, train=False)
+            rows.append({k: float(v) for k, v in metrics.items()})
+    finally:
+        if _e124_save is not None:
+            (_e124_bb.e124_rt_hard, _e124_bb.e124_rt_progress, _e124_bb.e124_rt_temp) = _e124_save
     model.train()
     merged = {}
     for key in rows[0]:
@@ -4056,6 +4111,177 @@ def _add_s1_args(parser: argparse.ArgumentParser) -> None:
         "--e123-donor-seed", type=int, default=20260907,
         help="乱序列跨窗置换种子 (与数据流种子分离; 置换表落盘 out_dir/e123_donor_perm.json)",
     )
+    # --- E124 硬预算检索门（任务书冻结 v1.0 2026-09-09）: block-1 部署查询对
+    # index(K) 行打分 → top-k 命中 memory(V) 行做可学 α-entmax 加权; 未命中行
+    # 权重结构性恰零。默认关 = 不建门件, 旧路径逐位不变（条件创建纪律）。---
+    parser.add_argument(
+        "--e124-budget-gate", action="store_true",
+        help="E124 硬预算检索门总开关 (a 格限定: k=index ∧ v=memory; 需 --init-checkpoint "
+             "s0pp 基座 + 全键全形校验, 白名单仅 backbone.e124_alpha_raw)",
+    )
+    parser.add_argument(
+        "--e124-alpha-init", type=float, default=2.0,
+        help="可学 α-entmax 锐度初值 (sparsemax 点; α=1+softplus(raw) 恒>1, bisect 数值域)",
+    )
+    parser.add_argument(
+        "--e124-gate-k-final", type=int, default=9,
+        help="逐查询检索预算退火终点 k (任务书 §3.5 定稿 k=9)",
+    )
+    parser.add_argument(
+        "--e124-gate-anneal-frac", type=float, default=0.4,
+        help="预算/温度退火窗 = max_steps 的前段分数 (0-40%% 窗内线性 全量→k_final)",
+    )
+    parser.add_argument(
+        "--e124-gate-temp-start", type=float, default=1.0,
+        help="软 top-k 温度时间表起点 (训练软门的 logsigmoid 打分温度; 不可学)",
+    )
+    parser.add_argument(
+        "--e124-gate-temp-end", type=float, default=0.05,
+        help="软 top-k 温度时间表终点 (退火窗末; eval/部署硬模式下温度无作用)",
+    )
+    parser.add_argument(
+        "--e123-cuts-pin", action="store_true",
+        help="E124 切点钉死 (用户裁定 2026-09-10: 内容缺席、结构不动): 遮蔽前向复用 "
+             "选择器日志落盘的干净窗 hard_cut (需含 hard_cut 键的 2026-09-10 后口径日志; "
+             "默认关 = E123 旧路径逐位不变)",
+    )
+
+
+# E124 基座审计期望差集（2026-09-10 一次性枚举冻结: s0pp_pro_v4_sft_20260805
+# latest.pt (v36 状态机线, 350 键) vs E124 comb 模型 (v37 slm a 格 qpool, 337 键)
+# = 287 全键全形匹配 + 4 形不符 + 45 缺席 + 59 冗键; 枚举脚本口径:
+# build_model(comb 配置, kda_impl=torch) vs torch.load(init)["model"]。
+# 三组都是 v36↔v37 结构鸿沟的确定成分: 缺席 = slm backbone/decoder_in_mem/
+# index_ffn/pool_queries (v37 slm 新件, 随机初始化归训练); 形不符 = chunk_pos
+# (max_chunks 64→1024) + summarizer.ffn (mean→qpool 宽度); 冗键 = write_head/
+# state_machine/encoder 式 backbone/decoder_in (v36 状态机件, v37 无归属)。
+# 审计 = 实际差集与三组冻结集合精确相等 (白名单 backbone.e124_alpha_raw 另行
+# 豁免——门唯一新件, 确定性常数初始化, 不进基座属正常); 任何漂移 (典型:
+# parser 现行默认填补老配置缺键, 2026-08-29 冒烟事故入例) 都会改变差集 → 响亮。
+_E124_EXPECT_ABSENT = frozenset(
+    [
+        "backbone.align_k.weight", "backbone.align_v.weight",
+        "backbone.ffn1.0.bias", "backbone.ffn1.0.weight",
+        "backbone.ffn1.2.bias", "backbone.ffn1.2.weight",
+        "backbone.ln_ffn1.bias", "backbone.ln_ffn1.weight",
+        "backbone.norm.bias", "backbone.norm.weight",
+        "backbone.o_proj.weight", "backbone.q_proj.weight",
+        "backbone.self_blocks.0.ffn.0.bias", "backbone.self_blocks.0.ffn.0.weight",
+        "backbone.self_blocks.0.ffn.2.bias", "backbone.self_blocks.0.ffn.2.weight",
+        "backbone.self_blocks.0.k.weight",
+        "backbone.self_blocks.0.ln_f.bias", "backbone.self_blocks.0.ln_f.weight",
+        "backbone.self_blocks.0.ln_s.bias", "backbone.self_blocks.0.ln_s.weight",
+        "backbone.self_blocks.0.o.weight", "backbone.self_blocks.0.q.weight",
+        "backbone.self_blocks.0.v.weight",
+        "backbone.self_blocks.1.ffn.0.bias", "backbone.self_blocks.1.ffn.0.weight",
+        "backbone.self_blocks.1.ffn.2.bias", "backbone.self_blocks.1.ffn.2.weight",
+        "backbone.self_blocks.1.k.weight",
+        "backbone.self_blocks.1.ln_f.bias", "backbone.self_blocks.1.ln_f.weight",
+        "backbone.self_blocks.1.ln_s.bias", "backbone.self_blocks.1.ln_s.weight",
+        "backbone.self_blocks.1.o.weight", "backbone.self_blocks.1.q.weight",
+        "backbone.self_blocks.1.v.weight",
+        "decoder_in_mem.bias", "decoder_in_mem.weight",
+        "summarizer.index_ffn.0.bias", "summarizer.index_ffn.0.weight",
+        "summarizer.index_ffn.1.bias", "summarizer.index_ffn.1.weight",
+        "summarizer.index_ffn.3.bias", "summarizer.index_ffn.3.weight",
+        "summarizer.pool_queries",
+    ]
+)
+_E124_EXPECT_SHAPE_BAD = frozenset(
+    [
+        "chunk_pos.weight",
+        "summarizer.ffn.0.bias", "summarizer.ffn.0.weight", "summarizer.ffn.1.weight",
+    ]
+)
+_E124_EXPECT_EXTRA = frozenset(
+    [
+        "backbone.encoder.layers.0.linear1.bias", "backbone.encoder.layers.0.linear1.weight",
+        "backbone.encoder.layers.0.linear2.bias", "backbone.encoder.layers.0.linear2.weight",
+        "backbone.encoder.layers.0.norm1.bias", "backbone.encoder.layers.0.norm1.weight",
+        "backbone.encoder.layers.0.norm2.bias", "backbone.encoder.layers.0.norm2.weight",
+        "backbone.encoder.layers.0.self_attn.in_proj_bias",
+        "backbone.encoder.layers.0.self_attn.in_proj_weight",
+        "backbone.encoder.layers.0.self_attn.out_proj.bias",
+        "backbone.encoder.layers.0.self_attn.out_proj.weight",
+        "backbone.encoder.layers.1.linear1.bias", "backbone.encoder.layers.1.linear1.weight",
+        "backbone.encoder.layers.1.linear2.bias", "backbone.encoder.layers.1.linear2.weight",
+        "backbone.encoder.layers.1.norm1.bias", "backbone.encoder.layers.1.norm1.weight",
+        "backbone.encoder.layers.1.norm2.bias", "backbone.encoder.layers.1.norm2.weight",
+        "backbone.encoder.layers.1.self_attn.in_proj_bias",
+        "backbone.encoder.layers.1.self_attn.in_proj_weight",
+        "backbone.encoder.layers.1.self_attn.out_proj.bias",
+        "backbone.encoder.layers.1.self_attn.out_proj.weight",
+        "backbone.encoder.layers.2.linear1.bias", "backbone.encoder.layers.2.linear1.weight",
+        "backbone.encoder.layers.2.linear2.bias", "backbone.encoder.layers.2.linear2.weight",
+        "backbone.encoder.layers.2.norm1.bias", "backbone.encoder.layers.2.norm1.weight",
+        "backbone.encoder.layers.2.norm2.bias", "backbone.encoder.layers.2.norm2.weight",
+        "backbone.encoder.layers.2.self_attn.in_proj_bias",
+        "backbone.encoder.layers.2.self_attn.in_proj_weight",
+        "backbone.encoder.layers.2.self_attn.out_proj.bias",
+        "backbone.encoder.layers.2.self_attn.out_proj.weight",
+        "backbone.in_proj.bias", "backbone.in_proj.weight",
+        "backbone.pos.weight",
+        "decoder_in.bias", "decoder_in.weight",
+        "state_machine.readout_query",
+        "state_machine.realign.0.bias", "state_machine.realign.0.weight",
+        "state_machine.realign.1.bias", "state_machine.realign.1.weight",
+        "state_machine.realign.3.bias", "state_machine.realign.3.weight",
+        "write_head.alpha_logit",
+        "write_head.to_beta.bias", "write_head.to_beta.weight",
+        "write_head.to_k.bias", "write_head.to_k.weight",
+        "write_head.to_v.bias", "write_head.to_v.weight",
+        "write_head.trunk.0.bias", "write_head.trunk.0.weight",
+        "write_head.trunk.1.bias", "write_head.trunk.1.weight",
+    ]
+)
+
+
+def _e124_audit_init_checkpoint(model, args) -> None:
+    """E124 基座全键全形校验（⑤, 去噪臂冒烟事故入例的 loud-fail 升级款）:
+    init_checkpoint 的通用加载是静默形状过滤 (compatible dict)——E124 臂
+    （gate 或 cuts_pin 开）锚定 s0pp 冻结接管基座, 实际差集必须与三组冻结
+    期望集合精确相等（_E124_EXPECT_ABSENT/_SHAPE_BAD/_EXTRA, 2026-09-10
+    一次性枚举冻结, 287/4/45/59）, 白名单仅 backbone.e124_alpha_raw（门
+    唯一新件, 确定性常数初始化, 不进基座属正常）。任何架构漂移都会改变
+    差集 → 响亮退出, 不许静默训一个残缺基座。"""
+    payload = torch.load(args.init_checkpoint, map_location="cpu", weights_only=False)["model"]
+    cur = model.state_dict()
+    whitelist = "backbone.e124_alpha_raw"
+    absent = frozenset(k for k in cur if k != whitelist and k not in payload)
+    shape_bad = frozenset(k for k in cur if k in payload and payload[k].shape != cur[k].shape)
+    extra = frozenset(k for k in payload if k not in cur)
+    drift = []
+    if absent != _E124_EXPECT_ABSENT:
+        drift.append(
+            f"缺席集漂移: 新缺席={sorted(absent - _E124_EXPECT_ABSENT)[:5]} "
+            f"已消缺={sorted(_E124_EXPECT_ABSENT - absent)[:5]}"
+        )
+    if shape_bad != _E124_EXPECT_SHAPE_BAD:
+        drift.append(
+            f"形不符集漂移: 新={sorted(shape_bad - _E124_EXPECT_SHAPE_BAD)[:5]} "
+            f"已修复={sorted(_E124_EXPECT_SHAPE_BAD - shape_bad)[:5]}"
+        )
+    if extra != _E124_EXPECT_EXTRA:
+        drift.append(
+            f"冗键集漂移: 新冗={sorted(extra - _E124_EXPECT_EXTRA)[:5]} "
+            f"已归位={sorted(_E124_EXPECT_EXTRA - extra)[:5]}"
+        )
+    if drift:
+        raise SystemExit(
+            "[s1][e124] 基座全键全形校验失败（差集与 2026-09-10 冻结期望不符）: "
+            + " | ".join(drift)
+            + " —— 检查 --config 来源与基座的架构漂移 (典型: summarizer_pool 现行默认 "
+            "qpool vs 老基座 mean 类 parser 默认漂移, 需显式旗标对齐历史口径; 若漂移是"
+            "有意的新形态, 须重跑一次性枚举并原地更新三组冻结集合)"
+        )
+    n_matched = len(cur) - len(absent) - len(shape_bad) - int(whitelist in cur)
+    print(
+        f"[s1][e124] 基座全键全形校验通过: {n_matched} 键匹配 "
+        f"+ {len(shape_bad)} 形不符(冻结豁免) + {len(absent)} 缺席(冻结豁免) "
+        f"+ {len(extra)} 冗键(冻结豁免) | 白名单: {whitelist}",
+        flush=True,
+    )
+    del payload, cur
 
 
 def main() -> None:
@@ -4351,6 +4577,59 @@ def main() -> None:
                 f"(donor_seed={int(args.e123_donor_seed)}, donor 窗料化 {len(_E123_DONOR_WINDOWS)} 窗)",
                 flush=True,
             )
+    e124_on = bool(getattr(args, "e124_budget_gate", False))
+    if e124_on:
+        # E124 硬预算检索门（任务书冻结 v1.0 2026-09-09）: 响亮校验——
+        # a 格限定 (index K 命中 → memory V 取回的原生通道映射; model 构造期
+        # 对非 a 格也响亮报错, 此处 CLI 层先拦); batch=1 (批内混合预算语义未
+        # 定义, 时间表按窗流定标); 与改动损失面/读出链/数据流的历史臂互斥
+        # (E123 不在互斥列——comb 列 = 门 + E123 需求器件合体是设计内形态)。
+        if getattr(args, "backbone_mode", "") != "slm":
+            raise SystemExit("--e124-budget-gate requires --backbone-mode slm (v3.7; legacy 路径 N/A)")
+        if getattr(args, "k_row_source", "index") != "index" or \
+                getattr(args, "v_row_source", "memory") != "memory":
+            raise SystemExit(
+                "--e124-budget-gate requires slm a 格 (k_row_source=index ∧ v_row_source=memory; "
+                "任务书 §1 格别裁定, d/b 格注册为转移臂候选)"
+            )
+        if int(args.batch_size) != 1:
+            raise SystemExit("--e124-budget-gate requires batch_size=1 (批内混合预算语义未定义)")
+        if bool(getattr(args, "k_block_eval", False)):
+            raise SystemExit(
+                "--e124-budget-gate 不组合 --k-block-eval (S39 探针的均匀键使 top-k "
+                "退化为位置别名; 单变量纪律)"
+            )
+        for _flag, _name in [
+            (q18_on, "Q18"), (_q15_enabled(args), "Q15"),
+            (bool(getattr(args, "q15_attn_diag", False)), "q15-attn-diag"),
+            (d1_on, "D1"), (_multislot_readout_enabled(args), "Q20 多槽读出"),
+            (bool(getattr(args, "e120_readout_swap", False)), "E120 读出替换"),
+            (_decoder_denoise_enabled(args), "decoder 去噪"),
+            (_cloze_enabled(args), "cloze"), (_retrieval_enabled(args), "retrieval"),
+            (_burst_enabled(args), "burst"),
+            (int(getattr(args, "decoder_markov", 0)) > 0, "decoder-markov"),
+        ]:
+            if _flag:
+                raise SystemExit(f"--e124-budget-gate 不组合 {_name} 臂 (E124 单变量纪律; 响亮拒绝)")
+        if not args.init_checkpoint:
+            raise SystemExit(
+                "--e124-budget-gate 需要 --init-checkpoint <s0pp 基座> (全键全形校验 + "
+                "白名单仅 backbone.e124_alpha_raw; 门的有效性账锚定冻结接管基座, 非从零)"
+            )
+        if not (0.0 < float(args.e124_gate_anneal_frac) <= 1.0):
+            raise SystemExit("--e124-gate-anneal-frac 须在 (0, 1] (退火窗 = max_steps 前段分数)")
+        print(
+            f"[s1][e124] 硬预算检索门: alpha_init={float(args.e124_alpha_init)} "
+            f"k_final={int(args.e124_gate_k_final)} anneal_frac={float(args.e124_gate_anneal_frac)} "
+            f"temp={float(args.e124_gate_temp_start)}→{float(args.e124_gate_temp_end)} "
+            f"(训练软门, eval 硬门+终点预算)",
+            flush=True,
+        )
+    if bool(getattr(args, "e123_cuts_pin", False)) and not e123_on:
+        raise SystemExit(
+            "--e123-cuts-pin requires --e123-mask-log (切点钉死消费选择器日志的 hard_cut 键; "
+            "无日志无切点源, 响亮拒绝)"
+        )
     if _q15_enabled(args):
         # Q15 回路养成臂 (任务书 2026-08-25 冻结): λ 初值 (§3.4) 落 args
         # 属性, step_model 每步读, 回调线 (§5) 原地降权. λ_out 继承
@@ -4472,6 +4751,10 @@ def main() -> None:
             compatible = {k: v for k, v in compatible.items() if any(k.startswith(p) for p in init_prefixes)}
         model.load_state_dict(compatible, strict=False)
         print(f"[s1] init: loaded={len(compatible)} skipped={len(payload['model']) - len(compatible)} prefixes={init_prefixes or 'ALL'}", flush=True)
+    if (e124_on or bool(getattr(args, "e123_cuts_pin", False))) and args.init_checkpoint:
+        # E124 臂 (gate 或 cuts_pin 开) 基座 loud-fail 校验 (⑤): 通用加载
+        # 是静默形状过滤, 本臂锚定 s0pp 冻结接管基座, 不齐响亮退出
+        _e124_audit_init_checkpoint(model, args)
     q18_warm_report = None
     q18_base_step = 0
     q18_base_payload = None
@@ -4744,6 +5027,23 @@ def main() -> None:
                 # 时 DataLoader 从头重放, 窗索引 = step - start_step 与数据同步）
                 args.e123_step = step
                 args.e123_window_id = step - start_step
+            if e124_on:
+                # E124 门时间表（任务书冻结 v1.0 §6 退火纪律: 纯时间表, 无可学
+                # 时间表件; 预算与温度单自由度各归各禁互相代偿）: 退火进度
+                # p = min(1, step / (anneal_frac·max_steps)) 线性 0→1 (预算从
+                # 全量退到 k_final, 起点 = 门关逐位一致锚); 温度 τ 同窗从
+                # temp_start 线性退到 temp_end; 训练恒软门 (rt_hard=False,
+                # 可微路径), rt_budget=None (不覆写, 按进度表)。eval 姿态在
+                # evaluate() 内另设 (硬门+终点), 与此处不串。
+                _bb124 = model.backbone
+                _frac124 = max(float(args.e124_gate_anneal_frac), 1e-9)
+                _p124 = min(1.0, step / (_frac124 * float(args.max_steps)))
+                _bb124.e124_rt_progress = _p124
+                _bb124.e124_rt_temp = float(args.e124_gate_temp_start) + (
+                    float(args.e124_gate_temp_end) - float(args.e124_gate_temp_start)
+                ) * _p124
+                _bb124.e124_rt_hard = False
+                _bb124.e124_rt_budget = None
             loss, metrics = step_model(model, batch, args, device, train=True)
             if loss is None:
                 # Q18 echo 离网 (burst 未激活窗): 步进照走不参训 (独立训练器

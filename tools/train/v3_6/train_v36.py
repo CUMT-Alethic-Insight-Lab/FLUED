@@ -104,6 +104,10 @@ def build_model(args: Namespace) -> FLUEDV36:
             multislot_readout=getattr(args, "multislot_readout", False),
             multislot_readout_k=str(getattr(args, "multislot_readout_k", "4")),
             e120_readout_swap=getattr(args, "e120_readout_swap", False),
+            # E124 硬预算检索门 (任务书冻结 v1.0): 默认关 = 不创建 (条件创建
+            # 纪律); getattr 兜默认, 老 resolved_config 无此键也安全 (关态)
+            e124_budget_gate=getattr(args, "e124_budget_gate", False),
+            e124_alpha_init=float(getattr(args, "e124_alpha_init", 2.0)),
             decoder_hidden=args.decoder_hidden,
             decoder_layers=args.decoder_layers,
             max_chunks=args.max_chunks,

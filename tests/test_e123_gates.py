@@ -191,23 +191,50 @@ def test_e123_window_plan_modes(_e123_state):
     base = dict(e123_window_id=0, e123_lambda_ramp=1000, e123_mode="combined")
     # K_max=1 档（step 500）：k=2 对被滤除，遮蔽只含 k=1 块
     args = _NS(**base, e123_step=500)
-    plan, mask, inject = s1m._e123_window_plan(None, clean, args, torch.device("cpu"))
+    plan, mask, inject, cuts = s1m._e123_window_plan(None, clean, args, torch.device("cpu"))
     assert plan["kmax"] == 1 and len(plan["kept"]) == 1 and len(plan["pairs"]) == 2
     assert mask is not None and mask.shape == (1, 1, 1, 512)
     assert mask[0, 0, 0, :64].all() and not mask[0, 0, 0, 64:].any()
     assert len(inject[0]) == 1 and inject[0][0]["lam"] == 0.5
     # K_max=2 档：两对都纳入
     args = _NS(**base, e123_step=2500)
-    plan, mask, inject = s1m._e123_window_plan(None, clean, args, torch.device("cpu"))
+    plan, mask, inject, cuts = s1m._e123_window_plan(None, clean, args, torch.device("cpu"))
     assert len(plan["kept"]) == 2 and mask[0, 0, 0, 128:192].all()
     # control 列：无遮蔽无注入，plan 照出（仪表用）
     args = _NS(**{**base, "e123_mode": "control"}, e123_step=2500)
-    plan, mask, inject = s1m._e123_window_plan(None, clean, args, torch.device("cpu"))
+    plan, mask, inject, cuts = s1m._e123_window_plan(None, clean, args, torch.device("cpu"))
     assert mask is None and inject is None and len(plan["pairs"]) == 2
     # 无记录窗：零遮蔽零注入
     args = _NS(**{**base, "e123_step": 2500, "e123_window_id": 1})
-    plan, mask, inject = s1m._e123_window_plan(None, clean, args, torch.device("cpu"))
+    plan, mask, inject, cuts = s1m._e123_window_plan(None, clean, args, torch.device("cpu"))
     assert mask is None and inject is None and plan["pairs"] == []
+    assert cuts is None  # cuts_pin 默认关 = 旧路径逐位不变（条件创建纪律）
+
+
+def test_e124_cuts_pin_window_plan(_e123_state):
+    """E124 切点钉死训练侧消费（--e123-cuts-pin）：hard_cut 键 → cuts_override
+    契约的 (1, T) bool（pad-right False 到 T）；缺键/长度不符一律响亮。"""
+    hc = ([1] + [0] * 63) * 2  # 128 字节窗的两切点
+    entry = {**_log_entry(0, [_pair(0, 0, 64, 1, [64, 65])]), "hard_cut": hc}
+    s1m._E123_LOG = {0: entry, 1: _log_entry(1, [])}
+    s1m._E123_KMAX_SCHED = s1m._e123_parse_kmax("1:0,2:2000")
+    clean = torch.ones(1, 140, dtype=torch.long)  # 非 PAD 128 字节 + 尾 PAD
+    clean[0, 128:] = 0
+    base = dict(e123_window_id=0, e123_lambda_ramp=1000, e123_mode="combined",
+                e123_step=500, e123_cuts_pin=True)
+    args = _NS(**base)
+    plan, mask, inject, cuts = s1m._e123_window_plan(None, clean, args, torch.device("cpu"))
+    assert cuts is not None and cuts.shape == (1, 140) and cuts.dtype == torch.bool
+    assert cuts[0, :128].long().tolist() == hc  # 切点逐位对齐
+    assert not cuts[0, 128:].any()  # PAD 区 pad-right False
+    # 缺 hard_cut 键（旧口径日志）→ 响亮
+    s1m._E123_LOG = {0: _log_entry(0, [_pair(0, 0, 64, 1, [64, 65])]), 1: _log_entry(1, [])}
+    with pytest.raises(ValueError, match="hard_cut"):
+        s1m._e123_window_plan(None, clean, args, torch.device("cpu"))
+    # 长度 ≠ 非 PAD 数 → 响亮
+    s1m._E123_LOG = {0: {**entry, "hard_cut": hc[:-1]}, 1: _log_entry(1, [])}
+    with pytest.raises(ValueError, match="hard_cut 长度"):
+        s1m._e123_window_plan(None, clean, args, torch.device("cpu"))
 
 
 def test_e123_apply_injections_math():
