@@ -7,7 +7,9 @@
   双遮蔽（槽一钉死）：字节流/位置/分段全不动——(1) 窗内注意力键侧视野抹除
   （attn_block_mask 线程，E123 遮蔽器件同码）；(2) 该 chunk 的 store 行与上游
   相邻行交换（内容错误、行存在性保留，E122 b2 纪律；donor 避开下游 c+1 防直
-  接面污染）。目标位 = 下游第一个真实 chunk（c+1）的 valid 字节；读数面分开：
+  接面污染）。（2026-09-10 勘误：「分段不动」非天然性质——锚定段界器下遮蔽
+  会翻转切点（实测漂移 95%），现由 cuts_override 钉死干净窗切点强制保证。）
+  目标位 = 下游第一个真实 chunk（c+1）的 valid 字节；读数面分开：
   logits_direct（编码器状态效应）与 logits_backbone（行替换效应），合计等权
   为主判读。口径与 E122 冻结 §4 同源：500 窗 seed42+9999 eval 流、窗级
   bootstrap 2000、逐位 NLL fp32 无 autocast、判读只在 CUDA 线、任务注入零。
@@ -79,13 +81,21 @@ def run_gate_window(model, ns, clean, byte_mask, rng, wi, n_blocks=N_BLOCKS,
     swap（只行交换——内容经状态行身份通道的依赖；伪影拆分控制）。"""
     device = clean.device
     source_a = clean.masked_fill(byte_mask.bool(), MASK_ID)
+    # E124 切点钉死（用户裁定 2026-09-10，「内容缺席、结构不动」）：「遮蔽不动
+    # 分段」的旧假设在锚定段界器基座上被证伪（遮蔽扰动 encoder 状态翻转切点，
+    # 实测漂移率 95%，outputs/_diag_e124_mask_drift_20260910.json）——改为显式
+    # 预算干净窗（A 基线口径 = 无注意力遮蔽）的切点，钉死一切 B 前向。前端冻结
+    # 时 _encode 走 no_grad（model.py:2390），零梯度和便宜。
+    _bs_a, conf_a, valid_a, _ = model._encode(source_a)
+    hard_cut_clean, _u8_a, _of_a = model._cuts(source_a, conf_a, valid_a)
 
-    def fwd(mask=None, perm=None):
+    def fwd(mask=None, perm=None, cuts=None):
         restore = None
         if perm is not None:
             restore = patch_store_rows_perm(model, perm)
         try:
-            return s1.s1_forward(model, source_a, ns, attn_block_mask=mask)
+            return s1.s1_forward(model, source_a, ns, attn_block_mask=mask,
+                                 cuts_override=cuts)
         finally:
             if restore is not None:
                 restore()
@@ -116,11 +126,16 @@ def run_gate_window(model, ns, clean, byte_mask, rng, wi, n_blocks=N_BLOCKS,
         for t in range(clean.size(1)):
             if int(ca[0, t]) == c:
                 mask_b[0, 0, 0, t] = True
-        out_b = fwd(mask=mask_b, perm=row_swap_perm(c, n_real))
+        out_b = fwd(mask=mask_b, perm=row_swap_perm(c, n_real), cuts=hard_cut_clean)
         cb, ob = out_b["chunks"].chunk_ids, out_b["chunks"].offsets
-        # 双遮蔽下分段不漂移的卫检（block_mask 不喂 segmentor，切点必不变）
-        if not bool((cb == ca).all()):
-            raise RuntimeError(f"win{wi} chunk c={c}: 双遮蔽下分段漂移（卫检失败）——仪器 bug")
+        # 钉死核验（E124）：B 前向复用干净窗切点（cuts_override），chunk 网格必须
+        # 与 A 逐位一致——不一致 = 钉死接线断了，响亮报错。旧假设「block_mask 不喂
+        # segmentor 故切点必不变」已证伪：segmentor 读的是扰动后的 encoder 状态
+        # （model.py:2395-2398），锚定段界器下切点会翻转。钉死后 B 的 n_real 与 A
+        # 恒等，行交换 perm（行域 = [0, n_real)）合法、patch/restore 语义不变。
+        if not (bool((cb == ca).all()) and bool((ob == oa).all())):
+            raise RuntimeError(f"win{wi} chunk c={c}: 切点钉死后 chunk 网格仍漂移"
+                               "——cuts_override 接线断了（仪器 bug）")
         na_d = gather_nll(out_a["logits_direct"], ca, oa, [t for t, _c in tgt], tgt_ids)
         nb_d = gather_nll(out_b["logits_direct"], cb, ob, [t for t, _c in tgt], tgt_ids)
         na_b = gather_nll(out_a["logits_backbone"], ca, oa, [t for t, _c in tgt], tgt_ids)

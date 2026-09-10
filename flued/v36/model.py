@@ -2380,8 +2380,12 @@ class FLUEDV36(nn.Module):
     def _encode(self, token_ids: torch.Tensor,
                 attn_block_mask: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """attn_block_mask（E123 遮蔽器件，条件创建）: (B, 1, 1, T) bool，True=该
-        字节对一切查询遮蔽——只抹窗内注意力键侧视野，字节流/位置/分段/valid 全
-        不动（被遮内容仍进 chunk builder→summarizer→状态通道）。None = 旧路径
+        字节对一切查询遮蔽——只抹窗内注意力键侧视野，字节流/位置/valid 不动
+        （被遮内容仍进 chunk builder→summarizer→状态通道）。勘误（2026-09-10）：
+        「分段不动」只在塌缩/饱和段界器上经验成立——锚定段界器下遮蔽扰动
+        encoder 状态使 confidence 翻转、切点漂移（实测 95%，诊断
+        outputs/_diag_e124_mask_drift_20260910.json）；需要结构恒定时由调用侧
+        以 cuts_override 钉死（train_v36_s1._slm_forward）。None = 旧路径
         逐位不变。"""
         valid = token_ids.ne(PAD_ID)
         # When the whole front end (byte lookup + encoder + segmentor) is frozen,

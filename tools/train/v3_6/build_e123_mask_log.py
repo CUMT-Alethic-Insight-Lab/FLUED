@@ -8,6 +8,17 @@
 逐窗决策日志落盘（槽五）：遮蔽块字节区间 + 依赖位绝对字节位 + 距离 + 信息量
 ——训练时零额外前向，决策按 window_id 索引。
 
+每窗 JSONL 字段（2026-09-10 起追加 hard_cut，用户裁定：切点是窗的确定函数，
+与遮蔽决策同批预计算产出，训练时零额外前向）：
+  window_id / n_real / masked_chunks / info_scores / dependency_pairs（旧五件）
+  hard_cut: list[int]（0/1，长度 = 该窗 trimmed 字节数 T）——干净窗（无注意力
+    遮蔽）经 _encode→_cuts 的预算后切点；E124 训练侧接线的消费源（读入后
+    torch.tensor(..., dtype=torch.bool).unsqueeze(0) 即合 cuts_override 的
+    (B=1, T) bool 契约），本脚本只负责落盘，训练侧消费属后续施工。
+  同窗测量语义同步：遮蔽变体前向一律 cuts_override=hard_cut（内容缺席、结构
+  不动——锚定段界器下遮蔽会翻转切点（实测漂移 95%），不钉则 ΔNLL 被网格
+  漂移污染）。
+
 窗流复现：StreamingReconstructionDataset(seq_len=4096, samples_per_worker=50000,
 seed=42, batch=1, num_workers=0)——与 v3_7_d1_w1.json 训练流逐项同构。
 
@@ -78,14 +89,19 @@ class _ForwardSlice:
 
 @torch.no_grad()
 def measure_window(model, ns, clean, n_variants_max: int = 80) -> dict:
-    """一窗真测量（一次 batched 前向）：返回 {masked: {c: info}, dep_bytes}。
-    clean: (1, T) 训练流窗（无 mask）。"""
+    """一窗真测量（一次 batched 前向）：返回 {masked: {c: info}, dep_bytes,
+    hard_cut}。clean: (1, T) 训练流窗（无 mask）。"""
     out0 = s1.s1_forward(model, clean, ns)
     ca, oa = out0["chunks"].chunk_ids, out0["chunks"].offsets
     n_real = int(out0["chunks"].chunk_mask[0].sum())
     T = clean.size(1)
+    # E124（用户裁定 2026-09-10）：干净窗切点随决策同批落盘；同时钉死本窗一切
+    # 遮蔽变体前向（内容缺席、结构不动）。前端冻结 → _encode 在 no_grad 下
+    # 重算零梯度（model.py:2390），相对整窗变体前向成本可忽略。
+    _bs0, conf0, valid0, _ = model._encode(clean)
+    hard_cut0, _u8_0, _of0 = model._cuts(clean, conf0, valid0)
     if n_real < 3:
-        return {"masked": {}, "n_real": n_real}
+        return {"masked": {}, "n_real": n_real, "hard_cut": hard_cut0}
     if n_real > int(ns.max_chunks):
         raise RuntimeError(f"窗真实 chunk 数 {n_real} > 截断网格 {ns.max_chunks}——"
                            "截断口径不适用（负载卫检，响亮拒绝）")
@@ -109,11 +125,16 @@ def measure_window(model, ns, clean, n_variants_max: int = 80) -> dict:
                     masks[v, 0, 0, t] = True
             perms.append(row_swap_perm(c, n_real))
         out = s1.s1_forward(model, src, ns, attn_block_mask=masks,
-                            row_perm_override=perms)
-        # 卫检：子批内所有变体分段与基线逐位一致
-        cb0, ob0 = out["chunks"].chunk_ids[0], out["chunks"].offsets[0]
-        if not bool((cb0 == ca[0]).all()):
-            raise RuntimeError(f"子批 {s0}: 分段漂移——仪器 bug")
+                            row_perm_override=perms,
+                            cuts_override=hard_cut0.expand(B, -1))
+        # 钉死核验（E124）：变体前向已复用干净窗切点，子批内所有行（基线行 +
+        # 遮蔽变体行）的网格必须与干净基线逐位一致——不一致 = 钉死接线断了，
+        # 响亮报错。（原卫检只查子批基线行 [0]，变体行漂移漏抓；口径随钉死
+        # 一并修正为全行核验。）
+        if not (bool((out["chunks"].chunk_ids == ca).all())
+                and bool((out["chunks"].offsets == oa).all())):
+            raise RuntimeError(f"子批 {s0}: 切点钉死后网格仍漂移——"
+                               "cuts_override 接线断了（仪器 bug）")
         for i, c in enumerate(sub):
             outs[1 + s0 + i] = _ForwardSlice(out, i + 1)
 
@@ -147,7 +168,8 @@ def measure_window(model, ns, clean, n_variants_max: int = 80) -> dict:
                               if int(ca[0, t]) == c + best_d
                               and 0 <= int(oa[0, t]) < int(ns.max_span)],
             }
-    return {"masked": masked, "dep_bytes": dep_bytes, "n_real": n_real}
+    return {"masked": masked, "dep_bytes": dep_bytes, "n_real": n_real,
+            "hard_cut": hard_cut0}
 
 
 def main() -> None:
@@ -211,6 +233,9 @@ def main() -> None:
                 "masked_chunks": sorted(sel),
                 "info_scores": {str(c): sel[c] for c in sorted(sel)},
                 "dependency_pairs": deps,
+                # E124 落盘字段（2026-09-10）：干净窗预算后切点，0/1 列表、
+                # 长度 = 该窗 trimmed 字节数 T；训练侧 cuts_override 消费源。
+                "hard_cut": [int(x) for x in rec["hard_cut"][0].tolist()],
             }, ensure_ascii=False) + "\n")
             n_sel += len(sel)
             wi += 1

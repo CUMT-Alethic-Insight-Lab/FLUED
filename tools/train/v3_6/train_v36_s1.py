@@ -2566,7 +2566,7 @@ def _completion_target_grids(
     return targets, slot_mask, masked_slot, torch.zeros((), device=clean.device)
 
 
-def s1_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None, retrieval_metas=None, burst_metas_q15=None, store_block_override=None, need_attn: bool = False, train: bool = False, attn_block_mask: torch.Tensor | None = None, row_perm_override: list | None = None, e123_inject: list | None = None) -> dict:
+def s1_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None, retrieval_metas=None, burst_metas_q15=None, store_block_override=None, need_attn: bool = False, train: bool = False, attn_block_mask: torch.Tensor | None = None, row_perm_override: list | None = None, e123_inject: list | None = None, cuts_override: torch.Tensor | None = None) -> dict:
     codec_final = getattr(args, "codec_final_state", False)
     if getattr(model.config, "backbone_mode", "") == "slm":
         # v3.7 (consensus §1-2): dedicated branch. codec_final / paged / draft
@@ -2584,11 +2584,12 @@ def s1_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None, re
             burst_metas_q15=burst_metas_q15, store_block_override=store_block_override,
             need_attn=need_attn, train=train, attn_block_mask=attn_block_mask,
             row_perm_override=row_perm_override, e123_inject=e123_inject,
+            cuts_override=cuts_override,
         )
-    if retrieval_metas is not None or burst_metas_q15 is not None or store_block_override is not None or e123_inject is not None:
+    if retrieval_metas is not None or burst_metas_q15 is not None or store_block_override is not None or e123_inject is not None or cuts_override is not None:
         raise ValueError(
-            "retrieval/burst store_block threading and e123 injection require backbone_mode='slm' (v3.7); "
-            "legacy xattn/paged/draft/attn paths are N/A"
+            "retrieval/burst store_block threading, e123 injection and cuts_override (E124 切点钉死) "
+            "require backbone_mode='slm' (v3.7); legacy xattn/paged/draft/attn paths are N/A"
         )
     byte_states, confidence, valid, _ = model._encode(source)
     hard_cut, utf8_cont, cut_overflow = model._cuts(source, confidence, valid)
@@ -2810,7 +2811,7 @@ def s1_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None, re
     }
 
 
-def _slm_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None, retrieval_metas=None, burst_metas_q15=None, store_block_override=None, need_attn: bool = False, train: bool = False, attn_block_mask: torch.Tensor | None = None, row_perm_override: list | None = None, e123_inject: list | None = None) -> dict:
+def _slm_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None, retrieval_metas=None, burst_metas_q15=None, store_block_override=None, need_attn: bool = False, train: bool = False, attn_block_mask: torch.Tensor | None = None, row_perm_override: list | None = None, e123_inject: list | None = None, cuts_override: torch.Tensor | None = None) -> dict:
     """v3.7 slm branch (docs/versions/v3.7/FLUED_V3_7_ARCHITECTURE_CONSENSUS_20260817_CN.md).
 
     Codec full-coverage law (consensus §2): any content task's loss covers the
@@ -2838,6 +2839,21 @@ def _slm_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None, 
     """
     byte_states, confidence, valid, _ = model._encode(source, attn_block_mask=attn_block_mask)
     hard_cut, utf8_cont, cut_overflow = model._cuts(source, confidence, valid)
+    if cuts_override is not None:
+        # E124 切点钉死（用户裁定 2026-09-10：内容缺席、结构不动）：遮蔽前向复用
+        # 干净窗预算的切点——chunk 网格（身份/数量/坐标）锁定，byte_states/
+        # confidence 仍随遮蔽响应。现算 _cuts 后整体替换 hard_cut（utf8_cont/
+        # cut_overflow 只依赖字节流，遮蔽不变，保持现算）；None（默认）= 旧路径
+        # 逐位不变（条件创建纪律）。shape/dtype/device 不符响亮报错。
+        if cuts_override.shape != source.shape or cuts_override.dtype != torch.bool \
+                or cuts_override.device != source.device:
+            raise ValueError(
+                f"cuts_override 须为与 source 同形的 (B, T) bool 同 device 张量，实得 "
+                f"shape={tuple(cuts_override.shape)} dtype={cuts_override.dtype} "
+                f"device={cuts_override.device}（source shape={tuple(source.shape)} "
+                f"device={source.device}）"
+            )
+        hard_cut = cuts_override
     chunks = model.chunk_builder(byte_states, valid, hard_cut, confidence)
     chunks = model.bridge(chunks, byte_states, confidence, valid, utf8_cont)
     k_rows, v_rows, state_norm, memory, index, k_store, v_store = model._slm_store_rows(chunks, with_views=True)
