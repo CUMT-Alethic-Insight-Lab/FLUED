@@ -28,11 +28,11 @@
 
 ## §D 卡A 150M 链（cron :31）——监控相位（09-11 23:59 换岗）
 
-状态：冒烟 500 绿（12.365→8.631 零 NaN）；seed42 已收官（20000/20000，loss 4.728，direct_acc 0.3517，零 NaN，02:31）；**seed1 已点火（pid 19872，~02:35，ETA ~04:55）**。seed2 配置 _s2.json 备妥待 seed1 收官接力。smoke 目录 /root/autodl-tmp/checkpoints/_smoke_scale3x_500 留档不删。
+状态：seed42 收官（dacc 0.3517）；seed1 收官（20000 步，loss 5.04，dacc 0.3367，零 NaN，~04:57）；**seed2 已点火（pid 27271，~05:33，ETA ~07:55）**。三 seed 收官后链完。
 
 每轮：
-1. ssh -p 47807：`tail -1 /root/autodl-tmp/checkpoints/v37ks_a_im_v373_scale3x_20k_ctx4096_20260911_s1/train_log.jsonl`（nan_skips=0 且 loss 降）+ `ps -p 19872`。健在→简报一句。
-2. seed1 收官（进程退+_s1/summary.json 在）→ 同形态点火 seed2：`--config outputs/_scale3x_20260911/v3_7_scale_3x_remote_s2.json`，log /root/autodl-tmp/scale3x_seed2.log，新 pid 记进本节。
+1. ssh -p 47807：`tail -1 /root/autodl-tmp/checkpoints/v37ks_a_im_v373_scale3x_20k_ctx4096_20260911_s2/train_log.jsonl`（nan_skips=0 且 loss 降）+ `ps -p 27271`。健在→简报一句。
+2. seed2 收官（进程退+_s2/summary.json 在）→ 三 seed 齐，读数原样报用户（判词留白），本链完。
 3. 异常：NaN/loss 爆炸（predict_loss 上千=4x@2e-4 前科形态）/进程死且步数<20000 → 停下报用户，不硬修。
 4. 三 seed 全收官→读数原样报用户（codec/direct_acc/predict_cos 七碑），判词留白。
 
