@@ -11,10 +11,12 @@ bypass 走 legacy SDPA 路径 = 门关逐位一致（条件创建纪律 + 冒烟
 
 Covers: (1) 同 seed 关/开两模型 state_dict 仅差 backbone.e124_alpha_raw，且
 退火起点（progress=0 全量预算）前向逐位一致；(2) 硬模式（rt_hard=True,
-rt_budget=2）last_block1_attn 逐查询未命中行恰 0.0、命中数 = min(k, 候选数)、
-命中集 ⊆ 因果候选集、last_e124_k 记录；(3) 软模式（rt_hard=False）backward
-梯度通路：backbone.q_proj / backbone.align_k / summarizer.index_ffn /
-e124_alpha_raw 均非零有限；(4) _e124_budget 退火曲线 p=0/0.5/1 与
+rt_budget=2）命中集寄存 last_e124_hit、top-k 构造命中数恰 = min(k, 候选数)、
+非命中恰零（非零 ⊆ 命中集，条款①否决项）、命中集 ⊆ 因果候选集、α-entmax
+命中集内稀疏化为设计行为（非零数 ≤ 命中数）、last_e124_k 记录；(3) 软模式
+（rt_hard=False）backward 梯度通路：backbone.q_proj / backbone.align_k /
+summarizer.index_ffn / e124_alpha_raw 均非零有限，且软门无离散命中集
+（last_e124_hit is None）；(4) _e124_budget 退火曲线 p=0/0.5/1 与
 rt_budget 覆写/上下限钳制；(5) 非 a 格（v_row_source="state"）构造期响亮报错。
 
 夹具：tests.test_v37_slm.tiny_config（默认即 slm a 格 index/memory），
@@ -89,18 +91,25 @@ def test_hard_gate_exact_zeros_and_hit_count():
         bb(k, v, cm, pos, need_attn=True)
     attn = bb.last_block1_attn
     assert attn is not None and attn.shape == (2, bb.nhead, n, n)
+    hit = bb.last_e124_hit
+    assert hit is not None and hit.shape == (2, bb.nhead, n, n)
     causal = ~torch.triu(torch.ones(n, n, dtype=torch.bool), diagonal=1)
     for i in range(n):  # 逐查询：候选 = 0..i（因果 ∩ 真实）
-        row = attn[0, :, i, :]  # (H, n)；per-head top-k —— 预算 head 共享、
-        nz = row > 0            # 命中集随各 head 分值独立（设计语义，勿断言跨头一致）
-        assert (nz.sum(dim=-1) == min(2, i + 1)).all()  # 命中数 = min(k, 候选数)
-        assert bool((nz <= causal[i].unsqueeze(0)).all())  # 命中集 ⊆ 因果候选集
-        assert torch.allclose(row.sum(dim=-1), torch.ones(bb.nhead), atol=1e-6)
+        h = hit[0, :, i, :]        # (H, n)；per-head top-k —— 预算 head 共享、
+        nz = attn[0, :, i, :] > 0  # 命中集随各 head 分值独立（设计语义，勿断言跨头一致）
+        assert (h.sum(dim=-1) == min(2, i + 1)).all()  # top-k 构造：命中数恰 = min(k, 候选数)
+        assert bool((nz <= h).all())  # 结构性不可见：非命中恰零（条款①否决项）
+        assert bool((h <= causal[i].unsqueeze(0)).all())  # 命中集 ⊆ 因果候选集
+        # α-entmax 可零化命中集内低分行（设计行为，2026-09-11 冒烟复核换锚）：
+        # 非零数 ≤ 命中数，不断言相等（「非零数恰=k」是 softmax 语义错误期望）
+        assert bool((nz.sum(dim=-1) <= h.sum(dim=-1)).all())
+        assert torch.allclose(attn[0, :, i, :].sum(dim=-1), torch.ones(bb.nhead), atol=1e-6)
     assert float(bb.last_e124_k) == 2.0
     # need_attn=False 时寄存槽保持 None（关态纪律）
     with torch.no_grad():
         bb(k, v, cm, pos)
     assert bb.last_block1_attn is None
+    assert bb.last_e124_hit is None
 
 
 # --- 3. 软模式：梯度通路审计（q_proj / align_k / index_ffn / α） ---------------------
@@ -118,6 +127,7 @@ def test_soft_gate_gradient_paths():
     ids = torch.randint(1, 257, (1, 96), generator=g)
     out = s1._slm_forward(model, ids, None)
     assert float(bb.last_e124_k) == 2.0  # 门确实激活（预算 < 真实块数）
+    assert bb.last_e124_hit is None  # 软门无离散命中集（审计口纪律）
     loss = out["logits_backbone"].square().mean()
     loss.backward()
     targets = {

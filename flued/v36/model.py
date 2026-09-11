@@ -1734,6 +1734,8 @@ class SLMBackbone(nn.Module):
         self.e124_rt_temp: float = 1.0  # 软 top-k 温度 (时间表件, 不可学)
         self.e124_rt_hard: bool = True  # True=硬 top-k (部署/eval/冒烟), False=软门 (训练)
         self.last_e124_k = None  # 本前向逐查询预算均值 (metrics 读出槽; None=门关/未前向)
+        self.last_e124_hit = None  # 硬门命中集 (B,H,n,n) bool (冒烟条款①a 直接审计口:
+        # 非命中恰零 = 非零 ⊆ hit 可逐位验; 软门模式 None——软门无离散命中集)
 
     def e124_alpha_value(self) -> torch.Tensor:
         """可学 α 当前值 (任务书副仪表 A: α = 1+softplus(raw), 恒 > 1)。"""
@@ -1930,8 +1932,13 @@ class SLMBackbone(nn.Module):
             )
             hit = (rank < k_q.unsqueeze(-1)) & cand
             z = scores.masked_fill(~hit, float("-inf"))
+            # 审计口: 硬门命中集寄存 (冒烟条款①a 直接验 非零 ⊆ hit;
+            # α-entmax 稀疏化命中集内低分行是设计行为, 故「非零数 == k」
+            # 是 softmax 语义的错误期望——正确形式 = 非命中恰零 + 命中数恰 k)
+            self.last_e124_hit = hit if need_attn else None
         else:
             # 软 top-k: 温度时间表的 logsigmoid 门控打分 (可微路径)
+            self.last_e124_hit = None  # 软门无离散命中集
             tau = max(float(self.e124_rt_temp), 1e-6)
             gate_log = F.logsigmoid((scores - kth.unsqueeze(-1)) / tau)
             z = scores + torch.where(cand, gate_log, torch.zeros_like(gate_log))

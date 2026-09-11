@@ -106,19 +106,28 @@ def main() -> None:
         cm = out["chunks"].chunk_mask[0]  # (C,) 真实块
         n_real = int(cm.sum())
         C = int(cm.size(0))
-        causal = ~torch.triu(torch.ones(C, C, dtype=torch.bool, device=device), diagonal=1)
-        cand = causal.unsqueeze(0) & cm.view(1, 1, -1)  # (1, C, C)
+        hit = bb.last_e124_hit
+        assert hit is not None, "硬门 + need_attn 未寄存 last_e124_hit（命中集审计口）"
+        # 条款①a 换锚（2026-09-11 冒烟复核）：「非零数 == min(k,候选)」是 softmax
+        # 语义的错误期望——α-entmax 的设计行为就是给命中集内低分行精确零（任务书
+        # §2「低分行拿精确零」）。条款①的正确可验形式 = ①结构性不可见（非零 ⊆
+        # 命中集，非命中恰零）+ ②top-k 构造（命中数恰 = min(k,候选)）; 命中集内
+        # 被 α 稀疏化的行数只报不判（副仪表 A 同族机制读数）。
         bad_rows = 0
+        sparse_rows = 0
         for i in range(n_real):  # 逐真实查询行（padded 行走对角护栏, 不在此条款）
-            nz = attn[0, :, i, :] > 0  # (H, C) per-head top-k: 命中集随头独立
-            cnt = nz.sum(dim=-1)  # (H,)
+            nz = attn[0, :, i, :] > 0  # (H, C)
+            h = hit[0, :, i, :]  # (H, C) 命中集（per-head top-k, 随头独立）
             expect = min(K_PROBE, i + 1)
-            if not bool((cnt == expect).all()):
+            if not bool((nz <= h).all()):  # 非命中恰零（否决项）
                 bad_rows += 1
-            if not bool((nz <= cand[0, i].unsqueeze(0)).all()):
+            if not bool((h.sum(dim=-1) == expect).all()):  # top-k 构造（否决项）
                 bad_rows += 1
+            if bool((nz.sum(dim=-1) < expect).any()):  # α 稀疏化（注记）
+                sparse_rows += 1
         c1a_pass = bad_rows == 0
         print(f"[条款①a 硬门恰零] pass={c1a_pass} n_real={n_real} 坏行={bad_rows} "
+              f"α稀疏化行(注记不判)={sparse_rows} "
               f"k={K_PROBE} last_e124_k={float(bb.last_e124_k)}", flush=True)
 
         # --- 条款①b：退火起点恒等（全量预算 bypass == 临时关gate legacy 路径） ---
