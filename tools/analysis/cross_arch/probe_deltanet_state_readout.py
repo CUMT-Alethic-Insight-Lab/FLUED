@@ -33,7 +33,8 @@
   前 s+n ≤ b，否则该边界远程目标作废并诚实计数）。
 - ridge 探针（线性核、对偶解，λ 可配）：S_t flatten（16 头×128×128 = 262144
   维，bf16 存、fp32 算）→ **训练窗**统计逐维标准化 → 预测目标 token 的输入
-  嵌入（fp32）。
+  嵌入（fp32）。多 λ 敏感性（--extra-ridge-lambdas）共享同一前向/状态缓存/
+  Gram/测试核，只重解对偶系——主口径 = --ridge-lambda。
 - 对照 = 打乱配对：同窗内置换目标（目标边缘分布不变、状态→目标配对破坏）重训
   同款探针；real/ctrl 两探针在同一测试配对上评估，差 = uplift（训练期配对信息
   的贡献，不是评估端技巧）。附加特异性读数：real 探针 × 测试端置换配对。
@@ -201,7 +202,7 @@ def standardize_fit(x: torch.Tensor, eps: float = 1e-5):
 
 def ridge_fit(x: torch.Tensor, y: torch.Tensor, lam: float) -> dict:
     """线性核对偶 ridge：ŷ = k(x)ᵀα + ȳ，K = XXᵀ/D + λI。x 已标准化、
-    y 内部中心化。"""
+    y 内部中心化。（单测/单 λ 便捷路径；生产多 λ 走 ridge_gram + ridge_solve）"""
     y_mean = y.mean(0)
     d = x.shape[1]
     gram = x @ x.T / d
@@ -209,6 +210,21 @@ def ridge_fit(x: torch.Tensor, y: torch.Tensor, lam: float) -> dict:
         gram + lam * torch.eye(x.shape[0], dtype=x.dtype, device=x.device),
         y - y_mean)
     return {"alpha": alpha, "x_train": x, "d": d, "y_mean": y_mean}
+
+
+def ridge_gram(x: torch.Tensor) -> torch.Tensor:
+    """对偶 Gram 矩阵 K = XXᵀ/D（标准化后的训练特征；λ 无关，一次算全复用）。"""
+    return x @ x.T / x.shape[1]
+
+
+def ridge_solve(gram: torch.Tensor, y: torch.Tensor, lam: float) -> dict:
+    """给定预计算 Gram 的对偶 ridge 求解（y 内部中心化）。"""
+    y_mean = y.mean(0)
+    alpha = torch.linalg.solve(
+        gram + lam * torch.eye(gram.shape[0], dtype=gram.dtype,
+                               device=gram.device),
+        y - y_mean)
+    return {"alpha": alpha, "y_mean": y_mean}
 
 
 def ridge_predict(probe: dict, x: torch.Tensor) -> torch.Tensor:
@@ -261,81 +277,108 @@ def probe_one(x_by_win: dict[int, torch.Tensor],
               train_win: list[int], test_win: list[int],
               emb: torch.Tensor, lam: float, ctrl_seed: int, p_seed: int,
               n_perm: int, near_cut: int, remote_cut: int,
-              by_distance: bool) -> dict:
+              by_distance: bool, extra_lambdas: tuple = ()) -> dict:
     """单探针全流程：real/ctrl（打乱配对重训）双探针 → 同一测试配对上
-    cos/acc → uplift + 窗级符号翻转 p + 距离桶分层。"""
+    cos/acc → uplift + 窗级符号翻转 p + 距离桶分层。
+
+    λ 敏感性：Gram 与测试核矩阵 k(x,x_train) 均 λ 无关，一次算全后每个
+    λ 只多做两次 N×N 解与两次核×α GEMM（前向一次、多 λ 复用）。主口径
+    = lam（顶层字段），extra_lambdas 只进 lambda_sensitivity 块；ctrl
+    配对与置换符号序列跨 λ 固定（同 ctrl_seed/p_seed，λ 间可比）。"""
+    d = next(iter(x_by_win.values())).shape[1]
     xtr = torch.cat([x_by_win[w] for w in train_win], 0)
     tids_tr = [t for w in train_win for t in tids_by_win[w]]
     mean, std = standardize_fit(xtr)
-    xtr_s = (xtr - mean) / std
+    xtr.sub_(mean).div_(std)  # 就地标准化（cat 副本，安全）
+    gram = ridge_gram(xtr)
     ytr = emb[torch.tensor(tids_tr, device=emb.device)]
     ctrl_rng = random.Random(ctrl_seed)
     ids_tr_ctrl = _permute_ids_within_windows(
         [tids_by_win[w] for w in train_win], ctrl_rng)
     tids_tr_ctrl = [t for ids in ids_tr_ctrl for t in ids]
-    probe_r = ridge_fit(xtr_s, ytr, lam)
-    probe_c = ridge_fit(xtr_s, emb[torch.tensor(tids_tr_ctrl, device=emb.device)], lam)
+    ytr_ctrl = emb[torch.tensor(tids_tr_ctrl, device=emb.device)]
+
+    # 测试核矩阵（λ 无关）一次算全；行切分与测试窗对齐
+    k_test, win_slices = [], []
+    c0 = 0
+    for w in test_win:
+        xg = (x_by_win[w] - mean) / std
+        k_test.append(xg @ xtr.T / d)
+        win_slices.append((w, c0, c0 + xg.shape[0]))
+        c0 += xg.shape[0]
+    k_test = torch.cat(k_test, 0) if k_test else None
+    del xtr
+    shuffled_by_win = {w: _permute_ids_within_windows([tids_by_win[w]],
+                                                      ctrl_rng)[0]
+                       for w in test_win}
 
     test_tids = [t for w in test_win for t in tids_by_win[w]]
     cand_ids = sorted(set(test_tids))
-    cand_emb = emb[torch.tensor(cand_ids, device=emb.device)]
+    cand_emb = emb[torch.tensor(cand_ids, device=emb.device)] if cand_ids else None
     row_of = {tid: i for i, tid in enumerate(cand_ids)}
 
-    per_win, per_sample = [], []
-    shuffled_cos = []
-    for w in test_win:
-        xg = (x_by_win[w] - mean) / std
-        tids = tids_by_win[w]
-        yg = emb[torch.tensor(tids, device=emb.device)]
-        rows = torch.tensor([row_of[t] for t in tids], device=emb.device)
-        pr = ridge_predict(probe_r, xg)
-        pc = ridge_predict(probe_c, xg)
-        cos_r, cos_c = cos_rows(pr, yg), cos_rows(pc, yg)
-        acc_r = nn_top1_correct(pr, cand_emb, rows).float()
-        acc_c = nn_top1_correct(pc, cand_emb, rows).float()
-        # 特异性：real 探针 × 测试端窗内置换配对
-        ids_shuf = _permute_ids_within_windows([tids], ctrl_rng)[0]
-        shuffled_cos.extend(cos_rows(pr, emb[torch.tensor(
-            ids_shuf, device=emb.device)]).tolist())
-        per_win.append({
-            "window": w, "n": len(tids),
-            "cos_real": cos_r.mean().item(), "cos_ctrl": cos_c.mean().item(),
-            "acc_real": acc_r.mean().item(), "acc_ctrl": acc_c.mean().item(),
-        })
-        dists = dist_by_win[w]
-        per_sample.extend({"window": w, "dist": int(d),
-                           "cos_real": float(a), "cos_ctrl": float(b),
-                           "acc_real": float(c), "acc_ctrl": float(e)}
-                          for a, b, c, e, d in zip(
-                              cos_r.tolist(), cos_c.tolist(), acc_r.tolist(),
-                              acc_c.tolist(), dists))
+    def _run_lambda(lam_v: float) -> dict:
+        pr_p = ridge_solve(gram, ytr, lam_v)
+        pc_p = ridge_solve(gram, ytr_ctrl, lam_v)
+        pred_r = k_test @ pr_p["alpha"] + pr_p["y_mean"] if k_test is not None else None
+        pred_c = k_test @ pc_p["alpha"] + pc_p["y_mean"] if k_test is not None else None
+        per_win, per_sample, shuffled_cos = [], [], []
+        for w, i0, i1 in win_slices:
+            tids = tids_by_win[w]
+            yg = emb[torch.tensor(tids, device=emb.device)]
+            rows = torch.tensor([row_of[t] for t in tids], device=emb.device)
+            pr, pc = pred_r[i0:i1], pred_c[i0:i1]
+            cos_r, cos_c = cos_rows(pr, yg), cos_rows(pc, yg)
+            acc_r = nn_top1_correct(pr, cand_emb, rows).float()
+            acc_c = nn_top1_correct(pc, cand_emb, rows).float()
+            # 特异性：real 探针 × 测试端窗内置换配对
+            shuffled_cos.extend(cos_rows(pr, emb[torch.tensor(
+                shuffled_by_win[w], device=emb.device)]).tolist())
+            per_win.append({
+                "window": w, "n": len(tids),
+                "cos_real": cos_r.mean().item(), "cos_ctrl": cos_c.mean().item(),
+                "acc_real": acc_r.mean().item(), "acc_ctrl": acc_c.mean().item(),
+            })
+            per_sample.extend({"window": w, "dist": int(dd),
+                               "cos_real": float(a2), "cos_ctrl": float(b2),
+                               "acc_real": float(c2), "acc_ctrl": float(e2)}
+                              for a2, b2, c2, e2, dd in zip(
+                                  cos_r.tolist(), cos_c.tolist(),
+                                  acc_r.tolist(), acc_c.tolist(),
+                                  dist_by_win[w]))
 
-    def _agg(key_r, key_c):
-        real = [pw[key_r] for pw in per_win]
-        ctrl = [pw[key_c] for pw in per_win]
-        sf = signflip_p([r - c for r, c in zip(real, ctrl)], n_perm, p_seed)
-        ns = sum(pw["n"] for pw in per_win)
-        mr = sum(r * pw["n"] for r, pw in zip(real, per_win)) / ns if ns else None
-        mc = sum(c * pw["n"] for c, pw in zip(ctrl, per_win)) / ns if ns else None
-        return mr, mc, sf
+        def _agg(key_r, key_c):
+            real = [pw[key_r] for pw in per_win]
+            ctrl = [pw[key_c] for pw in per_win]
+            sf = signflip_p([r - c for r, c in zip(real, ctrl)], n_perm, p_seed)
+            ns = sum(pw["n"] for pw in per_win)
+            mr = sum(r * pw["n"] for r, pw in zip(real, per_win)) / ns if ns else None
+            mc = sum(c * pw["n"] for c, pw in zip(ctrl, per_win)) / ns if ns else None
+            return mr, mc, sf
 
-    cos_r, cos_c, cos_sf = _agg("cos_real", "cos_ctrl")
-    acc_r, acc_c, acc_sf = _agg("acc_real", "acc_ctrl")
+        cos_r, cos_c, cos_sf = _agg("cos_real", "cos_ctrl")
+        acc_r, acc_c, acc_sf = _agg("acc_real", "acc_ctrl")
+        return {"cos": {"real": cos_r, "ctrl": cos_c,
+                        "uplift": (cos_r - cos_c) if (cos_r is not None and cos_c is not None) else None,
+                        "perm": cos_sf},
+                "acc": {"real": acc_r, "ctrl": acc_c,
+                        "uplift": (acc_r - acc_c) if (acc_r is not None and acc_c is not None) else None,
+                        "perm": acc_sf},
+                "per_win": per_win, "per_sample": per_sample,
+                "shuffled_cos": shuffled_cos}
+
+    primary = _run_lambda(lam)
     res = {
-        "train_n": int(xtr.shape[0]), "test_n": len(test_tids),
+        "train_n": int(gram.shape[0]), "test_n": len(test_tids),
         "n_candidates": len(cand_ids), "chance": (1.0 / len(cand_ids)) if cand_ids else None,
-        "cos": {"real": cos_r, "ctrl": cos_c,
-                "uplift": (cos_r - cos_c) if (cos_r is not None and cos_c is not None) else None,
-                "perm": cos_sf},
-        "acc": {"real": acc_r, "ctrl": acc_c,
-                "uplift": (acc_r - acc_c) if (acc_r is not None and acc_c is not None) else None,
-                "perm": acc_sf},
-        "cos_real_shuffled_test": (sum(shuffled_cos) / len(shuffled_cos)) if shuffled_cos else None,
-        "per_window": per_win,
+        "cos": primary["cos"], "acc": primary["acc"],
+        "cos_real_shuffled_test": (sum(primary["shuffled_cos"]) / len(primary["shuffled_cos"]))
+        if primary["shuffled_cos"] else None,
+        "per_window": primary["per_win"],
     }
     if by_distance:
         buckets: dict[str, list[dict]] = {}
-        for ps in per_sample:
+        for ps in primary["per_sample"]:
             buckets.setdefault(distance_bucket(ps["dist"], near_cut, remote_cut),
                                []).append(ps)
         res["by_distance"] = {
@@ -346,6 +389,11 @@ def probe_one(x_by_win: dict[int, torch.Tensor],
                 "acc_ctrl": sum(r["acc_ctrl"] for r in rows) / len(rows)}
             for b, rows in sorted(buckets.items())
         }
+    sens = {str(lam): {"cos": primary["cos"], "acc": primary["acc"]}}
+    for lam_v in extra_lambdas:
+        blk = _run_lambda(lam_v)
+        sens[str(lam_v)] = {"cos": blk["cos"], "acc": blk["acc"]}
+    res["lambda_sensitivity"] = sens
     return res
 
 
@@ -355,7 +403,7 @@ def run_layer_probes(x_by_win: dict[int, torch.Tensor],
                      emb: torch.Tensor, lam: float, seed: int, layer: int,
                      near_lags=(1, 2, 3), n_remote_js: int = 3,
                      near_cut: int = 32, remote_cut: int = 192,
-                     n_perm: int = 4096) -> dict:
+                     n_perm: int = 4096, extra_lambdas: tuple = ()) -> dict:
     """一层全部探针（近程 lag × 远程 j）。x_by_win: {w: [n_w, D] fp32}。"""
     out: dict[str, dict] = {}
     for probe_i, lag in enumerate(near_lags):
@@ -367,11 +415,20 @@ def run_layer_probes(x_by_win: dict[int, torch.Tensor],
             xw, tids, dists, train_win, test_win, emb, lam,
             ctrl_seed=seed + 500 * layer + probe_i,
             p_seed=seed + 1000 * layer + probe_i, n_perm=n_perm,
-            near_cut=near_cut, remote_cut=remote_cut, by_distance=False)
+            near_cut=near_cut, remote_cut=remote_cut, by_distance=False,
+            extra_lambdas=extra_lambdas)
     valid = {w: x_by_win[w] for w in x_by_win
              if any(s["remote"] for s in samples_by_win[w])}
     for j in range(n_remote_js):
-        xw = {w: valid[w] for w in valid}
+        xw, tids, dists = {}, {}, {}
+        for w in valid:
+            # 行对齐：x 行必须与 remote 样本子集逐行对应（部分窗：同一窗内
+            # 既有合法远程边界、又有源越界作废边界——500 窗实跑暴露的错位）
+            keep = [i for i, s in enumerate(samples_by_win[w]) if s["remote"]]
+            xw[w] = x_by_win[w][keep]
+            ss = [s for s in samples_by_win[w] if s["remote"]]
+            tids[w] = [s["remote"][j][2] for s in ss]
+            dists[w] = [s["remote"][j][3] for s in ss]
         tr = [w for w in train_win if w in xw]
         te = [w for w in test_win if w in xw]
         if not tr or not te:
@@ -381,18 +438,14 @@ def run_layer_probes(x_by_win: dict[int, torch.Tensor],
                                    "acc": {"real": None, "ctrl": None,
                                            "uplift": None, "perm": None},
                                    "cos_real_shuffled_test": None, "per_window": [],
-                                   "by_distance": {}}
+                                   "by_distance": {}, "lambda_sensitivity": {}}
             continue
-        tids, dists = {}, {}
-        for w in valid:
-            ss = [s for s in samples_by_win[w] if s["remote"]]
-            tids[w] = [s["remote"][j][2] for s in ss]
-            dists[w] = [s["remote"][j][3] for s in ss]
         out[f"remote_j{j}"] = probe_one(
             xw, tids, dists, tr, te, emb, lam,
             ctrl_seed=seed + 500 * layer + len(near_lags) + j,
             p_seed=seed + 1000 * layer + len(near_lags) + j, n_perm=n_perm,
-            near_cut=near_cut, remote_cut=remote_cut, by_distance=True)
+            near_cut=near_cut, remote_cut=remote_cut, by_distance=True,
+            extra_lambdas=extra_lambdas)
     return out
 
 
@@ -499,7 +552,10 @@ def main() -> None:
     p.add_argument("--tail", type=int, default=3)
     p.add_argument("--chunk-size", type=int, default=64, choices=[16, 32, 64])
     p.add_argument("--near-lags", default="1,2,3")
-    p.add_argument("--ridge-lambda", type=float, default=1.0)
+    p.add_argument("--ridge-lambda", type=float, default=1.0,
+                   help="主口径 λ")
+    p.add_argument("--extra-ridge-lambdas", default="",
+                   help="逗号分隔附加 λ（敏感性分析；主口径不变，状态/核一次算全复用）")
     p.add_argument("--train-frac", type=float, default=0.5)
     p.add_argument("--near-dist", type=int, default=32)
     p.add_argument("--remote-dist", type=int, default=192)
@@ -508,6 +564,9 @@ def main() -> None:
     p.add_argument("--probe-layers", default="all",
                    help="'all' 或逗号层号（0 起）——默认全层；500 窗正式跑可子集省内存")
     p.add_argument("--max-boundaries-per-window", type=int, default=24)
+    p.add_argument("--layers-per-pass", type=int, default=0,
+                   help="分 pass 缓存层数（0=全层单 pass；大窗数下防 cgroup 内存顶穿，"
+                        "每 pass 重跑前向，选择链零随机故各 pass 样本逐字一致）")
     p.add_argument("--verify-tol-rel", type=float, default=0.05)
     p.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     p.add_argument("--out-dir",
@@ -519,6 +578,10 @@ def main() -> None:
     if args.near_dist >= args.remote_dist:
         raise SystemExit("--near-dist须小于--remote-dist")
     near_lags = tuple(int(x) for x in args.near_lags.split(",") if x.strip())
+    extra_lambdas = tuple(float(x) for x in args.extra_ridge_lambdas.split(",")
+                          if x.strip())
+    if any(lv <= 0 for lv in extra_lambdas) or args.ridge_lambda <= 0:
+        raise SystemExit("λ 必须 > 0")
 
     device = torch.device(
         "cuda" if (args.device == "auto" and torch.cuda.is_available()) or args.device == "cuda"
@@ -543,8 +606,13 @@ def main() -> None:
     print(f"[dsr] model={Path(args.model_path).name} device={device.type} "
           f"layers={n_layers} probe={probe_layers} state_dim={state_dim}", flush=True)
 
-    # 窗循环：同卷定义（与 e122 必要账逐字同构）
-    store: dict[int, list[torch.Tensor]] = {l: [] for l in probe_layers}
+    # 窗循环（同卷定义，与 e122 必要账逐字同构）。大窗数下全层状态缓存会顶穿
+    # 容器 cgroup 内存限额（本机 memory.high=106GB：500 窗 × 24 层 ≈ 106GB），
+    # 故支持分 pass：每 pass 只缓存 pass_layers 的状态、跑完该 pass 探针即释放，
+    # 前向每 pass 重跑（选择链零随机 → 各 pass 样本逐字一致，同卷不破坏）。
+    layers_per_pass = args.layers_per_pass or len(probe_layers)
+    passes = [probe_layers[i:i + layers_per_pass]
+              for i in range(0, len(probe_layers), layers_per_pass)]
     samples_by_win: dict[int, list[dict]] = {}
     win_tokens: dict[int, int] = {}
     tally = {"n_windows_attempted": 0, "n_windows_used": 0, "n_windows_empty": 0,
@@ -552,74 +620,115 @@ def main() -> None:
     totals = {"n_samples": 0, "n_remote_skipped": 0, "n_boundaries_capped": 0,
               "n_selected_tails": 0}
     max_byte_touched = 0
+    layer_results: dict[int, dict] = {}
+    split_cache: tuple[list[int], list[int]] | None = None
     capture = ChunkDeltaRuleCapture()
+    print(f"[dsr] passes={[p[0] for p in passes]} layers_per_pass={layers_per_pass}",
+          flush=True)
 
     with corpus.open("rb") as f, capture:
-        for wi in range(args.n_windows):
-            w_abs = args.start_window + wi
-            f.seek(w_abs * args.window_bytes)
-            raw = f.read(args.window_bytes)
-            if len(raw) < args.window_bytes:
-                print(f"[dsr] 语料前缀尽（窗 {w_abs}），停", flush=True)
-                break
-            max_byte_touched = max(max_byte_touched, (w_abs + 1) * args.window_bytes)
-            ids, full_len = e122.tokenize_window(
-                tok, raw.decode("utf-8", errors="replace"), args.max_tokens)
-            if full_len > args.max_tokens:
-                tally["n_windows_truncated"] += 1
-            tally["n_windows_attempted"] += 1
-            tk = len(ids)
-            if tk < max(2 * args.chunk_size, args.segment_tokens + args.ngram_len + args.tail):
-                tally["n_windows_empty"] += 1
-                continue
-            occ = e122.cross_segment_occurrences(ids, args.ngram_len,
-                                                 args.segment_tokens)
-            rare = set(occ)  # 探针要密度：全体跨段 gram，无稀有表过滤（与必要账的差异，报告口径）
-            sel, _ov = e122.select_tail_positions(occ, rare, args.ngram_len,
-                                                  args.tail, tk)
-            if not sel:
-                tally["n_windows_empty"] += 1
-                continue
-            totals["n_selected_tails"] += len(sel)
-            samples, skipped = build_window_samples(
-                ids, sel, args.ngram_len, args.chunk_size, near_lags=near_lags,
-                remote_js=tuple(range(args.ngram_len)))
-            totals["n_remote_skipped"] += skipped
-            if len(samples) > args.max_boundaries_per_window:
-                totals["n_boundaries_capped"] += len(samples) - args.max_boundaries_per_window
-                samples = samples[:args.max_boundaries_per_window]
-            if not samples:
-                tally["n_windows_empty"] += 1
-                continue
+        for pi, pass_layers in enumerate(passes):
+            store: dict[int, list[torch.Tensor]] = {l: [] for l in pass_layers}
+            pass_used = 0
+            f.seek(0)
+            for wi in range(args.n_windows):
+                w_abs = args.start_window + wi
+                f.seek(w_abs * args.window_bytes)
+                raw = f.read(args.window_bytes)
+                if len(raw) < args.window_bytes:
+                    print(f"[dsr] 语料前缀尽（窗 {w_abs}），停", flush=True)
+                    break
+                max_byte_touched = max(max_byte_touched, (w_abs + 1) * args.window_bytes)
+                ids, full_len = e122.tokenize_window(
+                    tok, raw.decode("utf-8", errors="replace"), args.max_tokens)
+                if full_len > args.max_tokens:
+                    tally["n_windows_truncated"] += 1
+                tally["n_windows_attempted"] += 1
+                tk = len(ids)
+                if tk < max(2 * args.chunk_size, args.segment_tokens + args.ngram_len + args.tail):
+                    tally["n_windows_empty"] += 1
+                    continue
+                occ = e122.cross_segment_occurrences(ids, args.ngram_len,
+                                                     args.segment_tokens)
+                rare = set(occ)  # 探针要密度：全体跨段 gram，无稀有表过滤（与必要账的差异，报告口径）
+                sel, _ov = e122.select_tail_positions(occ, rare, args.ngram_len,
+                                                      args.tail, tk)
+                if not sel:
+                    tally["n_windows_empty"] += 1
+                    continue
+                totals["n_selected_tails"] += len(sel)
+                samples, skipped = build_window_samples(
+                    ids, sel, args.ngram_len, args.chunk_size, near_lags=near_lags,
+                    remote_js=tuple(range(args.ngram_len)))
+                totals["n_remote_skipped"] += skipped
+                if len(samples) > args.max_boundaries_per_window:
+                    totals["n_boundaries_capped"] += len(samples) - args.max_boundaries_per_window
+                    samples = samples[:args.max_boundaries_per_window]
+                if not samples:
+                    tally["n_windows_empty"] += 1
+                    continue
 
-            capture.records = []
-            capture.verify_next = tally["n_windows_used"] == 0  # 首有效窗逐层对拍
-            try:
-                with torch.no_grad():
-                    model(torch.tensor([ids], dtype=torch.long, device=device))
-                states_all, verr = extract_layer_boundary_states(
-                    capture.records, args.chunk_size, args.verify_tol_rel)
-            except RuntimeError as e:
-                if "对拍失败" in str(e):
-                    raise  # 前提哨兵响亮，不静默
-                tally["n_windows_forward_fails"] += 1
-                print(f"[dsr] win {w_abs} 前向失败（跳过）：{e}", flush=True)
-                continue
-            idx = torch.tensor([s["chunk"] for s in samples], device=device)
-            for l in probe_layers:
-                rows = states_all[l][idx].reshape(len(samples), -1)
-                store[l].append(rows.to(torch.bfloat16).cpu())
-            samples_by_win[w_abs] = samples
-            win_tokens[w_abs] = tk
-            tally["n_windows_used"] += 1
-            totals["n_samples"] += len(samples)
-            print(f"[dsr] win {w_abs:5d} tk={tk} bounds={len(samples)} "
-                  f"remote_skip={skipped} verif_max="
-                  f"{max((v['rel_err'] for v in verr), default=None)} "
+                capture.records = []
+                capture.verify_next = pass_used == 0  # 每 pass 首窗逐层对拍（前提哨兵）
+                try:
+                    with torch.no_grad():
+                        model(torch.tensor([ids], dtype=torch.long, device=device))
+                    states_all, verr = extract_layer_boundary_states(
+                        capture.records, args.chunk_size, args.verify_tol_rel)
+                except RuntimeError as e:
+                    if "对拍失败" in str(e):
+                        raise  # 前提哨兵响亮，不静默
+                    tally["n_windows_forward_fails"] += 1
+                    print(f"[dsr] win {w_abs} 前向失败（跳过）：{e}", flush=True)
+                    continue
+                idx = torch.tensor([s["chunk"] for s in samples], device=device)
+                for l in pass_layers:
+                    rows = states_all[l][idx].reshape(len(samples), -1)
+                    store[l].append(rows.to(torch.bfloat16).cpu())
+                if pi == 0:
+                    samples_by_win[w_abs] = samples
+                    win_tokens[w_abs] = tk
+                pass_used += 1
+                if pi == 0:
+                    totals["n_samples"] += len(samples)
+                print(f"[dsr] p{pi} win {w_abs:5d} tk={tk} bounds={len(samples)} "
+                      f"remote_skip={skipped} verif_max="
+                      f"{max((v['rel_err'] for v in verr), default=None)} "
+                      f"({time.time() - t0:.0f}s)", flush=True)
+
+            # 本 pass 探针（pass 0 完成后定劈分，全层同劈跨 pass 复用）
+            if not samples_by_win:
+                raise SystemExit("零有效窗（选择链颗粒或语料问题），响亮拒绝")
+            if split_cache is None:
+                window_ids = sorted(samples_by_win)
+                split_cache = split_windows(window_ids, args.train_frac, args.seed)
+                print(f"[dsr] 窗劈分 train={len(split_cache[0])} "
+                      f"test={len(split_cache[1])}；探针逐层…", flush=True)
+            train_win, test_win = split_cache
+            for l in pass_layers:
+                x_by_win = {w: store[l][i].float().to(emb.device)
+                            for i, w in enumerate(sorted(samples_by_win))}
+                layer_results[l] = run_layer_probes(
+                    x_by_win, samples_by_win, train_win, test_win, emb,
+                    args.ridge_lambda, args.seed, l, near_lags=near_lags,
+                    n_remote_js=args.ngram_len, near_cut=args.near_dist,
+                    remote_cut=args.remote_dist, n_perm=args.n_perm,
+                    extra_lambdas=extra_lambdas)
+                store[l] = []  # 逐层释放
+                r = layer_results[l]
+                print(f"[dsr] layer {l:2d} "
+                      f"near1 cos {r['near_lag1']['cos']['uplift']:+.4f} "
+                      f"(p={r['near_lag1']['cos']['perm']['p'] if r['near_lag1']['cos']['perm'] else None}) "
+                      f"remote_j0 cos {r['remote_j0']['cos']['uplift']:+.4f} "
+                      f"(p={r['remote_j0']['cos']['perm']['p'] if r['remote_j0']['cos']['perm'] else None})",
+                      flush=True)
+            del store
+            if pi == 0:
+                tally["n_windows_used"] = pass_used
+                summary_tally = dict(tally)
+                summary_totals = dict(totals)
+            print(f"[dsr] pass {pi}（层 {pass_layers[0]}-{pass_layers[-1]}）完成 "
                   f"({time.time() - t0:.0f}s)", flush=True)
-
-    if not samples_by_win:
-        raise SystemExit("零有效窗（选择链颗粒或语料问题），响亮拒绝")
 
     # 同卷锚：计分窗字节前缀 SHA256（dd 顺序写语料下，读过前缀已定终）
     prefix_sha = None
@@ -634,29 +743,6 @@ def main() -> None:
                 h.update(chunk)
                 remain -= len(chunk)
         prefix_sha = h.hexdigest()
-
-    # 窗劈分（全层同劈）+ 探针逐层
-    window_ids = sorted(samples_by_win)
-    train_win, test_win = split_windows(window_ids, args.train_frac, args.seed)
-    print(f"[dsr] 窗劈分 train={len(train_win)} test={len(test_win)}；探针逐层…",
-          flush=True)
-    layer_results: dict[int, dict] = {}
-    for l in probe_layers:
-        x_by_win = {w: store[l][i].float().to(emb.device)
-                    for i, w in enumerate(window_ids)}
-        layer_results[l] = run_layer_probes(
-            x_by_win, samples_by_win, train_win, test_win, emb,
-            args.ridge_lambda, args.seed, l, near_lags=near_lags,
-            n_remote_js=args.ngram_len, near_cut=args.near_dist,
-            remote_cut=args.remote_dist, n_perm=args.n_perm)
-        store[l] = []  # 逐层释放
-        r = layer_results[l]
-        print(f"[dsr] layer {l:2d} "
-              f"near1 cos {r['near_lag1']['cos']['uplift']:+.4f} "
-              f"(p={r['near_lag1']['cos']['perm']['p'] if r['near_lag1']['cos']['perm'] else None}) "
-              f"remote_j0 cos {r['remote_j0']['cos']['uplift']:+.4f} "
-              f"(p={r['remote_j0']['cos']['perm']['p'] if r['remote_j0']['cos']['perm'] else None})",
-              flush=True)
 
     # 层组汇总（early/mid/deep 三分）+ 判词
     groups = {"early": [l for l in probe_layers if l < n_layers / 3],
@@ -679,6 +765,32 @@ def main() -> None:
             "n_layers_remote_p_lt_0.05": sum(1 for x in ps if x < 0.05),
             "near_lag1_cos_uplift_mean": (sum(near_ups) / len(near_ups)) if near_ups else None,
         }
+    # λ 敏感性表（主口径 + 附加 λ，每 λ 一行；Gram/测试核已共享复用）
+    lam_table: dict[str, dict] = {}
+    for lv in [args.ridge_lambda] + list(extra_lambdas):
+        key = str(lv)
+        row: dict[str, dict] = {}
+        for gname, ls in groups.items():
+            if not ls:
+                continue
+            for pname in ("remote_j0", "near_lag1"):
+                ups, ps = [], []
+                for l in ls:
+                    sens = layer_results[l][pname].get("lambda_sensitivity", {})
+                    blk = sens.get(key)
+                    if not blk:
+                        continue
+                    if blk["cos"]["uplift"] is not None:
+                        ups.append(blk["cos"]["uplift"])
+                    if blk["cos"]["perm"]:
+                        ps.append(blk["cos"]["perm"]["p"])
+                row[f"{gname}_{pname}"] = {
+                    "cos_uplift_mean": (sum(ups) / len(ups)) if ups else None,
+                    "min_p": min(ps) if ps else None,
+                    "n_layers_p_lt_0.05": sum(1 for x in ps if x < 0.05),
+                }
+        lam_table[key] = row
+
     deep = group_summary.get("deep", {})
     deep_up, deep_p = deep.get("remote_j0_cos_uplift_mean"), deep.get("remote_j0_min_p")
     if deep_up is None:
@@ -743,15 +855,19 @@ def main() -> None:
             "segment_tokens": args.segment_tokens, "chunk_size": args.chunk_size,
             "near_lags": list(near_lags), "remote_js": list(range(args.ngram_len)),
             "ridge_lambda": args.ridge_lambda, "train_frac": args.train_frac,
+            "extra_ridge_lambdas": list(extra_lambdas),
             "near_dist_cut": args.near_dist, "remote_dist_cut": args.remote_dist,
             "n_perm": args.n_perm, "seed": args.seed,
             "probe_layers": probe_layers,
             "max_boundaries_per_window": args.max_boundaries_per_window,
         },
-        "windows": tally,
-        "samples": totals,
+        "windows": summary_tally,
+        "samples": summary_totals,
         "split": {"train_windows": train_win, "test_windows": test_win},
         "layer_groups": group_summary,
+        "lambda_sensitivity": {"primary_lambda": args.ridge_lambda,
+                               "note": "主口径=--ridge-lambda；附加 λ 共享同一状态缓存/Gram/测试核与前向，仅重解对偶系",
+                               "table": lam_table},
         "verdict": verdict,
         "timing_sec": round(time.time() - t0, 1),
     }

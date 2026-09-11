@@ -281,6 +281,51 @@ def test_signflip_direction_and_determinism():
 # ---------------------------------------------------------------------------
 
 
+def test_probe_multi_lambda_sensitivity():
+    """λ 敏感性：主口径顶层字段与 lambda_sensitivity[主λ] 一致；附加 λ 进入
+    sensitivity 块且线性世界多 λ 都为正读数；ctrl 配对跨 λ 固定。"""
+    x_by_win, samples_by_win, emb = _synthetic_probe_world(n_win=16, per_win=6)
+    tr, te = dsr.split_windows(sorted(x_by_win), 0.5, seed=7)
+    res = dsr.run_layer_probes(
+        x_by_win, samples_by_win, tr, te, emb, lam=0.01, seed=42, layer=2,
+        near_lags=(1,), n_remote_js=1, near_cut=32, remote_cut=192,
+        n_perm=64, extra_lambdas=(0.1,))
+    near = res["near_lag1"]
+    assert set(near["lambda_sensitivity"]) == {"0.01", "0.1"}
+    assert near["lambda_sensitivity"]["0.01"]["cos"]["uplift"] == near["cos"]["uplift"]
+    for key in ("0.01", "0.1"):
+        blk = near["lambda_sensitivity"][key]
+        assert blk["cos"]["uplift"] > 0.3          # 线性世界各 λ 都读得出
+        assert blk["cos"]["ctrl"] < blk["cos"]["real"]
+        assert blk["acc"]["uplift"] > 0.2
+    # 同一世界同一 λ（不同层号种子）逐字段可复现
+    res2 = dsr.run_layer_probes(
+        x_by_win, samples_by_win, tr, te, emb, lam=0.01, seed=42, layer=2,
+        near_lags=(1,), n_remote_js=1, near_cut=32, remote_cut=192,
+        n_perm=64, extra_lambdas=(0.1,))
+    assert json.dumps(res["near_lag1"]["lambda_sensitivity"], sort_keys=True) == \
+        json.dumps(res2["near_lag1"]["lambda_sensitivity"], sort_keys=True)
+
+
+def test_remote_partial_window_rows_aligned():
+    """部分窗（同一窗内合法+作废远程边界并存）：远程探针 x 行必须与 remote
+    样本逐行对应——500 窗实跑暴露的错位回归锁（solve 形状不匹配即炸）。"""
+    x_by_win, samples_by_win, emb = _synthetic_probe_world(n_win=8, per_win=6)
+    for w in range(8):  # 每窗 3 个样本远程作废（部分窗，非整窗作废）
+        for s_i, s in enumerate(samples_by_win[w]):
+            if s_i % 2 == 1:
+                s["remote"] = []
+    tr, te = dsr.split_windows(sorted(x_by_win), 0.5, seed=3)
+    res = dsr.run_layer_probes(
+        x_by_win, samples_by_win, tr, te, emb, lam=0.01, seed=42, layer=1,
+        near_lags=(1,), n_remote_js=1, near_cut=32, remote_cut=192, n_perm=64)
+    assert res["remote_j0"]["train_n"] == len(tr) * 3  # 每窗恰 3 个合法远程样本
+    assert res["remote_j0"]["test_n"] == len(te) * 3
+    # 对齐后照常回收（8×6 小世界 N/D 比低，阈值放宽；回收强度主测已盖）
+    assert res["remote_j0"]["cos"]["real"] > 0.5
+    assert res["near_lag1"]["train_n"] == len(tr) * 6  # 近程不受影响
+
+
 def test_layer_probes_end_to_end_deterministic():
     x_by_win, samples_by_win, emb = _synthetic_probe_world(
         n_win=6, per_win=4, d=32, seed=5)
