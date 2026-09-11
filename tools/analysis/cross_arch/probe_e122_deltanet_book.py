@@ -451,11 +451,61 @@ def real_forward_nll(model, ids: list[int], device: torch.device) -> list[float 
 # ---------------------------------------------------------------------------
 
 
+def _install_sdpa_attn_shim() -> str:
+    """flash-attn 缺席时，给 fla.layers.attn 挂 SDPA 等价 shim（跨架构对照臂用：
+    fla-hub/transformer-* 的 Attention 层在 __init__ 硬依赖 flash_attn import）。
+    数学等价性：causal 稠密分支 == SDPA(is_causal=True)；varlen 分支按 cu_seqlens
+    逐段 SDPA。滑窗（window_size ≠ (-1,-1)）不支持，loud fail。返回实际后端名。"""
+    import fla.layers.attn as _attn_mod
+
+    if getattr(_attn_mod, "flash_attn_func", None) is not None:
+        return "flash-attn"
+    import torch.nn.functional as F
+
+    def _sdpa_flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=None,
+                              causal=False, window_size=(-1, -1),
+                              alibi_slopes=None, deterministic=False,
+                              return_attn_probs=False):
+        assert window_size in ((-1, -1), (None, None)), f"SDPA shim 不支持滑窗 {window_size}"
+        qh, kh, vh = (t.transpose(1, 2) for t in (q, k, v))  # [b,h,s,d]
+        if qh.shape[1] != kh.shape[1]:  # GQA：KV 按 group 复制（flash-attn 语义）
+            n = qh.shape[1] // kh.shape[1]
+            kh = kh.repeat_interleave(n, dim=1)
+            vh = vh.repeat_interleave(n, dim=1)
+        o = F.scaled_dot_product_attention(qh, kh, vh, dropout_p=dropout_p,
+                                           is_causal=causal, scale=softmax_scale)
+        return o.transpose(1, 2)
+
+    def _sdpa_flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_k,
+                                     max_seqlen_q, max_seqlen_k, dropout_p=0.0,
+                                     softmax_scale=None, causal=False,
+                                     window_size=(-1, -1), alibi_slopes=None,
+                                     deterministic=False, return_attn_probs=False):
+        assert window_size in ((-1, -1), (None, None)), f"SDPA shim 不支持滑窗 {window_size}"
+        cq = cu_seqlens_q.tolist()
+        ck = cu_seqlens_k.tolist()
+        outs = []
+        for (s0, s1), (t0, t1) in zip(zip(cq[:-1], cq[1:]), zip(ck[:-1], ck[1:])):
+            qs = q[s0:s1].transpose(0, 1).unsqueeze(0)
+            ks = k[t0:t1].transpose(0, 1).unsqueeze(0)
+            vs = v[t0:t1].transpose(0, 1).unsqueeze(0)
+            outs.append(F.scaled_dot_product_attention(
+                qs, ks, vs, dropout_p=dropout_p, is_causal=causal,
+                scale=softmax_scale).squeeze(0).transpose(0, 1))
+        return torch.cat(outs, dim=0)
+
+    _attn_mod.flash_attn_func = _sdpa_flash_attn_func
+    _attn_mod.flash_attn_varlen_func = _sdpa_flash_attn_varlen_func
+    print("[dn122] flash-attn 缺席 → SDPA shim 已挂载到 fla.layers.attn（跨架构臂专用）")
+    return "sdpa-shim"
+
+
 def load_model_and_tokenizer(model_path: str, device: torch.device):
     import fla  # noqa: F401  # 先于 transformers：注册 fla 模型类
     import transformers
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
+    attn_backend = _install_sdpa_attn_shim()
     tok = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
         model_path, trust_remote_code=True, dtype=torch.bfloat16, device_map=str(device)
@@ -466,6 +516,7 @@ def load_model_and_tokenizer(model_path: str, device: torch.device):
         "vocab_size": int(model.config.vocab_size),
         "max_position_embeddings": int(model.config.max_position_embeddings),
         "dtype": "bfloat16",
+        "attn_backend": attn_backend,
         "gpu": torch.cuda.get_device_name(0) if device.type == "cuda" else "cpu",
         "torch": torch.__version__,
         "fla": getattr(fla, "__version__", "unknown"),
