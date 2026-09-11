@@ -28,6 +28,11 @@ E124 剂量段（2026-09-10，任务书冻结 v1.0）：E124 生产日志
 （按信息量降序取 top-N，平局按 chunk 序保确定性）、截断网格 64→256 承接
 4096B 窗 n_real≈173 的新体制（64 会触发负载卫检 RuntimeError）。
 
+E124 候选消偏置（2026-09-11，用户裁定）：--candidate-mode random 时候选按
+SHA256(seed:wi:c) 确定性抽样（跨机/跨库版本逐位一致，供双机一致性抽查），
+种子 --candidate-seed 与数据流种子分离；每行落 cand_mode/cand_seed/
+candidates/hw（硬件指纹）四审计字段。front 为 E123 旧口径复现路径。
+
 用法：
   python tools/train/v3_6/build_e123_mask_log.py --ckpt <a-w1> --data-path ... \
       --n-windows 10000 --threshold 0.05 --out outputs/e123_mask_log_seed42.jsonl \
@@ -56,6 +61,27 @@ from tools.analysis.v3_6.probe_oracle_write_verdict import load_model  # noqa: E
 import tools.train.v3_6.train_v36_s1 as s1  # noqa: E402
 
 MAX_DIST = 2  # 依赖带（回执二直方图：k=1 占 30%、k=2 占 70%、k≥3≈0）
+
+
+def _hw_fingerprint(device: torch.device) -> str:
+    """硬件指纹（E124 裁定 2026-09-11：mask log 全量带硬件指纹，双机一致性
+    抽查与日后追责的审计锚）。"""
+    import platform
+    gpu = torch.cuda.get_device_name(0) if device.type == "cuda" else "cpu"
+    import numpy as _np
+    return f"{gpu} | py{platform.python_version()} | torch{torch.__version__} | np{_np.__version__}"
+
+
+def _det_candidates(n_cand: int, k: int, seed: int, wi: int) -> list[int]:
+    """E124 候选消偏置（用户裁定 2026-09-11，坑9位置先验互染条款）：候选不再
+    取位置序前 k 块（新体制 173 块/窗下只剩 46% 覆盖且前段偏置，与位置先验
+    探针同轴互染），改按 SHA256(seed:wi:c) 排序抽 k 个再按数值升序——纯标准库
+    哈希，跨机/跨 numpy/跨 Python 微版本逐位一致（双机一致性抽查的确定性底座）。
+    候选抽样种子与数据流种子分离（--candidate-seed 独立于 dataset seed）。"""
+    import hashlib
+    scored = sorted(range(n_cand),
+                    key=lambda c: hashlib.sha256(f"{seed}:{wi}:{c}".encode()).digest())
+    return sorted(scored[:k])
 
 
 def _load_trimmed(ckpt: Path, device: torch.device, max_chunks_trim: int = 64):
@@ -94,7 +120,8 @@ class _ForwardSlice:
 
 
 @torch.no_grad()
-def measure_window(model, ns, clean, n_variants_max: int = 80) -> dict:
+def measure_window(model, ns, clean, n_variants_max: int = 80,
+                   cand_seed: int | None = None, window_id: int | None = None) -> dict:
     """一窗真测量（一次 batched 前向）：返回 {masked: {c: info}, dep_bytes,
     hard_cut}。clean: (1, T) 训练流窗（无 mask）。"""
     out0 = s1.s1_forward(model, clean, ns)
@@ -107,11 +134,15 @@ def measure_window(model, ns, clean, n_variants_max: int = 80) -> dict:
     _bs0, conf0, valid0, _ = model._encode(clean)
     hard_cut0, _u8_0, _of0 = model._cuts(clean, conf0, valid0)
     if n_real < 3:
-        return {"masked": {}, "n_real": n_real, "hard_cut": hard_cut0}
+        return {"masked": {}, "n_real": n_real, "hard_cut": hard_cut0, "cands": []}
     if n_real > int(ns.max_chunks):
         raise RuntimeError(f"窗真实 chunk 数 {n_real} > 截断网格 {ns.max_chunks}——"
                            "截断口径不适用（负载卫检，响亮拒绝）")
-    cands = list(range(min(n_real - 1, n_variants_max - 1)))  # 末 chunk 无下游
+    k_cand = min(n_real - 1, n_variants_max - 1)
+    if cand_seed is not None and window_id is not None:
+        cands = _det_candidates(n_real - 1, k_cand, cand_seed, window_id)
+    else:
+        cands = list(range(k_cand))  # 旧口径：位置序前 k 块（E123 复现路径）
 
     # 子批化（显存护栏）：alibi 偏置 (B,H,T,T) 随 B 平方级占显存（B=65 实测 OOM
     # 24GB）；子批 ≤7 变体/前向，结果拼回。返回 outs[v] = 变体 v 的前向行。
@@ -175,7 +206,7 @@ def measure_window(model, ns, clean, n_variants_max: int = 80) -> dict:
                               and 0 <= int(oa[0, t]) < int(ns.max_span)],
             }
     return {"masked": masked, "dep_bytes": dep_bytes, "n_real": n_real,
-            "hard_cut": hard_cut0}
+            "hard_cut": hard_cut0, "cands": cands}
 
 
 def main() -> None:
@@ -197,6 +228,12 @@ def main() -> None:
                    help="选择器专用 max_chunks 构建期截断（E123 旧口径 64; E124 新体制 "
                         "n_real≈173 须 256, 否则负载卫检 RuntimeError）")
     p.add_argument("--cell-relaxed", action="store_true")
+    p.add_argument("--candidate-mode", default="front", choices=["front", "random"],
+                   help="候选口径：front=位置序前 k 块（E123 旧口径复现路径）；"
+                        "random=SHA256 确定性随机抽 k 块（E124 生产口径，用户裁定 "
+                        "2026-09-11 消位置偏置，与必要性账均匀抽样同轴）")
+    p.add_argument("--candidate-seed", type=int, default=20260911,
+                   help="候选抽样种子（与数据流种子分离落盘；仅 random 模式生效）")
     args = p.parse_args()
     device = torch.device(
         "cuda" if (args.device == "auto" and torch.cuda.is_available()) or args.device == "cuda" else "cpu"
@@ -217,6 +254,8 @@ def main() -> None:
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    hw = _hw_fingerprint(device)
+    print(f"[e123-selector] hw: {hw}", flush=True)
     t0 = time.time()
     wi = 0
     n_sel = 0
@@ -227,7 +266,10 @@ def main() -> None:
             ids = batch[0][0]  # DataLoader 出 (src, tgt) 对 → src 批的首行 (T+1,)
             cut = int(ids.ne(PAD_ID).sum())
             clean = ids[:cut].unsqueeze(0).to(device)
-            rec = measure_window(model, ns, clean, n_variants_max=args.max_candidates)
+            rec = measure_window(model, ns, clean, n_variants_max=args.max_candidates,
+                                 cand_seed=(args.candidate_seed
+                                            if args.candidate_mode == "random" else None),
+                                 window_id=wi)
             sel = {c: s for c, s in rec["masked"].items() if s > args.threshold}
             if args.max_blocks > 0 and len(sel) > args.max_blocks:
                 # E124 剂量封顶（--max-blocks）: 按信息量降序取 top-N, 平局
@@ -253,6 +295,13 @@ def main() -> None:
                 # E124 落盘字段（2026-09-10）：干净窗预算后切点，0/1 列表、
                 # 长度 = 该窗 trimmed 字节数 T；训练侧 cuts_override 消费源。
                 "hard_cut": [int(x) for x in rec["hard_cut"][0].tolist()],
+                # E124 候选口径落盘（2026-09-11 裁定）：模式 + 抽样种子（与数据流
+                # 种子分离）+ 该窗实测候选清单（遮蔽集⊆候选集可审计）。
+                "cand_mode": args.candidate_mode,
+                "cand_seed": (args.candidate_seed
+                              if args.candidate_mode == "random" else None),
+                "candidates": rec["cands"],
+                "hw": hw,
             }, ensure_ascii=False) + "\n")
             n_sel += len(sel)
             wi += 1
