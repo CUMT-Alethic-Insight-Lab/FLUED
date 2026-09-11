@@ -191,3 +191,8 @@ E121 判「不确定」，但有一个更简单的解释尚未排除：
 1. **环 C 降级措辞照准**：可微付 1/3（信度分配付清、探索与方差不付）；§9 自陈最弱处（机器人域证据外推到 LLM 读出链）标注在册——降级后措辞不承重，风险可控；
 2. **撞车清单增补两条照准**：Adaptively Sparse Transformers（arXiv:1909.00015）、Sparse Access Memory（arXiv:1610.09027）——挂 H-DEMAND-GATE 设计公理（可学 α-entmax）名下，该假设冻结搁置期间清单随冻；
 3. **posterior collapse/REALM 处方来源边界照准**：结构类比作处方来源用、不作判据用（第六脸规格起草时的引用纪律）。
+
+## 撞车侦察补遗（2026-09-07，GDN2 两锚——主会话 WebSearch 收讫）
+
+1. **「3:1 跨代纹丝不动」锚定位成功、措辞修正**：原文出处 = Qwen3-Next 架构（Gated DeltaNet : 全注意力 = 3:1 混合层配比），Kimi Linear、Qwen3.6 同守 3:1——跨代跨厂**工程惯例**成立（[Qwen3-Next 分析](https://pub.towardsai.net/a-swap-is-a-reflection-the-delta-rule-behind-qwens-efficient-vlms-0634540426d6)、[Kimi/Qwen 3:1 惯例](https://studyai.ink/2026/02/05/Gated-DeltaNet/)、[Qwen3.6 3:1 确认](https://discuss.vllm.ai/t/support-for-qwen3-6-27b-35b-a3b-hybrid-gated-deltanet-models-on-tpu-v5e-8-with-vllm-and-sglang/2875/3)）。**诚实边界**：3:1 是多家复用的工程默认值，不是测得的架构常数——「配比是训练分布的函数」的释放臂第三结局读法**不被此锚证伪也不被它证实**（惯例的存在不回答成因），该结局的领域级主张仍须我们自己测。
+2. **「擦写解耦仅 3%」锚：查无出处**——GDN2 原文（[arXiv:2605.22791](https://arxiv.org/html/2605.22791v1)，Hatamizadeh/Choi/Kautz，NVIDIA，2026-05）全文无 3% 任何形态；Table 5 消融实际读数：擦/写两通道各自标量化都劣于全模型（两侧通道自由度都在承重），b（擦除）侧通道结构保住大部分收益、w（写入）侧保得少——**与我们转述的方向相反**（解耦不是「仅 3%」的小收益，是可测的实质收益，且不对称在擦除侧）。该锚按「未核实/误传」销案，不进论文。

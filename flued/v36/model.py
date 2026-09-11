@@ -22,6 +22,7 @@ from torch.utils.checkpoint import checkpoint as _grad_checkpoint
 
 from flued.data import PAD_ID
 from flued.v33.chunk_builder import ChunkBatch, ChunkBuilder
+from flued.v36.sparsemap import entmax_bisect
 from flued.v34.model import (
     DiTStyleBlock,
     FLUEDV34Probe,
@@ -333,6 +334,17 @@ class V36Config:
     # 默认关 = 旧路径逐位不变, 老 ckpt strict-load 干净 (条件创建纪律同
     # multislot_readout 先例)。温启动装载在训练器 _e120_warm_start (loud-fail)。
     e120_readout_swap: bool = False
+    # E124 硬预算检索门 + 可学 α-entmax 锐度 (任务书冻结 v1.0 2026-09-09:
+    # docs/versions/v3.7/FLUED_V3_7_E124_HARD_BUDGET_GATE_20260909_CN.md):
+    # slm a 格 block-1 cross-read 的 V 行可见性构造性绑死在 index(K) 命中上——
+    # 部署查询先对 index 行打分, top-k 命中的 memory(V) 行进注意力, 其余 V 行
+    # 硬模式注意力权重结构性恰为零; 预算 k 分位数退火 (E6 机制移植: 全量→k=9
+    # @总步数 40% 节点, 后恒预算), 可微路径 = 软 top-k + 温度时间表 (不可学),
+    # 门内命中分布 = 可学 α-entmax (flued/v36/sparsemap.py, 仓内 bisect 实现)。
+    # 条件创建纪律 (decoder_in_mem/multislot_readout 先例): 默认 False = 不创建
+    # e124_alpha_raw 参数、旧路径逐位不变、老 ckpt strict-load 干净。
+    e124_budget_gate: bool = False
+    e124_alpha_init: float = 2.0  # 可学 α 初值 (sparsemax 点; 轨迹 = 任务书副仪表 A)
 
 
 @dataclass
@@ -1593,6 +1605,26 @@ class CrossReadBackbone(nn.Module):
         return self.norm(h)
 
 
+# C8 效率件（outputs/_perf_audit_20260911/proposal.md）: SLMBackbone 逐前向
+# 重建的定长因果掩码静态件，按 (n, device) 缓存——纯常量函数、只读消费、
+# 无 in-place，命中 = 现算逐位一致。上限为卫生阀，淘汰后确定性重算。
+_CAUSAL_MASK_CACHE: dict[tuple[int, torch.device], tuple[torch.Tensor, torch.Tensor]] = {}
+_CAUSAL_MASK_CACHE_MAX = 64
+
+
+def _causal_keep_mask(n: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    """(因果下三角含对角, 单位阵)，均 (n, n) bool。"""
+    key = (n, device)
+    hit = _CAUSAL_MASK_CACHE.get(key)
+    if hit is None:
+        if len(_CAUSAL_MASK_CACHE) >= _CAUSAL_MASK_CACHE_MAX:
+            _CAUSAL_MASK_CACHE.clear()
+        future = torch.triu(torch.ones(n, n, dtype=torch.bool, device=device), diagonal=1)
+        hit = (~future, torch.eye(n, dtype=torch.bool, device=device))
+        _CAUSAL_MASK_CACHE[key] = hit
+    return hit
+
+
 class SLMBackbone(nn.Module):
     """v3.7 SLM backbone (consensus §1.3, user-ruled 2026-08-17): a standard
     small LM in the traditional decoder-only shape.
@@ -1694,6 +1726,42 @@ class SLMBackbone(nn.Module):
         self.last_block1_attn = None
         self.last_block1_ov = None
         self.last_block1_h = None
+        # E124 硬预算检索门 (任务书冻结 v1.0, 2026-09-09): 可学 α (entmax 锐度)
+        # 条件创建——确定性常数初始化 (softplus^{-1}(α_init-1)), 不消耗全局 RNG
+        # 流 (gate-on/off 两态其余模块初始化逐位一致 = 冒烟条款①「退火起点恒等」
+        # 的可检前提)。a 格限定 (index K 命中 → memory V 取回的原生通道映射,
+        # 任务书 §1 格别裁定; d/b 格注册为转移臂候选)。
+        self.e124_gate = getattr(c, "e124_budget_gate", False)
+        if self.e124_gate:
+            if k_src != "index" or v_src != "memory":
+                raise ValueError(
+                    "e124_budget_gate requires slm a 格 (k_row_source='index' + "
+                    f"v_row_source='memory'), got ({k_src!r}, {v_src!r}) —— index(K) 命中 "
+                    "→ memory(V) 取回的原生通道映射 (任务书 §1); d/b 格注册为转移臂候选"
+                )
+            a0 = float(getattr(c, "e124_alpha_init", 2.0))
+            if a0 <= 1.0:
+                raise ValueError(f"e124_alpha_init 须 > 1 (α-entmax bisect 数值域), got {a0}")
+            self.e124_alpha_raw = nn.Parameter(
+                torch.tensor(math.log(math.expm1(a0 - 1.0)))  # softplus^{-1}(α_init-1)
+            )
+        # E124 运行时旋钮 (训练器/仪器每步设定; 纯 Python 属性不进 state_dict;
+        # e124_gate 关时全部不生效——forward 先看 e124_gate)。默认值 = 全量
+        # 预算硬模式: 与门关逐位一致 (bypass)。
+        self.e124_rt_budget: int | None = None  # 绝对预算覆写 (RD 扫描仪器); None=按进度表
+        self.e124_rt_progress: float = 0.0  # 退火进度 [0,1]: 0=全量(≡关态) 1=终点 k_final
+        self.e124_rt_k_final: int = 9  # 退火终点 (任务书 §3.5 定稿 k=9)
+        self.e124_rt_temp: float = 1.0  # 软 top-k 温度 (时间表件, 不可学)
+        self.e124_rt_hard: bool = True  # True=硬 top-k (部署/eval/冒烟), False=软门 (训练)
+        self.last_e124_k = None  # 本前向逐查询预算均值 (metrics 读出槽; None=门关/未前向)
+        self.last_e124_hit = None  # 硬门命中集 (B,H,n,n) bool (冒烟条款①a 直接审计口:
+        # 非命中恰零 = 非零 ⊆ hit 可逐位验; 软门模式 None——软门无离散命中集)
+
+    def e124_alpha_value(self) -> torch.Tensor:
+        """可学 α 当前值 (任务书副仪表 A: α = 1+softplus(raw), 恒 > 1)。"""
+        if not self.e124_gate:
+            raise ValueError("e124_alpha_value: e124_budget_gate 关 (无 α 参数)")
+        return 1.0 + F.softplus(self.e124_alpha_raw)
 
     def forward(
         self,
@@ -1718,7 +1786,10 @@ class SLMBackbone(nn.Module):
         attention path (scores = q@kᵀ/√hd, masked positions -inf, softmax in
         float32, then @v) and the probabilities land in
         ``self.last_block1_attn`` with gradient kept (L_attend 经它回传);
-        off = legacy SDPA path, bitwise untouched."""
+        off = legacy SDPA path, bitwise untouched.
+        E124 硬预算检索门 (任务书冻结 v1.0): self.e124_gate 开且逐样本预算 <
+        窗内真实块数时, block-1 改走 _e124_gated_read (软/硬 top-k + 可学
+        α-entmax 命中分布); 全量预算或门关 = legacy 路径逐位不变 (bypass)。"""
         bsz, n = chunk_mask.shape
         # 捕获槽默认关态 (views 路径提前返回也保持 None; Q16: ov/h 同模式)
         self.last_block1_attn = None
@@ -1727,6 +1798,11 @@ class SLMBackbone(nn.Module):
         kv = k_rows.size(2) if k_rows.dim() == 4 else 1
         vv = v_rows.size(2) if v_rows.dim() == 4 else 1
         if max(kv, vv) > 1:
+            if self.e124_gate:
+                raise ValueError(
+                    "e124_budget_gate is N/A on the multi-view store path "
+                    "(readout_views>1; E124 锚定 a 格经典单行 store, 任务书 §1)"
+                )
             if need_attn:
                 # Q15 校验 readout_views==1: views 路径不支持手工注意力, 响亮报错
                 raise ValueError(
@@ -1761,14 +1837,27 @@ class SLMBackbone(nn.Module):
         v = store_v.view(bsz, n, nh, hd).transpose(1, 2)
         # causal over the store; keep the diagonal even on padded rows (a
         # fully-masked SDPA row yields NaN, and 0*NaN poisons downstream)
-        future = torch.triu(torch.ones(n, n, dtype=torch.bool, device=k_rows.device), diagonal=1)
-        allowed = (~future).view(1, 1, n, n) & chunk_mask.view(bsz, 1, 1, n)
+        keep_diag, diag_eye = _causal_keep_mask(n, k_rows.device)
+        allowed = keep_diag.view(1, 1, n, n) & chunk_mask.view(bsz, 1, 1, n)
         if store_block is not None:
             allowed = allowed & ~store_block.view(bsz, 1, n, n)
-        allowed = allowed | torch.eye(n, dtype=torch.bool, device=k_rows.device).view(1, 1, n, n)
+        allowed = allowed | diag_eye.view(1, 1, n, n)
         # block 1: cross-read; Q self-produced from the hidden state
         q = self.q_proj(h).view(bsz, n, nh, hd).transpose(1, 2)
-        if need_attn:
+        e124_active = False
+        if self.e124_gate:
+            # E124 硬预算检索门 (任务书冻结 v1.0 §2): 预算 < 窗内真实块数才激活;
+            # 全量预算 (退火起点) 整体 bypass 走 legacy 路径 = 门关逐位一致
+            # (冒烟条款① 的可检锚)。k_block_eval (S39 K 侧归零探针) 与门语义
+            # 互斥 (均匀分值的 top-k 是位置别名, 单变量纪律), 响亮拒绝。
+            if self.k_block_eval:
+                raise ValueError("e124_budget_gate 不组合 k_block_eval (S39 探针的均匀键使 top-k 退化为位置别名; 单变量纪律)")
+            k_b = self._e124_budget(chunk_mask)
+            self.last_e124_k = k_b.float().mean().detach()
+            e124_active = bool((k_b < chunk_mask.sum(dim=1)).any())
+        if e124_active:
+            o = self._e124_gated_read(q, k, v, chunk_mask, allowed, k_b, need_attn)
+        elif need_attn:
             # Q15 (任务书 §7.1): 手工注意力 -- scores = q@kᵀ/√hd, 掩码位置
             # -inf, softmax 在 float32 计算, 再 @v; 概率带梯度寄存 (L_attend
             # 的奖励靶点). allowed|eye 已保对角, 无全掩码行 NaN 风险 (同 SDPA).
@@ -1800,6 +1889,86 @@ class SLMBackbone(nn.Module):
             h = h + blk["o"](o.transpose(1, 2).reshape(bsz, n, nh * hd))
             h = h + blk["ffn"](blk["ln_f"](h))
         return self.norm(h)
+
+    def _e124_budget(self, chunk_mask: torch.Tensor) -> torch.Tensor:
+        """E124 逐样本预算 (分位数退火, E6 机制移植改造——原 v34 rate_emit 是
+        emit 侧固定分数预算件, 此处移植为窗内相对预算): rt_budget 覆写优先
+        (RD 扫描仪器), 否则按 rt_progress 从全量 (窗内全部真实块) 线性退到
+        rt_k_final: k_b = round(n_real·(1-p) + k_final·p), clamp 到 [1, n_real]。
+        返回 (B,) long。时间表冻结进任务书附件, 臂内不改 (§6 退火纪律)。"""
+        n_real = chunk_mask.sum(dim=1)  # (B,)
+        if self.e124_rt_budget is not None:
+            k_b = torch.full_like(n_real, int(self.e124_rt_budget))
+        else:
+            p = min(max(float(self.e124_rt_progress), 0.0), 1.0)
+            k_b = torch.round(
+                n_real.float() * (1.0 - p) + float(self.e124_rt_k_final) * p
+            ).long()
+        return torch.minimum(k_b, n_real).clamp(min=1)
+
+    def _e124_gated_read(
+        self,
+        q: torch.Tensor,      # (B, H, n, hd) 部署查询 (q_proj(h))
+        k: torch.Tensor,      # (B, H, n, hd) index(K) 行 (align_k)
+        v: torch.Tensor,      # (B, H, n, hd) memory(V) 行 (align_v)
+        chunk_mask: torch.Tensor,  # (B, n) 真实块
+        allowed: torch.Tensor,     # (B, 1, n, n) 因果∩真实∪对角护栏 (含 store_block 剔除)
+        k_b: torch.Tensor,         # (B,) 逐样本预算
+        need_attn: bool,
+    ) -> torch.Tensor:
+        """E124 门内 cross-read: 部署查询先对 index(K) 行打分, top-k 命中的
+        memory(V) 行进注意力, 其余 V 行硬模式下权重结构性恰为零。
+
+        候选集 cand = 因果∩真实行 (对角护栏仅兜 padded 查询行的 NaN 底, 不经门
+        也不放行真实行的漏网——门覆盖一切真实 V 行的可见性)。软模式 (训练,
+        rt_hard=False): 软 top-k = logsigmoid((s-kth)/τ), kth = 第 k 名分值的
+        detach 快照 (kth 不进反向图), τ = rt_temp 时间表 (不可学); 命中分布 =
+        可学 α-entmax (低分行精确零, softmax 弥散定理管不着)。硬模式 (部署/
+        eval/冒烟, rt_hard=True): 名次<k 行列掩码, 其余 -inf → entmax 精确零。
+        温度与 α 单自由度各归各, 禁互相代偿 (任务书 §6)。
+        need_attn=True 时门控后的概率寄存 last_block1_attn (冒烟条款① dump 口,
+        Q15/Q16 捕获槽同策略)。"""
+        bsz, nh, n, hd = q.shape
+        device = q.device
+        cand = allowed & chunk_mask.view(bsz, 1, 1, n)  # 实因果实行 (对角护栏除外)
+        eye = torch.eye(n, dtype=torch.bool, device=device).view(1, 1, n, n)
+        scores = torch.matmul(q, k.transpose(-1, -2)).float() / math.sqrt(hd)
+        s_cand = scores.masked_fill(~cand, float("-inf"))
+        count = cand.sum(dim=-1)  # (B, 1, n) 逐查询候选数 (head 间一致)
+        k_q = torch.minimum(k_b.view(bsz, 1, 1), count).clamp(min=1)  # (B, 1, n)
+        # 第 k 名分值: 排序后按名次取 (detach——预算阈值不进反向图)
+        sorted_s = s_cand.sort(dim=-1, descending=True).values  # (B, H, n, n)
+        kth = sorted_s.gather(
+            -1, (k_q - 1).unsqueeze(-1).expand(bsz, nh, n, 1)
+        ).squeeze(-1).detach()  # (B, H, n)
+        if self.e124_rt_hard:
+            # 硬 top-k: 名次 < k 命中 (argsort 双趟得名次, 平局按列序稳定);
+            # 未命中 -inf → entmax 精确零 (结构性不可见)
+            order = s_cand.argsort(dim=-1, descending=True)
+            rank = torch.empty_like(order)
+            rank.scatter_(
+                -1, order,
+                torch.arange(n, device=device).view(1, 1, 1, n).expand_as(order),
+            )
+            hit = (rank < k_q.unsqueeze(-1)) & cand
+            z = scores.masked_fill(~hit, float("-inf"))
+            # 审计口: 硬门命中集寄存 (冒烟条款①a 直接验 非零 ⊆ hit;
+            # α-entmax 稀疏化命中集内低分行是设计行为, 故「非零数 == k」
+            # 是 softmax 语义的错误期望——正确形式 = 非命中恰零 + 命中数恰 k)
+            self.last_e124_hit = hit if need_attn else None
+        else:
+            # 软 top-k: 温度时间表的 logsigmoid 门控打分 (可微路径)
+            self.last_e124_hit = None  # 软门无离散命中集
+            tau = max(float(self.e124_rt_temp), 1e-6)
+            gate_log = F.logsigmoid((scores - kth.unsqueeze(-1)) / tau)
+            z = scores + torch.where(cand, gate_log, torch.zeros_like(gate_log))
+            z = z.masked_fill(~cand, float("-inf"))
+        # 对角护栏只兜「候选全空」的 padded 查询行 (NaN 底, 同 legacy |eye 语义)
+        z = torch.where(eye & ~cand, scores, z)
+        p = entmax_bisect(z, self.e124_alpha_value(), dim=-1)  # float32
+        if need_attn:
+            self.last_block1_attn = p  # (B, H, C, C) float32, 门控后分布
+        return torch.matmul(p.to(v.dtype), v)
 
     def _forward_views(
         self,
@@ -2179,6 +2348,13 @@ class GlobalSpanDecoder(nn.Module):
         # (CheckpointError metadata mismatch). train_v36_s1 toggles this off
         # around _frozen_decoder_logits.
         self._ckpt_enabled = True
+        # C8 效率件（outputs/_perf_audit_20260911/proposal.md）: 归一化字节表
+        # 缓存，键含 (weight._version, device, dtype)，值再带 weight 对象做
+        # identity 兜底（参数整体替换时 _version 可能撞号）。表是权重的确定性
+        # 函数且只读消费，命中 = 现算逐位一致；权重可训时整体旁路（见下）。
+        self._byte_table_cache: dict[
+            tuple[int, torch.device, torch.dtype], tuple[torch.Tensor, torch.Tensor]
+        ] = {}
         self.scale = nn.Parameter(torch.tensor(10.0))
         # DSpark Markov head (research sweep 2026-08-08): low-rank bigram
         # transition bias for parallel byte decoding. prev_ids row 258 is the
@@ -2186,6 +2362,28 @@ class GlobalSpanDecoder(nn.Module):
         if c.decoder_markov > 0:
             self.markov_embed = nn.Embedding(259, c.decoder_markov)
             self.markov_out = nn.Linear(c.decoder_markov, 258, bias=False)
+
+    def _byte_table(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        """归一化字节表 (258, d_byte)，C8 缓存路径。权重 requires_grad=True 时
+        整体旁路（不读也不写缓存）——可训表每前向各建一份图节点，缓存的跨调
+        用复用会合并两条反向支路的归约序，为保梯度逐位一律现算；冻结→解冻的
+        运行期翻转同样在此拦下（缓存只服务冻结态，绝不给可训表喂无梯度的旧
+        张量）。冻结态下 _version 在优化器原地步进 / load_state_dict 时自增，
+        缓存随之自然失效。命中 = 现算逐位一致。"""
+        weight = self.byte_lookup.embedding.weight
+        if weight.requires_grad:
+            vocab = torch.arange(258, device=device)
+            return F.normalize(self.byte_lookup(vocab).to(dtype), dim=-1)
+        key = (weight._version, device, dtype)
+        hit = self._byte_table_cache.get(key)
+        if hit is not None and hit[0] is weight:
+            return hit[1]
+        vocab = torch.arange(258, device=device)
+        table_norm = F.normalize(self.byte_lookup(vocab).to(dtype), dim=-1)
+        if len(self._byte_table_cache) > 8:
+            self._byte_table_cache.clear()
+        self._byte_table_cache[key] = (weight, table_norm)
+        return table_norm
 
     def forward(
         self,
@@ -2209,10 +2407,9 @@ class GlobalSpanDecoder(nn.Module):
             else:
                 h = block(h, valid, noise)
         h = self.out_proj(h)
-        vocab = torch.arange(258, device=h.device)
-        table = self.byte_lookup(vocab).to(h.dtype)
+        table_norm = self._byte_table(h.device, h.dtype)
         logits = self.scale.clamp(1.0, 100.0) * torch.matmul(
-            F.normalize(h, dim=-1), F.normalize(table, dim=-1).transpose(0, 1)
+            F.normalize(h, dim=-1), table_norm.transpose(0, 1)
         )
         if prev_ids is not None and hasattr(self, "markov_out"):
             # prev_ids: (B, C, span) long, 258 = window-start sentinel
@@ -2304,6 +2501,9 @@ class FLUEDV36(nn.Module):
             # the d_pack decoder_in exists only where a coarse V readout does
             self.decoder_in = nn.Linear(c.d_pack, c.d_backbone) if c.d_pack != c.d_backbone else nn.Identity()
         self.decoder = GlobalSpanDecoder(c, self.byte_lookup)
+        # C8 效率件: _front_end_frozen 判定缓存（冻结集运行期不变——裁定；
+        # 运行期改冻结面的臂必须先调 _front_end_frozen_reset()）。
+        self._front_end_frozen_cache: bool | None = None
         self.chunk_pos = nn.Embedding(c.max_chunks, c.d_backbone)
         nn.init.trunc_normal_(self.chunk_pos.weight, std=0.02)
         # fork 3 F2 (user-ruled 2026-08-21; spec docs/versions/v3.7/
@@ -2374,14 +2574,27 @@ class FLUEDV36(nn.Module):
         return self.aux_out(h)
 
     def _front_end_frozen(self) -> bool:
-        mods = (self.byte_lookup, *self.encoder_blocks, *self.segmentor_blocks, self.segmentor_head)
-        return all(not p.requires_grad for m in mods for p in m.parameters())
+        """C8 效率件: 结果缓存一次——冻结面运行期不变（裁定：冻结/解冻全部
+        发生在训练循环开工前的 setup 段），省掉每次 _encode 的全参数扫描。
+        运行期若改冻结面，必须先调 _front_end_frozen_reset()。"""
+        if self._front_end_frozen_cache is None:
+            mods = (self.byte_lookup, *self.encoder_blocks, *self.segmentor_blocks, self.segmentor_head)
+            self._front_end_frozen_cache = all(not p.requires_grad for m in mods for p in m.parameters())
+        return self._front_end_frozen_cache
+
+    def _front_end_frozen_reset(self) -> None:
+        """冻结面运行期变更后的显式失效口（_front_end_frozen 缓存的安全阀）。"""
+        self._front_end_frozen_cache = None
 
     def _encode(self, token_ids: torch.Tensor,
                 attn_block_mask: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """attn_block_mask（E123 遮蔽器件，条件创建）: (B, 1, 1, T) bool，True=该
-        字节对一切查询遮蔽——只抹窗内注意力键侧视野，字节流/位置/分段/valid 全
-        不动（被遮内容仍进 chunk builder→summarizer→状态通道）。None = 旧路径
+        字节对一切查询遮蔽——只抹窗内注意力键侧视野，字节流/位置/valid 不动
+        （被遮内容仍进 chunk builder→summarizer→状态通道）。勘误（2026-09-10）：
+        「分段不动」只在塌缩/饱和段界器上经验成立——锚定段界器下遮蔽扰动
+        encoder 状态使 confidence 翻转、切点漂移（实测 95%，诊断
+        outputs/_diag_e124_mask_drift_20260910.json）；需要结构恒定时由调用侧
+        以 cuts_override 钉死（train_v36_s1._slm_forward）。None = 旧路径
         逐位不变。"""
         valid = token_ids.ne(PAD_ID)
         # When the whole front end (byte lookup + encoder + segmentor) is frozen,
@@ -2390,12 +2603,17 @@ class FLUEDV36(nn.Module):
         ctx = torch.no_grad() if self._front_end_frozen() else torch.enable_grad()
         with ctx:
             x = self.byte_lookup(token_ids)
+            # C6 效率件（outputs/_perf_audit_20260911/proposal.md）: bool→浮点
+            # 精确转换同源同值，把每层的 valid.unsqueeze(-1).to(dtype) 提为入口
+            # 一次 (B,T,1) 副本沿 encoder/segmentor 链下传；dtype 不齐的层在
+            # 块内自动回落现算（旧路径）。
+            valid_f = valid.unsqueeze(-1).to(x.dtype)
             noise = x.new_zeros(token_ids.size(0))
             for block in self.encoder_blocks:
-                x = block(x, valid, noise, attn_block_mask)
+                x = block(x, valid, noise, attn_block_mask, valid_f=valid_f)
             byte_states = x
             for block in self.segmentor_blocks:
-                x = block(x, valid, noise)
+                x = block(x, valid, noise, valid_f=valid_f)
             logits = self.segmentor_head(x).squeeze(-1)
             confidence = _plastic_signed_confidence(logits)
         return byte_states, confidence, valid, logits

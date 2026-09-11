@@ -2001,6 +2001,240 @@ def _d1_weighted_ce(logits: torch.Tensor, targets: torch.Tensor,
     return (ce * picked_w[keep]).sum() / picked_w[keep].sum()
 
 
+# ---------------------------------------------------------------------------
+# E123 合体臂（遮蔽 + 延迟自读出，定向剥夺形态；任务书冻结 v1.3 2026-09-07:
+# docs/versions/v3.7/FLUED_V3_7_E123_MASK_DELAYED_READOUT_20260907_CN.md）
+#
+# 形态：离线选择器（build_e123_mask_log.py，冻结基座真测量）预扫训练流 10K 窗
+# 产决策日志；训练时零额外前向——窗索引 = 训练流序（batch=1、同种子流，与选择器
+# 逐项同构）。三列共用同一份日志与仪表：
+#   control  = 纯续训（无遮蔽无注入，仪表照跑 = 盲猜地板参照列）
+#   combined = 定向注意力遮蔽（内容活进状态）+ 延迟自读出注入（λ 缓升）
+#   shuffled = 同遮蔽 + 注入源换另一窗同形态块（跨窗置换，donor 行 detach）
+# 默认全关（--e123-mask-log 空）= 旧路径逐位不变（--multislot-readout-* 先例）。
+# ---------------------------------------------------------------------------
+_E123_LOG: dict[int, dict] | None = None          # window_id -> 决策日志行
+_E123_KMAX_SCHED: list[tuple[int, float]] | None = None  # (step, K_max) 升序
+_E123_DONOR: dict[int, int] | None = None         # shuffled: window_id -> donor window_id
+_E123_DONOR_WINDOWS: list[torch.Tensor] | None = None    # shuffled: donor 窗字节（数据流重放落内存）
+
+
+def _e123_enabled(args) -> bool:
+    return bool(getattr(args, "e123_mask_log", ""))
+
+
+def _load_e123_mask_log(path: str) -> dict[int, dict]:
+    """装载选择器决策日志（槽五）：window_id 索引；schema/序号响亮校验。"""
+    log: dict[int, dict] = {}
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            wi = int(rec["window_id"])
+            if wi in log:
+                raise ValueError(f"E123 决策日志 window_id 重复: {wi}（{path}）")
+            for p in rec.get("dependency_pairs", []):
+                for k in ("src_byte_range", "positions", "distance"):
+                    if k not in p:
+                        raise ValueError(f"E123 决策日志窗 {wi} 依赖对缺键 {k}")
+            log[wi] = rec
+    if not log:
+        raise ValueError(f"E123 决策日志为空: {path}（缺件响亮报错，不静默空表）")
+    if sorted(log) != list(range(max(log) + 1)):
+        raise ValueError(f"E123 决策日志 window_id 不连续（{path}）——窗流对齐前提破坏")
+    return log
+
+
+def _e123_parse_kmax(spec: str) -> list[tuple[int, float]]:
+    """'1:0,2:2000,4:6000,16:8000' -> [(0, 1.0), (2000, 2.0), ...]（值:步 序对，
+    与 _parse_block_ramp 同格式但 K_max 整数域，不走其 [0,1] 校验）。"""
+    ramp = []
+    for item in spec.split(","):
+        v_s, step_s = item.split(":")
+        v, s = float(v_s), int(step_s)
+        if v < 1 or v != int(v):
+            raise SystemExit(f"--e123-kmax-schedule K_max 须为正整数: {v_s}")
+        ramp.append((s, v))
+    ramp.sort()
+    if not ramp or ramp[0][0] != 0:
+        raise SystemExit("--e123-kmax-schedule 必须从 step 0 起档")
+    return ramp
+
+
+def _e123_lambda(args, step: int) -> float:
+    """注入强度缓升（开口项① 终审：前 1K 步 0→1 线性，吸收早期盲读者噪声；
+    禁可坍缩门——λ 是纯时间表，无可学件）。"""
+    ramp = max(1, int(getattr(args, "e123_lambda_ramp", 1000)))
+    return min(1.0, max(0.0, step / ramp))
+
+
+def _e123_build_donor_perm(log: dict[int, dict], seed: int) -> dict[int, int]:
+    """乱序列跨窗置换（槽二）：eligible = 有依赖对的窗；donor = 同 eligible 集
+    的 seeded 轮转（offset ∈ [1, n)，保证零不动点 = 必跨窗；确定性、种子落盘）。"""
+    import random as _random
+
+    elig = sorted(wi for wi, e in log.items() if e.get("dependency_pairs"))
+    if len(elig) < 2:
+        raise ValueError("E123 乱序列需要 ≥2 个有依赖对的窗（跨窗置换无料）")
+    off = _random.Random(seed).randrange(1, len(elig))
+    return {wi: elig[(i + off) % len(elig)] for i, wi in enumerate(elig)}
+
+
+def _e123_materialize_windows(args, n_windows: int) -> list[torch.Tensor]:
+    """乱序列 donor 窗字节：按训练流同构口径（StreamingReconstructionDataset,
+    batch=1, 同种子）重放数据流，逐窗收 non-PAD 字节。纯数据装载，零模型前向。"""
+    from flued.data import StreamingReconstructionDataset
+
+    ds = StreamingReconstructionDataset(
+        file_path=args.data_path, seq_len=int(args.seq_len),
+        samples_per_worker=int(getattr(args, "stream_samples_per_worker", 50000)),
+        seed=int(args.seed),
+    )
+    loader = torch.utils.data.DataLoader(ds, batch_size=1, shuffle=False, num_workers=0)
+    wins: list[torch.Tensor] = []
+    for batch in loader:
+        if len(wins) >= n_windows:
+            break
+        ids = batch[0][0]  # DataLoader 出 (src, tgt) 对 → src 首行 (T+1,)
+        wins.append(ids[: int(ids.ne(PAD_ID).sum())].clone())
+    if len(wins) < n_windows:
+        raise ValueError(f"E123 donor 窗料化不足: {len(wins)} < {n_windows}（数据流短于决策日志）")
+    return wins
+
+
+def _e123_window_plan(model, clean: torch.Tensor, args, device):
+    """当前窗的 E123 计划：(plan, attn_mask, inject_metas, cuts_pin)。
+
+    plan 携带全量依赖对（仪表按 k 分层读全量，K_max 切档不纠缠——任务书 §5
+    仪表①口径）；mask/inject 只含 distance ≤ K_max(step) 的对（§4 时间表内
+    只遮蔽/监督档内块，超程块后续档自动纳入）。control 列 mask/inject 全 None
+    （纯续训 + 仪表 = 地板参照）。遮蔽按 src_byte_range 字节区间（训练期分段
+    会漂移，不走选择器时的 chunk 索引——交接设计钉）。
+
+    cuts_pin（E124 切点钉死，--e123-cuts-pin 开才取，默认 None = 旧路径逐位
+    不变）：选择器日志同批落盘的干净窗预算后切点 hard_cut（切点是窗的确定
+    函数，训练时零额外前向）。缺键/长度 ≠ clean 首行非 PAD 数一律响亮报错；
+    长度对齐后 pad-right（False）到 T 得 cuts_override 契约的 (1, T) bool。"""
+    wi = int(getattr(args, "e123_window_id", 0))
+    step = int(getattr(args, "e123_step", 0))
+    entry = _E123_LOG.get(wi) if _E123_LOG is not None else None
+    pairs = entry.get("dependency_pairs", []) if entry else []
+    kmax = int(_ramp_lookup(_E123_KMAX_SCHED, step)) if _E123_KMAX_SCHED else 0
+    lam = _e123_lambda(args, step)
+    kept = [p for p in pairs if 1 <= int(p["distance"]) <= kmax]
+    T = int(clean.size(1))
+    mask = None
+    inject = None
+    mode = getattr(args, "e123_mode", "control")
+    if mode in ("combined", "shuffled") and kept:
+        mask = torch.zeros(1, 1, 1, T, dtype=torch.bool, device=device)
+        for p in kept:
+            s, e = (int(x) for x in p["src_byte_range"])
+            mask[0, 0, 0, s:min(e, T)] = True
+        if mode == "combined":
+            inject = [[{"src_range": [int(x) for x in p["src_byte_range"]],
+                        "positions": [int(x) for x in p["positions"]],
+                        "lam": lam, "donor_row": None} for p in kept]]
+        else:
+            inject = [_e123_donor_metas(model, args, wi, kept, lam, device)]
+    plan = {"wi": wi, "pairs": pairs, "kept": kept, "kmax": kmax, "lam": lam}
+    cuts = None
+    if getattr(args, "e123_cuts_pin", False):
+        # E124 切点钉死（用户裁定 2026-09-10：内容缺席、结构不动）——遮蔽
+        # 前向复用选择器落盘的干净窗切点，锁 chunk 网格。无 hard_cut 键的
+        # 旧日志（E123 三列遗产）响亮拒绝，不静默现算（现算 = 训练期前向
+        # 漂白选择器口径，且每步一次额外 _encode/_cuts 前向）。
+        if entry is None or "hard_cut" not in entry:
+            raise ValueError(
+                f"E124 cuts-pin: 窗 {wi} 的决策日志缺 hard_cut 键——"
+                "旧版选择器日志无切点字段，需用 2026-09-10 后口径重建 mask log"
+            )
+        hc = entry["hard_cut"]
+        n_nonpad = int(clean[0].ne(PAD_ID).sum())
+        if len(hc) != n_nonpad:
+            raise ValueError(
+                f"E124 cuts-pin: 窗 {wi} hard_cut 长度 {len(hc)} != 训练窗非 PAD "
+                f"字节数 {n_nonpad}——窗流对齐前提破坏（选择器与训练流须逐项同构）"
+            )
+        cuts = torch.zeros(1, T, dtype=torch.bool, device=device)
+        cuts[0, : len(hc)] = torch.tensor(hc, dtype=torch.bool, device=device)
+    return plan, mask, inject, cuts
+
+
+def _e123_donor_metas(model, args, wi: int, kept: list[dict], lam: float, device) -> list[dict]:
+    """乱序列注入元数据：donor 窗（跨窗置换）经当前模型 no_grad 部分前向取
+    donor 块的 memory 行（真内容、真可读、对应关系错——槽二）；donor 行 detach
+    （donor 窗不在本步损失流，梯度穿它会污染数据流序）。注入目标位仍是本窗
+    真依赖位——损失仍压真目标，乱的是注入内容，此列必须学不会。"""
+    donor_wi = _E123_DONOR[wi]
+    donor_bytes = _E123_DONOR_WINDOWS[donor_wi].unsqueeze(0).to(device)
+    donor_pairs = sorted(_E123_LOG[donor_wi]["dependency_pairs"], key=lambda p: int(p["src_chunk"]))
+    with torch.no_grad(), torch.autocast(
+        "cuda", dtype=torch.bfloat16, enabled=bool(args.amp) and device.type == "cuda"
+    ):
+        bs, conf, val, _ = model._encode(donor_bytes)
+        hc, u8, _ = model._cuts(donor_bytes, conf, val)
+        dch = model.chunk_builder(bs, val, hc, conf)
+        dch = model.bridge(dch, bs, conf, val, u8)
+        _, d_vrows, _, _, _, _, _ = model._slm_store_rows(dch, with_views=True)
+    dca = dch.chunk_ids[0]
+    dT = int(donor_bytes.size(1))
+    metas = []
+    for j, p in enumerate(kept):
+        dp = donor_pairs[j % len(donor_pairs)]  # 同形态块按秩配对
+        d_s = min(int(dp["src_byte_range"][0]), dT - 1)
+        c_d = int(dca[d_s])
+        metas.append({
+            "src_range": [int(x) for x in p["src_byte_range"]],
+            "positions": [int(x) for x in p["positions"]],
+            "lam": lam,
+            "donor_row": d_vrows[0, c_d].detach(),
+        })
+    return metas
+
+
+def _e123_apply_injections(cond_direct: torch.Tensor, proj: torch.Tensor,
+                           dec_in, chunk_ids: torch.Tensor,
+                           inject: list[list[dict] | None]) -> tuple[torch.Tensor, dict]:
+    """延迟自读出注入（设计钉）：cond_direct[b, t_c] += λ·dec_in(源行)，
+    t_c = 依赖位在**当步分段网格**上的 chunk（训练期分段漂移，位置→(chunk,slot)
+    运行时映射）；源行 = 同窗 v_rows 的已算投影（deploy 查询投影同源，梯度经
+    dec_in 与源行回传——第七性质），donor 行（乱序列）另行过 dec_in（已 detach）。
+    返回 (新 cond_direct, {"pairs": n, "positions": m})。"""
+    B, T = chunk_ids.size(0), chunk_ids.size(1)
+    n_pairs = 0
+    n_pos = 0
+    for b in range(B):
+        metas = inject[b] if b < len(inject) else None
+        if not metas:
+            continue
+        ca_b = chunk_ids[b]
+        for m in metas:
+            lam = float(m["lam"])
+            if lam <= 0.0:
+                continue  # λ 缓升起步期零注入（梯度审计须在 λ>0 步——冒烟条款②）
+            s_byte = min(max(int(m["src_range"][0]), 0), T - 1)
+            c_src = int(ca_b[s_byte])
+            if not 0 <= c_src < cond_direct.size(1):
+                continue
+            if m.get("donor_row") is not None:
+                src_proj = dec_in(m["donor_row"]).to(cond_direct.dtype)
+            else:
+                src_proj = proj[b, c_src]
+            tcs = sorted({
+                int(ca_b[p]) for p in m["positions"]
+                if 0 <= int(p) < T and 0 <= int(ca_b[p]) < cond_direct.size(1)
+            })
+            for t_c in tcs:
+                cond_direct[b, t_c] = cond_direct[b, t_c] + lam * src_proj
+            if tcs:
+                n_pairs += 1
+                n_pos += len([p for p in m["positions"] if 0 <= int(p) < T])
+    return cond_direct, {"pairs": n_pairs, "positions": n_pos}
+
+
 def _q18_enabled(args) -> bool:
     return bool(getattr(args, "q18_arm", ""))
 
@@ -2357,7 +2591,7 @@ def _completion_target_grids(
     return targets, slot_mask, masked_slot, torch.zeros((), device=clean.device)
 
 
-def s1_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None, retrieval_metas=None, burst_metas_q15=None, store_block_override=None, need_attn: bool = False, train: bool = False, attn_block_mask: torch.Tensor | None = None) -> dict:
+def s1_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None, retrieval_metas=None, burst_metas_q15=None, store_block_override=None, need_attn: bool = False, train: bool = False, attn_block_mask: torch.Tensor | None = None, row_perm_override: list | None = None, e123_inject: list | None = None, cuts_override: torch.Tensor | None = None) -> dict:
     codec_final = getattr(args, "codec_final_state", False)
     if getattr(model.config, "backbone_mode", "") == "slm":
         # v3.7 (consensus §1-2): dedicated branch. codec_final / paged / draft
@@ -2374,11 +2608,13 @@ def s1_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None, re
             model, source, args, clean=clean, byte_mask=byte_mask, retrieval_metas=retrieval_metas,
             burst_metas_q15=burst_metas_q15, store_block_override=store_block_override,
             need_attn=need_attn, train=train, attn_block_mask=attn_block_mask,
+            row_perm_override=row_perm_override, e123_inject=e123_inject,
+            cuts_override=cuts_override,
         )
-    if retrieval_metas is not None or burst_metas_q15 is not None or store_block_override is not None:
+    if retrieval_metas is not None or burst_metas_q15 is not None or store_block_override is not None or e123_inject is not None or cuts_override is not None:
         raise ValueError(
-            "retrieval/burst store_block threading requires backbone_mode='slm' (v3.7); "
-            "legacy xattn/paged/draft/attn paths are N/A"
+            "retrieval/burst store_block threading, e123 injection and cuts_override (E124 切点钉死) "
+            "require backbone_mode='slm' (v3.7); legacy xattn/paged/draft/attn paths are N/A"
         )
     byte_states, confidence, valid, _ = model._encode(source)
     hard_cut, utf8_cont, cut_overflow = model._cuts(source, confidence, valid)
@@ -2600,7 +2836,7 @@ def s1_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None, re
     }
 
 
-def _slm_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None, retrieval_metas=None, burst_metas_q15=None, store_block_override=None, need_attn: bool = False, train: bool = False, attn_block_mask: torch.Tensor | None = None) -> dict:
+def _slm_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None, retrieval_metas=None, burst_metas_q15=None, store_block_override=None, need_attn: bool = False, train: bool = False, attn_block_mask: torch.Tensor | None = None, row_perm_override: list | None = None, e123_inject: list | None = None, cuts_override: torch.Tensor | None = None) -> dict:
     """v3.7 slm branch (docs/versions/v3.7/FLUED_V3_7_ARCHITECTURE_CONSENSUS_20260817_CN.md).
 
     Codec full-coverage law (consensus §2): any content task's loss covers the
@@ -2628,9 +2864,49 @@ def _slm_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None, 
     """
     byte_states, confidence, valid, _ = model._encode(source, attn_block_mask=attn_block_mask)
     hard_cut, utf8_cont, cut_overflow = model._cuts(source, confidence, valid)
+    if cuts_override is not None:
+        # E124 切点钉死（用户裁定 2026-09-10：内容缺席、结构不动）：遮蔽前向复用
+        # 干净窗预算的切点——chunk 网格（身份/数量/坐标）锁定，byte_states/
+        # confidence 仍随遮蔽响应。现算 _cuts 后整体替换 hard_cut（utf8_cont/
+        # cut_overflow 只依赖字节流，遮蔽不变，保持现算）；None（默认）= 旧路径
+        # 逐位不变（条件创建纪律）。shape/dtype/device 不符响亮报错。
+        if cuts_override.shape != source.shape or cuts_override.dtype != torch.bool \
+                or cuts_override.device != source.device:
+            raise ValueError(
+                f"cuts_override 须为与 source 同形的 (B, T) bool 同 device 张量，实得 "
+                f"shape={tuple(cuts_override.shape)} dtype={cuts_override.dtype} "
+                f"device={cuts_override.device}（source shape={tuple(source.shape)} "
+                f"device={source.device}）"
+            )
+        hard_cut = cuts_override
     chunks = model.chunk_builder(byte_states, valid, hard_cut, confidence)
     chunks = model.bridge(chunks, byte_states, confidence, valid, utf8_cont)
     k_rows, v_rows, state_norm, memory, index, k_store, v_store = model._slm_store_rows(chunks, with_views=True)
+    if row_perm_override is not None:
+        # E123 门②批化测量（2026-09-07）：前向级逐样本行置换——perm[b][c] = 输出行
+        # c 的内容来源行（行存在性保留、内容错位，E122 b2 行手术的前向级形态）。
+        # None = 逐位不变。只置换真实行域 [0, n_real_b)，其余原样。
+        def _row_permute(t):
+            if t is None:
+                return None
+            B = t.size(0)
+            assert len(row_perm_override) == B
+            idx = torch.arange(t.size(1), device=t.device).unsqueeze(0).expand(B, -1).clone()
+            n_real_b = chunks.chunk_mask.sum(dim=1)  # (B,)
+            for b in range(B):
+                if row_perm_override[b] is None:
+                    continue  # None = 该样本恒等（基线变体）
+                nrb = int(n_real_b[b])
+                idx[b, :nrb] = torch.tensor(row_perm_override[b], dtype=torch.long,
+                                            device=t.device)[:nrb]
+            gidx = idx.view(B, -1, *([1] * (t.dim() - 2)))
+            return torch.gather(t, 1, gidx.expand_as(t))
+        k_rows = _row_permute(k_rows)
+        v_rows = _row_permute(v_rows)
+        memory = _row_permute(memory)
+        index = _row_permute(index)
+        k_store = _row_permute(k_store)
+        v_store = _row_permute(v_store)
     n_chunks = chunks.chunk_mask.size(1)
     pos = model.chunk_pos.weight.unsqueeze(0)[:, :n_chunks]
     # a+pos arm: window-relative per-chunk start byte offsets (None = off)
@@ -2677,8 +2953,38 @@ def _slm_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None, 
         v_rows_direct = _multislot_readout_rows(model, index, chunks.chunk_mask)
         q20_engaged = 1.0
     cond_direct = dec_in(v_rows_direct) + pos
+    e123_stats = None
+    if e123_inject is not None:
+        # E123 延迟自读出器件（任务书冻结 v1.3 §4，注入点 = direct 腿 cond；设计钉
+        # 2026-09-08）：依赖位所在 chunk 的条件加 λ·dec_in(源行)——部署查询投影
+        # 同源（dec_in 既约件，无独立头/独立 loss 项/可坍缩门），λ 纯时间表缓升。
+        # 关态（None）= 旧路径逐位不变（q20/去噪臂同位先例）。
+        proj_direct = dec_in(v_rows_direct)
+        cond_direct, e123_stats = _e123_apply_injections(
+            cond_direct, proj_direct, dec_in, chunks.chunk_ids, e123_inject
+        )
     logits_direct = model.decoder(cond_direct, chunks.token_mask)
     logits_backbone = model.decoder(cond_backbone, chunks.token_mask)
+    # C1 (2026-09-11 效率施工): 两枚诊断指标去 nonzero/any 硬同步 —— 布尔掩码
+    # 压缩均值改全量加权和均值。metrics-only（step_model 里 detach 进日志、
+    # 不进损失）：fp 归约序与被掩码压缩后的 mean 不同，容许末位 ulp 差
+    # （提案 §C1 验收条款 allclose(atol=1e-7)，tests/test_perf_phase12_parity
+    # 显式标注）；loss/参数侧零接触。空窗兜底语义不变（valid_count==0 时回
+    # 全量均值，与旧 fallback 同一算式逐位同值）。
+    valid_count = valid.sum()
+    valid_cf = valid.to(confidence.dtype)
+    hard_cut_f = hard_cut.float()
+    valid_hf = valid.to(hard_cut_f.dtype)
+    boundary_confidence_mean = torch.where(
+        valid_count > 0,
+        (confidence * valid_cf).sum() / valid_count.clamp(min=1),
+        confidence.mean(),
+    )
+    hard_cut_fraction = torch.where(
+        valid_count > 0,
+        (hard_cut_f * valid_hf).sum() / valid_count.clamp(min=1),
+        hard_cut_f.mean(),
+    )
     return {
         "logits_direct": logits_direct,
         "logits_backbone": logits_backbone,
@@ -2688,6 +2994,7 @@ def _slm_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None, 
         "v_rows": v_rows,  # decoder-side V source rows (the predict anchor, §1.4)
         "denoise_stats": denoise_stats,  # decoder 去噪臂扰动计数 (None = 关/eval, 旧路径不变)
         "q20_engaged": q20_engaged,  # Q20 多槽读出臂接通计 (1.0 = 本前向 direct 腿吃了读出行; 关态/eval 零占位)
+        "e123_stats": e123_stats,  # E123 注入计数 (None = 关/eval, 旧路径不变)
         "memory": memory,
         "index": index,  # summarizer K rows (resident key-geometry metrics, E80 补充 2)
         "retrieval_block_rate": retrieval_block_rate,  # 档 a excision hit rate (0.0 when off)
@@ -2696,9 +3003,26 @@ def _slm_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None, 
         "chunks": chunks,
         "cut_overflow": cut_overflow,
         "state_norm": state_norm,
-        "boundary_confidence_mean": confidence[valid].mean() if valid.any() else confidence.mean(),
-        "hard_cut_fraction": hard_cut.float()[valid].mean() if valid.any() else hard_cut.float().mean(),
+        "boundary_confidence_mean": boundary_confidence_mean,
+        "hard_cut_fraction": hard_cut_fraction,
     }
+
+
+# C7 (2026-09-11 效率施工, 提案 §C7): step_model 关态臂列的零占位标量按
+# device 缓存 —— 每步 ~35 次 torch.zeros kernel launch 归零为一次查表。缓存
+# 张量只读共享：训练循环首次入 pending 时 clone、后续 add_ 原地累加（写在
+# pending 副本上，不碰缓存本体）；eval 侧 float(v) 只读。值与旧逐位新建的
+# 零张量全等。
+_STEP_ZERO_CACHE: dict = {}
+
+
+def _step_zero(device) -> torch.Tensor:
+    key = (device.type, device.index)
+    zero = _STEP_ZERO_CACHE.get(key)
+    if zero is None:
+        zero = torch.zeros((), device=device)
+        _STEP_ZERO_CACHE[key] = zero
+    return zero
 
 
 @torch.no_grad()
@@ -2710,12 +3034,23 @@ def _key_geometry_metrics(model, out: dict, device) -> dict:
     mu (mean off-diagonal |cos|), mu_max (worst pair), PR/n (Gram eigenvalue
     participation ratio over n_real, per-head pooled). Zero placeholders for
     absent channels (the a grid has no WriteHead). One scalar sync per step
-    (n_real); metrics-only path, everything detached."""
-    zero = torch.zeros((), device=device)
+    (n_real); metrics-only path, everything detached. C5 (2026-09-11 效率施
+    工): the channel check precedes the n_real sync — the a grid (both
+    channels non-state) returns the zero dict with no sync at all; state
+    grids keep the old order and values."""
+    zero = _step_zero(device)
     res = {
-        "key_mu": zero, "key_mu_max": zero.clone(), "key_pr": zero.clone(),
-        "key_mu_k": zero.clone(), "key_mu_max_k": zero.clone(), "key_pr_k": zero.clone(),
+        "key_mu": zero, "key_mu_max": zero, "key_pr": zero,
+        "key_mu_k": zero, "key_mu_max_k": zero, "key_pr_k": zero,
     }
+    cfg = model.config
+    v_state = getattr(cfg, "v_row_source", "") == "state"
+    k_state = getattr(cfg, "k_row_source", "") == "state"
+    if not (v_state or k_state):
+        # C5: a 格（两路均非 state）直接返回零字典 —— 旧路径此时的 n_real
+        # 硬同步纯属空跑（两个 stats 分支都不进，返回的就是这六个零）。
+        # 输出与旧实现逐位相同；n_real 只喂被跳过的 stats 分支。
+        return res
     chunks = out["chunks"]
     n_real = int(chunks.chunk_mask[0].sum())
     if n_real < 2:
@@ -2740,13 +3075,12 @@ def _key_geometry_metrics(model, out: dict, device) -> dict:
                 prs.append(torch.zeros((), device=kh.device))
         return torch.stack(mus).mean().detach(), torch.stack(mx).max().detach(), torch.stack(prs).mean().detach()
 
-    cfg = model.config
     # metrics run OUTSIDE the autocast region: the forward's rows are bf16
     # under amp; cast to fp32 before the (fp32-weight) WriteHead modules.
-    if getattr(cfg, "v_row_source", "") == "state":
+    if v_state:
         gates = model.write_head(out["memory"].float())
         res["key_mu"], res["key_mu_max"], res["key_pr"] = stats(gates["k"])
-    if getattr(cfg, "k_row_source", "") == "state":
+    if k_state:
         gates_k = model.write_head_k(out["index"].float())
         res["key_mu_k"], res["key_mu_max_k"], res["key_pr_k"] = stats(gates_k["k"])
     return res
@@ -2863,11 +3197,17 @@ def step_model(model, batch, args, device, train: bool):
             sieve_model=_BURST_SIEVE_MODEL if bool(getattr(args, "burst_prior_sieve", False)) else None,
             stats=burst_stats,
         )
-    clean = clean.to(device)
+    # C4 (2026-09-11 效率施工, 提案 §C4): 掩码直接吃 host 张量（loader 出来
+    # 就在 CPU；burst/cloze/retrieval splice 后仍是 CPU 张量），消掉
+    # to(device)→cpu() 的 D2H 往返硬同步（S1）与那份 32KB 白绕拷贝。值与
+    # _MASK_GENERATOR 消费序全不变 → byte_mask 逐位一致、窗流不动。掩码段
+    # 流水化变体（下一窗预构造）不在本次范围。
+    clean_host = clean
+    clean = clean_host.to(device)
     valid = clean.ne(PAD_ID)
     if getattr(args, "mask_mode", "byte_span") == "mixed":
         byte_mask = make_mixed_mask(
-            clean.cpu(),
+            clean_host,
             args.mask_prob,
             char_frac=args.mask_char_frac,
             char_span_max=args.mask_char_span_max,
@@ -2889,6 +3229,13 @@ def step_model(model, batch, args, device, train: bool):
         # tail force-masked, the R-1 earlier occurrences force-unmasked.
         byte_mask = _burst_mask_overrides(byte_mask, burst_metas)
     source = clean.masked_fill(byte_mask, MASK_ID)
+    # E123 合体臂（任务书冻结 v1.3）：train 态按计划出遮蔽/注入；control 列与
+    # eval 全 None（纯续训 + 仪表 = 地板参照列；eval 形态零变化）。计划构建在
+    # byte_mask 之后、前向之前——遮蔽是注意力侧器件，不进 byte_mask 流。
+    e123_on = _e123_enabled(args)
+    e123_plan = e123_mask = e123_inject = e123_cuts = None
+    if e123_on and train:
+        e123_plan, e123_mask, e123_inject, e123_cuts = _e123_window_plan(model, clean, args, device)
     with torch.autocast("cuda", dtype=torch.bfloat16, enabled=args.amp and device.type == "cuda"):
         out = s1_forward(
             model, source, args, clean=clean, byte_mask=byte_mask, retrieval_metas=retrieval_metas,
@@ -2898,6 +3245,11 @@ def step_model(model, batch, args, device, train: bool):
             burst_metas_q15=burst_metas if q15_on else None,
             need_attn=q15_diag and train,
             train=train,  # decoder 去噪臂: direct 腿扰动只在训练前向 (关态零影响)
+            attn_block_mask=e123_mask,
+            e123_inject=e123_inject,
+            # E124 切点钉死（--e123-cuts-pin）: 只随遮蔽窗传（未遮窗恒等,
+            # test_e124_cuts_override 证), 未遮窗保持旧调用形态逐位不变
+            cuts_override=e123_cuts if e123_mask is not None else None,
         )
     chunks = out["chunks"]
     # Per-chunk base grids: direct (encoded) and predict views keep these.
@@ -3012,8 +3364,8 @@ def step_model(model, batch, args, device, train: bool):
         # Predict task OFF in this arm (user-ruled 2026-08-11): it carries no
         # retention signal and would only muddy the variable set. Not computed
         # at all; zero metrics keep the log schema aligned with other arms.
-        se = torch.zeros((), device=device)
-        predict_cos = torch.zeros((), device=device)
+        se = _step_zero(device)
+        predict_cos = _step_zero(device)
         pair_mask = chunks.chunk_mask.new_ones((1,))  # placeholder, unused
     elif getattr(args, "backbone_mode", "") == "paged_xattn":
         # S37 page-level latent predict: the penultimate page's output row
@@ -3101,10 +3453,10 @@ def step_model(model, batch, args, device, train: bool):
             predict_cos = (cos * pair_mask).sum() / pair_mask.sum().clamp(min=1.0)
 
     predict_mode = getattr(args, "predict_mode", "latent")
-    predict_ce = torch.zeros((), device=device)
-    predict_byte_acc = torch.zeros((), device=device)
+    predict_ce = _step_zero(device)
+    predict_byte_acc = _step_zero(device)
     if codec_final:
-        predict_loss = torch.zeros((), device=device)
+        predict_loss = _step_zero(device)
     elif predict_mode == "decode":
         # frozen-decoder supervision, v2.1: the predict branch consumes
         # content.detach() -- predict CE trains the BACKBONE ONLY. s13 (E31)
@@ -3129,11 +3481,11 @@ def step_model(model, batch, args, device, train: bool):
     # (post-Markov-head, same form); the weight sits ON TOP of the three main
     # tasks (their weights are untouched). Zero placeholders keep the log
     # schema aligned when the task is off or no sample is active.
-    cloze_loss = torch.zeros((), device=device)
+    cloze_loss = _step_zero(device)
     cloze_metrics = {
-        "cloze_byte_acc": torch.zeros((), device=device),
-        "cloze_exact": torch.zeros((), device=device),
-        "cloze_count": torch.zeros((), device=device),
+        "cloze_byte_acc": _step_zero(device),
+        "cloze_exact": _step_zero(device),
+        "cloze_count": _step_zero(device),
     }
     if cloze_metas is not None:
         cloze_slot, cloze_active = _cloze_slot_grid(
@@ -3149,19 +3501,19 @@ def step_model(model, batch, args, device, train: bool):
     # ON TOP of the three main tasks (their weights are untouched). Zero
     # placeholders keep the log schema aligned when the task is off or no
     # sample is active.
-    retrieval_loss = torch.zeros((), device=device)
+    retrieval_loss = _step_zero(device)
     retrieval_metrics = {
-        "retrieval_byte_acc": torch.zeros((), device=device),
-        "retrieval_exact": torch.zeros((), device=device),
-        "retrieval_count": torch.zeros((), device=device),
-        "retrieval_block_rate": torch.zeros((), device=device),
+        "retrieval_byte_acc": _step_zero(device),
+        "retrieval_exact": _step_zero(device),
+        "retrieval_count": _step_zero(device),
+        "retrieval_block_rate": _step_zero(device),
         # Q12 示例密集形态 (修订案 v3 / 附录 A2②): window-budget and
         # construction-defect gauges; all-zero in the example-free form
         # (metas carry no budget fields there).
-        "retrieval_budget_ratio": torch.zeros((), device=device),
-        "retrieval_examples": torch.zeros((), device=device),
-        "retrieval_drop_rate": torch.zeros((), device=device),
-        "retrieval_defect": torch.zeros((), device=device),
+        "retrieval_budget_ratio": _step_zero(device),
+        "retrieval_examples": _step_zero(device),
+        "retrieval_drop_rate": _step_zero(device),
+        "retrieval_defect": _step_zero(device),
     }
     if retrieval_metas is not None:
         retrieval_slot, retrieval_active = _cloze_slot_grid(
@@ -3202,14 +3554,14 @@ def step_model(model, batch, args, device, train: bool):
     # 数据分布, the codec three tasks already cover the masked tail. Metrics
     # only, zero placeholders keep the log schema aligned when off.
     burst_metrics = {
-        "burst_tail_byte_acc": torch.zeros((), device=device),
-        "burst_tail_exact": torch.zeros((), device=device),
-        "burst_count": torch.zeros((), device=device),
-        "burst_tail_chars": torch.zeros((), device=device),
+        "burst_tail_byte_acc": _step_zero(device),
+        "burst_tail_exact": _step_zero(device),
+        "burst_count": _step_zero(device),
+        "burst_tail_chars": _step_zero(device),
         # Q14 (修订案 2026-08-23 §2.2): 先验筛拒收率与产出率 (激活率 =
         # 激活样本/抽中样本); 筛关时 reject_rate 恒 0, 任务关时双双零占位.
-        "burst_sieve_reject_rate": torch.zeros((), device=device),
-        "burst_yield": torch.zeros((), device=device),
+        "burst_sieve_reject_rate": _step_zero(device),
+        "burst_yield": _step_zero(device),
     }
     if burst_metas is not None:
         # burst_slot/burst_active 已在 comp 网格处算好 (Q15 §3.2 剔除共用)
@@ -3229,19 +3581,19 @@ def step_model(model, batch, args, device, train: bool):
     # Q15 回路养成臂三件套 (任务书 2026-08-25 §3, 全部 train-only; eval 零
     # 占位, 网格不动 -- §7.2 形态纪律). λ 每步从 args 读 (回调线 §5 原地降权).
     q15_metrics = {
-        "q15_attend_mass": torch.zeros((), device=device),
-        "q15_attend_maxmass": torch.zeros((), device=device),  # §3.2v1: 门所见单头最大 T 质量
-        "q15_attend_chance": torch.zeros((), device=device),  # §3.2v1: 均匀基线 (判读矩阵基线读数)
-        "q15_attend_loss": torch.zeros((), device=device),
-        "q15_gate_mean": torch.zeros((), device=device),
-        "q15_echo_loss": torch.zeros((), device=device),
-        "q15_couple_loss": torch.zeros((), device=device),
-        "q15_twin_d": torch.zeros((), device=device),
-        "q15_twin_count": torch.zeros((), device=device),
+        "q15_attend_mass": _step_zero(device),
+        "q15_attend_maxmass": _step_zero(device),  # §3.2v1: 门所见单头最大 T 质量
+        "q15_attend_chance": _step_zero(device),  # §3.2v1: 均匀基线 (判读矩阵基线读数)
+        "q15_attend_loss": _step_zero(device),
+        "q15_gate_mean": _step_zero(device),
+        "q15_echo_loss": _step_zero(device),
+        "q15_couple_loss": _step_zero(device),
+        "q15_twin_d": _step_zero(device),
+        "q15_twin_count": _step_zero(device),
     }
-    attend_loss = torch.zeros((), device=device)
-    echo_loss = torch.zeros((), device=device)
-    couple_loss = torch.zeros((), device=device)
+    attend_loss = _step_zero(device)
+    echo_loss = _step_zero(device)
+    couple_loss = _step_zero(device)
     if q15_diag and train and burst_metas is not None:
         attn = out.get("block1_attn")
         if attn is None:
@@ -3359,7 +3711,7 @@ def step_model(model, batch, args, device, train: bool):
     # summarizer the tail bytes must be IN the memory row. Train-time only:
     # never computed in eval, so eval_loss stays form-identical to historical
     # runs (comparability); the aux head never enters inference.
-    aux_recon_loss = torch.zeros((), device=device)
+    aux_recon_loss = _step_zero(device)
     if train and getattr(args, "summarizer_aux_recon", False) and out.get("memory") is not None:
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=args.amp and device.type == "cuda"):
             aux_logits = model.aux_recon_logits(out["memory"])
@@ -3424,11 +3776,11 @@ def step_model(model, batch, args, device, train: bool):
     # + 干净行 direct acc ——混合 direct_acc 在扰动臂下天然回落, 干净行读数才是
     # §2 有效性门的判读面。关态/eval = 零占位, log schema 对齐 (本文件臂列惯例)。
     denoise_metrics = {
-        "denoise_noise_frac": torch.zeros((), device=device),
-        "denoise_mhat_frac": torch.zeros((), device=device),
-        "denoise_clean_frac": torch.zeros((), device=device),
+        "denoise_noise_frac": _step_zero(device),
+        "denoise_mhat_frac": _step_zero(device),
+        "denoise_clean_frac": _step_zero(device),
         "denoise_grade": torch.full((), -1.0, device=device),
-        "denoise_direct_clean_acc": torch.zeros((), device=device),
+        "denoise_direct_clean_acc": _step_zero(device),
     }
     dn = out.get("denoise_stats")
     if dn is not None:
@@ -3460,6 +3812,65 @@ def step_model(model, batch, args, device, train: bool):
     # 是否吃了多槽读出行 (train 态旗标开才 1; 关态/eval = 零占位, log schema
     # 对齐本文件臂列惯例)
     metrics["q20_engaged"] = torch.tensor(float(out.get("q20_engaged", 0.0)), device=device)
+    # E123 合体臂仪表（任务书 §5 仪表① + §7 冒烟条款）：自读出 byte-acc 按
+    # 源-汇距离 k 分层（池化与 K_max 切档纠缠，判据读分层数）——计分层用
+    # 决策日志全量依赖对（未纳入当前 K_max 档的对是同列未注入参照），目标格
+    # = clean targets，剔除 byte_mask 随机遮蔽位（那些位 direct 腿学的是
+    # MASK_ID，不是内容）。对照列同键照跑 = 盲猜地板逐碑落盘（坑 9 纪律：
+    # 地板按种子窗流逐种子自锚，本臂地板 = control 列同键读数）。
+    # 关态/eval = 零占位，log schema 对齐本文件臂列惯例。
+    # C7: e123_zero 取缓存零；关态各键只读共享缓存本体，clone 拷贝既不必要
+    # 也省去（值与旧逐位 clone 的零张量全等）。
+    e123_zero = _step_zero(device)
+    e123_dep_stats = {"e123_acc_d1": e123_zero, "e123_acc_d2": e123_zero,
+                      "e123_n_d1": e123_zero, "e123_n_d2": e123_zero,
+                      "e123_blocks": e123_zero, "e123_lambda": e123_zero,
+                      "e123_kmax": e123_zero}
+    if e123_on and train and e123_plan is not None:
+        # λ/K_max/遮蔽块数是时间表与计划量，与窗内有无依赖对无关——逐步落盘，
+        # 轨迹判读不断流（无料窗 blocks=0 本身是有信息读数）
+        e123_dep_stats["e123_blocks"] = torch.tensor(float(len(e123_plan["kept"])), device=device)
+        e123_dep_stats["e123_lambda"] = torch.tensor(e123_plan["lam"], device=device)
+        e123_dep_stats["e123_kmax"] = torch.tensor(float(e123_plan["kmax"]), device=device)
+    if e123_on and train and e123_plan is not None and e123_plan["pairs"]:
+        ca, oa = chunks.chunk_ids[0], chunks.offsets[0]
+        T_w = int(clean.size(1))
+        C_g, S_g = targets.size(1), targets.size(2)
+        pred_d = out["logits_direct"].argmax(dim=-1)
+        for d in (1, 2):
+            dep_m = torch.zeros(1, C_g, S_g, dtype=torch.bool, device=device)
+            n_pos = 0
+            for pair in e123_plan["pairs"]:
+                if int(pair["distance"]) != d:
+                    continue
+                for p in pair["positions"]:
+                    p = int(p)
+                    if not 0 <= p < T_w or bool(byte_mask[0, p]):
+                        continue
+                    c, s = int(ca[p]), int(oa[p])
+                    if 0 <= c < C_g and 0 <= s < S_g:
+                        dep_m[0, c, s] = True
+                        n_pos += 1
+            e123_dep_stats[f"e123_acc_d{d}"] = _acc_tensor(pred_d, targets, dep_m & slot_mask)
+            e123_dep_stats[f"e123_n_d{d}"] = torch.tensor(float(n_pos), device=device)
+    metrics.update(e123_dep_stats)
+    e123_st = out.get("e123_stats")
+    metrics["e123_injected_pairs"] = torch.tensor(
+        float(e123_st["pairs"]) if e123_st else 0.0, device=device
+    )
+    # E124 门仪表（任务书冻结 v1.0 §5: 副仪表 A = 可学 α 轨迹; 逐查询预算
+    # 均值 k 轨迹）——门关 = 零占位（log schema 对齐本文件臂列惯例,
+    # e123_dep_stats 同款纪律）
+    e124_zero = _step_zero(device)
+    _bb = getattr(model, "backbone", None)
+    if _bb is not None and getattr(_bb, "e124_gate", False):
+        metrics["e124_alpha"] = _bb.e124_alpha_value().detach()
+        metrics["e124_k"] = (
+            _bb.last_e124_k if _bb.last_e124_k is not None else e124_zero
+        ).to(device)
+    else:
+        metrics["e124_alpha"] = e124_zero
+        metrics["e124_k"] = e124_zero
     if slm_mode:
         # E80 补充 2: resident key-geometry dashboard (slm default-on; legacy
         # paths never gain these keys)
@@ -3505,12 +3916,26 @@ def evaluate(model, eval_loader, args, device):
     _RETRIEVAL_GENERATOR.manual_seed(args.eval_mask_seed + _RETRIEVAL_SEED_OFFSET)
     # burst eval determinism: same discipline, its own stream offset.
     _BURST_GENERATOR.manual_seed(args.eval_mask_seed + _BURST_SEED_OFFSET)
-    rows = []
-    for i, batch in enumerate(eval_loader):
-        if i >= args.max_eval_batches:
-            break
-        _, metrics = step_model(model, batch, args, device, train=False)
-        rows.append({k: float(v) for k, v in metrics.items()})
+    # E124: eval 一律部署姿态（硬门 + 终点预算 k_final; 温度对硬模式无作用
+    # 但按任务书 §6 一并钉 temp_end 保读数可复演）; 退出恢复原训练姿态
+    # (try/finally——中途异常也不把部署姿态泄漏回训练循环)。
+    _e124_bb = getattr(model, "backbone", None)
+    _e124_save = None
+    if _e124_bb is not None and getattr(_e124_bb, "e124_gate", False):
+        _e124_save = (_e124_bb.e124_rt_hard, _e124_bb.e124_rt_progress, _e124_bb.e124_rt_temp)
+        _e124_bb.e124_rt_hard = True
+        _e124_bb.e124_rt_progress = 1.0
+        _e124_bb.e124_rt_temp = float(getattr(args, "e124_gate_temp_end", 0.05))
+    try:
+        rows = []
+        for i, batch in enumerate(eval_loader):
+            if i >= args.max_eval_batches:
+                break
+            _, metrics = step_model(model, batch, args, device, train=False)
+            rows.append({k: float(v) for k, v in metrics.items()})
+    finally:
+        if _e124_save is not None:
+            (_e124_bb.e124_rt_hard, _e124_bb.e124_rt_progress, _e124_bb.e124_rt_temp) = _e124_save
     model.train()
     merged = {}
     for key in rows[0]:
@@ -3714,6 +4139,204 @@ def _add_s1_args(parser: argparse.ArgumentParser) -> None:
         "--d1-tail", type=int, default=3,
         help="稀有命中处起的续尾字节数 T (任务书 §1 终审① 冻结 3)",
     )
+    # --- E123 合体臂：遮蔽 + 延迟自读出（任务书冻结 v1.3 2026-09-07:
+    # docs/versions/v3.7/FLUED_V3_7_E123_MASK_DELAYED_READOUT_20260907_CN.md）---
+    # 离线选择器决策日志驱动（训练时零额外前向），三列同一日志同一仪表。
+    # 默认全关（--e123-mask-log 空）= 旧路径逐位不变（--multislot-readout-* 先例）。
+    parser.add_argument(
+        "--e123-mask-log", default="",
+        help="E123 合体臂总开关 = 选择器决策日志 jsonl (build_e123_mask_log.py 落盘; "
+             "窗索引 = 训练流序, batch=1 同种子流逐项同构前提; 缺件/schema 坏响亮报错)",
+    )
+    parser.add_argument(
+        "--e123-mode", choices=["control", "combined", "shuffled"], default="control",
+        help="control=纯续训+仪表(地板参照列) | combined=定向遮蔽+延迟自读出注入(主列) | "
+             "shuffled=同遮蔽+注入源跨窗置换(乱序对照列, 必须学不会)",
+    )
+    parser.add_argument(
+        "--e123-lambda-ramp", type=int, default=1000,
+        help="注入强度 λ 缓升步数 (开口项① 终审: 前 1K 步 0→1 线性; 纯时间表, 禁可坍缩门)",
+    )
+    parser.add_argument(
+        "--e123-kmax-schedule", default="1:0,2:2000,4:6000,16:8000",
+        help="K_max 时间表 'K:step' 档列 (任务书 §4 按回执二直方图倾斜定案: "
+             "1:0-2K / 2:2K-6K / 4:6K-8K / 16:8K-10K; 档内只遮蔽/监督距离≤K_max 的块)",
+    )
+    parser.add_argument(
+        "--e123-donor-seed", type=int, default=20260907,
+        help="乱序列跨窗置换种子 (与数据流种子分离; 置换表落盘 out_dir/e123_donor_perm.json)",
+    )
+    # --- E124 硬预算检索门（任务书冻结 v1.0 2026-09-09）: block-1 部署查询对
+    # index(K) 行打分 → top-k 命中 memory(V) 行做可学 α-entmax 加权; 未命中行
+    # 权重结构性恰零。默认关 = 不建门件, 旧路径逐位不变（条件创建纪律）。---
+    parser.add_argument(
+        "--e124-budget-gate", action="store_true",
+        help="E124 硬预算检索门总开关 (a 格限定: k=index ∧ v=memory; 需 --init-checkpoint "
+             "s0pp 基座 + 全键全形校验, 白名单仅 backbone.e124_alpha_raw)",
+    )
+    parser.add_argument(
+        "--e124-alpha-init", type=float, default=2.0,
+        help="可学 α-entmax 锐度初值 (sparsemax 点; α=1+softplus(raw) 恒>1, bisect 数值域)",
+    )
+    parser.add_argument(
+        "--e124-gate-k-final", type=int, default=9,
+        help="逐查询检索预算退火终点 k (任务书 §3.5 定稿 k=9)",
+    )
+    parser.add_argument(
+        "--e124-gate-anneal-frac", type=float, default=0.4,
+        help="预算/温度退火窗 = max_steps 的前段分数 (0-40%% 窗内线性 全量→k_final)",
+    )
+    parser.add_argument(
+        "--e124-gate-temp-start", type=float, default=1.0,
+        help="软 top-k 温度时间表起点 (训练软门的 logsigmoid 打分温度; 不可学)",
+    )
+    parser.add_argument(
+        "--e124-gate-temp-end", type=float, default=0.05,
+        help="软 top-k 温度时间表终点 (退火窗末; eval/部署硬模式下温度无作用)",
+    )
+    parser.add_argument(
+        "--e123-cuts-pin", action="store_true",
+        help="E124 切点钉死 (用户裁定 2026-09-10: 内容缺席、结构不动): 遮蔽前向复用 "
+             "选择器日志落盘的干净窗 hard_cut (需含 hard_cut 键的 2026-09-10 后口径日志; "
+             "默认关 = E123 旧路径逐位不变)",
+    )
+
+
+# E124 基座审计期望差集（2026-09-10 一次性枚举冻结: s0pp_pro_v4_sft_20260805
+# latest.pt (v36 状态机线, 350 键) vs E124 comb 模型 (v37 slm a 格 qpool, 337 键)
+# = 287 全键全形匹配 + 4 形不符 + 45 缺席 + 59 冗键; 枚举脚本口径:
+# build_model(comb 配置, kda_impl=torch) vs torch.load(init)["model"]。
+# 三组都是 v36↔v37 结构鸿沟的确定成分: 缺席 = slm backbone/decoder_in_mem/
+# index_ffn/pool_queries (v37 slm 新件, 随机初始化归训练); 形不符 = chunk_pos
+# (max_chunks 64→1024) + summarizer.ffn (mean→qpool 宽度); 冗键 = write_head/
+# state_machine/encoder 式 backbone/decoder_in (v36 状态机件, v37 无归属)。
+# 审计 = 实际差集与三组冻结集合精确相等 (白名单 backbone.e124_alpha_raw 另行
+# 豁免——门唯一新件, 确定性常数初始化, 不进基座属正常); 任何漂移 (典型:
+# parser 现行默认填补老配置缺键, 2026-08-29 冒烟事故入例) 都会改变差集 → 响亮。
+_E124_EXPECT_ABSENT = frozenset(
+    [
+        "backbone.align_k.weight", "backbone.align_v.weight",
+        "backbone.ffn1.0.bias", "backbone.ffn1.0.weight",
+        "backbone.ffn1.2.bias", "backbone.ffn1.2.weight",
+        "backbone.ln_ffn1.bias", "backbone.ln_ffn1.weight",
+        "backbone.norm.bias", "backbone.norm.weight",
+        "backbone.o_proj.weight", "backbone.q_proj.weight",
+        "backbone.self_blocks.0.ffn.0.bias", "backbone.self_blocks.0.ffn.0.weight",
+        "backbone.self_blocks.0.ffn.2.bias", "backbone.self_blocks.0.ffn.2.weight",
+        "backbone.self_blocks.0.k.weight",
+        "backbone.self_blocks.0.ln_f.bias", "backbone.self_blocks.0.ln_f.weight",
+        "backbone.self_blocks.0.ln_s.bias", "backbone.self_blocks.0.ln_s.weight",
+        "backbone.self_blocks.0.o.weight", "backbone.self_blocks.0.q.weight",
+        "backbone.self_blocks.0.v.weight",
+        "backbone.self_blocks.1.ffn.0.bias", "backbone.self_blocks.1.ffn.0.weight",
+        "backbone.self_blocks.1.ffn.2.bias", "backbone.self_blocks.1.ffn.2.weight",
+        "backbone.self_blocks.1.k.weight",
+        "backbone.self_blocks.1.ln_f.bias", "backbone.self_blocks.1.ln_f.weight",
+        "backbone.self_blocks.1.ln_s.bias", "backbone.self_blocks.1.ln_s.weight",
+        "backbone.self_blocks.1.o.weight", "backbone.self_blocks.1.q.weight",
+        "backbone.self_blocks.1.v.weight",
+        "decoder_in_mem.bias", "decoder_in_mem.weight",
+        "summarizer.index_ffn.0.bias", "summarizer.index_ffn.0.weight",
+        "summarizer.index_ffn.1.bias", "summarizer.index_ffn.1.weight",
+        "summarizer.index_ffn.3.bias", "summarizer.index_ffn.3.weight",
+        "summarizer.pool_queries",
+    ]
+)
+_E124_EXPECT_SHAPE_BAD = frozenset(
+    [
+        "chunk_pos.weight",
+        "summarizer.ffn.0.bias", "summarizer.ffn.0.weight", "summarizer.ffn.1.weight",
+    ]
+)
+_E124_EXPECT_EXTRA = frozenset(
+    [
+        "backbone.encoder.layers.0.linear1.bias", "backbone.encoder.layers.0.linear1.weight",
+        "backbone.encoder.layers.0.linear2.bias", "backbone.encoder.layers.0.linear2.weight",
+        "backbone.encoder.layers.0.norm1.bias", "backbone.encoder.layers.0.norm1.weight",
+        "backbone.encoder.layers.0.norm2.bias", "backbone.encoder.layers.0.norm2.weight",
+        "backbone.encoder.layers.0.self_attn.in_proj_bias",
+        "backbone.encoder.layers.0.self_attn.in_proj_weight",
+        "backbone.encoder.layers.0.self_attn.out_proj.bias",
+        "backbone.encoder.layers.0.self_attn.out_proj.weight",
+        "backbone.encoder.layers.1.linear1.bias", "backbone.encoder.layers.1.linear1.weight",
+        "backbone.encoder.layers.1.linear2.bias", "backbone.encoder.layers.1.linear2.weight",
+        "backbone.encoder.layers.1.norm1.bias", "backbone.encoder.layers.1.norm1.weight",
+        "backbone.encoder.layers.1.norm2.bias", "backbone.encoder.layers.1.norm2.weight",
+        "backbone.encoder.layers.1.self_attn.in_proj_bias",
+        "backbone.encoder.layers.1.self_attn.in_proj_weight",
+        "backbone.encoder.layers.1.self_attn.out_proj.bias",
+        "backbone.encoder.layers.1.self_attn.out_proj.weight",
+        "backbone.encoder.layers.2.linear1.bias", "backbone.encoder.layers.2.linear1.weight",
+        "backbone.encoder.layers.2.linear2.bias", "backbone.encoder.layers.2.linear2.weight",
+        "backbone.encoder.layers.2.norm1.bias", "backbone.encoder.layers.2.norm1.weight",
+        "backbone.encoder.layers.2.norm2.bias", "backbone.encoder.layers.2.norm2.weight",
+        "backbone.encoder.layers.2.self_attn.in_proj_bias",
+        "backbone.encoder.layers.2.self_attn.in_proj_weight",
+        "backbone.encoder.layers.2.self_attn.out_proj.bias",
+        "backbone.encoder.layers.2.self_attn.out_proj.weight",
+        "backbone.in_proj.bias", "backbone.in_proj.weight",
+        "backbone.pos.weight",
+        "decoder_in.bias", "decoder_in.weight",
+        "state_machine.readout_query",
+        "state_machine.realign.0.bias", "state_machine.realign.0.weight",
+        "state_machine.realign.1.bias", "state_machine.realign.1.weight",
+        "state_machine.realign.3.bias", "state_machine.realign.3.weight",
+        "write_head.alpha_logit",
+        "write_head.to_beta.bias", "write_head.to_beta.weight",
+        "write_head.to_k.bias", "write_head.to_k.weight",
+        "write_head.to_v.bias", "write_head.to_v.weight",
+        "write_head.trunk.0.bias", "write_head.trunk.0.weight",
+        "write_head.trunk.1.bias", "write_head.trunk.1.weight",
+    ]
+)
+
+
+def _e124_audit_init_checkpoint(model, args) -> None:
+    """E124 基座全键全形校验（⑤, 去噪臂冒烟事故入例的 loud-fail 升级款）:
+    init_checkpoint 的通用加载是静默形状过滤 (compatible dict)——E124 臂
+    （gate 或 cuts_pin 开）锚定 s0pp 冻结接管基座, 实际差集必须与三组冻结
+    期望集合精确相等（_E124_EXPECT_ABSENT/_SHAPE_BAD/_EXTRA, 2026-09-10
+    一次性枚举冻结, 287/4/45/59）, 白名单仅 backbone.e124_alpha_raw（门
+    唯一新件, 确定性常数初始化, 不进基座属正常）。任何架构漂移都会改变
+    差集 → 响亮退出, 不许静默训一个残缺基座。"""
+    payload = torch.load(args.init_checkpoint, map_location="cpu", weights_only=False)["model"]
+    cur = model.state_dict()
+    whitelist = "backbone.e124_alpha_raw"
+    absent = frozenset(k for k in cur if k != whitelist and k not in payload)
+    shape_bad = frozenset(k for k in cur if k in payload and payload[k].shape != cur[k].shape)
+    extra = frozenset(k for k in payload if k not in cur)
+    drift = []
+    if absent != _E124_EXPECT_ABSENT:
+        drift.append(
+            f"缺席集漂移: 新缺席={sorted(absent - _E124_EXPECT_ABSENT)[:5]} "
+            f"已消缺={sorted(_E124_EXPECT_ABSENT - absent)[:5]}"
+        )
+    if shape_bad != _E124_EXPECT_SHAPE_BAD:
+        drift.append(
+            f"形不符集漂移: 新={sorted(shape_bad - _E124_EXPECT_SHAPE_BAD)[:5]} "
+            f"已修复={sorted(_E124_EXPECT_SHAPE_BAD - shape_bad)[:5]}"
+        )
+    if extra != _E124_EXPECT_EXTRA:
+        drift.append(
+            f"冗键集漂移: 新冗={sorted(extra - _E124_EXPECT_EXTRA)[:5]} "
+            f"已归位={sorted(_E124_EXPECT_EXTRA - extra)[:5]}"
+        )
+    if drift:
+        raise SystemExit(
+            "[s1][e124] 基座全键全形校验失败（差集与 2026-09-10 冻结期望不符）: "
+            + " | ".join(drift)
+            + " —— 检查 --config 来源与基座的架构漂移 (典型: summarizer_pool 现行默认 "
+            "qpool vs 老基座 mean 类 parser 默认漂移, 需显式旗标对齐历史口径; 若漂移是"
+            "有意的新形态, 须重跑一次性枚举并原地更新三组冻结集合)"
+        )
+    n_matched = len(cur) - len(absent) - len(shape_bad) - int(whitelist in cur)
+    print(
+        f"[s1][e124] 基座全键全形校验通过: {n_matched} 键匹配 "
+        f"+ {len(shape_bad)} 形不符(冻结豁免) + {len(absent)} 缺席(冻结豁免) "
+        f"+ {len(extra)} 冗键(冻结豁免) | 白名单: {whitelist}",
+        flush=True,
+    )
+    del payload, cur
 
 
 def main() -> None:
@@ -3957,6 +4580,111 @@ def main() -> None:
             f"grams={n_d1_grams}",
             flush=True,
         )
+    e123_on = _e123_enabled(args)
+    if e123_on:
+        # E123 合体臂（任务书冻结 v1.3 2026-09-07）: 响亮校验——
+        # 窗索引 = 训练流序（batch=1 + 流式训练 + 同种子，与选择器逐项同构）;
+        # a 格 fine-V（v_row_source=memory）的 per-chunk 网格; 与改动损失面/
+        # 读出链/数据流的历史臂全部互斥（单变量 = 合体需求有无）。
+        if getattr(args, "backbone_mode", "") != "slm":
+            raise SystemExit("--e123-mask-log requires --backbone-mode slm (v3.7; legacy 路径 N/A)")
+        if getattr(args, "v_row_source", "memory") != "memory":
+            raise SystemExit(
+                "--e123-mask-log requires v_row_source=memory (a 格 fine-V per-chunk 网格; "
+                "state 源累积召回槽破坏 byte->slot 对应, N/A)"
+            )
+        if int(args.batch_size) != 1:
+            raise SystemExit("--e123-mask-log requires batch_size=1 (窗索引 = 训练流序 1:1 对齐前提)")
+        if not getattr(args, "streaming_train", False):
+            raise SystemExit("--e123-mask-log requires --streaming-train (窗流与选择器同构前提)")
+        for _flag, _name in [
+            (q18_on, "Q18"), (_q15_enabled(args), "Q15"),
+            (bool(getattr(args, "q15_attn_diag", False)), "q15-attn-diag"),
+            (d1_on, "D1"), (_multislot_readout_enabled(args), "Q20 多槽读出"),
+            (bool(getattr(args, "e120_readout_swap", False)), "E120 读出替换"),
+            (_decoder_denoise_enabled(args), "decoder 去噪"),
+            (_cloze_enabled(args), "cloze"), (_retrieval_enabled(args), "retrieval"),
+            (_burst_enabled(args), "burst"),
+            (int(getattr(args, "decoder_markov", 0)) > 0, "decoder-markov"),
+        ]:
+            if _flag:
+                raise SystemExit(f"--e123-mask-log 不组合 {_name} 臂 (E123 单变量纪律; 响亮拒绝)")
+        global _E123_LOG, _E123_KMAX_SCHED, _E123_DONOR, _E123_DONOR_WINDOWS
+        _E123_LOG = _load_e123_mask_log(args.e123_mask_log)
+        _E123_KMAX_SCHED = _e123_parse_kmax(args.e123_kmax_schedule)
+        print(
+            f"[s1][e123] E123 合体臂 ({args.e123_mode}): log={args.e123_mask_log} "
+            f"({len(_E123_LOG)} 窗) kmax_schedule={_E123_KMAX_SCHED} "
+            f"lambda_ramp={int(args.e123_lambda_ramp)}",
+            flush=True,
+        )
+        if int(args.max_steps) > len(_E123_LOG):
+            print(
+                f"[s1][e123] 警告: max_steps={args.max_steps} > 日志窗数 {len(_E123_LOG)} "
+                f"——超程窗无决策记录（零遮蔽零注入, 仪表零占位）",
+                flush=True,
+            )
+        if args.e123_mode == "shuffled":
+            _E123_DONOR = _e123_build_donor_perm(_E123_LOG, int(args.e123_donor_seed))
+            _E123_DONOR_WINDOWS = _e123_materialize_windows(args, len(_E123_LOG))
+            print(
+                f"[s1][e123] 乱序列: 跨窗置换 {len(_E123_DONOR)} 窗 "
+                f"(donor_seed={int(args.e123_donor_seed)}, donor 窗料化 {len(_E123_DONOR_WINDOWS)} 窗)",
+                flush=True,
+            )
+    e124_on = bool(getattr(args, "e124_budget_gate", False))
+    if e124_on:
+        # E124 硬预算检索门（任务书冻结 v1.0 2026-09-09）: 响亮校验——
+        # a 格限定 (index K 命中 → memory V 取回的原生通道映射; model 构造期
+        # 对非 a 格也响亮报错, 此处 CLI 层先拦); batch=1 (批内混合预算语义未
+        # 定义, 时间表按窗流定标); 与改动损失面/读出链/数据流的历史臂互斥
+        # (E123 不在互斥列——comb 列 = 门 + E123 需求器件合体是设计内形态)。
+        if getattr(args, "backbone_mode", "") != "slm":
+            raise SystemExit("--e124-budget-gate requires --backbone-mode slm (v3.7; legacy 路径 N/A)")
+        if getattr(args, "k_row_source", "index") != "index" or \
+                getattr(args, "v_row_source", "memory") != "memory":
+            raise SystemExit(
+                "--e124-budget-gate requires slm a 格 (k_row_source=index ∧ v_row_source=memory; "
+                "任务书 §1 格别裁定, d/b 格注册为转移臂候选)"
+            )
+        if int(args.batch_size) != 1:
+            raise SystemExit("--e124-budget-gate requires batch_size=1 (批内混合预算语义未定义)")
+        if bool(getattr(args, "k_block_eval", False)):
+            raise SystemExit(
+                "--e124-budget-gate 不组合 --k-block-eval (S39 探针的均匀键使 top-k "
+                "退化为位置别名; 单变量纪律)"
+            )
+        for _flag, _name in [
+            (q18_on, "Q18"), (_q15_enabled(args), "Q15"),
+            (bool(getattr(args, "q15_attn_diag", False)), "q15-attn-diag"),
+            (d1_on, "D1"), (_multislot_readout_enabled(args), "Q20 多槽读出"),
+            (bool(getattr(args, "e120_readout_swap", False)), "E120 读出替换"),
+            (_decoder_denoise_enabled(args), "decoder 去噪"),
+            (_cloze_enabled(args), "cloze"), (_retrieval_enabled(args), "retrieval"),
+            (_burst_enabled(args), "burst"),
+            (int(getattr(args, "decoder_markov", 0)) > 0, "decoder-markov"),
+        ]:
+            if _flag:
+                raise SystemExit(f"--e124-budget-gate 不组合 {_name} 臂 (E124 单变量纪律; 响亮拒绝)")
+        if not args.init_checkpoint:
+            raise SystemExit(
+                "--e124-budget-gate 需要 --init-checkpoint <s0pp 基座> (全键全形校验 + "
+                "白名单仅 backbone.e124_alpha_raw; 门的有效性账锚定冻结接管基座, 非从零)"
+            )
+        if not (0.0 < float(args.e124_gate_anneal_frac) <= 1.0):
+            raise SystemExit("--e124-gate-anneal-frac 须在 (0, 1] (退火窗 = max_steps 前段分数)")
+        print(
+            f"[s1][e124] 硬预算检索门: alpha_init={float(args.e124_alpha_init)} "
+            f"k_final={int(args.e124_gate_k_final)} anneal_frac={float(args.e124_gate_anneal_frac)} "
+            f"temp={float(args.e124_gate_temp_start)}→{float(args.e124_gate_temp_end)} "
+            f"(训练软门, eval 硬门+终点预算)",
+            flush=True,
+        )
+    if bool(getattr(args, "e123_cuts_pin", False)) and not e123_on:
+        raise SystemExit(
+            "--e123-cuts-pin requires --e123-mask-log (切点钉死消费选择器日志的 hard_cut 键; "
+            "无日志无切点源, 响亮拒绝)"
+        )
     if _q15_enabled(args):
         # Q15 回路养成臂 (任务书 2026-08-25 冻结): λ 初值 (§3.4) 落 args
         # 属性, step_model 每步读, 回调线 (§5) 原地降权. λ_out 继承
@@ -4020,6 +4748,14 @@ def main() -> None:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "resolved_config.json").write_text(json.dumps(vars(args), indent=2), encoding="utf-8")
+    if e123_on and args.e123_mode == "shuffled":
+        # E123 乱序列跨窗置换表落盘（种子落盘纪律：独立种子 + 置换全表可复诊）
+        (out_dir / "e123_donor_perm.json").write_text(
+            json.dumps({"donor_seed": int(args.e123_donor_seed),
+                        "perm": {str(k): v for k, v in _E123_DONOR.items()}},
+                       ensure_ascii=False),
+            encoding="utf-8",
+        )
 
     model = build_model(args).to(device)
     if args.eval_only:
@@ -4070,6 +4806,10 @@ def main() -> None:
             compatible = {k: v for k, v in compatible.items() if any(k.startswith(p) for p in init_prefixes)}
         model.load_state_dict(compatible, strict=False)
         print(f"[s1] init: loaded={len(compatible)} skipped={len(payload['model']) - len(compatible)} prefixes={init_prefixes or 'ALL'}", flush=True)
+    if (e124_on or bool(getattr(args, "e123_cuts_pin", False))) and args.init_checkpoint:
+        # E124 臂 (gate 或 cuts_pin 开) 基座 loud-fail 校验 (⑤): 通用加载
+        # 是静默形状过滤, 本臂锚定 s0pp 冻结接管基座, 不齐响亮退出
+        _e124_audit_init_checkpoint(model, args)
     q18_warm_report = None
     q18_base_step = 0
     q18_base_payload = None
@@ -4337,6 +5077,28 @@ def main() -> None:
                 args.retrieval_block_prob = _ramp_lookup(_RETRIEVAL_RAMP, step)
             if denoise_on:
                 args.decoder_denoise_step = step  # 去噪课程查表步 (本 run 内 0 基; eval 路径不消费)
+            if e123_on:
+                # E123: 课程查表步 + 窗索引（= 本 run 消费的训练流窗序; resume
+                # 时 DataLoader 从头重放, 窗索引 = step - start_step 与数据同步）
+                args.e123_step = step
+                args.e123_window_id = step - start_step
+            if e124_on:
+                # E124 门时间表（任务书冻结 v1.0 §6 退火纪律: 纯时间表, 无可学
+                # 时间表件; 预算与温度单自由度各归各禁互相代偿）: 退火进度
+                # p = min(1, step / (anneal_frac·max_steps)) 线性 0→1 (预算从
+                # 全量退到 k_final, 起点 = 门关逐位一致锚); 温度 τ 同窗从
+                # temp_start 线性退到 temp_end; 训练恒软门 (rt_hard=False,
+                # 可微路径), rt_budget=None (不覆写, 按进度表)。eval 姿态在
+                # evaluate() 内另设 (硬门+终点), 与此处不串。
+                _bb124 = model.backbone
+                _frac124 = max(float(args.e124_gate_anneal_frac), 1e-9)
+                _p124 = min(1.0, step / (_frac124 * float(args.max_steps)))
+                _bb124.e124_rt_progress = _p124
+                _bb124.e124_rt_temp = float(args.e124_gate_temp_start) + (
+                    float(args.e124_gate_temp_end) - float(args.e124_gate_temp_start)
+                ) * _p124
+                _bb124.e124_rt_hard = False
+                _bb124.e124_rt_budget = None
             loss, metrics = step_model(model, batch, args, device, train=True)
             if loss is None:
                 # Q18 echo 离网 (burst 未激活窗): 步进照走不参训 (独立训练器
@@ -4344,20 +5106,32 @@ def main() -> None:
                 step += 1
                 sched.step()
                 continue
+            # C3 (2026-09-11 效率施工, 提案 §C3): isfinite 判据后移到 backward
+            # 发射之后 —— CPU 等待点从「前向全长排空」变为「反向已入队」，等待
+            # 期 GPU 在算反向而非空转。判据张量、跳过行为、nan_skips 语义全部
+            # 不变（非有限时照旧 zero_grad + sched.step + continue，且不 clip
+            # 不 opt.step；多做一次 backward 是罕见事件的代价）；有限路径语句
+            # 序（zero_grad→backward→clip→step→sched）与旧版逐位同效。
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
             if not bool(torch.isfinite(loss)):
                 nan_skips += 1
                 opt.zero_grad(set_to_none=True)
                 step += 1
                 sched.step()
                 continue
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
             grad = torch.nn.utils.clip_grad_norm_(trainable, args.grad_clip)
             opt.step()
             sched.step()
             step += 1
             for k, v in metrics.items():
-                pending[k] = pending[k] + v if k in pending else v.clone()
+                # C7 (2026-09-11 效率施工): add_ 原地累加替换「新建中间张量再
+                # 换绑」——同一加法、同值逐位；首见键仍 clone，故 step_zero
+                # 缓存本体永不入 pending、不被原地写。
+                if k in pending:
+                    pending[k].add_(v)
+                else:
+                    pending[k] = v.clone()
             pending_n += 1
             if _q15_enabled(args) and not q18_on and _Q15_ANCHOR_RANGE[0] <= step <= _Q15_ANCHOR_RANGE[1]:
                 # Q15 回调线锚窗 (§5): steps 800-1000 累计训练批读数
