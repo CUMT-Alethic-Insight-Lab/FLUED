@@ -1605,6 +1605,26 @@ class CrossReadBackbone(nn.Module):
         return self.norm(h)
 
 
+# C8 效率件（outputs/_perf_audit_20260911/proposal.md）: SLMBackbone 逐前向
+# 重建的定长因果掩码静态件，按 (n, device) 缓存——纯常量函数、只读消费、
+# 无 in-place，命中 = 现算逐位一致。上限为卫生阀，淘汰后确定性重算。
+_CAUSAL_MASK_CACHE: dict[tuple[int, torch.device], tuple[torch.Tensor, torch.Tensor]] = {}
+_CAUSAL_MASK_CACHE_MAX = 64
+
+
+def _causal_keep_mask(n: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    """(因果下三角含对角, 单位阵)，均 (n, n) bool。"""
+    key = (n, device)
+    hit = _CAUSAL_MASK_CACHE.get(key)
+    if hit is None:
+        if len(_CAUSAL_MASK_CACHE) >= _CAUSAL_MASK_CACHE_MAX:
+            _CAUSAL_MASK_CACHE.clear()
+        future = torch.triu(torch.ones(n, n, dtype=torch.bool, device=device), diagonal=1)
+        hit = (~future, torch.eye(n, dtype=torch.bool, device=device))
+        _CAUSAL_MASK_CACHE[key] = hit
+    return hit
+
+
 class SLMBackbone(nn.Module):
     """v3.7 SLM backbone (consensus §1.3, user-ruled 2026-08-17): a standard
     small LM in the traditional decoder-only shape.
@@ -1817,11 +1837,11 @@ class SLMBackbone(nn.Module):
         v = store_v.view(bsz, n, nh, hd).transpose(1, 2)
         # causal over the store; keep the diagonal even on padded rows (a
         # fully-masked SDPA row yields NaN, and 0*NaN poisons downstream)
-        future = torch.triu(torch.ones(n, n, dtype=torch.bool, device=k_rows.device), diagonal=1)
-        allowed = (~future).view(1, 1, n, n) & chunk_mask.view(bsz, 1, 1, n)
+        keep_diag, diag_eye = _causal_keep_mask(n, k_rows.device)
+        allowed = keep_diag.view(1, 1, n, n) & chunk_mask.view(bsz, 1, 1, n)
         if store_block is not None:
             allowed = allowed & ~store_block.view(bsz, 1, n, n)
-        allowed = allowed | torch.eye(n, dtype=torch.bool, device=k_rows.device).view(1, 1, n, n)
+        allowed = allowed | diag_eye.view(1, 1, n, n)
         # block 1: cross-read; Q self-produced from the hidden state
         q = self.q_proj(h).view(bsz, n, nh, hd).transpose(1, 2)
         e124_active = False
@@ -2328,6 +2348,13 @@ class GlobalSpanDecoder(nn.Module):
         # (CheckpointError metadata mismatch). train_v36_s1 toggles this off
         # around _frozen_decoder_logits.
         self._ckpt_enabled = True
+        # C8 效率件（outputs/_perf_audit_20260911/proposal.md）: 归一化字节表
+        # 缓存，键含 (weight._version, device, dtype)，值再带 weight 对象做
+        # identity 兜底（参数整体替换时 _version 可能撞号）。表是权重的确定性
+        # 函数且只读消费，命中 = 现算逐位一致；权重可训时整体旁路（见下）。
+        self._byte_table_cache: dict[
+            tuple[int, torch.device, torch.dtype], tuple[torch.Tensor, torch.Tensor]
+        ] = {}
         self.scale = nn.Parameter(torch.tensor(10.0))
         # DSpark Markov head (research sweep 2026-08-08): low-rank bigram
         # transition bias for parallel byte decoding. prev_ids row 258 is the
@@ -2335,6 +2362,28 @@ class GlobalSpanDecoder(nn.Module):
         if c.decoder_markov > 0:
             self.markov_embed = nn.Embedding(259, c.decoder_markov)
             self.markov_out = nn.Linear(c.decoder_markov, 258, bias=False)
+
+    def _byte_table(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        """归一化字节表 (258, d_byte)，C8 缓存路径。权重 requires_grad=True 时
+        整体旁路（不读也不写缓存）——可训表每前向各建一份图节点，缓存的跨调
+        用复用会合并两条反向支路的归约序，为保梯度逐位一律现算；冻结→解冻的
+        运行期翻转同样在此拦下（缓存只服务冻结态，绝不给可训表喂无梯度的旧
+        张量）。冻结态下 _version 在优化器原地步进 / load_state_dict 时自增，
+        缓存随之自然失效。命中 = 现算逐位一致。"""
+        weight = self.byte_lookup.embedding.weight
+        if weight.requires_grad:
+            vocab = torch.arange(258, device=device)
+            return F.normalize(self.byte_lookup(vocab).to(dtype), dim=-1)
+        key = (weight._version, device, dtype)
+        hit = self._byte_table_cache.get(key)
+        if hit is not None and hit[0] is weight:
+            return hit[1]
+        vocab = torch.arange(258, device=device)
+        table_norm = F.normalize(self.byte_lookup(vocab).to(dtype), dim=-1)
+        if len(self._byte_table_cache) > 8:
+            self._byte_table_cache.clear()
+        self._byte_table_cache[key] = (weight, table_norm)
+        return table_norm
 
     def forward(
         self,
@@ -2358,10 +2407,9 @@ class GlobalSpanDecoder(nn.Module):
             else:
                 h = block(h, valid, noise)
         h = self.out_proj(h)
-        vocab = torch.arange(258, device=h.device)
-        table = self.byte_lookup(vocab).to(h.dtype)
+        table_norm = self._byte_table(h.device, h.dtype)
         logits = self.scale.clamp(1.0, 100.0) * torch.matmul(
-            F.normalize(h, dim=-1), F.normalize(table, dim=-1).transpose(0, 1)
+            F.normalize(h, dim=-1), table_norm.transpose(0, 1)
         )
         if prev_ids is not None and hasattr(self, "markov_out"):
             # prev_ids: (B, C, span) long, 258 = window-start sentinel
@@ -2453,6 +2501,9 @@ class FLUEDV36(nn.Module):
             # the d_pack decoder_in exists only where a coarse V readout does
             self.decoder_in = nn.Linear(c.d_pack, c.d_backbone) if c.d_pack != c.d_backbone else nn.Identity()
         self.decoder = GlobalSpanDecoder(c, self.byte_lookup)
+        # C8 效率件: _front_end_frozen 判定缓存（冻结集运行期不变——裁定；
+        # 运行期改冻结面的臂必须先调 _front_end_frozen_reset()）。
+        self._front_end_frozen_cache: bool | None = None
         self.chunk_pos = nn.Embedding(c.max_chunks, c.d_backbone)
         nn.init.trunc_normal_(self.chunk_pos.weight, std=0.02)
         # fork 3 F2 (user-ruled 2026-08-21; spec docs/versions/v3.7/
@@ -2523,8 +2574,17 @@ class FLUEDV36(nn.Module):
         return self.aux_out(h)
 
     def _front_end_frozen(self) -> bool:
-        mods = (self.byte_lookup, *self.encoder_blocks, *self.segmentor_blocks, self.segmentor_head)
-        return all(not p.requires_grad for m in mods for p in m.parameters())
+        """C8 效率件: 结果缓存一次——冻结面运行期不变（裁定：冻结/解冻全部
+        发生在训练循环开工前的 setup 段），省掉每次 _encode 的全参数扫描。
+        运行期若改冻结面，必须先调 _front_end_frozen_reset()。"""
+        if self._front_end_frozen_cache is None:
+            mods = (self.byte_lookup, *self.encoder_blocks, *self.segmentor_blocks, self.segmentor_head)
+            self._front_end_frozen_cache = all(not p.requires_grad for m in mods for p in m.parameters())
+        return self._front_end_frozen_cache
+
+    def _front_end_frozen_reset(self) -> None:
+        """冻结面运行期变更后的显式失效口（_front_end_frozen 缓存的安全阀）。"""
+        self._front_end_frozen_cache = None
 
     def _encode(self, token_ids: torch.Tensor,
                 attn_block_mask: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -2543,12 +2603,17 @@ class FLUEDV36(nn.Module):
         ctx = torch.no_grad() if self._front_end_frozen() else torch.enable_grad()
         with ctx:
             x = self.byte_lookup(token_ids)
+            # C6 效率件（outputs/_perf_audit_20260911/proposal.md）: bool→浮点
+            # 精确转换同源同值，把每层的 valid.unsqueeze(-1).to(dtype) 提为入口
+            # 一次 (B,T,1) 副本沿 encoder/segmentor 链下传；dtype 不齐的层在
+            # 块内自动回落现算（旧路径）。
+            valid_f = valid.unsqueeze(-1).to(x.dtype)
             noise = x.new_zeros(token_ids.size(0))
             for block in self.encoder_blocks:
-                x = block(x, valid, noise, attn_block_mask)
+                x = block(x, valid, noise, attn_block_mask, valid_f=valid_f)
             byte_states = x
             for block in self.segmentor_blocks:
-                x = block(x, valid, noise)
+                x = block(x, valid, noise, valid_f=valid_f)
             logits = self.segmentor_head(x).squeeze(-1)
             confidence = _plastic_signed_confidence(logits)
         return byte_states, confidence, valid, logits

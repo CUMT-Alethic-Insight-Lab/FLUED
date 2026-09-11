@@ -158,17 +158,32 @@ def make_byte_mask(valid: torch.Tensor, mask_prob: float, span_min: int, span_ma
 
 def make_targets(clean: torch.Tensor, byte_mask: torch.Tensor, chunk_ids: torch.Tensor, offsets: torch.Tensor, max_chunks: int, max_span: int):
     bsz, seq_len = clean.shape
-    targets = torch.full((bsz, max_chunks, max_span), PAD_ID, dtype=torch.long, device=clean.device)
-    slot_mask = torch.zeros((bsz, max_chunks, max_span), dtype=torch.bool, device=clean.device)
-    masked_slot = torch.zeros_like(slot_mask)
+    grid_numel = max_chunks * max_span
+    real_numel = bsz * grid_numel
     valid = chunk_ids.ge(0) & chunk_ids.lt(max_chunks) & offsets.ge(0) & offsets.lt(max_span) & clean.ne(PAD_ID)
-    b_idx, t_idx = valid.nonzero(as_tuple=True)
-    c_idx = chunk_ids[b_idx, t_idx]
-    s_idx = offsets[b_idx, t_idx]
-    targets[b_idx, c_idx, s_idx] = clean[b_idx, t_idx]
-    slot_mask[b_idx, c_idx, s_idx] = True
-    masked_slot[b_idx, c_idx, s_idx] = byte_mask[b_idx, t_idx]
-    return targets, slot_mask, masked_slot
+    # C1 零同步网格 (2026-09-11 效率施工, 提案 §C1): 静态 flat 网格替换
+    # valid.nonzero —— 每个 (chunk, slot) 至多一个源字节（chunk_builder 打包
+    # 保证 rank 严格递增 ⇒ 同 chunk 内 slot 互异，现代码注释的 "(row,rank)
+    # 对唯一、scatter 不碰撞" 同构前提），真实槽无写冲突、逐位确定；
+    # valid 位之外统一指各 batch 的 dump 行（缓冲尾部追加 bsz 行，narrow
+    # 截去、不外泄）。
+    grid_b = torch.arange(bsz, device=clean.device).unsqueeze(1)
+    dst = torch.where(
+        valid,
+        grid_b * grid_numel + chunk_ids * max_span + offsets,
+        grid_b + real_numel,
+    ).reshape(-1)
+    targets_flat = torch.full((real_numel + bsz,), PAD_ID, dtype=torch.long, device=clean.device)
+    targets_flat.scatter_(0, dst, clean.reshape(-1))
+    slot_flat = torch.zeros(real_numel + bsz, dtype=torch.bool, device=clean.device)
+    slot_flat.scatter_(0, dst, valid.reshape(-1))
+    masked_flat = torch.zeros(real_numel + bsz, dtype=torch.bool, device=clean.device)
+    masked_flat.scatter_(0, dst, byte_mask.reshape(-1))
+    return (
+        targets_flat.narrow(0, 0, real_numel).view(bsz, max_chunks, max_span),
+        slot_flat.narrow(0, 0, real_numel).view(bsz, max_chunks, max_span),
+        masked_flat.narrow(0, 0, real_numel).view(bsz, max_chunks, max_span),
+    )
 
 
 def masked_readouts_from_slots(masked_slot: torch.Tensor, chunk_mask: torch.Tensor, readouts: int) -> torch.Tensor:

@@ -2965,6 +2965,26 @@ def _slm_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None, 
         )
     logits_direct = model.decoder(cond_direct, chunks.token_mask)
     logits_backbone = model.decoder(cond_backbone, chunks.token_mask)
+    # C1 (2026-09-11 效率施工): 两枚诊断指标去 nonzero/any 硬同步 —— 布尔掩码
+    # 压缩均值改全量加权和均值。metrics-only（step_model 里 detach 进日志、
+    # 不进损失）：fp 归约序与被掩码压缩后的 mean 不同，容许末位 ulp 差
+    # （提案 §C1 验收条款 allclose(atol=1e-7)，tests/test_perf_phase12_parity
+    # 显式标注）；loss/参数侧零接触。空窗兜底语义不变（valid_count==0 时回
+    # 全量均值，与旧 fallback 同一算式逐位同值）。
+    valid_count = valid.sum()
+    valid_cf = valid.to(confidence.dtype)
+    hard_cut_f = hard_cut.float()
+    valid_hf = valid.to(hard_cut_f.dtype)
+    boundary_confidence_mean = torch.where(
+        valid_count > 0,
+        (confidence * valid_cf).sum() / valid_count.clamp(min=1),
+        confidence.mean(),
+    )
+    hard_cut_fraction = torch.where(
+        valid_count > 0,
+        (hard_cut_f * valid_hf).sum() / valid_count.clamp(min=1),
+        hard_cut_f.mean(),
+    )
     return {
         "logits_direct": logits_direct,
         "logits_backbone": logits_backbone,
@@ -2983,9 +3003,26 @@ def _slm_forward(model, source: torch.Tensor, args, clean=None, byte_mask=None, 
         "chunks": chunks,
         "cut_overflow": cut_overflow,
         "state_norm": state_norm,
-        "boundary_confidence_mean": confidence[valid].mean() if valid.any() else confidence.mean(),
-        "hard_cut_fraction": hard_cut.float()[valid].mean() if valid.any() else hard_cut.float().mean(),
+        "boundary_confidence_mean": boundary_confidence_mean,
+        "hard_cut_fraction": hard_cut_fraction,
     }
+
+
+# C7 (2026-09-11 效率施工, 提案 §C7): step_model 关态臂列的零占位标量按
+# device 缓存 —— 每步 ~35 次 torch.zeros kernel launch 归零为一次查表。缓存
+# 张量只读共享：训练循环首次入 pending 时 clone、后续 add_ 原地累加（写在
+# pending 副本上，不碰缓存本体）；eval 侧 float(v) 只读。值与旧逐位新建的
+# 零张量全等。
+_STEP_ZERO_CACHE: dict = {}
+
+
+def _step_zero(device) -> torch.Tensor:
+    key = (device.type, device.index)
+    zero = _STEP_ZERO_CACHE.get(key)
+    if zero is None:
+        zero = torch.zeros((), device=device)
+        _STEP_ZERO_CACHE[key] = zero
+    return zero
 
 
 @torch.no_grad()
@@ -2997,12 +3034,23 @@ def _key_geometry_metrics(model, out: dict, device) -> dict:
     mu (mean off-diagonal |cos|), mu_max (worst pair), PR/n (Gram eigenvalue
     participation ratio over n_real, per-head pooled). Zero placeholders for
     absent channels (the a grid has no WriteHead). One scalar sync per step
-    (n_real); metrics-only path, everything detached."""
-    zero = torch.zeros((), device=device)
+    (n_real); metrics-only path, everything detached. C5 (2026-09-11 效率施
+    工): the channel check precedes the n_real sync — the a grid (both
+    channels non-state) returns the zero dict with no sync at all; state
+    grids keep the old order and values."""
+    zero = _step_zero(device)
     res = {
-        "key_mu": zero, "key_mu_max": zero.clone(), "key_pr": zero.clone(),
-        "key_mu_k": zero.clone(), "key_mu_max_k": zero.clone(), "key_pr_k": zero.clone(),
+        "key_mu": zero, "key_mu_max": zero, "key_pr": zero,
+        "key_mu_k": zero, "key_mu_max_k": zero, "key_pr_k": zero,
     }
+    cfg = model.config
+    v_state = getattr(cfg, "v_row_source", "") == "state"
+    k_state = getattr(cfg, "k_row_source", "") == "state"
+    if not (v_state or k_state):
+        # C5: a 格（两路均非 state）直接返回零字典 —— 旧路径此时的 n_real
+        # 硬同步纯属空跑（两个 stats 分支都不进，返回的就是这六个零）。
+        # 输出与旧实现逐位相同；n_real 只喂被跳过的 stats 分支。
+        return res
     chunks = out["chunks"]
     n_real = int(chunks.chunk_mask[0].sum())
     if n_real < 2:
@@ -3027,13 +3075,12 @@ def _key_geometry_metrics(model, out: dict, device) -> dict:
                 prs.append(torch.zeros((), device=kh.device))
         return torch.stack(mus).mean().detach(), torch.stack(mx).max().detach(), torch.stack(prs).mean().detach()
 
-    cfg = model.config
     # metrics run OUTSIDE the autocast region: the forward's rows are bf16
     # under amp; cast to fp32 before the (fp32-weight) WriteHead modules.
-    if getattr(cfg, "v_row_source", "") == "state":
+    if v_state:
         gates = model.write_head(out["memory"].float())
         res["key_mu"], res["key_mu_max"], res["key_pr"] = stats(gates["k"])
-    if getattr(cfg, "k_row_source", "") == "state":
+    if k_state:
         gates_k = model.write_head_k(out["index"].float())
         res["key_mu_k"], res["key_mu_max_k"], res["key_pr_k"] = stats(gates_k["k"])
     return res
@@ -3150,11 +3197,17 @@ def step_model(model, batch, args, device, train: bool):
             sieve_model=_BURST_SIEVE_MODEL if bool(getattr(args, "burst_prior_sieve", False)) else None,
             stats=burst_stats,
         )
-    clean = clean.to(device)
+    # C4 (2026-09-11 效率施工, 提案 §C4): 掩码直接吃 host 张量（loader 出来
+    # 就在 CPU；burst/cloze/retrieval splice 后仍是 CPU 张量），消掉
+    # to(device)→cpu() 的 D2H 往返硬同步（S1）与那份 32KB 白绕拷贝。值与
+    # _MASK_GENERATOR 消费序全不变 → byte_mask 逐位一致、窗流不动。掩码段
+    # 流水化变体（下一窗预构造）不在本次范围。
+    clean_host = clean
+    clean = clean_host.to(device)
     valid = clean.ne(PAD_ID)
     if getattr(args, "mask_mode", "byte_span") == "mixed":
         byte_mask = make_mixed_mask(
-            clean.cpu(),
+            clean_host,
             args.mask_prob,
             char_frac=args.mask_char_frac,
             char_span_max=args.mask_char_span_max,
@@ -3311,8 +3364,8 @@ def step_model(model, batch, args, device, train: bool):
         # Predict task OFF in this arm (user-ruled 2026-08-11): it carries no
         # retention signal and would only muddy the variable set. Not computed
         # at all; zero metrics keep the log schema aligned with other arms.
-        se = torch.zeros((), device=device)
-        predict_cos = torch.zeros((), device=device)
+        se = _step_zero(device)
+        predict_cos = _step_zero(device)
         pair_mask = chunks.chunk_mask.new_ones((1,))  # placeholder, unused
     elif getattr(args, "backbone_mode", "") == "paged_xattn":
         # S37 page-level latent predict: the penultimate page's output row
@@ -3400,10 +3453,10 @@ def step_model(model, batch, args, device, train: bool):
             predict_cos = (cos * pair_mask).sum() / pair_mask.sum().clamp(min=1.0)
 
     predict_mode = getattr(args, "predict_mode", "latent")
-    predict_ce = torch.zeros((), device=device)
-    predict_byte_acc = torch.zeros((), device=device)
+    predict_ce = _step_zero(device)
+    predict_byte_acc = _step_zero(device)
     if codec_final:
-        predict_loss = torch.zeros((), device=device)
+        predict_loss = _step_zero(device)
     elif predict_mode == "decode":
         # frozen-decoder supervision, v2.1: the predict branch consumes
         # content.detach() -- predict CE trains the BACKBONE ONLY. s13 (E31)
@@ -3428,11 +3481,11 @@ def step_model(model, batch, args, device, train: bool):
     # (post-Markov-head, same form); the weight sits ON TOP of the three main
     # tasks (their weights are untouched). Zero placeholders keep the log
     # schema aligned when the task is off or no sample is active.
-    cloze_loss = torch.zeros((), device=device)
+    cloze_loss = _step_zero(device)
     cloze_metrics = {
-        "cloze_byte_acc": torch.zeros((), device=device),
-        "cloze_exact": torch.zeros((), device=device),
-        "cloze_count": torch.zeros((), device=device),
+        "cloze_byte_acc": _step_zero(device),
+        "cloze_exact": _step_zero(device),
+        "cloze_count": _step_zero(device),
     }
     if cloze_metas is not None:
         cloze_slot, cloze_active = _cloze_slot_grid(
@@ -3448,19 +3501,19 @@ def step_model(model, batch, args, device, train: bool):
     # ON TOP of the three main tasks (their weights are untouched). Zero
     # placeholders keep the log schema aligned when the task is off or no
     # sample is active.
-    retrieval_loss = torch.zeros((), device=device)
+    retrieval_loss = _step_zero(device)
     retrieval_metrics = {
-        "retrieval_byte_acc": torch.zeros((), device=device),
-        "retrieval_exact": torch.zeros((), device=device),
-        "retrieval_count": torch.zeros((), device=device),
-        "retrieval_block_rate": torch.zeros((), device=device),
+        "retrieval_byte_acc": _step_zero(device),
+        "retrieval_exact": _step_zero(device),
+        "retrieval_count": _step_zero(device),
+        "retrieval_block_rate": _step_zero(device),
         # Q12 示例密集形态 (修订案 v3 / 附录 A2②): window-budget and
         # construction-defect gauges; all-zero in the example-free form
         # (metas carry no budget fields there).
-        "retrieval_budget_ratio": torch.zeros((), device=device),
-        "retrieval_examples": torch.zeros((), device=device),
-        "retrieval_drop_rate": torch.zeros((), device=device),
-        "retrieval_defect": torch.zeros((), device=device),
+        "retrieval_budget_ratio": _step_zero(device),
+        "retrieval_examples": _step_zero(device),
+        "retrieval_drop_rate": _step_zero(device),
+        "retrieval_defect": _step_zero(device),
     }
     if retrieval_metas is not None:
         retrieval_slot, retrieval_active = _cloze_slot_grid(
@@ -3501,14 +3554,14 @@ def step_model(model, batch, args, device, train: bool):
     # 数据分布, the codec three tasks already cover the masked tail. Metrics
     # only, zero placeholders keep the log schema aligned when off.
     burst_metrics = {
-        "burst_tail_byte_acc": torch.zeros((), device=device),
-        "burst_tail_exact": torch.zeros((), device=device),
-        "burst_count": torch.zeros((), device=device),
-        "burst_tail_chars": torch.zeros((), device=device),
+        "burst_tail_byte_acc": _step_zero(device),
+        "burst_tail_exact": _step_zero(device),
+        "burst_count": _step_zero(device),
+        "burst_tail_chars": _step_zero(device),
         # Q14 (修订案 2026-08-23 §2.2): 先验筛拒收率与产出率 (激活率 =
         # 激活样本/抽中样本); 筛关时 reject_rate 恒 0, 任务关时双双零占位.
-        "burst_sieve_reject_rate": torch.zeros((), device=device),
-        "burst_yield": torch.zeros((), device=device),
+        "burst_sieve_reject_rate": _step_zero(device),
+        "burst_yield": _step_zero(device),
     }
     if burst_metas is not None:
         # burst_slot/burst_active 已在 comp 网格处算好 (Q15 §3.2 剔除共用)
@@ -3528,19 +3581,19 @@ def step_model(model, batch, args, device, train: bool):
     # Q15 回路养成臂三件套 (任务书 2026-08-25 §3, 全部 train-only; eval 零
     # 占位, 网格不动 -- §7.2 形态纪律). λ 每步从 args 读 (回调线 §5 原地降权).
     q15_metrics = {
-        "q15_attend_mass": torch.zeros((), device=device),
-        "q15_attend_maxmass": torch.zeros((), device=device),  # §3.2v1: 门所见单头最大 T 质量
-        "q15_attend_chance": torch.zeros((), device=device),  # §3.2v1: 均匀基线 (判读矩阵基线读数)
-        "q15_attend_loss": torch.zeros((), device=device),
-        "q15_gate_mean": torch.zeros((), device=device),
-        "q15_echo_loss": torch.zeros((), device=device),
-        "q15_couple_loss": torch.zeros((), device=device),
-        "q15_twin_d": torch.zeros((), device=device),
-        "q15_twin_count": torch.zeros((), device=device),
+        "q15_attend_mass": _step_zero(device),
+        "q15_attend_maxmass": _step_zero(device),  # §3.2v1: 门所见单头最大 T 质量
+        "q15_attend_chance": _step_zero(device),  # §3.2v1: 均匀基线 (判读矩阵基线读数)
+        "q15_attend_loss": _step_zero(device),
+        "q15_gate_mean": _step_zero(device),
+        "q15_echo_loss": _step_zero(device),
+        "q15_couple_loss": _step_zero(device),
+        "q15_twin_d": _step_zero(device),
+        "q15_twin_count": _step_zero(device),
     }
-    attend_loss = torch.zeros((), device=device)
-    echo_loss = torch.zeros((), device=device)
-    couple_loss = torch.zeros((), device=device)
+    attend_loss = _step_zero(device)
+    echo_loss = _step_zero(device)
+    couple_loss = _step_zero(device)
     if q15_diag and train and burst_metas is not None:
         attn = out.get("block1_attn")
         if attn is None:
@@ -3658,7 +3711,7 @@ def step_model(model, batch, args, device, train: bool):
     # summarizer the tail bytes must be IN the memory row. Train-time only:
     # never computed in eval, so eval_loss stays form-identical to historical
     # runs (comparability); the aux head never enters inference.
-    aux_recon_loss = torch.zeros((), device=device)
+    aux_recon_loss = _step_zero(device)
     if train and getattr(args, "summarizer_aux_recon", False) and out.get("memory") is not None:
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=args.amp and device.type == "cuda"):
             aux_logits = model.aux_recon_logits(out["memory"])
@@ -3723,11 +3776,11 @@ def step_model(model, batch, args, device, train: bool):
     # + 干净行 direct acc ——混合 direct_acc 在扰动臂下天然回落, 干净行读数才是
     # §2 有效性门的判读面。关态/eval = 零占位, log schema 对齐 (本文件臂列惯例)。
     denoise_metrics = {
-        "denoise_noise_frac": torch.zeros((), device=device),
-        "denoise_mhat_frac": torch.zeros((), device=device),
-        "denoise_clean_frac": torch.zeros((), device=device),
+        "denoise_noise_frac": _step_zero(device),
+        "denoise_mhat_frac": _step_zero(device),
+        "denoise_clean_frac": _step_zero(device),
         "denoise_grade": torch.full((), -1.0, device=device),
-        "denoise_direct_clean_acc": torch.zeros((), device=device),
+        "denoise_direct_clean_acc": _step_zero(device),
     }
     dn = out.get("denoise_stats")
     if dn is not None:
@@ -3766,11 +3819,13 @@ def step_model(model, batch, args, device, train: bool):
     # MASK_ID，不是内容）。对照列同键照跑 = 盲猜地板逐碑落盘（坑 9 纪律：
     # 地板按种子窗流逐种子自锚，本臂地板 = control 列同键读数）。
     # 关态/eval = 零占位，log schema 对齐本文件臂列惯例。
-    e123_zero = torch.zeros((), device=device)
-    e123_dep_stats = {"e123_acc_d1": e123_zero, "e123_acc_d2": e123_zero.clone(),
-                      "e123_n_d1": e123_zero.clone(), "e123_n_d2": e123_zero.clone(),
-                      "e123_blocks": e123_zero.clone(), "e123_lambda": e123_zero.clone(),
-                      "e123_kmax": e123_zero.clone()}
+    # C7: e123_zero 取缓存零；关态各键只读共享缓存本体，clone 拷贝既不必要
+    # 也省去（值与旧逐位 clone 的零张量全等）。
+    e123_zero = _step_zero(device)
+    e123_dep_stats = {"e123_acc_d1": e123_zero, "e123_acc_d2": e123_zero,
+                      "e123_n_d1": e123_zero, "e123_n_d2": e123_zero,
+                      "e123_blocks": e123_zero, "e123_lambda": e123_zero,
+                      "e123_kmax": e123_zero}
     if e123_on and train and e123_plan is not None:
         # λ/K_max/遮蔽块数是时间表与计划量，与窗内有无依赖对无关——逐步落盘，
         # 轨迹判读不断流（无料窗 blocks=0 本身是有信息读数）
@@ -3806,7 +3861,7 @@ def step_model(model, batch, args, device, train: bool):
     # E124 门仪表（任务书冻结 v1.0 §5: 副仪表 A = 可学 α 轨迹; 逐查询预算
     # 均值 k 轨迹）——门关 = 零占位（log schema 对齐本文件臂列惯例,
     # e123_dep_stats 同款纪律）
-    e124_zero = torch.zeros((), device=device)
+    e124_zero = _step_zero(device)
     _bb = getattr(model, "backbone", None)
     if _bb is not None and getattr(_bb, "e124_gate", False):
         metrics["e124_alpha"] = _bb.e124_alpha_value().detach()
@@ -3815,7 +3870,7 @@ def step_model(model, batch, args, device, train: bool):
         ).to(device)
     else:
         metrics["e124_alpha"] = e124_zero
-        metrics["e124_k"] = e124_zero.clone()
+        metrics["e124_k"] = e124_zero
     if slm_mode:
         # E80 补充 2: resident key-geometry dashboard (slm default-on; legacy
         # paths never gain these keys)
@@ -5051,20 +5106,32 @@ def main() -> None:
                 step += 1
                 sched.step()
                 continue
+            # C3 (2026-09-11 效率施工, 提案 §C3): isfinite 判据后移到 backward
+            # 发射之后 —— CPU 等待点从「前向全长排空」变为「反向已入队」，等待
+            # 期 GPU 在算反向而非空转。判据张量、跳过行为、nan_skips 语义全部
+            # 不变（非有限时照旧 zero_grad + sched.step + continue，且不 clip
+            # 不 opt.step；多做一次 backward 是罕见事件的代价）；有限路径语句
+            # 序（zero_grad→backward→clip→step→sched）与旧版逐位同效。
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
             if not bool(torch.isfinite(loss)):
                 nan_skips += 1
                 opt.zero_grad(set_to_none=True)
                 step += 1
                 sched.step()
                 continue
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
             grad = torch.nn.utils.clip_grad_norm_(trainable, args.grad_clip)
             opt.step()
             sched.step()
             step += 1
             for k, v in metrics.items():
-                pending[k] = pending[k] + v if k in pending else v.clone()
+                # C7 (2026-09-11 效率施工): add_ 原地累加替换「新建中间张量再
+                # 换绑」——同一加法、同值逐位；首见键仍 clone，故 step_zero
+                # 缓存本体永不入 pending、不被原地写。
+                if k in pending:
+                    pending[k].add_(v)
+                else:
+                    pending[k] = v.clone()
             pending_n += 1
             if _q15_enabled(args) and not q18_on and _Q15_ANCHOR_RANGE[0] <= step <= _Q15_ANCHOR_RANGE[1]:
                 # Q15 回调线锚窗 (§5): steps 800-1000 累计训练批读数

@@ -33,17 +33,38 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     return torch.stack((-odd, even), dim=-1).flatten(-2)
 
 
-def _rope(x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+# C2 效率件（outputs/_perf_audit_20260911/proposal.md）: cos/sin 模块级缓存。
+# 键 = (cache_key, dim, device, dtype)；positions 为固定 arange 时 cos/sin 是
+# 常量（不持梯度、只读消费、无 in-place），命中 = 现算逐位一致。上限仅为防
+# 变长 seq 撑爆显存的卫生阀，淘汰后按同确定性重算，无数值影响。
+_ROPE_CACHE: dict[tuple[str, int, torch.device, torch.dtype], tuple[torch.Tensor, torch.Tensor]] = {}
+_ROPE_CACHE_MAX = 128
+
+
+def _rope(x: torch.Tensor, positions: torch.Tensor,
+          cache_key: str | None = None) -> torch.Tensor:
+    """cache_key（C2）: 仅当 positions 是固定 arange（seq/slots/width 等常量）
+    时才允许传；None = 旧路径现算，逐位不变。"""
     dim = x.size(-1)
     if dim % 2:
         raise ValueError("RoPE head dimension must be even")
-    inv = torch.exp(
-        torch.arange(0, dim, 2, device=x.device, dtype=torch.float32)
-        * (-math.log(10000.0) / dim)
-    )
-    phase = positions.float().unsqueeze(-1) * inv
-    cos = torch.repeat_interleave(phase.cos(), 2, dim=-1).to(x.dtype)
-    sin = torch.repeat_interleave(phase.sin(), 2, dim=-1).to(x.dtype)
+    cos = sin = None
+    if cache_key is not None:
+        hit = _ROPE_CACHE.get((cache_key, dim, x.device, x.dtype))
+        if hit is not None:
+            cos, sin = hit
+    if cos is None:
+        inv = torch.exp(
+            torch.arange(0, dim, 2, device=x.device, dtype=torch.float32)
+            * (-math.log(10000.0) / dim)
+        )
+        phase = positions.float().unsqueeze(-1) * inv
+        cos = torch.repeat_interleave(phase.cos(), 2, dim=-1).to(x.dtype)
+        sin = torch.repeat_interleave(phase.sin(), 2, dim=-1).to(x.dtype)
+        if cache_key is not None:
+            if len(_ROPE_CACHE) >= _ROPE_CACHE_MAX:
+                _ROPE_CACHE.clear()
+            _ROPE_CACHE[(cache_key, dim, x.device, x.dtype)] = (cos, sin)
     while cos.ndim < x.ndim:
         cos = cos.unsqueeze(0)
         sin = sin.unsqueeze(0)
@@ -103,10 +124,15 @@ class ParallelAttention(nn.Module):
         self.out = nn.Linear(dim, dim, bias=False)
 
     def forward(self, x: torch.Tensor, valid: torch.Tensor,
-                block_mask: torch.Tensor | None = None) -> torch.Tensor:
+                block_mask: torch.Tensor | None = None,
+                *, valid_f: torch.Tensor | None = None) -> torch.Tensor:
         """block_mask（E123 遮蔽器件，条件创建）: (B, 1, 1, seq) bool，True=该键
         对一切查询遮蔽——被遮字节仍参与自身状态更新与分段（hidden 不清零、valid
-        不动），只从窗内注意力的键侧视野抹除；None = 旧路径逐位不变。"""
+        不动），只从窗内注意力的键侧视野抹除；None = 旧路径逐位不变。
+        valid_f（C6 效率件）: valid 的 (B,T,1) 浮点副本（valid.unsqueeze(-1)
+        一次算好，入口 _encode 沿链下传），省掉每层一次 bool→浮点 .to；
+        dtype 与本层 y.dtype 不齐（autocast 混合精度等）时自动回落现算，
+        None = 旧路径逐位不变。"""
         bsz, seq, _ = x.shape
         q, k, v = self.qkv(x).chunk(3, dim=-1)
         q = q.view(bsz, seq, self.nhead, self.head_dim).transpose(1, 2)
@@ -114,8 +140,8 @@ class ParallelAttention(nn.Module):
         v = v.view(bsz, seq, self.nhead, self.head_dim).transpose(1, 2)
         if self.use_rope:
             pos = torch.arange(seq, device=x.device)
-            q = _rope(q, pos)
-            k = _rope(k, pos)
+            q = _rope(q, pos, cache_key=f"pa:{seq}")
+            k = _rope(k, pos, cache_key=f"pa:{seq}")
         if self.use_alibi:
             mask = _bidirectional_alibi_bias(seq, self.nhead, x.device, q.dtype).unsqueeze(0)
             mask = mask.masked_fill(~valid[:, None, None, :], float("-inf"))
@@ -127,7 +153,9 @@ class ParallelAttention(nn.Module):
                 mask = mask & ~block_mask
         y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
         y = y.transpose(1, 2).reshape(bsz, seq, self.dim)
-        return self.out(y) * valid.unsqueeze(-1).to(y.dtype)
+        if valid_f is None or valid_f.dtype != y.dtype:
+            valid_f = valid.unsqueeze(-1).to(y.dtype)
+        return self.out(y) * valid_f
 
 
 class DiTStyleBlock(nn.Module):
@@ -157,13 +185,18 @@ class DiTStyleBlock(nn.Module):
         self.ff_scale = nn.Parameter(torch.tensor(0.1))
 
     def forward(self, x: torch.Tensor, valid: torch.Tensor, noise_level: torch.Tensor,
-                block_mask: torch.Tensor | None = None) -> torch.Tensor:
+                block_mask: torch.Tensor | None = None,
+                *, valid_f: torch.Tensor | None = None) -> torch.Tensor:
+        """valid_f（C6 效率件）: valid 的 (B,T,1) 浮点副本沿链下传；dtype 与
+        本层残差流 x.dtype 不齐时自动回落现算，None = 旧路径逐位不变。"""
         cond = self.noise_cond(noise_level.view(-1, 1)).unsqueeze(1).to(x.dtype)
-        x = x + self.attn_scale.to(x.dtype) * self.attn(self.norm1(x + cond), valid, block_mask)
+        x = x + self.attn_scale.to(x.dtype) * self.attn(self.norm1(x + cond), valid, block_mask, valid_f=valid_f)
         ff_gate, ff_value = self.ff_in(self.norm2(x + cond)).chunk(2, dim=-1)
         ff = self.ff_out(F.silu(ff_gate) * ff_value)
         x = x + self.ff_scale.to(x.dtype) * ff
-        return x * valid.unsqueeze(-1).to(x.dtype)
+        if valid_f is None or valid_f.dtype != x.dtype:
+            valid_f = valid.unsqueeze(-1).to(x.dtype)
+        return x * valid_f
 
     def inverse_block(
         self,
@@ -306,8 +339,8 @@ class QueryPool(nn.Module):
         k = self.k_proj(x).view(flat, width, self.nhead, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(flat, width, self.nhead, self.head_dim).transpose(1, 2)
         if self.use_position:
-            q = _rope(q, torch.arange(self.slots, device=x.device))
-            k = _rope(k, torch.arange(width, device=x.device))
+            q = _rope(q, torch.arange(self.slots, device=x.device), cache_key=f"qp_q:{self.slots}")
+            k = _rope(k, torch.arange(width, device=x.device), cache_key=f"qp_k:{width}")
         mask = valid[:, None, None, :]
         pooled = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
         pooled = pooled.transpose(1, 2).reshape(flat, self.slots, dim)
