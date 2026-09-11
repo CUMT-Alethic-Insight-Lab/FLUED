@@ -506,6 +506,17 @@ def load_model_and_tokenizer(model_path: str, device: torch.device):
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     attn_backend = _install_sdpa_attn_shim()
+    # transformers 5.x 要求 _tied_weights_keys 为 dict（v5 格式）；fla 0.5.2 仍是
+    # v4 list。仅 tie_word_embeddings=True 的模型踩雷（DeltaNet=false 侥幸绕过，
+    # fla-hub/transformer-* =true 必炸）。此处规范化为等价 dict 映射， tying 语义不变。
+    import fla.models.transformer.modeling_transformer as _fla_tf_mod
+
+    if isinstance(_fla_tf_mod.TransformerForCausalLM.__dict__.get("_tied_weights_keys"), list):
+        _fla_tf_mod.TransformerForCausalLM._tied_weights_keys = {
+            "lm_head.weight": "model.embeddings.weight"
+        }
+        print("[dn122] fla TransformerForCausalLM._tied_weights_keys list→dict 已规范化"
+              "（transformers 5.x 兼容，tying 语义不变）")
     tok = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
         model_path, trust_remote_code=True, dtype=torch.bfloat16, device_map=str(device)
