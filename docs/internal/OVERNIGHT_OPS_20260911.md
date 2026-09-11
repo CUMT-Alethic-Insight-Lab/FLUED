@@ -26,15 +26,17 @@
 
 同 §B 流程，端口 42166、日志 corpus_transfer.log、对侧查 47807。卡B收官报「卡B全量就绪」。
 
-## §D 卡A 150M 点火链（cron :31）
+## §D 卡A 150M 链（cron :31）——监控相位（09-11 23:59 换岗）
 
-1. 前置：卡A /root/autodl-tmp/corpus/VERIFIED.sha256 存在且与 4090 源端一致。不在→简报等下一小时。
-2. scp 本地 outputs/_scale3x_20260911/v3_7_scale_3x.json → 卡A /root/autodl-tmp/FLUED/outputs/_scale3x_20260911/。
-3. 卡A python 生成 remote 版配置：data_path=/root/autodl-tmp/corpus/corpus_v3.txt、device=cuda、out_dir=/root/autodl-tmp/checkpoints/v37ks_a_im_v373_scale3x_20k_ctx4096_20260911、run_id 同名、seed=42。
-4. 500 步冒烟（setsid nohup，--max-steps 500 覆盖）→ 读 train_log：零 NaN、loss 下降、无 OOM。红→停下报用户。
-5. 绿→正式点火 seed42 20K（setsid nohup）；另备 seed1/2 配置副本（run_id 后缀 _s1/_s2）不点火。
-6. 换岗：本 cron 改 150M 监控（train_log 尾+NaN+direct_acc+进程/GPU）；seed42 收官→自动接 seed1→seed2；三列全收官→读数报用户，判词留白。
-7. 显存/内核问题→停下报用户不硬修。纪律：锁卡A；setsid nohup。
+状态：冒烟 500 绿（12.365→8.631 零 NaN）；seed42 正式已点火（pid 14753，2.29 步/s，ETA ~2.4h）。smoke 目录 /root/autodl-tmp/checkpoints/_smoke_scale3x_500 留档不删。
+
+每轮：
+1. ssh -p 47807：`tail -1 /root/autodl-tmp/checkpoints/v37ks_a_im_v373_scale3x_20k_ctx4096_20260911/train_log.jsonl`（nan_skips=0 且 loss 降）+ `ps -p 14753`。健在→简报一句。
+2. seed42 收官（进程退+summary.json 在）→ 同形态点火 seed1：`--config outputs/_scale3x_20260911/v3_7_scale_3x_remote_s1.json`，log /root/autodl-tmp/scale3x_seed1.log，记录新 pid 进本节；seed1 收官→seed2（_s2.json，scale3x_seed2.log）。
+3. 异常：NaN/loss 爆炸（predict_loss 上千=4x@2e-4 前科形态）/进程死且步数<20000 → 停下报用户，不硬修。
+4. 三 seed 全收官→读数原样报用户（codec/direct_acc/predict_cos 七碑），判词留白。
+
+（历史：第 1-5 步已执行——VERIFIED 核验、bundle 同步卡A repo 至 fa1554f、remote 配置三枚、bpe tokenizer 补传 sha256 对拍、冒烟与点火。）
 
 ## §E 卡B 复证臂队列（无 cron，subagent 线）
 
