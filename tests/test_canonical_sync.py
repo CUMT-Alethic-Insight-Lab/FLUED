@@ -261,3 +261,46 @@ def test_v37_canonical_parses_to_slm_a_grid() -> None:
     # 坑 8 pinned 对称面（行动 5）：v37 侧两键也必须显式在册，不靠 parser 默认兜底
     assert canonical.get("summarizer_pool") == "qpool"
     assert canonical.get("seed_source") == "k"
+
+
+# --- a 格死键守卫（2026-09-11 红队总审行动项，用户裁定）：
+# --- kda_*/write_hidden/d_pack 在 a 格（slm, index/memory）零参数，
+# --- decoder_hidden 现行码不消费。死键最危险的不是占配置，而是未来某天被
+# --- 静默激活或被跨代引用时无人察觉——扰动测试：同 seed 下改动死键值，
+# --- a 格模型 state_dict（含 buffer）必须逐位不变；一旦被接线激活即红灯。
+# --- 启用任何死键的正确姿势：先删本守卫条目 + 同步 docs/CURRENT_STATE.md。
+
+A_GRID_DEAD_KEYS = (
+    "kda_heads",
+    "kda_head_k",
+    "kda_head_v",
+    "kda_tau_max",
+    "write_hidden",
+    "d_pack",
+    "decoder_hidden",
+)
+
+
+def test_a_grid_dead_keys_inert() -> None:
+    import torch
+
+    from flued.v36 import FLUEDV36
+    from tests.test_v37_slm import tiny_config
+
+    baseline = tiny_config()
+    torch.manual_seed(0)
+    ref = FLUEDV36(baseline).state_dict()
+    for key in A_GRID_DEAD_KEYS:
+        old = getattr(baseline, key)
+        new = old + 1 if isinstance(old, int) else old * 1.5 + 1.0
+        torch.manual_seed(0)
+        perturbed = FLUEDV36(tiny_config(**{key: new})).state_dict()
+        assert perturbed.keys() == ref.keys(), (
+            f"a 格死键 {key!r}（{old!r}->{new!r}）改变了参数键集——死键被激活，"
+            "见 A_GRID_DEAD_KEYS 注释的启用纪律"
+        )
+        dirty = [k for k in ref if not torch.equal(perturbed[k], ref[k])]
+        assert not dirty, (
+            f"a 格死键 {key!r}（{old!r}->{new!r}）改变了参数值 {dirty[:5]}——"
+            "死键被激活，见 A_GRID_DEAD_KEYS 注释的启用纪律"
+        )
