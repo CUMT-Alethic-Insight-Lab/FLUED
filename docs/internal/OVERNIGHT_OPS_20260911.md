@@ -6,6 +6,15 @@
 
 ## §A E124 收官+四列点火（cron :13）
 
+> **状态（09-13 07:35 更新）：四列在跑，本 cron 转监控相位（步骤 6）。**
+> 面具 log 已收官（10000 窗/29839 chunk/42.4h，sha256=276c2e69…338906，字段审计全过）；
+> 密度闸门**过线**：73.93 B/窗 ≥ 54.8（口径=Σ(src_byte_range 末−初+1)，预期 71B/1.30× 吻合）。
+> 四列驱动 `outputs/_e124_ignite_4cols.sh`（本地 bash-6mqi5eqd）07:26 点火 comb 列，
+> 全键校验过（loaded=287）、GPU 88%/10.6G。ETA：~62min/列 ×4 ≈ 11:40 全收官。
+> **每轮**：`tail -1 checkpoints/v37ks_a_e124_<当前列>/train_log.jsonl`（nan_skips=0 且
+> loss 降/acc 水位）+ 驱动进程健在 + GPU 占用；列切换看驱动输出 VERIFIED/CHAIN_ABORT；
+> 见 E124_4COLS_ALL_DONE → 步骤 8 五仪表雏形；NaN/进程死/CHAIN_ABORT → 报用户不硬修。
+
 1. ssh -i ~/.ssh/flued_partner_ed25519 -p 60222 root@106.15.75.26：`ps -p 37725 -o pid,etime --no-headers` + `wc -l < /workspace/outputs/e124_mask_log_seed42.jsonl`。未到 10000 → 简报一句结束。
 2. 到 10000 → scp 拉回 `/workspace/outputs/e124_mask_log_seed42.jsonl` → 本地 `outputs/e124_mask_log_seed42.jsonl`（串行重试）。
 3. sha256 登记 + 末窗字段审计（cand_mode=random / cand_seed=20260911 / candidates / hw 含 4090）。
