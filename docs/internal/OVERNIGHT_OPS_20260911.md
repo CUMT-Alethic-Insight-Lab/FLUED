@@ -1,7 +1,8 @@
-# OVERNIGHT OPS 2026-09-11（夜班操作手册）
+# OVERNIGHT OPS 2026-09-11/12（夜班操作手册）
 
-> 用途：cron 触发时按指引用节执行。用户已授权先斩后奏（有效期至 09-12 中午）。
+> 用途：cron 触发时按指引用节执行。用户已授权先斩后奏（09-12 晚续期：**有效期至 09-13 中午**）。
 > 自主权边界：判词裁定（密度闸门掉线、DeltaNet 分支定性）一律停下等用户。
+> **09-12 注**：§B/§C/§D 为 09-11 夜旧机（47807/42166 已失效）历史记录；卡A 内容已克隆至新双卡机 A79（15970），语料/150M 三 seed 基座已在数据盘验证副本。今晚现役链 = §A + §H。
 
 ## §A E124 收官+四列点火（cron :13）
 
@@ -57,3 +58,22 @@
 - 卡A 计划：~23:30 点火 seed42（2-4h）→ seed1 → seed2 串行；seed2 可能撞上余额见底（ckpt_every=1000 兜底，损失可控）。
 - 卡B：agent-203 冒烟后无任务 → 建议用户早上下手动关机（省 ~¥7/h 延卡A跑道）；我无法远程关停计费。
 - Kimi Code 额度：7 天 49.53%（09-13 夜重置）——cron 提示词已瘦身，subagent 优先于主会话长操作。
+
+## §H 15970 挂双卡 + Kimi Linear 复证臂链（cron :47，09-12 夜新增）
+
+背景：A79 机（实例 56e9nt826x-29a8cae7，当前**无卡模式**运行中）数据盘在收 98G 权重（本地任务 bash-wlrbwa52，日志 `outputs/_kimi_linear_download/ul.log`，成功标志 `KIMI_LINEAR_BASE_UPLOAD_VERIFIED`）。**上传未完绝不关机**（scp 断点续传但白烧时间）。
+
+状态机（每轮推进一格，逐格验证）：
+
+1. **等上传**：`tail -5 outputs/_kimi_linear_download/ul.log`。无 VERIFIED → 简报一句结束。
+2. **挂卡**（webbridge，daemon http://127.0.0.1:10086，session=`autodl-gpu-attach`，Windows 下请求体一律写临时 json 文件用 `curl.exe --data-binary` 发，非 ASCII 禁内联）：
+   a. find_tab url=https://www.autodl.com/console/instance/list（不在则 navigate newTab:true）→ snapshot。
+   b. 找 A79机/56e9nt826x 行的「关机」按钮（09-12 21:40 快照为 @e22，**以实时快照为准**）→ click → 确认弹窗点确认 → 轮询 snapshot 至状态「已关机」（1-3 min）。
+   c. 点该行「开机」（普通开机=带卡；**绝不点 更多→无卡模式开机**）→ 轮询至「运行中」且无「无卡模式」标（3-8 min）。
+   d. snapshot 读该行新 SSH 登录指令（**端口重启后可能变**）→ 用新端口探活：`ssh -o BatchMode=yes -o ConnectTimeout=15 -p <PORT> root@connect.westd.seetacloud.com "hostname; nvidia-smi -L"`（key auth 已装）。盼：2× RTX PRO 6000。
+3. **冒烟**：ssh 进 `/root/kimi_linear_deploy`，按其 README/脚本跑装载+前向+哨兵首验（transformers 4.57.x 环境在机；权重 `/root/autodl-tmp/models/Kimi-Linear-48B-A3B-Base/`；双卡 device_map）。冒烟任何一灯不绿 → 停下报用户，不硬修。
+4. **点火必要性账**：冒烟全绿 → setsid nohup 起三探针第一发（必要性账，复证臂最高优先），产物落数据盘（系统盘只有 30G），登记 pid+log 路径。
+5. 换岗：本 cron 此后转监控探针（log 尾+进程+显存）；探针收官 → 读数原样报用户（判词留白）→ **关机回无卡模式**（webbridge 同法）→ 删本 cron。
+6. 余额纪律：挂卡后烧 ¥13.97/h；若探针无法过夜跑（如冒烟红灯待修），**当晚关机回无卡模式**，不空烧。
+
+预算快照（09-12 21:40 估）：余额 ~¥190；挂卡 9h ≈ ¥126，明早余 ~¥60+，够烧到 09-13 午。
