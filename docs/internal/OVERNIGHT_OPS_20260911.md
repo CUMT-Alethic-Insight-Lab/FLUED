@@ -61,9 +61,18 @@
 
 ## §H 15970 挂双卡 + Kimi Linear 复证臂链（cron :47，09-12 夜新增）
 
-**当前状态（09-12 22:34 更新）：仍阻塞在登录，且是「profile 错位」形态**——用户已在某浏览器登录，但 webbridge 驱动的这个浏览器上下文首页右上角仍是「登录|注册」，实例页仍跳 /login。登录页 tab 已留在 «AutoDL 挂双卡» 组里等用户就地登录。
-**解锁动作（用户，30 秒）**：在 **webbridge 控制的这个浏览器**（Edge，标签组 «AutoDL 挂双卡»）里完成登录——直接在留着的那页登录，或确认 www.autodl.com 右上角显示「炼丹师5295」。
-**cron 执行注意**：每轮先 navigate www.autodl.com（沿用现有 tab）→ snapshot 查「炼丹师5295」——缺席即「等登录」简报结束，不重复尝试登录页；在席再进实例列表走步骤 2（**全程用当轮新快照的 ref，严禁跨 reload 复用**）。
+**当前状态（09-13 00:35 更新）：挂卡完成，三探针连夜链已点火。**
+- 挂卡：22:56 关机→带卡开机全走通（关机/开机确认弹窗都是「确定」；**端口不变** 15970，key auth 重启后仍在）；探活 2× PRO 6000 97887MiB 全闲。
+- 环境三坑已修入册（requirements/install/README 三文件，commit 813b042 本地、待推）：fla 必须 **flash-linear-attention==0.4.0 + fla-core==0.4.0**（完整包才有 fla.layers；0.4.0 后 fused_kda_gate 签名重构丢 g_bias；旧签名 head_k_dim/head_dim 同名值 128 无碍）；三探针 `--max-memory` 字符串键 bug 同修（commit 3b1734c）。
+- 冒烟全绿：book 2 窗、backend=sdpa-shim（flash-attn 缺席，双臂同后端）、V=163840、kda_layers=20、双卡指纹在录，~115s/窗。
+- **在跑**：驱动 `/root/autodl-tmp/outputs/run_kimi_probes.sh`（pid 7764），book(40窗)→state_readout(40窗)→state_surgery(40窗) 串行，日志 `/root/autodl-tmp/outputs/kimi_probes_20260913{,_driver.log}`，收官标志 `ALL_PROBES_DONE`。单窗 ~2min ×3 probe ×40 窗 + 装载 ×3 ≈ 4-5h，ETA ~05:00。
+
+**cron :47 每轮动作**（监控相位）：
+1. ssh -p 15970：`tail -3 /root/autodl-tmp/outputs/kimi_probes_20260913_driver.log` + `ps -p 7764 -o pid --no-headers`。
+2. 驱动健在 → 简报一句（当前 probe 名+最近 DONE 行）。
+3. 见 `ALL_PROBES_DONE` → 三 probe 各 summary.json 关键读数原样报用户（判词留白）→ **webbridge 关机回无卡模式**（步骤 2b 流程，登录在席直接走）→ 删本 cron。
+4. 驱动死且无 DONE → 查对应 probe log 尾部，报错报用户，不硬修；机器留无卡决策给用户。
+5. 余额纪律不变：任何 probe 连续 2 轮日志无推进 → 报用户（不擅自关机，探针在烧 ¥13.97/h）。
 
 背景：A79 机（实例 56e9nt826x-29a8cae7，当前**无卡模式**运行中）数据盘在收 98G 权重（本地任务 bash-wlrbwa52，日志 `outputs/_kimi_linear_download/ul.log`，成功标志 `KIMI_LINEAR_BASE_UPLOAD_VERIFIED`）。**上传未完绝不关机**（scp 断点续传但白烧时间）。
 
