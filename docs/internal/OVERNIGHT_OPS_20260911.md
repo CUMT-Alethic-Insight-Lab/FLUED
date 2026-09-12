@@ -61,6 +61,10 @@
 
 ## §H 15970 挂双卡 + Kimi Linear 复证臂链（cron :47，09-12 夜新增）
 
+**当前状态（09-12 22:30 更新）：阻塞在登录**——AutoDL 会话已掉线（22:25 操作中被重定向到 /login）。**事故记录**：reload 后沿用旧快照的 @e22 点击，命中了一个跳 /login 的 A 标签（疑似退出/会话链接）→ 教训入册：**webbridge 每次 location.reload() 后必须重新 snapshot 解引用，跨 reload 复用 ref 一律视为脏**。上传已 VERIFIED、数据零损失、机器仍在无卡模式（低费率空挂）。
+**解锁动作（用户，30 秒）**：在 Edge 任意 AutoDL 页重新登录（手机号+密码或微信扫码）。登录后 cron :47 自动续走下文状态机；若 cron 发现仍跳 /login → 简报「等登录」一句结束，不重复尝试。
+**cron 执行注意**：进步骤 2 前先 evaluate 查 `location.href`，含 `/login` 即中止本轮。
+
 背景：A79 机（实例 56e9nt826x-29a8cae7，当前**无卡模式**运行中）数据盘在收 98G 权重（本地任务 bash-wlrbwa52，日志 `outputs/_kimi_linear_download/ul.log`，成功标志 `KIMI_LINEAR_BASE_UPLOAD_VERIFIED`）。**上传未完绝不关机**（scp 断点续传但白烧时间）。
 
 状态机（每轮推进一格，逐格验证）：
