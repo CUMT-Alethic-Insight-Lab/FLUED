@@ -73,6 +73,18 @@ def parse_int_list(text: str, kda_layers: list[int]) -> list[int]:
     return vals
 
 
+def map_states_to_layers(kda_layers: list[int],
+                         states_all: list[torch.Tensor]) -> dict[int, torch.Tensor]:
+    """extract_kda_boundary_states 按**捕获次序**返回（records 无层号元数据；
+    捕获序 = KDA 层前向执行序 = kda_layers 升序）——映射到绝对层号。层数不符
+    即捕获遗漏/重复，前提破，响亮拒。"""
+    if len(states_all) != len(kda_layers):
+        raise RuntimeError(
+            f"捕获层数 {len(states_all)} ≠ KDA 层数 {len(kda_layers)}——"
+            f"层序映射前提破，响亮停机")
+    return dict(zip(kda_layers, states_all))
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--model-path",
@@ -230,8 +242,9 @@ def main() -> None:
                     verr_max_overall = vm if verr_max_overall is None \
                         else max(verr_max_overall, vm)
                 idx = torch.tensor([s["chunk"] for s in samples])
+                states_by_layer = map_states_to_layers(kda_layers, states_all)
                 for l in pass_layers:
-                    rows = states_all[l][idx].reshape(len(samples), -1)
+                    rows = states_by_layer[l][idx].reshape(len(samples), -1)
                     store[l].append(rows.to(torch.bfloat16).cpu())
                 if pi == 0:
                     samples_by_win[w_abs] = samples

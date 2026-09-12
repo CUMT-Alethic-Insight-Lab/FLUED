@@ -358,6 +358,18 @@ def test_readout_module_wiring():
         kread.parse_int_list("", kda)
 
 
+def test_map_states_to_layers_capture_order():
+    # 捕获序（20 条 records）→ 绝对层号（含空洞的 KDA 层表）：绝对层号直接索引
+    # states_all 会在层 24/25 处 IndexError（2026-09-13 连夜实证）
+    kda = [0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14, 16, 17, 18, 20, 21, 22, 24, 25]
+    states = [torch.full((1,), float(i)) for i in range(len(kda))]
+    m = kread.map_states_to_layers(kda, states)
+    assert set(m) == set(kda)
+    assert m[25].item() == 19.0 and m[24].item() == 18.0 and m[0].item() == 0.0
+    with pytest.raises(RuntimeError, match="捕获层数"):
+        kread.map_states_to_layers(kda, states[:19])
+
+
 def test_kbook_reuses_e122_machinery():
     # 必要性账 = e122 选择/手术/判读原样复用（不复制不分叉的结构性断言）
     for fn in ("run_window", "plan_window_surgery", "bootstrap_contrast",
