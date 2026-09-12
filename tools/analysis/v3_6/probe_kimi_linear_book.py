@@ -115,8 +115,10 @@ def main() -> None:
 
     max_memory = None
     if args.max_memory:
-        max_memory = dict(
-            kv.split(":", 1) for kv in args.max_memory.split(",") if kv)
+        max_memory = {
+            (int(k) if k.isdigit() else k): v
+            for k, v in (
+                kv.split(":", 1) for kv in args.max_memory.split(",") if kv)}
     model, tok, fingerprint = kload.load_model_and_tokenizer(
         args.model_path, device, max_memory=max_memory)
     v = fingerprint["vocab_size"]
