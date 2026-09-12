@@ -127,14 +127,21 @@ def select_dissociation_positions(ids: list[int], split: int, n: int, tail: int,
 def build_window_sums(nll_base: list[float | None],
                       nll_zero: list[float | None],
                       remote_tails: dict[int, tuple],
-                      local_tails: dict[int, tuple]) -> dict:
-    """单窗 sums（e122.bootstrap_contrast 键位同构：remote→sel，local→ctl）。"""
+                      local_tails: dict[int, tuple],
+                      split: int = 0) -> dict:
+    """单窗 sums（e122.bootstrap_contrast 键位同构：remote→sel，local→ctl）。
+
+    tails 的键是全窗绝对位 t；nll_base/nll_zero 是 suffix 局部坐标
+    （长度 = tk − split，绝对位 t 对应 j = t − split）——索引统一换算。"""
     sums = {"n_sel": 0, "sel_d_b1": 0.0, "n_strong": 0,
             "n_ctl": 0, "ctl_d_b1": 0.0}
     for role, tails, k_n, k_d in (("remote", remote_tails, "n_sel", "sel_d_b1"),
                                   ("local", local_tails, "n_ctl", "ctl_d_b1")):
         for t in sorted(tails):
-            nb, nz = nll_base[t], nll_zero[t]
+            j = t - split
+            if j < 0 or j >= len(nll_base):
+                continue
+            nb, nz = nll_base[j], nll_zero[j]
             if nb is None or nz is None:
                 continue
             d = nz - nb
@@ -166,7 +173,8 @@ def run_dissociation_window(model, ids: list[int], split: int,
                             device: torch.device, zero_layers: list[int],
                             zero_conv: bool = False) -> dict:
     """单窗三前向：prefix 建缓存 → 置零手术 suffix（术臂）→ 快照恢复 suffix
-    （基线臂）。返回 {nll_base, nll_zero, n_zeroed}。"""
+    （基线臂）。返回 {nll_base, nll_zero, n_zeroed}；nll_* 为 suffix 局部坐标
+    （长度 = tk − split，全窗绝对位 t 对应 j = t − split）。"""
     pre_ids = torch.tensor([ids[:split]], dtype=torch.long, device=device)
     suf_ids = torch.tensor([ids[split:]], dtype=torch.long, device=device)
     with torch.no_grad():
@@ -312,7 +320,7 @@ def main() -> None:
             rec = run_dissociation_window(model, ids, split, device,
                                           zero_layers, args.zero_conv_too)
             sums = build_window_sums(rec["nll_base"], rec["nll_zero"],
-                                     remote, local)
+                                     remote, local, split=split)
             if sums["n_sel"] > 0 and sums["n_ctl"] > 0:
                 tally["n_windows_used"] += 1
                 window_sums.append(sums)
@@ -320,14 +328,16 @@ def main() -> None:
                     for role, tails in (("remote", remote), ("local", local)):
                         for t in sorted(tails):
                             g, pp = tails[t]
+                            j = t - split  # nll_* 为 suffix 局部坐标
+                            nb_t = rec["nll_base"][j] if 0 <= j < len(rec["nll_base"]) else None
+                            nz_t = rec["nll_zero"][j] if 0 <= j < len(rec["nll_zero"]) else None
                             fi.write(json.dumps({
                                 "window_id": w_abs, "role": role,
                                 "token_pos": t, "gram": list(g), "repeat_pos": pp,
-                                "NLL_base": rec["nll_base"][t],
-                                "NLL_zero": rec["nll_zero"][t],
-                                "delta": (None if rec["nll_base"][t] is None or
-                                          rec["nll_zero"][t] is None else
-                                          rec["nll_zero"][t] - rec["nll_base"][t]),
+                                "NLL_base": nb_t,
+                                "NLL_zero": nz_t,
+                                "delta": (None if nb_t is None or nz_t is None
+                                          else nz_t - nb_t),
                             }, ensure_ascii=False) + "\n")
             else:
                 tally["n_windows_empty"] += 1

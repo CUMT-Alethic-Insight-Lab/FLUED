@@ -133,6 +133,24 @@ def test_kda_chunk_boundary_states_match_naive_reference():
     assert states3.shape[0] == 3
 
 
+def test_kda_chunk_boundary_states_accepts_unit_batch_capture():
+    """捕获直出带 B=1 batch 维（[1,T,H,*]）→ 入口挤掉；非 1 batch 响亮拒。"""
+    torch.manual_seed(7)
+    k = torch.randn(6, 2, 3)
+    v = torch.randn(6, 2, 4)
+    g = -torch.rand(6, 2, 3) * 0.5
+    beta = torch.rand(6, 2)
+    ref = kload.kda_chunk_boundary_states(k, v, g, beta, 4, apply_l2norm=False)
+    got = kload.kda_chunk_boundary_states(
+        k.unsqueeze(0), v.unsqueeze(0), g.unsqueeze(0), beta.unsqueeze(0),
+        4, apply_l2norm=False)
+    assert torch.equal(got, ref)
+    with pytest.raises(ValueError, match="维度不符"):
+        kload.kda_chunk_boundary_states(
+            torch.randn(2, 6, 2, 3), v.unsqueeze(0), g.unsqueeze(0),
+            beta.unsqueeze(0), 4, apply_l2norm=False)
+
+
 def test_kda_l2norm_unit_norm():
     x = torch.randn(7, 3, 16)
     y = kload.kda_l2norm(x)
@@ -294,6 +312,13 @@ def test_build_window_sums_math():
     assert sums["n_sel"] == 2 and sums["sel_d_b1"] == pytest.approx(0.5 + 6.0)
     assert sums["n_ctl"] == 1 and sums["ctl_d_b1"] == pytest.approx(2.0)
     assert sums["n_strong"] == 1  # 仅 remote 位 Δ=6.0 ≥ 1 nat；local 位不计数
+    # split ≠ 0：tails 键为全窗绝对位 t，nll 为 suffix 局部坐标（j = t − split）；
+    # j 越界位跳过（split=3 时 t=2 → j=−1）
+    sums2 = ksurg.build_window_sums(base, zero,
+                                    {2: (("x",), 0), 4: (("a",), 1)},
+                                    {5: (("c",), 1)}, split=3)
+    assert sums2["n_sel"] == 1 and sums2["sel_d_b1"] == pytest.approx(0.5)
+    assert sums2["n_ctl"] == 1 and sums2["ctl_d_b1"] == pytest.approx(0.5)
 
 
 def test_bootstrap_contrast_sign_separation():

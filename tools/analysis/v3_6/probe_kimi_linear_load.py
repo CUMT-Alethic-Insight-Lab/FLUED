@@ -268,6 +268,13 @@ def kda_state_recurrence_step(s: torch.Tensor, k_i: torch.Tensor,
     return s + torch.einsum("hk,hv->hkv", beta_i.unsqueeze(-1) * k_i, upd)
 
 
+def _drop_unit_batch(t: torch.Tensor, dim_expected: int) -> torch.Tensor:
+    """chunk_kda 捕获原态带 batch 维（[1,T,H,*]）——B=1 挤掉；其余原样。"""
+    if t.dim() == dim_expected + 1 and t.shape[0] == 1:
+        return t.squeeze(0)
+    return t
+
+
 def kda_chunk_boundary_states(k: torch.Tensor, v: torch.Tensor,
                               g: torch.Tensor, beta: torch.Tensor,
                               chunk_size: int = DEFAULT_CHUNK_SIZE,
@@ -278,7 +285,18 @@ def kda_chunk_boundary_states(k: torch.Tensor, v: torch.Tensor,
     k [T,H,K]（捕获原态；apply_l2norm=True 时先逐 token L2）、v [T,H,V]、
     g [T,H,K]（log 域 fine-grained 门控）、beta [T,H] → states [NS+1,H,K,V]，
     states[c] = 恰好消费 token < c·chunk_size 后的状态；末槽 = 终态（T 非整
-    chunk 时末槽为部分 chunk 态，如实标注由调用方处理）。"""
+    chunk 时末槽为部分 chunk 态，如实标注由调用方处理）。
+    捕获直出（KdaChunkCapture.records）带 B=1 batch 维（[1,T,H,*]），入口挤掉；
+    挤后维度仍不符则响亮报错，不静默错位。"""
+    k = _drop_unit_batch(k, 3)
+    v = _drop_unit_batch(v, 3)
+    g = _drop_unit_batch(g, 3)
+    beta = _drop_unit_batch(beta, 2)
+    if not (k.dim() == 3 and v.dim() == 3 and g.dim() == 3 and beta.dim() == 2):
+        raise ValueError(
+            f"kda_chunk_boundary_states 维度不符：k{tuple(k.shape)} "
+            f"v{tuple(v.shape)} g{tuple(g.shape)} beta{tuple(beta.shape)}"
+            f"（期望 k/v/g [T,H,*]、beta [T,H]，可带 B=1 batch 维）")
     if apply_l2norm:
         k = kda_l2norm(k)
     k = k.transpose(0, 1).float()      # [H,T,K]
