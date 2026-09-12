@@ -66,14 +66,15 @@
 - 环境三坑已修入册（requirements/install/README 三文件，commit 813b042）：fla 必须 **flash-linear-attention==0.4.0 + fla-core==0.4.0**（完整包才有 fla.layers；0.4.0 后 fused_kda_gate 签名重构丢 g_bias；旧签名 head_k_dim/head_dim 同名值 128 无碍）；三探针 `--max-memory` 字符串键 bug 同修（commit 3b1734c）。
 - 冒烟全绿：book 2 窗、backend=sdpa-shim（flash-attn 缺席，双臂同后端）、V=163840、kda_layers=20、双卡指纹在录，~115s/窗。
 - 连夜链收官（23:49，原驱动 run_kimi_probes.sh）：**book 40 窗真收官**（summary.json 在）；state_readout / state_surgery 各 exit=1——两 bug 已修（commit e1ef4dc，813+4 全绿，已推）：① `kda_chunk_boundary_states` 入口挤 B=1 batch 维（捕获直出 [1,T,H,*]，非 1 batch 响亮拒）；② surgery `build_window_sums`+items 写出坐标系错位（nll_* 为 suffix 局部坐标，j=t−split），各带回归测试。
-- **在跑**：`$OUT/rerun_two.sh`（pid 11583，00:04:48 起），state_readout(40窗)→state_surgery(40窗) 串行，日志 `/root/autodl-tmp/outputs/kimi_probes_20260913/{state_readout,state_surgery}.log`+`rerun.log`，收官标志 `RERUN_ALL_DONE`。book 不重跑。GitHub 断连恢复，积压已推净（至 e1ef4dc），:33 兜底 cron 已删。
+- 重跑第一轮（rerun_two.sh，00:04-00:07）：**surgery 真收官**（40窗/用12，remote n=194 mean Δ=+0.00757，local n=97 +0.00071，contrast +0.0069 nat CI[−0.0083,+0.0225] 含 0，n_strong=1，verdict「解离未落转 500 窗」）；**readout 又撞第三 bug** exit=1：`states_all` 按捕获序返回而主循环用绝对层号索引（层 24/25 越界 IndexError）——已修（commit a9b5029，`map_states_to_layers` 捕获序→绝对层号映射+层数响亮校验+回归测试，814+4 全绿已推）。附注：rerun_two.sh 的 `exit=$?` 被同行 `$(date)` 吞成 0（exit 码不可信，以 log/summary 为准）。
+- **在跑**：`$OUT/rerun_readout.sh`（pid 13992，00:18:44 起），仅 state_readout(40窗)，日志 `state_readout.log`+`rerun2.log`，收官标志 `RERUN2_DONE`。book/surgery 不重跑。GitHub 断连恢复，积压已推净（至 a9b5029），:33 兜底 cron 已删。
 
 **cron :47 每轮动作**（监控相位）：
-1. ssh -p 15970：`tail -3 /root/autodl-tmp/outputs/kimi_probes_20260913/rerun.log` + 当前 probe log 尾两行 + `pgrep -f rerun_two.sh`。
-2. 重跑健在 → 简报一句（当前 probe 名+最近窗号）。
-3. 见 `RERUN_ALL_DONE` → 三 probe 各 summary.json 关键读数原样报用户（判词留白；book 已读：40窗/用30、selected n=130 mean Δ≈−0.0008、contrast −0.00055 nat CI[−0.0019,+0.0005] 含 0、n_strong=0、verdict 串误写「DeltaNet」待正名）→ **webbridge 关机回无卡模式**（步骤 2b 流程，登录在席直接走）→ 删本 cron。
-4. 重跑死且无 DONE → 查对应 probe log 尾部，报错报用户，不硬修；机器留无卡决策给用户。
-5. 余额纪律不变：任何 probe 连续 2 轮日志无推进 → 报用户（不擅自关机，探针在烧 ¥13.97/h）。
+1. ssh -p 15970：`tail -2 /root/autodl-tmp/outputs/kimi_probes_20260913/rerun2.log` + `tail -2 .../state_readout.log` + `pgrep -f rerun_readout.sh`。
+2. 重跑健在 → 简报一句（最近窗号）。
+3. 见 `RERUN2_DONE` → 三 probe 各 summary.json 关键读数原样报用户（判词留白；book：40窗/用30、selected n=130 mean Δ≈−0.0008、contrast −0.00055 nat CI[−0.0019,+0.0005] 含 0、n_strong=0、verdict 串误写「DeltaNet」待正名；surgery：见上）→ **webbridge 关机回无卡模式**（步骤 2b 流程，登录在席直接走）→ 删本 cron。
+4. 重跑死且无 DONE → 查 state_readout.log 尾部，报错报用户，不硬修；机器留无卡决策给用户。
+5. 余额纪律不变：连续 2 轮日志无推进 → 报用户（不擅自关机，探针在烧 ¥13.97/h）。
 
 背景：A79 机（实例 56e9nt826x-29a8cae7，当前**无卡模式**运行中）数据盘在收 98G 权重（本地任务 bash-wlrbwa52，日志 `outputs/_kimi_linear_download/ul.log`，成功标志 `KIMI_LINEAR_BASE_UPLOAD_VERIFIED`）。**上传未完绝不关机**（scp 断点续传但白烧时间）。
 
