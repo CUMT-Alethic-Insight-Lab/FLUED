@@ -58,7 +58,8 @@
 bash /root/kimi_linear_deploy/code/install_kimi_linear_env.sh
 # 或手动：
 /root/miniconda3/bin/pip install -U pip
-/root/miniconda3/bin/pip install -U "transformers>=4.57.0,<5" "fla-core>=0.4.0" \
+/root/miniconda3/bin/pip install -U "transformers>=4.57.0,<5" \
+    "flash-linear-attention==0.4.0" "fla-core==0.4.0" \
     tiktoken einops packaging accelerate
 # 可选（MLA 原生后端；缺席自动 SDPA shim，仪器双臂同后端不受影响）：
 /root/miniconda3/bin/pip install flash-attn --no-build-isolation
@@ -66,6 +67,9 @@ bash /root/kimi_linear_deploy/code/install_kimi_linear_env.sh
 
 `requirements_kimi_linear.txt` 为 pinned 清单。**transformers 必须 <5**（v5 的
 `_tied_weights_keys` dict 化与远码/fla 组合有已知的雷，DeltaNet 臂 2026-09 实证）。
+**fla 必须钉 0.4.0 全家桶**（2026-09-12 冒烟实证，见 requirements 文件头三条：
+fla-core 任意版本无 `fla.layers`；`fused_kda_gate` 签名 0.4.0 后重构；旧签名第三参
+名 head_k_dim 与远码传的 head_dim 同为 128 无碍）。
 
 ## 5. 模型事实速查（ref/ 已读码验证，git blob sha1 对上 HF MANIFEST）
 
