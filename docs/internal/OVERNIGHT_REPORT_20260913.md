@@ -34,6 +34,19 @@
 - 四列串行（5080，驱动 `outputs/_e124_ignite_4cols.sh`，任务 bash-6mqi5eqd，11:02 全收官 E124_4COLS_ALL_DONE，全 rc=0 零 NaN）：comb（07:26 点火，60min：**eval_direct_acc 0.7486 / eval_backbone_acc 0.6957 / eval_loss 2.035 / masked 0.1163**）→ gate（08:25，55min：**0.7629 / 0.7076 / 1.957 / masked 0.1109**）→ demand（09:20，55min：**0.7561 / 0.7026 / 1.978 / masked 0.1120**）→ cont（10:15，48min：**0.7591 / 0.7053 / 1.965 / masked 0.1166**）。
 - 列间双标志硬校验（summary.json+latest.pt），断列即断链报用户；基座全键全形校验每列过（loaded=287）。
 
+### 4. E124 五仪表雏形读数包（11:20 落地，agent-210 施工+跑数，判词留白）
+
+仪器 `tools/analysis/v3_6/readout_e124_five_instruments.py`（commit `ce72b4d`，本地未推；测试 seam4+gate6+新9 共 19 绿），产物 `outputs/e124_readout_20260913/<instrument>/<run>/{summary,items}`（5×4=20 组，eval 流+seed1042+硬门终点姿态，16 窗同卷）。覆盖：①②③⑤ 仅 comb/gate（demand/cont 无门结构 skip，原因已入各 summary）；④ 四列全。
+
+- **① RD 曲线**：comb/gate 全档平（comb k=1→0.6951、k=9→0.6957、k=173→0.6959；gate 同形），无拐点亦无塌；k=173 档 16 窗中 11 窗 bypass（n_real<173，语义=全量读锚点）。
+- **② K 侧置乱 Δ**：comb 五档 Δmasked≈+0.0445（CI 全不含零）、**Δoverall≈+0.607**（置乱后 backbone 整体塌到 ~0.089）；gate 同形（+0.039/+0.621）。
+- **③ 位置先验**：k=9 命中集 vs 因果最近-k 预测器重合率 comb 0.2150 / gate 0.2251（完全命中率 ~0.056）；lag0 占 25.2%（comb）/34.8%（gate）。
+- **④ 遮蔽位读出**：收官 eval 锚 comb 0.1163 / gate 0.1109 / demand 0.1120 / cont 0.1166；自锚地板 majority 0.0974 / uniform 0.0039 → gap comb +0.0190 vs **cont +0.0192**（同水位）。注意前提偏差：train_log 无 eval 行（评估只在收官跑一次），轨迹段是训练姿态步点（峰值 comb 0.1968 后回落），eval 姿态只有收官锚——仪器 summary 的 log_note 已分标未混充。
+- **⑤ 消融双跑**：先行对拍逐位过。**仪器语义勘定（主会话审计 model.py:1844）：`allowed | diag_eye` 对角护栏 → 全局臂实为「仅自读」而非「全剔」**。comb：全局 Δmasked=−0.0020（CI 含零）/Δunmasked=+0.0031；定向 Δmasked=+0.0006/Δunmasked=+0.0004；direct 腿全零（构造性不读 store）。
+- ②/⑤ 张力已解：读错行剧毒（−0.607，V 读出内容敏感的铁证）vs 仅自读几乎无损（−0.003）——**backbone_acc 几乎全由对角自读承载**；两读数不矛盾，但 ⑤ 的「全局」字段名与真实语义不符，判读时必须带此注记。
+
+待用户终审：五面判读（任务书 §4 主判据组合 + §5 结局格）、条件列裁定（阳性才跑乱序 5K）、种子 {1,2}。
+
 ## 二、机器状态（09-13 早）
 
 | 机 | 状态 | 说明 |
