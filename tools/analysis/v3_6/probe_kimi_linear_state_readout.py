@@ -322,18 +322,25 @@ def main() -> None:
             "near_lag1_cos_uplift_mean": (sum(near_ups) / len(near_ups)) if near_ups else None,
         }
 
-    deep = group_summary.get("deep", {})
-    deep_up, deep_p = deep.get("remote_j0_cos_uplift_mean"), deep.get("remote_j0_min_p")
-    if deep_up is None:
+    # 判词按全部层组数据生成（2026-09-13 文案勘误：旧版只读 deep 组且串自称
+    # 「深部」，与实测 early 最强矛盾——数据不动，措辞改为点名显著层组；显著层组
+    # 判据=组内过半层 p<0.05 且组均 uplift>0，单离群层不足以带全组）。
+    sig_groups = [g for g, d in group_summary.items()
+                  if (d.get("remote_j0_cos_uplift_mean") or 0.0) > 0
+                  and d["n_layers_remote_p_lt_0.05"] * 2 > len(d["layers"])]
+    if not group_summary:
         verdict_txt = "无读数"
-    elif deep_up > 0 and deep_p is not None and deep_p < 0.05:
-        verdict_txt = ("深部 KDA 层远程内容线性可读（remote uplift>0 且 p<0.05）——状态写入可线性读出；"
-                       "与必要性账/置零解离并读（冒烟级，判词留白待 500 窗）")
-    elif deep_up <= 0 or (deep_p is not None and deep_p >= 0.05):
-        verdict_txt = ("深部 KDA 层远程内容未见线性可读——读出或是非线性/注意式"
-                       "（冒烟级，判词留白待 500 窗）")
+    elif sig_groups:
+        verdict_txt = ("KDA 状态远程内容线性可读（显著层组："
+                       + "/".join(sig_groups)
+                       + "，组均 remote uplift>0 且组内过半层 p<0.05；层位定位以 layer_groups 数据字段为准）"
+                       "——状态写入可线性读出；与必要性账/置零解离并读（冒烟级，判词留白待 500 窗）")
+    elif any((d.get("remote_j0_cos_uplift_mean") or 0.0) > 0 for d in group_summary.values()):
+        verdict_txt = ("KDA 状态远程内容线性读出信号未过显著线（有正 uplift 但 p≥0.05）"
+                       "——读出或是非线性/注意式（冒烟级，判词留白待 500 窗）")
     else:
-        verdict_txt = "证据不足（冒烟级，判词留白）"
+        verdict_txt = ("KDA 状态远程内容未见线性可读——读出或是非线性/注意式"
+                       "（冒烟级，判词留白待 500 窗）")
 
     summary = {
         "probe": "E122 配套表示侧 · Kimi-Linear KDA 线性状态闭式读出探针（第三把尺子）",

@@ -13,9 +13,9 @@
 | surgery KDA 状态置零解离（全 20 KDA 层置零） | 40窗/用12；remote n=194 +0.00757 vs local n=97 +0.00071（remote≈10× local）；contrast +0.0069 CI[−0.0083,+0.0225] 含 0；n_strong=1 | 方向对、剂量不足（28/40 窗空）；仪器自述转 500 窗/换层集 |
 | readout KDA 状态闭式读出（哨兵全过 max rel_err 0.0051«0.05） | 40窗/用39，n_samples=169；remote_j0 cos uplift：**early（层0-8）+0.0166，min p=0.00024，6/7 层 p<0.05**；mid +0.0068（2/7）；deep +0.0072（1/6）；near_lag1 阳性对照全层组 +0.013~+0.027 | 信号最強在 **early** 非 deep |
 
-**仪器文案两勘误待修**（不影响数据，判读以 summary 数据字段为准）：
-- book 的 verdict 串误写「DeltaNet 跨架构复证未过」（实为 kimi122 臂）——硬编码串 bug；
-- readout 的 verdict 自称「深部 KDA 层远程内容线性可读」，与自家 layer_groups 数据（early 最强）方向不符。
+**仪器文案两勘误（2026-09-13 午已修，数据不动）**：
+- book 的 verdict 串误写「DeltaNet 跨架构复证未过」（实为 kimi122 臂）——根因=复用 DeltaNet 臂 verdict 函数；已改本地 `_verdict_kimi`（混合架构逃逸口全限定措辞）；
+- readout 的 verdict 自称「深部 KDA 层远程内容线性可读」，与自家 layer_groups 数据（early 最强 6/7 层）不符——已改按层组多数显著性点名（实测仅 early 显著）；存量 summary.json 的旧 verdict 串不回刷（数据字段为准），代码修复见本日 commit。
 
 产物：本地 `outputs/kimi_probes_20260913/`（15 文件 716K，三 summary+items+probes+samples 齐）；远端 A79 `/root/autodl-tmp/outputs/kimi_probes_20260913/` 同份。
 

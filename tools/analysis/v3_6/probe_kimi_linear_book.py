@@ -20,7 +20,10 @@ tokenizer），在工业级非自造架构上复证「线性状态通道写入�
    build_inputs_with_special_tokens）——窗 = 裸 token 序列，落 summary。
 4. 判读口径：主判读量 = mean ΔNLL(处理) − mean ΔNLL(对照)，逐位 fp32、无
    autocast；窗级 bootstrap 95% CI（2000 次）；强响应尾 1 nat；判序 CI 在先
-   ——全部原样复用 e122.bootstrap_contrast / verdict。
+   ——bootstrap_contrast 原样复用 e122；**verdict 用本臂本地版 _verdict_kimi**
+   （2026-09-13 文案勘误：旧版直接复用 DeltaNet 臂 verdict，串中硬编码
+   「DeltaNet 跨架构复证」张冠李戴；且混合架构 CI 含 0 的语义≠「复证未过」，
+   须带逃逸口全限定——用户判词二）。
 
 结构差（跨架构并表用）：
 - MoE 架构（256 experts top-8）：推理路径确定（eval 模式无 dropout/路由随机），
@@ -63,6 +66,23 @@ except ImportError:  # 脚本直跑（sys.path[0] = 脚本目录）
     _sys.path.insert(0, str(_P(__file__).resolve().parent))
     import probe_e122_deltanet_book as e122
     import probe_kimi_linear_load as kload
+
+
+def _verdict_kimi(mean_sel, contrast: dict) -> str:
+    """本臂 verdict（判序 CI 在先，与 e122 同构）——措辞锚=Kimi-Linear 混合架构整模
+    必要性账。CI 含 0 在本臂的语义不是「复证未过」：3:1 KDA:MLA 混合下整模测量混
+    读者（逃逸口条款），贴零只排除「此任务此剂量下整模远程依赖 ≳CI 半宽量级」，
+    通道级结论归 surgery/readout 两臂（2026-09-13 用户判词二）。"""
+    if mean_sel is None or contrast["point"] is None:
+        return "无读数"
+    if not contrast["ci_excludes_zero"]:
+        return ("整模远程依赖贴零（CI 含 0）——限于本任务/剂量/窗流，排除 ≳CI 半宽量级的"
+                "整模远程依赖；混合架构注意力层在场，本账不隔离 KDA 通道（逃逸口）")
+    if contrast["point"] < 0:
+        return "反常（对照>处理——仪器 bug 或选择口径错，停，转口径审计）"
+    if mean_sel >= e122.STRONG_LINE_NAT:
+        return "整模远程依赖实存（强）——剂量打在黑板上"
+    return "整模远程依赖实存（弱）——剂量部分在板"
 
 STRONG_LINE_NAT = e122.STRONG_LINE_NAT
 
@@ -290,7 +310,7 @@ def main() -> None:
             "offtable_hit_grams": totals.get("offtable_grams", 0),
             "selection_overlap": totals.get("n_selection_overlap", 0),
         },
-        "verdict": e122.verdict(mean_sel, boot),
+        "verdict": _verdict_kimi(mean_sel, boot),
         "arch_note": "Kimi-Linear = KDA(20) + MLA(7) 混合；必要性账动输入、双臂同前向，"
                      "测「模型整体读不读」；KDA 状态通道单独隔离见 "
                      "probe_kimi_linear_state_surgery.py / probe_kimi_linear_state_readout.py",
