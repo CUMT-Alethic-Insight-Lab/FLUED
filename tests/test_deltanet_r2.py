@@ -163,6 +163,11 @@ def test_strict_save_load_roundtrip_bitexact(tmp_path):
     """strict 系加载 + 全键 loud-fail：save_pretrained → from_pretrained 逐键逐位
     一致（仪器 AutoModelForCausalLM 装载通路实证）。"""
     from transformers import AutoModelForCausalLM
+    import fla.models.delta_net.modeling_delta_net as _fla_dn_mod
+    if isinstance(_fla_dn_mod.DeltaNetForCausalLM.__dict__.get("_tied_weights_keys"), list):
+        # tf5.15.1 from_pretrained 对 v4 list 崩溃（484c636 同款规范化，tying 语义不变）
+        _fla_dn_mod.DeltaNetForCausalLM._tied_weights_keys = {
+            "lm_head.weight": "model.embeddings.weight"}
     model = _build_model()
     d = tmp_path / "m"
     model.save_pretrained(d)

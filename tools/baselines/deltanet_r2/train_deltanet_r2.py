@@ -144,6 +144,11 @@ def main() -> int:
             # 权重回填 latest 模型目录
             from transformers import AutoModelForCausalLM
             import fla  # noqa: F401
+            import fla.models.delta_net.modeling_delta_net as _fla_dn_mod
+            if isinstance(_fla_dn_mod.DeltaNetForCausalLM.__dict__.get("_tied_weights_keys"), list):
+                # tf5.15.1 from_pretrained 对 v4 list 崩溃（484c636 同款规范化，tying 语义不变）
+                _fla_dn_mod.DeltaNetForCausalLM._tied_weights_keys = {
+                    "lm_head.weight": "model.embeddings.weight"}
             m2 = AutoModelForCausalLM.from_pretrained(out_dir / "latest")
             model.load_state_dict(m2.state_dict(), strict=True)
             del m2

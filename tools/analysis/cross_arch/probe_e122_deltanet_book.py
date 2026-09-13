@@ -517,6 +517,18 @@ def load_model_and_tokenizer(model_path: str, device: torch.device):
         }
         print("[dn122] fla TransformerForCausalLM._tied_weights_keys list→dict 已规范化"
               "（transformers 5.x 兼容，tying 语义不变）")
+    # 2026-09-13（R2 施工，5.15.1 实测新增，484c636 同族）：transformers 5.15.1 的
+    # from_pretrained 无条件走 _get_tied_weight_keys（modeling_utils.py:382 对
+    # list 调 .keys() 崩溃）——tie=false 同样炸，5.17.0 无此路径。DeltaNet 同款
+    # 规范化，tying 语义不变。
+    import fla.models.delta_net.modeling_delta_net as _fla_dn_mod
+
+    if isinstance(_fla_dn_mod.DeltaNetForCausalLM.__dict__.get("_tied_weights_keys"), list):
+        _fla_dn_mod.DeltaNetForCausalLM._tied_weights_keys = {
+            "lm_head.weight": "model.embeddings.weight"
+        }
+        print("[dn122] fla DeltaNetForCausalLM._tied_weights_keys list→dict 已规范化"
+              "（transformers 5.15.1 from_pretrained 兼容，tying 语义不变）")
     tok = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
         model_path, trust_remote_code=True, dtype=torch.bfloat16, device_map=str(device)
