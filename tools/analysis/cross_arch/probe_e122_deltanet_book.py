@@ -534,6 +534,12 @@ def load_model_and_tokenizer(model_path: str, device: torch.device):
         model_path, trust_remote_code=True, dtype=torch.bfloat16, device_map=str(device)
     )
     model.eval()
+    # 2026-09-13（R2 施工新增，fla 0.5.1 × transformers 5.15.1 实测）：no_grad 前向
+    # 默认 use_cache=True 会走 FLAGenerationCache 层复制路径，而 fla 0.5.1 的
+    # FLALayer 未实现 tf5.15.1 新增抽象方法 get_max_length → TypeError 崩溃
+    # （训练态带梯度自动关 cache 故不触发）。本仪器单窗单前向、无生成，关 cache
+    # 对 NLL/状态读数语义零影响。
+    model.config.use_cache = False
     fingerprint = {
         "model_path": str(model_path),
         "vocab_size": int(model.config.vocab_size),
