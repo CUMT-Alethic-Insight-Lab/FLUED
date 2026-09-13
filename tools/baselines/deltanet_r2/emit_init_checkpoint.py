@@ -41,6 +41,7 @@ def main() -> None:
     if n != spec.EXPECTED_PARAM_COUNT:
         raise RuntimeError(f"[r2-init] 参数锚不符：{n:,} != "
                            f"{spec.EXPECTED_PARAM_COUNT:,}——停报")
+    spec.normalize_tied_weights_keys()  # save_pretrained 前置（tf5.15.1 list 崩溃在案）
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)

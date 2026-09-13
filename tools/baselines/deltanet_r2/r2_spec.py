@@ -144,6 +144,27 @@ def is_diverged(loss: float) -> bool:
     return not math.isfinite(loss) or loss > DIVERGENCE_LINE
 
 
+def normalize_tied_weights_keys() -> bool:
+    """tf5.15.1 兼容 shim（484c636 同款，tying 语义不变）：fla 0.5.1 的
+    DeltaNetForCausalLM._tied_weights_keys 是 v4 list，而 transformers 5.15.1 的
+    save_pretrained 与 from_pretrained 都无条件走 _get_tied_weight_keys
+    （modeling_utils.py:382 对 list 调 .keys() 崩溃）——save/load 之前必须规范化。
+    规范化目标 = 等价 dict 映射 {"lm_head.weight": "model.embeddings.weight"}。
+    返回是否发生了规范化；无 fla 环境（本地单测）返回 False。"""
+    try:
+        import fla.models.delta_net.modeling_delta_net as _m
+    except ImportError:
+        return False
+    if isinstance(_m.DeltaNetForCausalLM.__dict__.get("_tied_weights_keys"), list):
+        _m.DeltaNetForCausalLM._tied_weights_keys = {
+            "lm_head.weight": "model.embeddings.weight"
+        }
+        print("[r2] fla DeltaNetForCausalLM._tied_weights_keys list→dict 已规范化"
+              "（tf5.15.1 save/load 兼容，tying 语义不变）")
+        return True
+    return False
+
+
 def compute_expected_param_count(cfg: dict = R2_CONFIG) -> int:
     """解析式参数计数（fla 0.5.1 DeltaNetForCausalLM 结构的纯算术镜像；
     与实例化互证——实例化数必须等于本函数返回值 = EXPECTED_PARAM_COUNT）。"""
