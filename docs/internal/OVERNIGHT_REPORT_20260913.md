@@ -31,7 +31,7 @@
 
 - 面具 log：10000/10000 窗、29839 遮蔽 chunk（2.984 块/窗）、42.4h、sha256 `276c2e69b749418d6778e2c58b24de284575fe0b8db7636556535d937d338906`、字段审计全过（cand_mode=random / cand_seed=20260911 / hw=4090）。
 - **密度闸门：73.93 B/窗 ≥ 54.8 过线**（口径=逐窗 Σ(src_byte_range 末−初+1)；与定稿预期 71B/1.30× 吻合）——不需剂量重裁。
-- 四列串行（5080，驱动 `outputs/_e124_ignite_4cols.sh`，任务 bash-6mqi5eqd）：comb（07:26 点火，60min 收官 rc=0：**eval_direct_acc 0.7486 / eval_backbone_acc 0.6957 / eval_loss 2.035**）→ gate（08:25 点火，10K 步已到在收官）→ demand → cont。ETA ~11:40 全收官。
+- 四列串行（5080，驱动 `outputs/_e124_ignite_4cols.sh`，任务 bash-6mqi5eqd）：comb（07:26 点火，60min 收官 rc=0：**eval_direct_acc 0.7486 / eval_backbone_acc 0.6957 / eval_loss 2.035**）→ gate（08:25 点火，55min 收官 rc=0：**eval_direct_acc 0.7629 / eval_backbone_acc 0.7076 / eval_loss 1.957**）→ demand（09:20 点火在跑）→ cont。ETA ~11:40 全收官。
 - 列间双标志硬校验（summary.json+latest.pt），断列即断链报用户；基座全键全形校验每列过（loaded=287）。
 
 ## 二、机器状态（09-13 早）
