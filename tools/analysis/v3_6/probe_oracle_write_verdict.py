@@ -263,11 +263,15 @@ def decode_direct(model, v_rows: torch.Tensor, chunks) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 
-def byte_probe(X: torch.Tensor, Y: torch.Tensor, valid: torch.Tensor, lam: float = 1.0):
+def byte_probe(X: torch.Tensor, Y: torch.Tensor, valid: torch.Tensor, lam: float = 1.0,
+               return_records: bool = False):
     """One-vs-all ridge from feature rows to the chunk's slot byte ids
     (2-fold split, fixed split seed). Returns per-slot (acc, majority baseline).
-    Closed-form algebra only — no parameter training."""
+    Closed-form algebra only — no parameter training.
+    return_records=True (审计落盘字段, 默认关=原行为逐位不变): 额外返回逐样本
+    held-out 预测/目标/样本选择/折号 —— 聚合数与 accs 同源同一次计算。"""
     out = {}
+    records: dict[str, dict] = {}
     for s in range(Y.size(1)):
         m = valid[:, s]
         x, y = X[m].float(), Y[m][:, s].long()
@@ -278,15 +282,24 @@ def byte_probe(X: torch.Tensor, Y: torch.Tensor, valid: torch.Tensor, lam: float
         y1 = F.one_hot(y.clamp(min=0, max=257), 258).float()
         idx = torch.randperm(n, generator=torch.Generator().manual_seed(0))
         accs = []
-        for lo, hi in ((0, n // 2), (n // 2, n)):
+        preds = torch.zeros(n, dtype=torch.long)
+        fold = torch.zeros(n, dtype=torch.uint8)
+        for fi, (lo, hi) in enumerate(((0, n // 2), (n // 2, n))):
             te = idx[lo:hi]
             tr = idx[n // 2 :] if lo == 0 else idx[: n // 2]
             W = torch.linalg.solve(
                 x[tr].T @ x[tr] + lam * torch.eye(x.size(1)), x[tr].T @ y1[tr]
             )
-            accs.append(float((x[te] @ W).argmax(dim=-1).eq(y[te]).float().mean()))
+            p = (x[te] @ W).argmax(dim=-1)
+            accs.append(float(p.eq(y[te]).float().mean()))
+            preds[te] = p
+            fold[te] = fi
         maj = float(y1.mean(dim=0).max())  # majority-class baseline
         out[str(s)] = {"acc": round(sum(accs) / len(accs), 4), "majority": round(maj, 4), "n": n}
+        if return_records:
+            records[str(s)] = {"preds": preds, "targets": y, "sel": m, "fold": fold}
+    if return_records:
+        return out, records
     return out
 
 
@@ -503,6 +516,9 @@ def main() -> None:
     p.add_argument("--out-dir", default="outputs/oracle_write_verdict_20260818")
     p.add_argument("--skip-a-anchor", action="store_true")
     p.add_argument("--skip-amp-control", action="store_true")
+    p.add_argument("--dump-probe-bytes", action="store_true",
+                   help="审计落盘字段: A6 逐样本 held-out 预测/目标/折号 → byte_probe_records.npz"
+                        "（与聚合 accs 同源同一次计算, 口径零改动）")
     args = p.parse_args()
     device = torch.device("cuda" if (args.device == "auto" and torch.cuda.is_available()) or args.device == "cuda" else "cpu")
     out_dir = Path(args.out_dir)
@@ -578,8 +594,15 @@ def main() -> None:
     xs_m = torch.cat([r["xs_m"] for r in probe_rows_all], dim=0)
     ys = torch.cat([r["ys"] for r in probe_rows_all], dim=0)
     y_valid = torch.cat([r["y_valid"] for r in probe_rows_all], dim=0)
-    mech_agg["byte_probe_from_v"] = byte_probe(xs_v, ys, y_valid)
-    mech_agg["byte_probe_from_m"] = byte_probe(xs_m, ys, y_valid)
+    # --dump-probe-bytes (审计落盘字段, 聚合数同源): 逐样本 held-out 记录 → npz
+    probe_records: dict | None = None
+    if args.dump_probe_bytes:
+        mech_agg["byte_probe_from_v"], rec_v = byte_probe(xs_v, ys, y_valid, return_records=True)
+        mech_agg["byte_probe_from_m"], rec_m = byte_probe(xs_m, ys, y_valid, return_records=True)
+        probe_records = {"v": rec_v, "m": rec_m}
+    else:
+        mech_agg["byte_probe_from_v"] = byte_probe(xs_v, ys, y_valid)
+        mech_agg["byte_probe_from_m"] = byte_probe(xs_m, ys, y_valid)
     bp_v = mech_agg["byte_probe_from_v"].get("0", {})
     bp_m = mech_agg["byte_probe_from_m"].get("0", {})
     print(
@@ -587,6 +610,18 @@ def main() -> None:
         f"| from_m acc={bp_m.get('acc')} (majority {bp_m.get('majority')})",
         flush=True,
     )
+    if probe_records is not None:
+        import numpy as np
+
+        arrays: dict = {}
+        for src, recs in probe_records.items():
+            for s, r in recs.items():
+                arrays[f"{src}_s{s}_preds"] = r["preds"].numpy().astype(np.int16)
+                arrays[f"{src}_s{s}_targets"] = r["targets"].numpy().astype(np.int16)
+                arrays[f"{src}_s{s}_sel"] = r["sel"].numpy().astype(np.uint8)
+                arrays[f"{src}_s{s}_fold"] = r["fold"].numpy()
+        np.savez_compressed(out_dir / "byte_probe_records.npz", **arrays)
+        print(f"[A6] per-sample probe records -> {out_dir / 'byte_probe_records.npz'}", flush=True)
 
     # a-grid anchor on the same windows
     a_anchor = None

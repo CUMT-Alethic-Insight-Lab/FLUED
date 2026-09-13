@@ -180,12 +180,15 @@ def load_ckpt(ckpt: str, device: torch.device):
 @torch.no_grad()
 def eval_window_columns(model, ns, clean: torch.Tensor, byte_mask: torch.Tensor, device, fuzz: dict,
                         gen_noise: torch.Generator, gen_scr: torch.Generator, s_ladder=S_LADDER,
-                        donor=None) -> dict:
+                        donor=None, collect_bytes: bool = False) -> dict:
     """单窗四列: 前端 → 真 memory 行 → 列变体 → direct 腿 (decode_rows_donor)
     → fine 细格 echo byte_acc (as-encoded 主口径 + clean 视图备查)。batch=1。
     Q20 五列形态 (donor 在岗时): q20_k 行再过 donor (E68 未练钝端口) 的
     decode 链得 q20_e68 归因列 (eval-only, 非硬通货)——前端位级同源 (写入侧/
-    前端全冻), token_mask 取本窗 chunks (decode_rows_donor D1 借口同款)。"""
+    前端全冻), token_mask 取本窗 chunks (decode_rows_donor D1 借口同款)。
+    collect_bytes=True (审计落盘字段, 默认关=行为逐位不变): rec["_bytes"]
+    附逐列 argmax 预测/as-encoded 目标/真字节目标/槽掩码/掩码位 —— 聚合数
+    与 grid_metrics 同源同一次前向。"""
     source = clean.masked_fill(byte_mask, MASK_ID)
     chunks, memory, index = _front_end(model, source)
     n_real = int(chunks.chunk_mask[0].sum())
@@ -195,7 +198,12 @@ def eval_window_columns(model, ns, clean: torch.Tensor, byte_mask: torch.Tensor,
     targets_enc, slot_mask, _m = s1.make_targets(
         source, zeros, chunks.chunk_ids, chunks.offsets, ns.max_chunks, ns.max_span
     )
+    if collect_bytes:
+        targets_true, _sm_t, masked_true = s1.make_targets(
+            clean, byte_mask, chunks.chunk_ids, chunks.offsets, ns.max_chunks, ns.max_span
+        )
     rec = {"n_real": n_real}
+    byte_recs: dict = {}
     for name, rows in cols.items():
         logits = decode_rows_donor(model, rows.unsqueeze(0).float(), chunks.token_mask)
         gm = grid_metrics(
@@ -203,6 +211,16 @@ def eval_window_columns(model, ns, clean: torch.Tensor, byte_mask: torch.Tensor,
             targets_enc.to(device), torch.zeros_like(slot_mask).to(device),
         )
         rec[name] = {"acc": round(gm["acc"], 4), "acc_clean": round(gm["acc_clean"], 4), "n_slots": gm["n_slots"]}
+        if collect_bytes:
+            n = logits.size(1)
+            byte_recs[name] = {
+                "preds": logits.argmax(dim=-1)[:, :n].to(torch.int16).cpu(),
+                "targets_enc": targets_enc[:, :n].to(torch.int16).cpu(),
+                "targets_true": targets_true[:, :n].to(torch.int16).cpu(),
+                "slot_mask": slot_mask[:, :n].to(torch.uint8).cpu(),
+                "masked_true": masked_true[:, :n].to(torch.uint8).cpu(),
+                "n": n,
+            }
         if name == "q20_k" and donor is not None:
             logits_e68 = decode_rows_donor(donor, rows.unsqueeze(0).float(), chunks.token_mask)
             gm_e68 = grid_metrics(
@@ -212,6 +230,18 @@ def eval_window_columns(model, ns, clean: torch.Tensor, byte_mask: torch.Tensor,
             rec["q20_e68"] = {
                 "acc": round(gm_e68["acc"], 4), "acc_clean": round(gm_e68["acc_clean"], 4), "n_slots": gm_e68["n_slots"]
             }
+            if collect_bytes:
+                n = logits_e68.size(1)
+                byte_recs["q20_e68"] = {
+                    "preds": logits_e68.argmax(dim=-1)[:, :n].to(torch.int16).cpu(),
+                    "targets_enc": targets_enc[:, :n].to(torch.int16).cpu(),
+                    "targets_true": targets_true[:, :n].to(torch.int16).cpu(),
+                    "slot_mask": slot_mask[:, :n].to(torch.uint8).cpu(),
+                    "masked_true": masked_true[:, :n].to(torch.uint8).cpu(),
+                    "n": n,
+                }
+    if collect_bytes:
+        rec["_bytes"] = byte_recs
     return rec
 
 
@@ -235,6 +265,11 @@ def main() -> None:
                    help="基座 t=0 自检门: clean 贴水位锚 ±2pp (E68 0.7917; Q20 形态换 E118 0.8323) 且 scrambled ≤0.10, 不过非零退出")
     p.add_argument("--q20-e68-ckpt", default=Q20_E68_CKPT,
                    help="Q20 五列形态的 q20×E68 归因列 donor (E68 未练钝端口基座; 仅 q20 模式装载)")
+    p.add_argument("--data-path", default=None,
+                   help="覆盖 resolved_config 的语料路径（远端基座回本地重跑用, E122 探针同款; 窗口流=同语料同 seed 逐位复演）")
+    p.add_argument("--dump-bytes", action="store_true",
+                   help="审计落盘字段: 逐窗逐列 argmax 预测/目标/掩码 → items_bytes.npz"
+                        "（与 grid_metrics 同源同一次前向, 口径零改动）")
     args = p.parse_args()
     device = torch.device("cuda" if (args.device == "auto" and torch.cuda.is_available()) or args.device == "cuda" else "cpu")
     out_dir = Path(args.out_dir)
@@ -243,6 +278,8 @@ def main() -> None:
     s_ladder = [float(x) for x in args.s_ladder.split(",")]
 
     model, ns, step, run_name, pt_name = load_ckpt(args.ckpt, device)
+    if args.data_path:
+        ns.data_path = args.data_path  # 远端基座回本地重跑: 窗口流语料路径覆盖（同语料同 seed = 同窗）
     if getattr(ns, "v_row_source", "") != "memory" or not hasattr(model, "decoder_in_mem"):
         raise SystemExit(f"{run_name}: 预期 b 格 v_row_source='memory' + decoder_in_mem 在岗 (去噪臂作用端口缺席)")
     # Q20 五列形态 (E119 任务书冻结 v1 §2/§3.6): ckpt 的 resolved_config 带
@@ -272,13 +309,18 @@ def main() -> None:
     items_path = out_dir / "items.jsonl"
     items_fp = items_path.open("w", encoding="utf-8")
     win_recs = []
+    byte_buf: dict[str, list] = {c: [] for c in col_names} if args.dump_bytes else {}
     for wi, (clean, byte_mask) in enumerate(zip(windows, masks)):
         rec = eval_window_columns(
             model, ns, clean.to(device), byte_mask.to(device), device, fuzz, gen_noise, gen_scr, s_ladder,
-            donor=donor,
+            donor=donor, collect_bytes=args.dump_bytes,
         )
+        bytes_rec = rec.pop("_bytes", None)
         rec = {"kind": "column_window", "window": wi, **rec}
         win_recs.append(rec)
+        if bytes_rec is not None:
+            for c, b in bytes_rec.items():
+                byte_buf[c].append(b)
         items_fp.write(json.dumps(rec, ensure_ascii=False) + "\n")
         items_fp.flush()
         print(
@@ -287,6 +329,19 @@ def main() -> None:
             + f"（{time.time() - t0:.0f}s）",
             flush=True,
         )
+    if args.dump_bytes:
+        import numpy as np
+
+        arrays: dict = {}
+        for c, rows in byte_buf.items():
+            arrays[f"{c}_preds"] = torch.cat([b["preds"] for b in rows], dim=1).numpy()
+            arrays[f"{c}_targets_enc"] = torch.cat([b["targets_enc"] for b in rows], dim=1).numpy()
+            arrays[f"{c}_targets_true"] = torch.cat([b["targets_true"] for b in rows], dim=1).numpy()
+            arrays[f"{c}_slot_mask"] = torch.cat([b["slot_mask"] for b in rows], dim=1).numpy()
+            arrays[f"{c}_masked_true"] = torch.cat([b["masked_true"] for b in rows], dim=1).numpy()
+            arrays[f"{c}_row_counts"] = np.asarray([int(b["n"]) for b in rows], dtype=np.int64)
+        np.savez_compressed(out_dir / "items_bytes.npz", **arrays)
+        print(f"[denoise-eval] per-byte records -> {out_dir / 'items_bytes.npz'}", flush=True)
     col_acc = {c: round(sum(r[c]["acc"] for r in win_recs) / len(win_recs), 4) for c in col_names}
     col_acc_clean = {c: round(sum(r[c]["acc_clean"] for r in win_recs) / len(win_recs), 4) for c in col_names}
 

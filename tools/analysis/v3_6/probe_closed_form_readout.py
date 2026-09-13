@@ -439,6 +439,9 @@ def main() -> None:
     p.add_argument("--lam-unmix", type=float, default=1e-2, help="段1 ridge 解混 λ（E73 扫档中值固定）")
     p.add_argument("--lam-stage2", type=float, default=1.0, help="段2 ridge v̂→m̂ λ（RMS 预条件后, D5）")
     p.add_argument("--out-dir", default=OUT_DIR)
+    p.add_argument("--dump-stage3-bytes", action="store_true",
+                   help="审计落盘字段: 段3 逐窗逐列 argmax 预测/目标/掩码 → stage3_byte_records.npz"
+                        "（聚合数同源同一次计算, 口径零改动）")
     args = p.parse_args()
     device = torch.device("cuda" if (args.device == "auto" and torch.cuda.is_available()) or args.device == "cuda" else "cpu")
     out_dir = Path(args.out_dir)
@@ -520,6 +523,12 @@ def main() -> None:
 
     # 段3: 逐窗逐列冻结 donor direct 口 + 网格读数
     stage3_ledger: dict[str, list[dict]] = {c: [] for c in COLUMNS}
+    # --dump-stage3-bytes (审计落盘字段, 口径零改动): 逐窗逐列 argmax 预测/目标/掩码
+    stage3_dump = (
+        {c: {"preds": [], "te": [], "tc": [], "sm": [], "ms": [], "n": []} for c in COLUMNS}
+        if args.dump_stage3_bytes
+        else None
+    )
     for wi, rec in enumerate(recs):
         tm = rec["token_mask"]
         te, sm_ = rec["targets_enc"].to(device), rec["slot_mask"].to(device)
@@ -528,7 +537,28 @@ def main() -> None:
             rows = mhat[col][wi].unsqueeze(0).to(device)
             logits = decode_rows_donor(donor, rows, tm)
             stage3_ledger[col].append(grid_metrics(logits, te, sm_, tc, ms))
+            if stage3_dump is not None:
+                n = logits.size(1)
+                stage3_dump[col]["preds"].append(logits.argmax(dim=-1)[:, :n].to(torch.int16).cpu())
+                stage3_dump[col]["te"].append(te[:, :n].to(torch.int16).cpu())
+                stage3_dump[col]["tc"].append(tc[:, :n].to(torch.int16).cpu())
+                stage3_dump[col]["sm"].append(sm_[:, :n].to(torch.uint8).cpu())
+                stage3_dump[col]["ms"].append(ms[:, :n].to(torch.uint8).cpu())
+                stage3_dump[col]["n"].append(n)
         print(f"[q19] 段3 window {wi} 完成（{time.time() - t0:.0f}s）", flush=True)
+    if stage3_dump is not None:
+        import numpy as np
+
+        arrays: dict = {}
+        for col, d in stage3_dump.items():
+            arrays[f"{col}_preds"] = torch.cat(d["preds"], dim=1).numpy()
+            arrays[f"{col}_targets_enc"] = torch.cat(d["te"], dim=1).numpy()
+            arrays[f"{col}_targets_clean"] = torch.cat(d["tc"], dim=1).numpy()
+            arrays[f"{col}_slot_mask"] = torch.cat(d["sm"], dim=1).numpy()
+            arrays[f"{col}_masked_slot"] = torch.cat(d["ms"], dim=1).numpy()
+            arrays[f"{col}_row_counts"] = np.asarray(d["n"], dtype=np.int64)
+        np.savez_compressed(out_dir / "stage3_byte_records.npz", **arrays)
+        print(f"[q19] stage3 per-byte records -> {out_dir / 'stage3_byte_records.npz'}", flush=True)
 
     matrix = {
         col: {
