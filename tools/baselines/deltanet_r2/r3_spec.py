@@ -453,6 +453,10 @@ def attach_summ(model: nn.Module, enabled: bool) -> list[str]:
     if hasattr(base, SUMM_ATTR):
         raise RuntimeError(f"[r3] 重复挂接：base.{SUMM_ATTR} 已存在——停报")
     summ = build_summarizer()
+    ref = next(model.parameters())  # 对齐宿主当前 device/dtype：训练器路径（fp32
+    # CPU 挂接、后随 model.to 迁移）与仪器路径（bf16 CUDA 已就位后 strict 重载）
+    # 两条装载序都成立
+    summ.to(device=ref.device, dtype=ref.dtype)
     base.r3_summ = summ  # 注册为子模块：model.to(device) 随全局迁移
     ctx: dict = {}
 
