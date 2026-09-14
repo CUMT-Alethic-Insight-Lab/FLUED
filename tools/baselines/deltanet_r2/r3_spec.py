@@ -137,7 +137,10 @@ def attach_echo(model: nn.Module, enabled: bool,
             torch.full((), float(gate_init), dtype=ref.dtype, device=ref.device))
 
         def _v_hook(_mod, _inp, output, _attn=attn):
-            _attn._r3_echo_v = output  # v_t：use_short_conv 之后、β 门控之前
+            # fla 0.5.1 ShortConvolution.forward 恒返回 (x, final_state) 元组
+            # （层内 `v, conv_state_v = self.v_conv1d(...)` 双值解包，delta_net.py:213-218）
+            v = output[0] if isinstance(output, tuple) else output
+            _attn._r3_echo_v = v  # v_t：use_short_conv 之后、β 门控之前
             return output
 
         def _o_pre_hook(_mod, args, _attn=attn):
