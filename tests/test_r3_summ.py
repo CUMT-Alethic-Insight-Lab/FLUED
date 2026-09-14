@@ -469,8 +469,8 @@ def test_summ_on_dual_head_semantics_on_fla():
     for t_len, core in ((48, "fused_recurrent(q_len<=64)"), (130, "chunk")):
         captured.clear()
         x = torch.randint(3, 32000, (1, t_len), device="cuda")
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            m(input_ids=x)
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+            m(input_ids=x, use_cache=False)  # 全窗前向（eval 态禁 fla 缓存路径）
         # 独立复算 summarizer（同输入同 autocast 同形状 → 同构造）
         with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
             h = m.model.embeddings(x)
