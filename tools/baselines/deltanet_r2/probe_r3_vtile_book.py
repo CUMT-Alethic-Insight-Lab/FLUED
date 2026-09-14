@@ -39,7 +39,6 @@ import tools.analysis.cross_arch.probe_e122_deltanet_book as e122  # noqa: E402
 import tools.baselines.deltanet_r2.r2_spec as r2spec  # noqa: E402
 import tools.baselines.deltanet_r2.r3_spec as r3  # noqa: E402
 
-_orig_load = e122.load_model_and_tokenizer
 _orig_run_window = e122.run_window
 
 _HOLDER: dict = {"segmentor": None, "tok": None, "device": None,
@@ -59,7 +58,9 @@ def _resolve_s0_checkpoint() -> str:
 
 
 def _load_with_r3_vtile(model_path, device):
-    model, tok, fp = _orig_load(model_path, device)
+    # 本地 5080 env 无 accelerate：装载走 r3_spec 本地等价装载器（device_map →
+    # .to，单卡放置等价；shim/规范化/fingerprint 全保留），丙字段照常接通
+    model, tok, fp = r3.load_model_and_tokenizer_local(model_path, device)
     if r3.config_has_vtile(model.config):
         s0 = _resolve_s0_checkpoint()
         report = r3.attach_and_reload_vtile(model, model_path, s0,

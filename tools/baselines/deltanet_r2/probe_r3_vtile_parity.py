@@ -93,8 +93,8 @@ def main() -> int:
     device = args.device
     t0 = time.time()
 
-    model, tok, fp = e122.load_model_and_tokenizer(args.model_path,
-                                                   torch.device(device))
+    model, tok, fp = r3.load_model_and_tokenizer_local(args.model_path,
+                                                       torch.device(device))
     if r3.config_has_vtile(model.config):
         raise SystemExit("[r3-vtile-parity] 底物带 r3_vtile 戳记（应为母列）——停报")
     s0_ckpt = _resolve_s0(args.s0_checkpoint)

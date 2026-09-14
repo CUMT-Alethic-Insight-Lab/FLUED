@@ -1017,3 +1017,49 @@ def attach_and_reload_vtile(model: nn.Module, model_dir: str | Path,
     report.update(attach)
     report["segmentor"] = segmentor
     return report
+
+
+def load_model_and_tokenizer_local(model_path: str, device) -> tuple:
+    """本地 5080 env 的仪器等价装载器（kda-kernels 无 accelerate，仪器本体
+    ``load_model_and_tokenizer`` 的 device_map 路径不可用；本 env 不许改动）。
+
+    与仪器本体逐项等价：fla 先注册、SDPA shim、两处 _tied_weights_keys
+    list→dict 规范化、bf16 装载、eval、use_cache=False、同 fingerprint 字段；
+    唯一差异 = ``device_map=str(device)`` → ``.to(device)``——单卡单模型放置
+    等价（无分片），NLL 语义零影响。供丙臂启动器与对拍门共用（坑 9：env
+    skew 随指纹登记，读数同机同 env 内成立）。"""
+    import fla  # noqa: F401  # 先于 transformers：注册 fla 模型类
+    import transformers
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    import tools.analysis.cross_arch.probe_e122_deltanet_book as _e122
+    attn_backend = _e122._install_sdpa_attn_shim()
+    import fla.models.transformer.modeling_transformer as _fla_tf_mod
+    if isinstance(_fla_tf_mod.TransformerForCausalLM.__dict__.get("_tied_weights_keys"), list):
+        _fla_tf_mod.TransformerForCausalLM._tied_weights_keys = {
+            "lm_head.weight": "model.embeddings.weight"}
+    import fla.models.delta_net.modeling_delta_net as _fla_dn_mod
+    if isinstance(_fla_dn_mod.DeltaNetForCausalLM.__dict__.get("_tied_weights_keys"), list):
+        _fla_dn_mod.DeltaNetForCausalLM._tied_weights_keys = {
+            "lm_head.weight": "model.embeddings.weight"}
+        print("[r3-vtile] fla DeltaNetForCausalLM._tied_weights_keys list→dict "
+              "已规范化（本地 env from_pretrained 兼容）", flush=True)
+    tok = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path, trust_remote_code=True, dtype=torch.bfloat16).to(device)
+    model.eval()
+    model.config.use_cache = False
+    fingerprint = {
+        "model_path": str(model_path),
+        "vocab_size": int(model.config.vocab_size),
+        "max_position_embeddings": int(model.config.max_position_embeddings),
+        "dtype": "bfloat16",
+        "attn_backend": attn_backend,
+        "gpu": torch.cuda.get_device_name(0) if device.type == "cuda" else "cpu",
+        "torch": torch.__version__,
+        "fla": getattr(fla, "__version__", "unknown"),
+        "transformers": transformers.__version__,
+        "loader": "r3_spec.load_model_and_tokenizer_local (no-accelerate "
+                  "equivalent: device_map -> .to)",
+    }
+    return model, tok, fingerprint
