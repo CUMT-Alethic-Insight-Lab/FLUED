@@ -392,7 +392,7 @@ def test_flag_off_forward_bitwise_vs_pure_fla():
     assert torch.equal(a.state_dict()["model.embeddings.weight"],
                        b.state_dict()["model.embeddings.weight"])
     x = torch.randint(3, 32000, (1, 96), device="cuda")
-    with torch.no_grad():
+    with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
         assert torch.equal(a(input_ids=x).logits, b(input_ids=x).logits)  # 逐位不变
 
 
@@ -404,7 +404,7 @@ def test_gate_zero_forward_bitwise_equal_mother_fla():
     b, _ = _same_seed_build(echo=True, gate_init=0.0)
     b = b.cuda()
     x = torch.randint(3, 32000, (1, 96), device="cuda")
-    with torch.no_grad():
+    with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
         assert torch.equal(a(input_ids=x).logits, b(input_ids=x).logits)
 
 
@@ -415,10 +415,11 @@ def test_echo_forward_differs_and_gate_grads_finite():
     b, _ = _same_seed_build(echo=True, gate_init=1.0)
     b = b.cuda()
     x = torch.randint(3, 32000, (1, 96), device="cuda")
-    la = a(input_ids=x).logits.float().square().sum()
-    lb = b(input_ids=x).logits
-    assert not torch.equal(la.detach(), lb.detach())  # 回声确实改变前向
-    lb.float().square().sum().backward()
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        la = a(input_ids=x).logits.float().square().sum()
+        lb = b(input_ids=x).logits
+        assert not torch.equal(la.detach(), lb.detach())  # 回声确实改变前向
+        lb.float().square().sum().backward()
     grads = [p.grad for k, p in b.named_parameters()
              if k.split(".")[-1] == r3.ECHO_PARAM_NAME]
     assert len(grads) == 24
