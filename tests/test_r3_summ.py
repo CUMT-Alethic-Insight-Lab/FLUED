@@ -436,6 +436,30 @@ def test_trainer_variant_flags_validation(monkeypatch):
     assert tr.parse_args().summ_side == "addr"  # 合法组合通过
 
 
+def test_ctrl_strict_reload_roundtrip_and_wrong_construction_loudfail(tmp_path):
+    """ctrl 列装载：pseudo 键集 strict 重载逐位复原；错构造挂接 loud fail
+    （坑 8：键集=构造指纹，DiT 白名单对 pseudo 文件必拒）。"""
+    torch.manual_seed(0)
+    src = _MockModel(n_layers=1)
+    keys = r3.attach_summ(src, True, ctrl=True)
+    assert any(".pad" in k for k in keys) and not any(".blocks." in k for k in keys)
+    with torch.no_grad():
+        for p in _summ_params(src).values():
+            p.add_(0.01)
+    d = _write_sd(tmp_path, src.state_dict())
+    torch.manual_seed(0)
+    fresh = _MockModel(n_layers=1)
+    rep = r3.strict_load_summ(fresh, d, ctrl=True)
+    assert rep["n_summ_keys"] == len(keys)
+    for (ka, va), (kb, vb) in zip(src.state_dict().items(),
+                                  fresh.state_dict().items()):
+        assert ka == kb and torch.equal(va, vb), ka
+    torch.manual_seed(0)
+    wrong = _MockModel(n_layers=1)  # 默认 DiT 构造挂接 → 键集不符
+    with pytest.raises(RuntimeError, match="不点火"):
+        r3.strict_load_summ(wrong, d, ctrl=False)
+
+
 # ---------------------------------------------------------------------------
 # fla 门控用例（远端 4090 施工靶机执行全量；三坑照甲例：autocast bf16 /
 # CUDA 门控 / ShortConvolution 元组解包）
@@ -564,6 +588,17 @@ def test_summ_on_differs_from_mother_and_grads_finite():
     assert len(grads) > 0
     assert all(g is not None and torch.isfinite(g).all() for g in grads)
     assert any(g.abs().sum() > 0 for g in grads)  # summarizer 在梯度链上
+
+
+@pytest.mark.skipif(not _HAS_FLA, reason="fla 未安装（本地跳过，远端跑全量）")
+def test_param_anchor_instantiation_ctrl_flag():
+    torch.manual_seed(r2spec.TRAIN_SEED)
+    m = _build_model()
+    keys = r3.attach_summ(m, True, ctrl=True)
+    r3.stamp_summ_config(m.config, ctrl=True)
+    assert sum(p.numel() for p in m.parameters()) == r3.EXPECTED_PARAM_COUNT_SUMM
+    assert any(".pad" in k for k in keys)  # pseudo 键集（非 DiT blocks 集）
+    assert m.config.r3_summ["ctrl"] is True
 
 
 @pytest.mark.skipif(not _HAS_FLA, reason="fla 未安装（本地跳过，远端跑全量）")

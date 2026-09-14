@@ -596,15 +596,16 @@ def unstamp_summ_config(config) -> None:
 
 
 def strict_load_summ(model: nn.Module, model_dir: str | Path,
-                     attach: bool = True) -> dict:
-    """summarizer checkpoint 的唯一合法装载路径：attach（模块+hook+白名单）
+                     attach: bool = True, ctrl: bool = False) -> dict:
+    """summarizer checkpoint 的唯一合法装载路径：attach（模块+hook+白名单；
+    ctrl=True 挂参数匹配 pseudo 模块——键集随构造不同，必须与训练列一致）
     → 全量文件 state dict 三分校验 → ``load_state_dict(strict=True)`` 逐键重载。
 
     文件侧新增键必须与 summarizer 键集**集合全等**——任何白名单外键出现即响亮
     （坑 8：from_pretrained 对 model.r3_summ.* 是 unexpected key 默认静默丢弃，
     必须文件全量 strict 重载回训练终态）。"""
     if attach:
-        attach_summ(model, True)
+        attach_summ(model, True, ctrl=ctrl)
     sd = read_state_dict(model_dir)
     model_keys = set(model.state_dict())
     summ_keys = set(_summ_param_keys(model))
@@ -623,10 +624,13 @@ def strict_load_summ(model: nn.Module, model_dir: str | Path,
     return report
 
 
-def attach_and_strict_reload_summ(model: nn.Module, model_dir: str | Path) -> dict:
+def attach_and_strict_reload_summ(model: nn.Module, model_dir: str | Path,
+                                  ctrl: bool = False) -> dict:
     """评测侧装载器（仪器启动器调用）：from_pretrained 装出的模型接 summarizer
-    + strict 白名单重载，返回报告（进仪器 fingerprint 留档）。"""
-    report = strict_load_summ(model, model_dir, attach=True)
+    （ctrl 按 checkpoint config 戳记选择构造）+ strict 白名单重载，返回报告
+    （进仪器 fingerprint 留档）。"""
+    report = strict_load_summ(model, model_dir, attach=True, ctrl=ctrl)
     report["spec"] = "tools/baselines/deltanet_r2/r3_spec.py"
     report["num_params"] = SUMM_NUM_PARAMS
+    report["ctrl"] = ctrl
     return report

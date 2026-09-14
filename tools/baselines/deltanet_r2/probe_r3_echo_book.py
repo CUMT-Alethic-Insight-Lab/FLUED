@@ -45,9 +45,11 @@ def _load_with_r3_echo(model_path, device):
               f"参数锚 {r2spec.EXPECTED_PARAM_COUNT:,}+{r3.ECHO_NUM_PARAMS}"
               f"={r3.EXPECTED_PARAM_COUNT_ECHO:,}）", flush=True)
     elif r3.config_has_summ(model.config):
-        report = r3.attach_and_strict_reload_summ(model, model_path)
+        summ_flag = getattr(model.config, "r3_summ", None) or {}
+        ctrl = bool(summ_flag.get("ctrl"))
+        report = r3.attach_and_strict_reload_summ(model, model_path, ctrl=ctrl)
         fp["r3_summ"] = report
-        print(f"[r3] summarizer 双头构造已接通 + strict 白名单重载"
+        print(f"[r3] summarizer 已接通（ctrl={ctrl}）+ strict 白名单重载"
               f"（{report['n_summ_keys']} 键 / {r3.SUMM_NUM_PARAMS:,} 参数，参数锚 "
               f"{r2spec.EXPECTED_PARAM_COUNT:,}+{r3.SUMM_NUM_PARAMS:,}"
               f"={r3.EXPECTED_PARAM_COUNT_SUMM:,}）", flush=True)
