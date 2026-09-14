@@ -1,22 +1,27 @@
-"""R3 移植臂训练器（R2 DeltaNet-50M + 旗标化移植件；甲=--echo，乙=--summ）。
+"""R3 移植臂训练器（R2 DeltaNet-50M + 旗标化移植件；甲=--echo，乙=--summ，
+丙=--vtile）。
 
 任务书：docs/versions/v3.7/FLUED_V3_7_R3_DELTANET_TRANSPLANT_DRAFT_20260914_CN.md
 （冻结 v1.0，§1 体制裁定：宿主=R2 母列同款，超参/窗/种子/语料逐项照抄 r2_spec.py，
-单变量=所移植之件；§2.1 构造见 r3_spec.py 甲节，§2.2 构造见 r3_spec.py 乙节）。
+单变量=所移植之件；§2.1 构造见 r3_spec.py 甲节，§2.2 构造见 r3_spec.py 乙节，
+§2.3 c1 变长铺瓦见 r3_spec.py 丙节）。
 
-旗标纪律（§2.1/§2.2）：``--echo``/``--summ`` 默认关=不挂任何 hook、不建任何
-参数，与 R2 母列逐位不变（同种子同数据序下 loss 轨迹逐位一致为验收，本训练器
-不含任何其他改动）；两旗标互斥（单变量纪律，同传 loud fail）。
+旗标纪律（§2.1/§2.2/§2.3）：``--echo``/``--summ``/``--vtile`` 默认关=不挂任何
+hook、不建任何参数、不 patch 任何名字，与 R2 母列逐位不变（同种子同数据序下
+loss 轨迹逐位一致为验收，本训练器不含任何其他改动）；三旗标两两互斥（单变量
+纪律，同传 loud fail）。
 ``--echo`` 开=接回声（24 标量门，init 1.0，锚 48,152,920 loud-fail）；
 ``--summ`` 开=接 summarizer 双头构造（单点摘要+双头全接，锚
-48,152,896+SUMM_NUM_PARAMS loud-fail）。
+48,152,896+SUMM_NUM_PARAMS loud-fail）；
+``--vtile`` 开=接 S0'' 变长铺瓦（零新增参数，锚 48,152,896 与母列全等；
+S0'' 段界器=canonical_v37 init_checkpoint，逐窗切点驱 WY 铺瓦）。
 
 Usage:
   python tools/baselines/deltanet_r2/train_deltanet_r3.py \
       --corpus /workspace/corpus/corpus_v3.txt \
       --tokenizer-path /workspace/models/delta_net-1.3B-100B \
-      --out-dir outputs/r3_transplant_summ_20260914/smoke500_summ \
-      --max-steps 500 --summ
+      --out-dir outputs/r3_transplant_vtile_20260914/smoke500_vtile \
+      --max-steps 500 --vtile
 """
 
 from __future__ import annotations
@@ -57,6 +62,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--summ-ctrl", action="store_true",
                    help="参数匹配对照构造（§4 杀死档自动触发）：同参数量同 tap 点"
                         "的 pseudo 双头（mean-pool+双 MLP），归因「构造毒性 vs 参数量」")
+    p.add_argument("--vtile", action="store_true",
+                   help="S0'' 变长铺瓦旗标（丙臂 §2.3 c1；默认关=与 R2 母列逐位"
+                        "不变；与 --echo/--summ 互斥；零新增参数）")
+    p.add_argument("--s0-checkpoint", default=None,
+                   help="S0'' 段界器权重（默认读 configs/canonical_v37.json 的 "
+                        "init_checkpoint；仅 --vtile 下使用）")
     p.add_argument("--max-steps", type=int, default=spec.MAX_STEPS)
     p.add_argument("--start-window", type=int, default=0)
     p.add_argument("--seed", type=int, default=spec.TRAIN_SEED)
@@ -66,20 +77,42 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--resume", action="store_true")
     p.add_argument("--device", default="cuda")
     args = p.parse_args()
-    if args.echo and args.summ:
-        raise SystemExit("[r3] --echo 与 --summ 互斥（单变量纪律：每臂只换一个件"
-                         "，任务书 §1 变量钉死）——停报")
+    flags = [bool(args.echo), bool(args.summ), bool(args.vtile)]
+    if sum(flags) > 1:
+        raise SystemExit("[r3] --echo/--summ/--vtile 两两互斥（单变量纪律：每臂只换"
+                         "一个件，任务书 §1 变量钉死）——停报")
     if (args.summ_side != "both" or args.summ_ctrl) and not args.summ:
         raise SystemExit("[r3] --summ-side/--summ-ctrl 仅在 --summ 下有效——停报")
+    if args.s0_checkpoint and not args.vtile:
+        raise SystemExit("[r3] --s0-checkpoint 仅在 --vtile 下有效——停报")
     return args
 
 
+def resolve_s0_checkpoint(path: str | None) -> str:
+    """S0'' 权重解析：显式旗标优先；缺省读 canonical_v37.json 的 init_checkpoint
+    （任务书 §2.3：S0'' 段界器权重=canonical_v37 init_checkpoint）。缺席响亮。"""
+    import json
+    if path:
+        p = Path(path)
+    else:
+        root = Path(__file__).resolve().parents[3]
+        canonical = json.loads(
+            (root / "configs" / "canonical_v37.json").read_text(encoding="utf-8"))
+        p = Path(canonical["init_checkpoint"])
+    if not p.exists():
+        raise SystemExit(f"[r3] S0'' 段界器权重缺席：{p}（canonical_v37 "
+                         "init_checkpoint 应在 K: 归档盘）——如实报，不点火")
+    return str(p)
+
+
 def build_model(device: str, echo: bool, summ: bool = False,
-                summ_side: str = "both", summ_ctrl: bool = False):
+                summ_side: str = "both", summ_ctrl: bool = False,
+                vtile: bool = False):
     """fla 原生 from_config 实例化；echo=True 挂回声（r3_spec.attach_echo）、
-    summ=True 挂 summarizer（r3_spec.attach_summ；side/ctrl=§4 触发变体），
-    参数锚 loud-fail 分档（关=48,152,896 与 R2 全等；echo=+24；
-    summ=+SUMM_NUM_PARAMS 精算锚，主构造/变体/对照全档一致）。"""
+    summ=True 挂 summarizer（r3_spec.attach_summ；side/ctrl=§4 触发变体）、
+    vtile=True 挂变长铺瓦（r3_spec.attach_vtile；零新增参数），参数锚 loud-fail
+    分档（关/vtile=48,152,896 与 R2 全等；echo=+24；summ=+SUMM_NUM_PARAMS
+    精算锚，主构造/变体/对照全档一致）。"""
     import fla  # noqa: F401  # 先于 transformers：注册 fla 模型类
     from fla.models.delta_net import DeltaNetConfig, DeltaNetForCausalLM
 
@@ -87,21 +120,28 @@ def build_model(device: str, echo: bool, summ: bool = False,
     model = DeltaNetForCausalLM(cfg)
     echo_keys: list[str] = []
     summ_keys: list[str] = []
+    vtile_report: dict = {}
     if echo:
         echo_keys = r3.attach_echo(model, True)
         r3.stamp_echo_config(model.config, num_layers=len(echo_keys))
     if summ:
         summ_keys = r3.attach_summ(model, True, side=summ_side, ctrl=summ_ctrl)
         r3.stamp_summ_config(model.config, side=summ_side, ctrl=summ_ctrl)
+    if vtile:
+        vtile_report = r3.attach_vtile(model, True)
+        r3.stamp_vtile_config(model.config)
     n = sum(p.numel() for p in model.parameters())
     want = r3.expected_param_count_any(echo, summ)
+    if vtile and want != spec.EXPECTED_PARAM_COUNT:
+        raise RuntimeError(f"[r3] vtile 参数锚漂移（丙零新增参数）：{want:,}——停报")
     if n != want:
         raise RuntimeError(
-            f"[r3] 参数锚不符（echo={echo}, summ={summ}）：实例化 {n:,} != 预注册 "
-            f"{want:,}——停报")
+            f"[r3] 参数锚不符（echo={echo}, summ={summ}, vtile={vtile}）：实例化 "
+            f"{n:,} != 预注册 {want:,}——停报")
     print(f"[r3] 实例化参数数 = {n:,}（预注册锚一致，echo={echo}, summ={summ}, "
-          f"side={summ_side}, ctrl={summ_ctrl}, "
-          f"回声键 {len(echo_keys)}, summarizer 键 {len(summ_keys)}）", flush=True)
+          f"vtile={vtile}, side={summ_side}, ctrl={summ_ctrl}, "
+          f"回声键 {len(echo_keys)}, summarizer 键 {len(summ_keys)}, "
+          f"vtile patched={vtile_report.get('patched', False)}）", flush=True)
     return model.to(device), echo_keys, summ_keys
 
 
@@ -111,10 +151,11 @@ def main() -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     device = args.device
     torch.manual_seed(args.seed)
+    s0_ckpt = resolve_s0_checkpoint(args.s0_checkpoint) if args.vtile else None
 
     resolved = {
         "probe": "R3 移植臂 × R2 DeltaNet-50M × corpus_v3 × 20K from-scratch"
-                 "（任务书冻结 v1.0；本列旗标见 echo/summ 字段）",
+                 "（任务书冻结 v1.0；本列旗标见 echo/summ/vtile 字段）",
         "spec_module": SPEC_MODULE,
         "base_spec_module": "tools/baselines/deltanet_r2/r2_spec.py",
         "echo": bool(args.echo),
@@ -134,6 +175,19 @@ def main() -> int:
             "r3_spec.PseudoDualHeadMLP（参数匹配对照：mean-pool+双 MLP，"
             "hidden=3878+pad56，锚精确匹配）",
         } if args.summ else None,
+        "vtile": bool(args.vtile),
+        "vtile_s0_checkpoint": s0_ckpt if args.vtile else None,
+        "vtile_construction": {
+            "chunk_size": r3.VTILE_CHUNK_SIZE,
+            "s0_seq_len": r3.VTILE_S0_SEQ_LEN,
+            "s0_max_chunks": r3.VTILE_S0_MAX_CHUNKS,
+            "state_carry": "bf16 handoff (= native chunk-to-chunk precision)",
+            "mapping": "byte cut -> char (utf-8 replace incremental) -> first "
+                       "token with start_offset >= c (round-right; byte-0 "
+                       "window-start marker skipped; BOS skipped), dedupe",
+            "n_params_added": 0,
+            "expected_param_count": spec.EXPECTED_PARAM_COUNT,
+        } if args.vtile else None,
         "expected_param_count": r3.expected_param_count_any(args.echo, args.summ),
         "expected_param_count_base": spec.EXPECTED_PARAM_COUNT,
         "config": spec.R2_CONFIG,
@@ -163,7 +217,25 @@ def main() -> int:
     tok = AutoTokenizer.from_pretrained(args.tokenizer_path, trust_remote_code=True)
 
     model, echo_keys, summ_keys = build_model(device, args.echo, args.summ,
-                                              args.summ_side, args.summ_ctrl)
+                                              args.summ_side, args.summ_ctrl,
+                                              vtile=args.vtile)
+    segmentor = None
+    if args.vtile:
+        import hashlib
+        segmentor = r3.load_s0_segmentor(s0_ckpt, device=device)
+        with open(s0_ckpt, "rb") as fh:
+            s0_sha16 = hashlib.sha256(fh.read()).hexdigest()[:16]
+        (out_dir / "vtile_meta.json").write_text(
+            json.dumps({"zero_new_params": True,
+                        "expected_param_count": spec.EXPECTED_PARAM_COUNT,
+                        "chunk_size": r3.VTILE_CHUNK_SIZE,
+                        "s0_checkpoint": s0_ckpt,
+                        "s0_sha256_16": s0_sha16,
+                        "s0_seq_len": r3.VTILE_S0_SEQ_LEN,
+                        "s0_max_chunks": r3.VTILE_S0_MAX_CHUNKS,
+                        "state_carry": "bf16 handoff",
+                        "tap": "fla.layers.delta_net.chunk_delta_rule"},
+                       ensure_ascii=False, indent=2), encoding="utf-8")
     spec.normalize_tied_weights_keys()  # 任何 save_pretrained 前置（tf5.15.1 list 崩溃在案）
     opt = torch.optim.AdamW(model.parameters(), lr=spec.LEARNING_RATE,
                             betas=spec.ADAM_BETAS, eps=spec.ADAM_EPS,
@@ -210,6 +282,10 @@ def main() -> int:
                 report = r3.strict_load_summ(model, out_dir / "latest", attach=True)
                 print(f"[r3] summarizer strict 重载：{report['n_summ_keys']} 键",
                       flush=True)
+            elif args.vtile:
+                report = r3.verify_vtile_reload(model, out_dir / "latest")
+                print(f"[r3] vtile 全等校验重载：{report['n_keys']} 键（零新增参数）",
+                      flush=True)
             else:
                 model.load_state_dict(m2.state_dict(), strict=True)
             del m2
@@ -224,6 +300,7 @@ def main() -> int:
     loss_ema = None
     diverged = None
     skipped_partial = 0
+    seg_counts: list[int] = []
 
     window_iter = spec.iter_byte_windows(args.corpus, spec.WINDOW_BYTES, args.start_window)
     log_f = log_path.open("a", encoding="utf-8")
@@ -245,8 +322,17 @@ def main() -> int:
         for g in opt.param_groups:
             g["lr"] = lr
 
-        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=(device == "cuda")):
-            out = model(input_ids=x)
+        vtile_stats = None
+        if args.vtile:
+            plan, vtile_stats = r3.vtile_plan_for_window(
+                segmentor, tok, raw, t_total=len(ids) - 1, device=device)
+            r3.set_vtile_plan(plan)
+        try:
+            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=(device == "cuda")):
+                out = model(input_ids=x)
+        finally:
+            if args.vtile:
+                r3.clear_vtile_plan()
         logits = out.logits.float()  # 坑 2 对偶：fp32 计算 CE
         loss = torch.nn.functional.cross_entropy(
             logits.reshape(-1, logits.size(-1)), y.reshape(-1))
@@ -263,11 +349,17 @@ def main() -> int:
 
         lv = loss.item()
         loss_ema = lv if loss_ema is None else 0.95 * loss_ema + 0.05 * lv
+        if args.vtile and vtile_stats is not None:
+            seg_counts.append(vtile_stats["n_segments"])
         if step % args.log_every == 0 or step == args.max_steps:
             rec = {"step": step, "loss": lv, "loss_ema": round(loss_ema, 4),
                    "lr": lr, "tokens_in_window": len(ids),
                    "sec_per_step": round((time.time() - t0) / max(1, step - start_step), 4),
                    "elapsed_sec": round(time.time() - t0, 1)}
+            if args.vtile and vtile_stats is not None:
+                # 旗标关路径零新增字段（BITWISE 逐位验收合同不受影响）
+                rec["n_segs"] = vtile_stats["n_segments"]
+                rec["n_cuts_byte"] = vtile_stats["n_cuts_byte"]
             log_f.write(json.dumps(rec) + "\n")
             log_f.flush()
             print(f"[r3] step {step}/{args.max_steps} loss {lv:.3f} ema {loss_ema:.3f} "
@@ -298,6 +390,14 @@ def main() -> int:
         "peak_mem_alloc_mib": (torch.cuda.max_memory_allocated() / 2**20) if device == "cuda" else None,
         "peak_mem_reserved_mib": (torch.cuda.max_memory_reserved() / 2**20) if device == "cuda" else None,
     }
+    if args.vtile and seg_counts:
+        summary["vtile_seg_stats"] = {
+            "n_windows": len(seg_counts),
+            "n_segments_mean": round(sum(seg_counts) / len(seg_counts), 2),
+            "n_segments_min": min(seg_counts), "n_segments_max": max(seg_counts),
+            "note": "token 空间段数（≤ byte 空间切点数；在册参照 ≈172.7 段/窗 "
+                    "= E124 门② byte 空间在册数，坑 9 口径随行）",
+        }
     (out_dir / "summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     if diverged is not None:

@@ -1,9 +1,11 @@
-"""R3 移植臂冻结规格单源（甲=对角护栏/恒等自读回声，乙=summarizer 双头构造）。
+"""R3 移植臂冻结规格单源（甲=对角护栏/恒等自读回声，乙=summarizer 双头构造，
+丙=S0'' 段界器/c1 变长铺瓦）。
 
 任务书：docs/versions/v3.7/FLUED_V3_7_R3_DELTANET_TRANSPLANT_DRAFT_20260914_CN.md
 （冻结 v1.0，2026-09-14 用户终审签发；前置门六件回执齐了点火）。
 甲臂回执：outputs/r3_transplant_echo_20260914/R3_ECHO_RECEIPT_20260914.md。
 乙臂回执：outputs/r3_transplant_summ_20260914/R3_SUMM_RECEIPT_20260914.md。
+丙臂施工（2026-09-14，本地 5080 承载；§9.6 承载机开口项对丙臂修订，用户指令）。
 
 构造（任务书 §2.1 主构造，逐字执行）：DeltaNet-50M 全部 24 层，每层状态读出处
 加恒通旁路 ``o_t ← o_t + g_l · v_t``：
@@ -633,4 +635,382 @@ def attach_and_strict_reload_summ(model: nn.Module, model_dir: str | Path,
     report["spec"] = "tools/baselines/deltanet_r2/r3_spec.py"
     report["num_params"] = SUMM_NUM_PARAMS
     report["ctrl"] = ctrl
+    return report
+
+
+# ===========================================================================
+# 丙节：S0'' 段界器 × c1 变长铺瓦（任务书 §2.3 主构造，冻结 v1.0 逐字执行）
+#
+# 构造（变长铺瓦臂）：按 S0'' 切点把 DeltaNet 的 WY 计算铺瓦从原生 BT=64
+# 改为变长——把窗按切点分成 ~172.7 段/窗（E124 门②在册数 ≈24B/块，施工
+# 直测复核），逐段调用 chunk_delta_rule 并以 initial_state/final_state 接力。
+# chunked delta rule 是线性递归的代数精确重排：分段+状态传递在精确算术下
+# 逐位等价，铺瓦粒度差仅 fp 结合序（预注册预期=不杀，函数恒等）。
+#
+# 实现路径（勘定结论，2026-09-14 本地 5080 fla 0.5.2 实证）：
+#   - fla 0.5.2 ``chunk_delta_rule`` 暴露 initial_state/output_final_state，
+#     backward 返回 dh0（initial_state 梯度）→ 逐段接力全链 BPTT 可导，
+#     训练等价成立；零自写核（1–2 天 masked-tile 备选路径解除）；
+#   - 接力态按 q.dtype（bf16）cast——与原生 chunk 间状态传递同精度语义
+#     （fla/ops/common/chunk_delta_h.py chunk_gated_delta_rule_fwd_h:30
+#     ``h = k.new_empty(...)`` 即 bf16 逐块状态；final_state 以 fp32 返回）；
+#   - use_qk_l2norm_in_kernel 的 L2 为逐 token 行归一，分段不变量；
+#   - 数学恒等实证：T=640 bf16 随机输入、66 段变长 vs 原生单调用，
+#     max|Δo|=3.0e-3、max|Δht|=2.4e-2（bf16 累积舍入带内）、dq/dk/dv/dβ
+#     相对差 ≤1.2e-2（bf16 噪声带，梯度链贯通无截断）。
+#
+# 施工形态（最小侵入）：patch ``fla.layers.delta_net.chunk_delta_rule`` 名字
+# （fla 0.5.2 layers/delta_net.py:20 模块级 import、:261 层内调用点）；旗标
+# 默认关 = 不 patch、不建任何东西、**零新增参数**（参数锚与 R2 母列全等
+# 48,152,896）。计划（每窗段长表）由调用侧逐窗设置（训练器/评测启动器），
+# wrapper 读取；plan=None 时 wrapper 逐位直通原生（对拍门原生路径同款）。
+#
+# 坑 8 纪律：零新增参数 → 键集白名单=空集；checkpoint 键集必须与基座全等
+# （任何多出/缺失键 loud-fail）。元数据随 config.json 字段 ``r3_vtile`` 落盘。
+# ===========================================================================
+
+VTILE_CONFIG_FIELD = "r3_vtile"
+VTILE_CHUNK_SIZE = 64  # 段内原生 BT（fla 仅收 16/32/64；恒 64=母列粒度）
+
+# S0'' 段界器 ctx4096 口径（E124 门②在册：训练流 172.7 块/窗 n=1001、
+# ≈24B/块；与 canonical_v37 的差恰为 seq_len 4096 + max_chunks 1024，
+# 见 checkpoints/v37ks_a_gate2base_v373_20k_ctx4096_20260910/resolved_config）
+VTILE_S0_SEQ_LEN = 4096
+VTILE_S0_MAX_CHUNKS = 1024
+VTILE_S0_FRONTEND_PREFIXES = ("byte_lookup.", "encoder_blocks.",
+                              "segmentor_blocks.", "segmentor_head.")
+
+# 计划/patch 上下文（模块级单例；训练器与启动器逐窗 set、前向毕 clear）
+_VTILE: dict = {"patched": False, "orig": None, "plan": None}
+
+
+def set_vtile_plan(seg_lens: list[int] | None) -> None:
+    """设置当前窗的段长表（sum 必须等于前向 T；由 wrapper 在核入口复核）。
+    None = 清计划（wrapper 逐位直通原生）。未挂接时设置 = 响亮停报。"""
+    if not _VTILE["patched"]:
+        raise RuntimeError("[r3-vtile] set_vtile_plan 于未挂接态调用（先 "
+                           "attach_vtile）——停报")
+    if seg_lens is not None:
+        if not seg_lens or any((not isinstance(l, int)) or l <= 0 for l in seg_lens):
+            raise RuntimeError(f"[r3-vtile] 非法计划 {seg_lens!r}（空/非正/非整）"
+                               "——停报")
+    _VTILE["plan"] = list(seg_lens) if seg_lens is not None else None
+
+
+def clear_vtile_plan() -> None:
+    """清计划（前向毕必调；防跨窗泄漏）。未挂接时调用为无害 no-op（评测
+    启动器 finally 路径的对称性）。"""
+    _VTILE["plan"] = None
+
+
+def vtile_apply(orig, plan: list[int] | None, q, k, v, beta, **kwargs):
+    """变长铺瓦核（纯函数，单测锚点）：plan=None 逐位直通原生；否则按段长表
+    切 T 维、逐段 ``orig(...)`` 并以 initial_state/final_state 接力（bf16
+    handoff）。cu_seqlens varlen 路径不在本臂契约内（响亮停报）。"""
+    if plan is None:
+        return orig(q, k, v, beta, **kwargs)
+    if kwargs.get("cu_seqlens") is not None or kwargs.get("cu_seqlens_cpu") is not None:
+        raise RuntimeError("[r3-vtile] cu_seqlens varlen 路径不在变长铺瓦契约内"
+                           "（R2 训练/评测均为 batch=1 全窗前向）——停报")
+    t_total = q.shape[1]
+    if not plan or sum(plan) != t_total:
+        raise RuntimeError(f"[r3-vtile] 计划与输入不齐：sum(plan)={sum(plan)} "
+                           f"!= T={t_total}（plan[:8]={plan[:8]}…，共 {len(plan)} 段）"
+                           "——停报")
+    # 层调用点全 kwarg 传参（delta_net.py:261）——initial_state/output_final_state
+    # 由本函数接管（层的 initial_state 用作接力起点 = cache 语义顺势正确）
+    passthrough = {kk: vv for kk, vv in kwargs.items()
+                   if kk not in ("output_final_state", "initial_state")}
+    outs, h = [], kwargs.get("initial_state")
+    hi = None
+    ofs = [0]
+    for l in plan:
+        ofs.append(ofs[-1] + l)
+    for s0, s1 in zip(ofs[:-1], ofs[1:]):
+        oi, hi = orig(q[:, s0:s1], k[:, s0:s1], v[:, s0:s1], beta[:, s0:s1],
+                      initial_state=h, output_final_state=True, **passthrough)
+        outs.append(oi)
+        # bf16 接力（= 原生 chunk 间状态精度语义；hi 为 fp32 时 cast 回 q.dtype）
+        h = hi.to(q.dtype) if hi is not None else None
+    if hi is None:
+        raise RuntimeError("[r3-vtile] 末段未返回 final_state（核契约漂移？）——停报")
+    o = torch.cat(outs, dim=1)
+    return o, (hi if kwargs.get("output_final_state") else None)
+
+
+def _vtile_patched_chunk_delta_rule(q=None, k=None, v=None, beta=None, **kwargs):
+    """fla.layers.delta_net.chunk_delta_rule 名字的替身（挂接态）：读模块级
+    计划上下文派发 vtile_apply。fla 层内调用点（delta_net.py:261）全 kwarg
+    传参，本签名全收。"""
+    return vtile_apply(_VTILE["orig"], _VTILE["plan"], q, k, v, beta, **kwargs)
+
+
+def attach_vtile(model: nn.Module, enabled: bool) -> dict:
+    """旗标化挂接。enabled=False：核验无 patch/计划残留、不挂任何东西（=与
+    R2 母列逐位不变路径）。enabled=True：核验宿主 chunk 模式契约后 patch
+    ``fla.layers.delta_net.chunk_delta_rule``（模块级名字；层调用点 :261）。
+    零新增参数、零权重改动。"""
+    if not enabled:
+        if _VTILE["patched"]:
+            raise RuntimeError("[r3-vtile] flag-off 但 patch 仍在（先 detach_"
+                               "vtile）——停报")
+        if _VTILE["plan"] is not None:
+            raise RuntimeError("[r3-vtile] flag-off 但计划残留——停报")
+        return {"patched": False, "n_params_added": 0}
+
+    import fla.layers.delta_net as dn_mod
+    if _VTILE["patched"]:
+        raise RuntimeError("[r3-vtile] 重复挂接（patch 已在场）——停报")
+    mode = getattr(getattr(model, "config", None), "attn_mode", None)
+    if mode != "chunk":
+        raise RuntimeError(f"[r3-vtile] 宿主 attn_mode={mode!r} ≠ 'chunk'"
+                           "（wrapper 只覆盖 chunk 调用点 delta_net.py:261）——停报")
+    _VTILE["orig"] = dn_mod.chunk_delta_rule
+    _VTILE["patched"] = True
+    _VTILE["plan"] = None
+    dn_mod.chunk_delta_rule = _vtile_patched_chunk_delta_rule
+    return {"patched": True, "n_params_added": 0,
+            "tap": "fla.layers.delta_net.chunk_delta_rule (module-level name)",
+            "chunk_size": VTILE_CHUNK_SIZE}
+
+
+def detach_vtile() -> None:
+    """摘 patch（对拍门同进程原生/vtile 双路切换用）。计划必须已清（响亮）。"""
+    if not _VTILE["patched"]:
+        return
+    if _VTILE["plan"] is not None:
+        raise RuntimeError("[r3-vtile] detach 时计划未清（跨窗泄漏风险）——停报")
+    import fla.layers.delta_net as dn_mod
+    if dn_mod.chunk_delta_rule is not _vtile_patched_chunk_delta_rule:
+        raise RuntimeError("[r3-vtile] patch 场被第三方改写（无法安全还原）——停报")
+    dn_mod.chunk_delta_rule = _VTILE["orig"]
+    _VTILE["patched"] = False
+    _VTILE["orig"] = None
+
+
+# ---------------------------------------------------------------------------
+# S0'' 切点 → token 计划（纯 Python 映射，确定性规约；单测锚点）
+# ---------------------------------------------------------------------------
+
+
+def byte_char_boundaries(raw: bytes) -> list[int]:
+    """char_before[b] = len(decode(raw[:b], errors='replace'))，b ∈ [0, len(raw)]
+    （len(raw)+1 项）——切点映射的唯一合法字符位语义（前缀解码）。
+
+    - 净 utf-8 窗（严格解码探针通过）：增量解码快路径——多字节字符在末字节
+      闭合，切点只落非续字节位（=字符边界），该处增量与前缀解码逐位相等；
+    - 违例字节窗：逐前缀解码慢路径（精确但 O(n²)，仅违例窗触发；替换字符
+      记账时点随前缀语义）。"""
+    try:
+        raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return [len(raw[:b].decode("utf-8", "replace"))
+                for b in range(len(raw) + 1)]
+    import codecs
+    dec = codecs.getincrementaldecoder("utf-8")("strict")
+    out = [0]
+    for byte in raw:
+        out.append(out[-1] + len(dec.decode(bytes([byte]))))
+    out[-1] += len(dec.decode(b"", True))
+    return out
+
+
+def token_plan_from_byte_cuts(cut_bytes, char_before, offsets, t_total: int,
+                              first_token: int = 1):
+    """byte 切点 → token 边界计划（映射规约，随 config.r3_vtile 落盘）：
+
+    - byte 0 切点 = 窗起点标记（每窗必有，E124 hard_cut 首位恒真），非内容
+      切点 → 跳过不映射；其余 byte 切点 b → 字符位 c = char_before[b]；
+    - token 边界 = 首个 start_offset ≥ c 的 token 下标 t ∈ [first_token,
+      t_total)（round-right：跨切点的 token 归左段——右段永不含切点前字节；
+      first_token=1 跳过 BOS 特殊位）；
+    - 去重；段长 = 相邻边界差（含 0 与 t_total 端点）。
+
+    返回 (段长表, 统计 dict)：n_cuts_byte（byte 空间切点数，含窗起点标记，
+    ≈172.7 直测复核量）、n_segments（token 空间段数 ≤ n_cuts_byte−1，合并
+    只少不多）、seg_len_min/max/mean。"""
+    if len(char_before) < 2:
+        raise RuntimeError("[r3-vtile] char_before 空表（raw 空？）——停报")
+    if t_total <= 0 or t_total > len(offsets):
+        raise RuntimeError(f"[r3-vtile] t_total={t_total} 与 offsets {len(offsets)}"
+                           "不齐——停报")
+    bounds: set[int] = set()
+    for b in cut_bytes:
+        if not (0 <= b < len(char_before) - 1):
+            raise RuntimeError(f"[r3-vtile] 切点 byte {b} 出界（窗长 "
+                               f"{len(char_before) - 1}）——停报")
+        if b == 0:
+            continue  # 窗起点标记，非内容切点
+        c = char_before[b]
+        t = first_token
+        while t < t_total and offsets[t][0] < c:
+            t += 1
+        if first_token <= t < t_total:
+            bounds.add(t)
+    ordered = sorted(bounds)
+    edges = [0] + ordered + [t_total]
+    plan = [hi - lo for lo, hi in zip(edges[:-1], edges[1:])]
+    stats = {
+        "n_cuts_byte": len(cut_bytes),
+        "n_segments": len(plan),
+        "seg_len_min": min(plan), "seg_len_max": max(plan),
+        "seg_len_mean": round(sum(plan) / len(plan), 4),
+    }
+    return plan, stats
+
+
+# ---------------------------------------------------------------------------
+# S0'' 段界器装载与逐窗计划（训练器/评测启动器共用单源）
+# ---------------------------------------------------------------------------
+
+
+def load_s0_segmentor(s0_checkpoint: str, device: str = "cuda",
+                      canonical_config_path: str | None = None):
+    """S0'' 段界器装载（canonical_v37 init_checkpoint 锚，ctx4096 口径）：
+    canonical_v37.json + {seq_len: 4096, max_chunks: 1024}（E124 门②在册
+    172.7 块/窗运行口径）构建 FLUEDV36，前端四前缀键 strict 形状校验载入
+    （E124 门①在册 199 键口径，实测数为准），前端 freeze + 全模 eval。
+
+    前端键集 = byte_lookup/encoder_blocks/segmentor_blocks/segmentor_head
+    （canonical_v37 freeze_prefixes）；缺键/形漂 loud-fail（坑 8）。"""
+    import json
+    from argparse import Namespace
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[3]
+    cfg_path = Path(canonical_config_path) if canonical_config_path \
+        else root / "configs" / "canonical_v37.json"
+    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    cfg.update({"seq_len": VTILE_S0_SEQ_LEN, "max_chunks": VTILE_S0_MAX_CHUNKS,
+                "data_manifest": ""})
+    if device == "cpu":
+        cfg["kda_impl"] = "torch"
+    from tools.train.v3_6.train_v36 import build_model
+    model = build_model(Namespace(**cfg))
+    payload = torch.load(s0_checkpoint, map_location="cpu", weights_only=False)
+    sd = payload["model"] if isinstance(payload, dict) and "model" in payload else payload
+    model_sd = model.state_dict()
+    fe_keys = [kk for kk in model_sd if kk.startswith(VTILE_S0_FRONTEND_PREFIXES)]
+    if not fe_keys:
+        raise RuntimeError("[r3-vtile] 模型无前端键（V36Config 结构漂移？）——停报")
+    missing = [kk for kk in fe_keys if kk not in sd]
+    shape_bad = [kk for kk in fe_keys
+                 if kk in sd and tuple(sd[kk].shape) != tuple(model_sd[kk].shape)]
+    if missing or shape_bad:
+        raise RuntimeError(
+            "[r3-vtile] S0'' 前端键校验失败——"
+            f"缺 {missing[:6]}{'…' if len(missing) > 6 else ''} / 形漂 "
+            f"{shape_bad[:6]}{'…' if len(shape_bad) > 6 else ''} ——停报")
+    model.load_state_dict({kk: sd[kk] for kk in fe_keys}, strict=False)
+    reloaded = model.state_dict()
+    for kk in fe_keys:
+        if not torch.equal(reloaded[kk], sd[kk]):
+            raise RuntimeError(f"[r3-vtile] 前端键 {kk} 载入后不逐位（strict=False "
+                               "静默过滤事故形态）——停报")
+    for p in model.parameters():
+        p.requires_grad_(False)
+    model.eval()
+    print(f"[r3-vtile] S0'' 段界器就位：{len(fe_keys)} 前端键 strict 载入"
+          f"（锚 {s0_checkpoint}，ctx4096 口径 max_chunks={VTILE_S0_MAX_CHUNKS}）",
+          flush=True)
+    return model.to(device)
+
+
+def s0_cut_bytes(segmentor, raw: bytes, device: str = "cuda") -> list[int]:
+    """S0'' 直测：4096B 窗 → 预算后切点 byte 位置表（v36 ``_encode→_cuts``
+    在册语义 = tau_cut 0.94 + utf8 续字节过滤 + capacity-safe，E124 hard_cut
+    同款）。容量溢出（overflow>0）响亮停报——切点被截断即非在册口径。"""
+    from flued.data import PAD_ID
+    from flued.v34.model import _plastic_signed_confidence
+    if len(raw) != VTILE_S0_SEQ_LEN:
+        raise RuntimeError(f"[r3-vtile] 窗长 {len(raw)} ≠ S0'' 口径 "
+                           f"{VTILE_S0_SEQ_LEN}——停报")
+    ids = torch.frombuffer(bytearray(raw), dtype=torch.uint8).long() + 1  # PAD-offset
+    ids = ids.unsqueeze(0).to(device)
+    if (ids == PAD_ID).any():
+        raise RuntimeError("[r3-vtile] 窗内出现 PAD_ID（bytes+1 编码下不可能）——停报")
+    with torch.no_grad():
+        logits, valid = segmentor.encode_boundary_logits(ids)
+        confidence = _plastic_signed_confidence(logits)
+        hard_cut, _utf8_cont, overflow = segmentor._cuts(ids, confidence, valid)
+    if int(overflow.sum()) > 0:
+        raise RuntimeError("[r3-vtile] S0'' 切点容量溢出（max_chunks/max_span "
+                           "截断发生，非在册口径）——停报")
+    pos = hard_cut[0].nonzero(as_tuple=True)[0].tolist()
+    return pos
+
+
+def vtile_plan_for_window(segmentor, tok, raw: bytes, t_total: int,
+                          device: str = "cuda") -> tuple[list[int], dict]:
+    """窗字节 → (段长表, 统计)。S0'' 切点（byte 空间）→ token 边界映射；
+    t_total = 前向 T（训练 = len(ids)-1，x/y 错位；评测 = len(ids)，仪器全
+    序前向）。统计含 n_cuts_byte（≈172.7 直测复核量）与 token 空间段长分布。"""
+    text = raw.decode("utf-8", errors="replace")
+    enc = tok(text, return_offsets_mapping=True)
+    offsets = [tuple(o) for o in enc["offset_mapping"]]
+    cut_bytes = s0_cut_bytes(segmentor, raw, device)
+    char_before = byte_char_boundaries(raw)
+    return token_plan_from_byte_cuts(cut_bytes, char_before, offsets, t_total)
+
+
+# ---------------------------------------------------------------------------
+# 丙侧 config 元数据与坑 8 装载校验（零新增参数 → 键集=基座全等）
+# ---------------------------------------------------------------------------
+
+
+def stamp_vtile_config(config, extra: dict | None = None) -> None:
+    config.r3_vtile = {
+        "enabled": True,
+        "construction": "variable-length WY tiling at S0'' cut points "
+                        "(per-segment chunk_delta_rule + initial_state carry)",
+        "chunk_size": VTILE_CHUNK_SIZE,
+        "state_carry": "bf16 handoff (= native chunk-to-chunk precision)",
+        "s0_seq_len": VTILE_S0_SEQ_LEN,
+        "s0_max_chunks": VTILE_S0_MAX_CHUNKS,
+        "mapping": "byte cut -> char (utf-8 replace incremental) -> first token "
+                   "with start_offset >= c (round-right; byte-0 window-start "
+                   "marker skipped; BOS skipped), dedupe",
+        "n_params_added": 0,
+        "spec": "tools/baselines/deltanet_r2/r3_spec.py",
+        **(extra or {}),
+    }
+
+
+def config_has_vtile(config) -> bool:
+    flag = getattr(config, VTILE_CONFIG_FIELD, None)
+    return bool(flag and flag.get("enabled"))
+
+
+def verify_vtile_reload(model: nn.Module, model_dir: str | Path) -> dict:
+    """丙 checkpoint 唯一合法装载校验（零新增参数特化）：config 戳记在场 +
+    文件键集与模型键集**集合全等**（任何多出/缺失键 loud-fail，坑 8）+ 参数
+    锚与 R2 母列全等 + 全量 strict 重载（对齐训练终态）。"""
+    if not config_has_vtile(model.config):
+        raise RuntimeError("[r3-vtile] checkpoint config 无 r3_vtile 戳记"
+                           "（旗标/路径错配）——停报")
+    sd = read_state_dict(model_dir)
+    model_keys = set(model.state_dict())
+    if set(sd) != model_keys:
+        extra = sorted(set(sd) - model_keys)[:8]
+        miss = sorted(model_keys - set(sd))[:8]
+        raise RuntimeError(f"[r3-vtile] 键集与基座不全等（丙零新增参数）："
+                           f"file-only={extra} model-only={miss} ——不点火")
+    n = sum(p.numel() for p in model.parameters())
+    if n != r2spec.EXPECTED_PARAM_COUNT:
+        raise RuntimeError(f"[r3-vtile] 参数锚 {n:,} ≠ 母列锚 "
+                           f"{r2spec.EXPECTED_PARAM_COUNT:,}（丙零新增参数）——停报")
+    model.load_state_dict(sd, strict=True)
+    return {"n_keys": len(model_keys), "n_params_added": 0,
+            "expected_param_count": r2spec.EXPECTED_PARAM_COUNT,
+            "spec": "tools/baselines/deltanet_r2/r3_spec.py"}
+
+
+def attach_and_reload_vtile(model: nn.Module, model_dir: str | Path,
+                            s0_checkpoint: str, device: str = "cuda") -> dict:
+    """评测侧装载器（仪器启动器调用）：attach patch + verify_vtile_reload +
+    S0'' 段界器就位（随报告返回，启动器持有以逐窗设计划）。"""
+    attach = attach_vtile(model, True)
+    report = verify_vtile_reload(model, model_dir)
+    segmentor = load_s0_segmentor(s0_checkpoint, device=device)
+    report.update(attach)
+    report["segmentor"] = segmentor
     return report
