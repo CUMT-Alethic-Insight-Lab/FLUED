@@ -153,7 +153,7 @@ def attach_echo(model: nn.Module, enabled: bool,
     want = sorted(echo_gate_keys(len(attns)))
     if got != want:
         raise RuntimeError(f"[r3] 回声键集与白名单不符：\n  got={got}\n  want={want}")
-    return want
+    return echo_gate_keys(len(attns))  # canonical 数值序（sorted 只用于集合校验）
 
 
 # ---------------------------------------------------------------------------

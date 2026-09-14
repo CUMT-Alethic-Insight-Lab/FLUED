@@ -351,7 +351,12 @@ def _same_seed_build(echo: bool, gate_init: float = r3.ECHO_GATE_INIT):
     torch.manual_seed(r2spec.TRAIN_SEED)
     m = _build_model()
     keys = r3.attach_echo(m, echo, gate_init=gate_init)
+    if echo:  # 镜像训练器 build_model：回声元数据随 config 落盘
+        r3.stamp_echo_config(m.config, num_layers=len(keys))
     return m, keys
+
+
+_HAS_FLA_CUDA = _HAS_FLA and torch.cuda.is_available()
 
 
 @pytest.mark.skipif(not _HAS_FLA, reason="fla 未安装（本地跳过，远端跑全量）")
@@ -377,35 +382,39 @@ def test_key_diff_two_instantiations_echo_on_identical():
     assert set(m0.state_dict()) - set(k1) == set()
 
 
-@pytest.mark.skipif(not _HAS_FLA, reason="fla 未安装（本地跳过，远端跑全量）")
+@pytest.mark.skipif(not _HAS_FLA_CUDA, reason="fla triton 核需 CUDA（本地跳过，远端 4090 跑全量）")
 def test_flag_off_forward_bitwise_vs_pure_fla():
     torch.manual_seed(r2spec.TRAIN_SEED)
-    a = _build_model()
-    b, _ = _same_seed_build(echo=False)  # 旗标关：挂接函数走 no-op 分支
+    a = _build_model().cuda()
+    torch.manual_seed(r2spec.TRAIN_SEED)
+    b = _build_model().cuda()
+    r3.attach_echo(b, False)  # 旗标关：挂接函数走 no-op 分支
     assert torch.equal(a.state_dict()["model.embeddings.weight"],
                        b.state_dict()["model.embeddings.weight"])
-    x = torch.randint(3, 32000, (1, 96))
+    x = torch.randint(3, 32000, (1, 96), device="cuda")
     with torch.no_grad():
         assert torch.equal(a(input_ids=x).logits, b(input_ids=x).logits)  # 逐位不变
 
 
-@pytest.mark.skipif(not _HAS_FLA, reason="fla 未安装（本地跳过，远端跑全量）")
+@pytest.mark.skipif(not _HAS_FLA_CUDA, reason="fla triton 核需 CUDA（本地跳过，远端 4090 跑全量）")
 def test_gate_zero_forward_bitwise_equal_mother_fla():
     """测试③真机形态：g=0 时逐位等于母列（同 init 同输入同 dtype）。"""
     torch.manual_seed(r2spec.TRAIN_SEED)
-    a = _build_model()
+    a = _build_model().cuda()
     b, _ = _same_seed_build(echo=True, gate_init=0.0)
-    x = torch.randint(3, 32000, (1, 96))
+    b = b.cuda()
+    x = torch.randint(3, 32000, (1, 96), device="cuda")
     with torch.no_grad():
         assert torch.equal(a(input_ids=x).logits, b(input_ids=x).logits)
 
 
-@pytest.mark.skipif(not _HAS_FLA, reason="fla 未安装（本地跳过，远端跑全量）")
+@pytest.mark.skipif(not _HAS_FLA_CUDA, reason="fla triton 核需 CUDA（本地跳过，远端 4090 跑全量）")
 def test_echo_forward_differs_and_gate_grads_finite():
     a, _ = _same_seed_build(echo=False)
+    a = a.cuda()
     b, _ = _same_seed_build(echo=True, gate_init=1.0)
-    x = torch.randint(3, 32000, (1, 96))
-    y = torch.randint(3, 32000, (1, 96))
+    b = b.cuda()
+    x = torch.randint(3, 32000, (1, 96), device="cuda")
     la = a(input_ids=x).logits.float().square().sum()
     lb = b(input_ids=x).logits
     assert not torch.equal(la.detach(), lb.detach())  # 回声确实改变前向
