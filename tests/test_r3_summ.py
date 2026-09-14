@@ -460,6 +460,33 @@ def test_ctrl_strict_reload_roundtrip_and_wrong_construction_loudfail(tmp_path):
         r3.strict_load_summ(wrong, d, ctrl=False)
 
 
+def test_side_threading_through_eval_loader(tmp_path):
+    """side 直传回归（2026-09-14 事故：装载通路漏传 side，去消融列判决曾以
+    双头全接评测）：strict_load/attach_and_strict_reload 必须把戳记 side 传到
+    attach_summ——value→仅 v tap hook，addr→仅 k tap hook，缺省 both→双侧。"""
+    torch.manual_seed(0)
+    src = _MockModel(n_layers=1)
+    keys = r3.attach_summ(src, True, side="value")
+    d = _write_sd(tmp_path, src.state_dict())
+
+    def hook_tags(m):
+        attn = m.model.layers[0].attn
+        return (bool(attn.k_conv1d._forward_hooks),
+                bool(attn.v_conv1d._forward_hooks))
+
+    for side, want in (("value", (False, True)), ("addr", (True, False)),
+                       ("both", (True, True))):
+        torch.manual_seed(0)
+        fresh = _MockModel(n_layers=1)
+        rep = r3.attach_and_strict_reload_summ(fresh, d, side=side)
+        assert hook_tags(fresh) == want, side
+        assert rep["side"] == side and rep["n_summ_keys"] == len(keys)
+    torch.manual_seed(0)
+    legacy = _MockModel(n_layers=1)  # 缺省回退=both（老戳记无 side 字段形态）
+    rep = r3.attach_and_strict_reload_summ(legacy, d)
+    assert hook_tags(legacy) == (True, True) and rep["side"] == "both"
+
+
 # ---------------------------------------------------------------------------
 # fla 门控用例（远端 4090 施工靶机执行全量；三坑照甲例：autocast bf16 /
 # CUDA 门控 / ShortConvolution 元组解包）
