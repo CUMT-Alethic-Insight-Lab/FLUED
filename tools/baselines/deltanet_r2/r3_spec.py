@@ -881,7 +881,10 @@ def load_s0_segmentor(s0_checkpoint: str, device: str = "cuda",
         else root / "configs" / "canonical_v37.json"
     cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
     cfg.update({"seq_len": VTILE_S0_SEQ_LEN, "max_chunks": VTILE_S0_MAX_CHUNKS,
-                "data_manifest": ""})
+                "data_manifest": "",
+                # canonical_v37.json 缺的新 CLI 字段，按在册 ctx4096 运行口径
+                # （checkpoints/v37ks_a_gate2base_v373_20k_ctx4096_20260910）
+                "prefix_task": False, "prefix_positions": 4})
     if device == "cpu":
         cfg["kda_impl"] = "torch"
     from tools.train.v3_6.train_v36 import build_model
