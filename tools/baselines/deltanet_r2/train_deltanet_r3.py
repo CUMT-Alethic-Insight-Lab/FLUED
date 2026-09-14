@@ -50,6 +50,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--summ", action="store_true",
                    help="summarizer 双头构造旗标（乙臂 §2.2；默认关=与 R2 母列"
                         "逐位不变；与 --echo 互斥）")
+    p.add_argument("--summ-side", choices=["both", "value", "addr"],
+                   default="both",
+                   help="乙变体（§4 杀死档自动触发）：both=双头全接（主构造）；"
+                        "value=仅值侧（乙-v2）；addr=仅地址侧（乙-v3）")
+    p.add_argument("--summ-ctrl", action="store_true",
+                   help="参数匹配对照构造（§4 杀死档自动触发）：同参数量同 tap 点"
+                        "的 pseudo 双头（mean-pool+双 MLP），归因「构造毒性 vs 参数量」")
     p.add_argument("--max-steps", type=int, default=spec.MAX_STEPS)
     p.add_argument("--start-window", type=int, default=0)
     p.add_argument("--seed", type=int, default=spec.TRAIN_SEED)
@@ -62,13 +69,17 @@ def parse_args() -> argparse.Namespace:
     if args.echo and args.summ:
         raise SystemExit("[r3] --echo 与 --summ 互斥（单变量纪律：每臂只换一个件"
                          "，任务书 §1 变量钉死）——停报")
+    if (args.summ_side != "both" or args.summ_ctrl) and not args.summ:
+        raise SystemExit("[r3] --summ-side/--summ-ctrl 仅在 --summ 下有效——停报")
     return args
 
 
-def build_model(device: str, echo: bool, summ: bool = False):
+def build_model(device: str, echo: bool, summ: bool = False,
+                summ_side: str = "both", summ_ctrl: bool = False):
     """fla 原生 from_config 实例化；echo=True 挂回声（r3_spec.attach_echo）、
-    summ=True 挂 summarizer 双头构造（r3_spec.attach_summ），参数锚 loud-fail
-    分档（关=48,152,896 与 R2 全等；echo=+24；summ=+SUMM_NUM_PARAMS 精算锚）。"""
+    summ=True 挂 summarizer（r3_spec.attach_summ；side/ctrl=§4 触发变体），
+    参数锚 loud-fail 分档（关=48,152,896 与 R2 全等；echo=+24；
+    summ=+SUMM_NUM_PARAMS 精算锚，主构造/变体/对照全档一致）。"""
     import fla  # noqa: F401  # 先于 transformers：注册 fla 模型类
     from fla.models.delta_net import DeltaNetConfig, DeltaNetForCausalLM
 
@@ -80,8 +91,8 @@ def build_model(device: str, echo: bool, summ: bool = False):
         echo_keys = r3.attach_echo(model, True)
         r3.stamp_echo_config(model.config, num_layers=len(echo_keys))
     if summ:
-        summ_keys = r3.attach_summ(model, True)
-        r3.stamp_summ_config(model.config)
+        summ_keys = r3.attach_summ(model, True, side=summ_side, ctrl=summ_ctrl)
+        r3.stamp_summ_config(model.config, side=summ_side, ctrl=summ_ctrl)
     n = sum(p.numel() for p in model.parameters())
     want = r3.expected_param_count_any(echo, summ)
     if n != want:
@@ -89,6 +100,7 @@ def build_model(device: str, echo: bool, summ: bool = False):
             f"[r3] 参数锚不符（echo={echo}, summ={summ}）：实例化 {n:,} != 预注册 "
             f"{want:,}——停报")
     print(f"[r3] 实例化参数数 = {n:,}（预注册锚一致，echo={echo}, summ={summ}, "
+          f"side={summ_side}, ctrl={summ_ctrl}, "
           f"回声键 {len(echo_keys)}, summarizer 键 {len(summ_keys)}）", flush=True)
     return model.to(device), echo_keys, summ_keys
 
@@ -109,13 +121,18 @@ def main() -> int:
         "echo_gate_init": r3.ECHO_GATE_INIT if args.echo else None,
         "echo_num_params": r3.ECHO_NUM_PARAMS if args.echo else 0,
         "summ": bool(args.summ),
+        "summ_side": args.summ_side if args.summ else None,
+        "summ_ctrl": bool(args.summ_ctrl) if args.summ else False,
         "summ_construction": {
             "dit_layers": r3.SUMM_DIT_LAYERS, "d": r3.SUMM_D,
             "heads": r3.SUMM_HEADS, "ffn_dim": r3.SUMM_FFN_DIM,
             "hidden": r3.SUMM_HIDDEN, "d_mem": r3.SUMM_D_MEM,
             "pool": r3.SUMM_POOL_MODE, "chunk_tokens": r3.SUMM_CHUNK_TOKENS,
             "num_params": r3.SUMM_NUM_PARAMS,
-            "component": "flued.v36.model.DiTChunkSummarizer（原类零重实现）",
+            "component": "flued.v36.model.DiTChunkSummarizer（原类零重实现）"
+            if not args.summ_ctrl else
+            "r3_spec.PseudoDualHeadMLP（参数匹配对照：mean-pool+双 MLP，"
+            "hidden=3878+pad56，锚精确匹配）",
         } if args.summ else None,
         "expected_param_count": r3.expected_param_count_any(args.echo, args.summ),
         "expected_param_count_base": spec.EXPECTED_PARAM_COUNT,
@@ -145,7 +162,8 @@ def main() -> int:
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(args.tokenizer_path, trust_remote_code=True)
 
-    model, echo_keys, summ_keys = build_model(device, args.echo, args.summ)
+    model, echo_keys, summ_keys = build_model(device, args.echo, args.summ,
+                                              args.summ_side, args.summ_ctrl)
     spec.normalize_tied_weights_keys()  # 任何 save_pretrained 前置（tf5.15.1 list 崩溃在案）
     opt = torch.optim.AdamW(model.parameters(), lr=spec.LEARNING_RATE,
                             betas=spec.ADAM_BETAS, eps=spec.ADAM_EPS,
@@ -161,6 +179,7 @@ def main() -> int:
             json.dumps({"keys": summ_keys, "num_keys": len(summ_keys),
                         "num_params": r3.SUMM_NUM_PARAMS,
                         "expected_param_count": r3.EXPECTED_PARAM_COUNT_SUMM,
+                        "side": args.summ_side, "ctrl": bool(args.summ_ctrl),
                         "construction": {
                             "dit_layers": r3.SUMM_DIT_LAYERS, "d": r3.SUMM_D,
                             "heads": r3.SUMM_HEADS, "ffn_dim": r3.SUMM_FFN_DIM,

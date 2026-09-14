@@ -335,19 +335,6 @@ def _summ_cfg():
         backbone_mode="slm")  # slm → index_ffn 双头创建（v3.7 consensus §1.1）
 
 
-def build_summarizer():
-    """原件构造零重实现：import flued.v36.model.DiTChunkSummarizer 实类实例化
-    （init 纪律随原件：pool_queries trunc_normal std=0.02，其余默认 init）。"""
-    from flued.v36.model import DiTChunkSummarizer
-    summ = DiTChunkSummarizer(_summ_cfg())
-    if not hasattr(summ, "index_ffn"):
-        raise RuntimeError("[r3] summarizer 无 index_ffn（backbone_mode≠slm？）"
-                           "——双头构造缺一头，停报")
-    if (summ.QPOOL_QUERIES, summ.QPOOL_ANCHOR_TEMP) != (4, 16.0):
-        raise RuntimeError("[r3] qpool 构造常量漂移（≠4 锚查询/temp 16.0）——停报")
-    return summ
-
-
 def summ_param_count_analytic() -> int:
     """新增参数解析式精算（与 DiTChunkSummarizer(320,5,768,qpool,hidden=768,
     d_mem=320) 实例化互证；任务书 §2.2「≈2–3M 待施工精算」的精算=4,972,932
@@ -430,16 +417,86 @@ def _summ_tap_contract(model: nn.Module) -> nn.Module:
     return base
 
 
+# ---------------------------------------------------------------------------
+# 去消融/对照件（§4 杀死档自动触发，2026-09-14 用户终审裁定）：
+#   side 变体（乙-v2 仅值侧 / 乙-v3 仅地址侧）= 模块整体在场（参数锚不变），
+#     只摘除另一头的 tap hook——头级归因（哪头的接线是凶手）；
+#   ctrl（参数匹配对照列）= 同参数量同 tap 点、构造最简化的 pseudo 双头
+#     （masked mean 池化 + LN + 双 MLP，无 DiT/qpool/双头 FFN 构造）——归因
+#     「构造毒性 vs 参数量」。
+# ---------------------------------------------------------------------------
+
+PSEUDO_HIDDEN = 3878
+PSEUDO_PAD = 56  # 零函数注册垫（1282*3878+1280=4,972,876，+56 精确匹配锚）
+
+
+class PseudoDualHeadMLP(nn.Module):
+    """参数匹配对照构造（归因「构造毒性 vs 参数量」）：与主构造同 tap 点同
+    广播机制，summarizer 内部换成最简形态——masked mean 池化（v37.2 前旧
+    口径池化，无可学查询）+ LN + 双 MLP 头。参数 = 1282×3878+1280+56(pad)
+    = 4,972,932 与主构造精确匹配；pad 为零函数注册参数（不在前向图上、
+    无梯度，AdamW 不更新——如实登记）。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.pad = nn.Parameter(torch.zeros(PSEUDO_PAD))
+        self.norm = nn.LayerNorm(SUMM_D)
+        self.head_m = nn.Sequential(
+            nn.Linear(SUMM_D, PSEUDO_HIDDEN), nn.SiLU(),
+            nn.Linear(PSEUDO_HIDDEN, SUMM_D_MEM))
+        self.head_k = nn.Sequential(
+            nn.Linear(SUMM_D, PSEUDO_HIDDEN), nn.SiLU(),
+            nn.Linear(PSEUDO_HIDDEN, SUMM_D_MEM))
+
+    def forward_with_index(self, spans: torch.Tensor,
+                           token_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        bsz, chunks, span, dim = spans.shape
+        valid = token_mask.reshape(bsz * chunks, span)
+        h = spans.reshape(bsz * chunks, span, dim)
+        denom = valid.sum(dim=1, keepdim=False).clamp(min=1).unsqueeze(-1).to(h.dtype)
+        pooled = (h * valid.unsqueeze(-1).to(h.dtype)).sum(dim=1) / denom  # (B*C, d)
+        memory = self.head_m(self.norm(pooled)).view(bsz, chunks, -1)
+        index = self.head_k(self.norm(pooled)).view(bsz, chunks, -1)
+        return memory, index
+
+
+def build_summarizer(ctrl: bool = False):
+    """构造选择：ctrl=False = 原件 DiTChunkSummarizer 零重实现（init 纪律随
+    原件）；ctrl=True = 参数匹配 pseudo 双头。两者参数锚一致（53,125,828 = 基
+    座 + SUMM_NUM_PARAMS）。"""
+    if ctrl:
+        pseudo = PseudoDualHeadMLP()
+        n = sum(p.numel() for p in pseudo.parameters())
+        if n != SUMM_NUM_PARAMS:
+            raise RuntimeError(f"[r3] pseudo 参数 {n:,} ≠ 主构造锚 "
+                               f"{SUMM_NUM_PARAMS:,}（参数匹配破坏）——停报")
+        return pseudo
+    from flued.v36.model import DiTChunkSummarizer
+    summ = DiTChunkSummarizer(_summ_cfg())
+    if not hasattr(summ, "index_ffn"):
+        raise RuntimeError("[r3] summarizer 无 index_ffn（backbone_mode≠slm？）"
+                           "——双头构造缺一头，停报")
+    if (summ.QPOOL_QUERIES, summ.QPOOL_ANCHOR_TEMP) != (4, 16.0):
+        raise RuntimeError("[r3] qpool 构造常量漂移（≠4 锚查询/temp 16.0）——停报")
+    return summ
+
+
 def _summ_param_keys(model: nn.Module) -> list[str]:
     return [k for k, _ in model.named_parameters()
             if f".{SUMM_ATTR}." in f".{k}"]
 
 
-def attach_summ(model: nn.Module, enabled: bool) -> list[str]:
-    """旗标化挂接（§2.2 主构造）。enabled=False：核验无 summarizer 残留、不挂
-    任何东西，返回 []（= 与 R2 母列逐位不变路径）。enabled=True：建
-    ``model.r3_summ`` 模块 + embedding 汇总 hook + 每层 k/v 替换 hook，返回
-    新增键表（=模块 named_parameters 穷举，白名单本体）。"""
+def attach_summ(model: nn.Module, enabled: bool, side: str = "both",
+                ctrl: bool = False) -> list[str]:
+    """旗标化挂接（§2.2 主构造 + §4 触发变体）。enabled=False：核验无
+    summarizer 残留、不挂任何东西，返回 []（= 与 R2 母列逐位不变路径）。
+    enabled=True：建 ``model.r3_summ`` 模块 + embedding 汇总 hook + tap 替换
+    hook，返回新增键表（=模块 named_parameters 穷举，白名单本体）。
+    side：both=双头全接（主构造）；value=仅值侧（乙-v2）；addr=仅地址侧
+    （乙-v3）——模块整体在场参数锚不变，只摘除另一头 tap（头级归因）。
+    ctrl：True=参数匹配 pseudo 双头（对照列，构造最简化）。"""
+    if side not in ("both", "value", "addr"):
+        raise RuntimeError(f"[r3] side={side!r} 非法（both|value|addr）——停报")
     if not enabled:
         base = getattr(model, "model", model)
         if getattr(base, SUMM_ATTR, None) is not None:
@@ -452,7 +509,7 @@ def attach_summ(model: nn.Module, enabled: bool) -> list[str]:
     base = _summ_tap_contract(model)
     if hasattr(base, SUMM_ATTR):
         raise RuntimeError(f"[r3] 重复挂接：base.{SUMM_ATTR} 已存在——停报")
-    summ = build_summarizer()
+    summ = build_summarizer(ctrl=ctrl)
     ref = next(model.parameters())  # 对齐宿主当前 device/dtype：训练器路径（fp32
     # CPU 挂接、后随 model.to 迁移）与仪器路径（bf16 CUDA 已就位后 strict 重载）
     # 两条装载序都成立
@@ -489,8 +546,10 @@ def attach_summ(model: nn.Module, enabled: bool) -> list[str]:
     hooks = [base.embeddings.register_forward_hook(_embed_hook)]
     for lyr in base.layers:
         attn = lyr.attn
-        hooks.append(attn.k_conv1d.register_forward_hook(_replace_hook("k_c")))
-        hooks.append(attn.v_conv1d.register_forward_hook(_replace_hook("m_c")))
+        if side in ("both", "addr"):  # 地址侧：k_t ← k_c 块内广播
+            hooks.append(attn.k_conv1d.register_forward_hook(_replace_hook("k_c")))
+        if side in ("both", "value"):  # 值侧：v_t ← m_c 块内广播
+            hooks.append(attn.v_conv1d.register_forward_hook(_replace_hook("m_c")))
     base._r3_summ_hooks = hooks
 
     got = _summ_param_keys(model)
@@ -504,10 +563,13 @@ def attach_summ(model: nn.Module, enabled: bool) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def stamp_summ_config(config) -> None:
+def stamp_summ_config(config, side: str = "both", ctrl: bool = False) -> None:
     config.r3_summ = {
         "enabled": True,
-        "construction": "single-point summary + dual-head full wiring",
+        "construction": ("param-matched pseudo dual-head (mean-pool + dual MLP)"
+                         if ctrl else
+                         "single-point summary + dual-head full wiring"),
+        "side": side, "ctrl": ctrl,
         "dit_layers": SUMM_DIT_LAYERS, "d": SUMM_D, "heads": SUMM_HEADS,
         "ffn_dim": SUMM_FFN_DIM, "hidden": SUMM_HIDDEN, "d_mem": SUMM_D_MEM,
         "pool": SUMM_POOL_MODE, "chunk_tokens": SUMM_CHUNK_TOKENS,

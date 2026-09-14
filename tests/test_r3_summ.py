@@ -384,6 +384,59 @@ def test_embed_hook_order_violation_loudfail():
 
 
 # ---------------------------------------------------------------------------
+# §4 触发件：side 去消融变体 + 参数匹配对照构造
+# ---------------------------------------------------------------------------
+
+
+def test_pseudo_ctrl_param_anchor_exact():
+    pseudo = r3.build_summarizer(ctrl=True)
+    n = sum(p.numel() for p in pseudo.parameters())
+    assert n == r3.SUMM_NUM_PARAMS == 4_972_932  # 与主构造精确匹配
+    m_c, k_c = pseudo.forward_with_index(
+        torch.randn(1, 2, 64, r3.SUMM_D),
+        torch.tensor([[[True] * 64, [True] * 2 + [False] * 62]]))
+    assert m_c.shape == (1, 2, r3.SUMM_D_MEM) and k_c.shape == (1, 2, r3.SUMM_D_MEM)
+    assert not torch.allclose(m_c[0, 0], k_c[0, 0])  # 双头独立（默认 init 下）
+
+
+def test_side_variant_wiring_mock():
+    """side 变体接线语义（mock 捕获替换后 conv 输出）：
+    value=仅值侧 → v 块内恒等、k 块内原生（随位置变化）；addr 反之。"""
+    torch.manual_seed(0)
+    for side, const_tag, vary_tag in (("value", "v", "k"), ("addr", "k", "v")):
+        m = _MockModel(n_layers=1)
+        keys = r3.attach_summ(m, True, side=side)
+        assert len(keys) == len(_summ_params(m))  # 模块整体在场，锚不变
+        cap = {}
+        m.model.layers[0].attn.k_conv1d.register_forward_hook(
+            lambda _mo, _i, out: cap.__setitem__("k", out[0].detach()) or out)
+        m.model.layers[0].attn.v_conv1d.register_forward_hook(
+            lambda _mo, _i, out: cap.__setitem__("v", out[0].detach()) or out)
+        _constantize_summ(m, 0.25, -0.5)  # 常数化 → 被替换头块内恒等且=常数
+        ids = torch.randint(0, 11, (1, 130))
+        with torch.no_grad():
+            m(ids)
+        const, vary = cap[const_tag], cap[vary_tag]
+        assert torch.equal(const[0, 0], const[0, 127])  # 被替换头：块间广播
+        assert not torch.equal(vary[0, 0], vary[0, 127])  # 原生头：逐位置独立
+        assert not torch.equal(vary[0, 0], vary[0, 1])  # 原生头：块内也独立
+
+
+def test_trainer_variant_flags_validation(monkeypatch):
+    import tools.baselines.deltanet_r2.train_deltanet_r3 as tr
+    base = ["train_deltanet_r3.py", "--corpus", "x", "--tokenizer-path", "y",
+            "--out-dir", "z"]
+    monkeypatch.setattr("sys.argv", base + ["--summ-side", "value"])
+    with pytest.raises(SystemExit, match="仅在 --summ 下有效"):
+        tr.parse_args()
+    monkeypatch.setattr("sys.argv", base + ["--summ-ctrl"])
+    with pytest.raises(SystemExit, match="仅在 --summ 下有效"):
+        tr.parse_args()
+    monkeypatch.setattr("sys.argv", base + ["--summ", "--summ-side", "addr"])
+    assert tr.parse_args().summ_side == "addr"  # 合法组合通过
+
+
+# ---------------------------------------------------------------------------
 # fla 门控用例（远端 4090 施工靶机执行全量；三坑照甲例：autocast bf16 /
 # CUDA 门控 / ShortConvolution 元组解包）
 # ---------------------------------------------------------------------------
