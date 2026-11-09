@@ -1,0 +1,315 @@
+                                        Bridging the Gap for Tokenizer-Free Language Models
+
+                                        Dokook Choe∗ Rami Al-Rfou∗ Mandy Guo                   Heeyoung Lee Noah Constant
+
+                                                                               Google AI
+                                                                    1600 Amphitheatre Parkway
+                                                                 Mountain View, California 94043
+                                        {choed, rmyeid, xyguo, hylee, nconstant}@google.com
+
+arXiv:1908.10322v1 [cs.CL] 27 Aug 2019                        Abstract                         niﬁcant complexity to real applications. As such,
+                                                                                               it is appealing to shift to more general LMs that
+                                             Purely character-based language models            process raw text at the character level. Processing
+                                             (LMs) have been lagging in quality on large       language at the character level allows us to model
+                                             scale datasets, and current state-of-the-art      morphological variants of a word, assign reason-
+                                             LMs rely on word tokenization. It has been        able likelihood to out-of-vocabulary words, and
+                                             assumed that injecting the prior knowledge        learn subword-level language abstractions. This
+                                             of a tokenizer into the model is essential to     open vocabulary modeling is quite important for
+                                             achieving competitive results. In this paper,     languages with complex morphology such as Ara-
+                                             we show that contrary to this conventional        bic, Turkish, or Finnish (Lee et al., 2016; Bo-
+                                             wisdom, tokenizer-free LMs with sufﬁcient         janowski et al., 2017; Kim et al., 2016).
+                                             capacity can achieve competitive performance
+                                             on a large scale dataset. We train a vanilla         While character- and word-based LMs have
+                                             transformer network with 40 self-attention        both improved in their performance over time,
+                                             layers on the One Billion Word (lm1b)             purely character-based LMs have continued to lag
+                                             benchmark and achieve a new state of the          in performance compared to models that leverage
+                                             art for tokenizer-free LMs, pushing these         a tokenizer. Al-Rfou et al. (2019) report inferior
+                                             models to be on par with their word-based         performance from character-level modeling on a
+                                             counterparts.                                     large scale word-level benchmark, lm1b (Chelba
+                                                                                               et al., 2013). Similarly, Radford et al. (2019) ob-
+                                        1 Introduction                                         serve that a character-level LM is harder to train to
+                                                                                               competitive performance on their huge WebText
+                                        There has been a recent surge of improvements          corpus, as compared with subword segmentation
+                                        in language modeling, powered by the introduc-         using byte pair encoding (BPE) (Sennrich et al.,
+                                        tion of the transformer architecture (Vaswani et al.,  2016; Gage, 1994).
+                                        2017). These gains stem from the ability of
+                                        the transformer self-attention mechanism to bet-          Sub-word tokenization approaches like BPE
+                                        ter model long context (as compared to RNN net-        represent a middle ground for text segmentation.
+                                        works), spanning hundreds of characters (Al-Rfou       On one hand, they can help with better modeling
+                                        et al., 2019) or words (Baevski and Auli, 2018;        open vocabulary. On the other hand, they still de-
+                                        Radford et al., 2019). These approaches con-           pend on a tokenizer, adding complexity to the ﬁ-
+                                        sider language modeling as a classiﬁcation prob-       nal system. Moreover, the preprocessing stage is
+                                        lem with the aim of predicting the next token          not jointly optimized with learning the task objec-
+                                        given a ﬁxed-size preceding context. To support        tive. This last point is especially relevant given
+                                        variable-length context, Dai et al. (2019) adds re-    that LMs are increasingly used for their ability
+                                        currence to a transformer model, improving the         to produce pretrained representations that will be
+                                        state-of-the-art further.                              ﬁne-tuned for a downstream task (Devlin et al.,
+                                                                                               2018; Howard and Ruder, 2018; Radford et al.,
+                                           Current word-based language models (LMs) de-        2018; Peters et al., 2018). Since word-based LMs
+                                        pend on a series of preprocessing steps that in-       use closed vocabulary and sub-word models adopt
+                                        clude lowercasing, tokenization, normalization,        a segmentation that targets the pretraining corpus,
+                                        and out-of-vocabulary handling. This preprocess-       there is little space to adapt the vocabulary or op-
+                                        ing stage is language dependent and can add sig-
+
+                                             ∗Equal contribution.
+timize the segmentation to ﬁt the ﬁnal task data      span complete and partial sentences. We dropout
+distribution.                                         both timesteps of self-attention layers and features
+                                                      of relu activations across timesteps with a proba-
+   The rest of this paper is organized as follows.    bility of 0.3. We use the Adam optimizer (Kingma
+In Section 2, we describe our model architecture,     and Ba, 2014) with initial learning rate 10−4 and
+which is a vanilla deep transformer byte-level LM.    batch size 1024. The training runs for two mil-
+Section 3 describes the lm1b dataset and our eval-    lion steps, and at every 10,000 steps we decay the
+uation methodology. Section 4 presents our re-        learning rate geometrically by 0.99.
+sults and how our model compares to the previous
+work. In Section 5 we analyze the representations     2.2 Windowed Prediction
+learned by the network at different depths using
+word-similarity benchmarks. For this analysis to      To score each byte prediction, we need to process
+be feasible we propose a strategy to extract word     an entire 512-byte context from scratch, which is
+representations from a character model.               computationally intensive. To speed up develop-
+                                                      ment, for each window of context size c, we score
+   To summarize our contributions:                    (stride = c/2) characters in parallel (the second
+                                                      half of the window). This leads to a tractable run-
+   • We develop a competitive tokenizer-free lan-     ning time for our development evaluation process.
+      guage model on a large scalable dataset.        While this setup is sub-optimal for our model, we
+                                                      did not observe any signiﬁcant regression in our
+   • We probe the performance of our model’s          metrics. For example, the ﬁnal bits/byte value of
+      learned intermediate representations on word    0.874055 (stride = 1) only grows to 0.87413 with
+      similarity tasks.                               stride = 256. Our ﬁnal test evaluation is reported
+                                                      with stride = 1.
+2 Modeling
+                                                      3 Experimental Setup
+Language models (LMs) assign a probability dis-
+tribution over a sequence x0:t by factoring out the   There are no large scale datasets that are heav-
+joint probability from left to right as follows       ily studied for both word and character language
+                                                      modeling. Typically, a speciﬁc dataset will be con-
+                                              t       sidered under just one level of segmentation. For
+                                                      our efforts to be comparable with the literature, we
+          P (x0:t) = P (x0) P (xi|x<i). (1)           use a word LM dataset. This puts our model at
+                                                      a disadvantage; the dataset is tokenized and our
+                                            i=1       model will not utilize the given word boundary
+                                                      information. Our approach is able to model rare
+Instead of reading in the tokenized input text, our   words and estimate their appropriate likelihoods,
+model reads raw utf-8 bytes. For English text         however, they have been replaced with a special
+in the ASCII range, this is equivalent to process-    token to produce closed vocabulary text that is
+ing characters as individual tokens. Non-ASCII        appropriate for word-level modeling. Hence, the
+characters (e.g. accented characters, or non-Latin    metrics we report are meant to provide a lower
+scripts) are typically two or three utf-8 bytes. We   bound on the utility of our approach in realistic
+use a standard “transformer decoder” (a stack of      settings.
+transformer layers with a causal attention mask)
+to process the sequence x0:i−1 and predict the fol-   shards # of words       # of bytes
+lowing byte xi. The model’s prediction is an esti-
+mate of the probability distribution over all possi-  train 01-99 798,947,561 4,132,763,660
+ble 256 byte values. Our input byte embedding
+matrix has dimensionality 256. Our byte-level         dev 01 of 00   165,560  856,742
+transformer model has 40 standard transformer
+layers with hidden size 1024, ﬁlter size 8192, and    test 00 of 00  159,658  826,189
+16 heads. The model has around 836M parame-
+ters, of which only 66K are byte embeddings.          Table 1: Word and byte counts in lm1b. The word
+                                                      count includes end of sentence tokens, and byte count
+2.1 Training                                          includes newline characters.
+
+We sample random byte sequences of length 512.
+This sampling process does not respect the sen-
+tence boundary. Therefore, one example might
+Shazeer et al. (2017)      Segmentation   Context Length  # of params  Perplexity  Bits/Byte
+Shazeer et al. (2018)          Word             Fixed         6.0B        28.0       0.929
+Baevski and Auli (2018)                         Fixed         4.9B        24.0       0.886
+Dai et al. (2019)           Word-Piece          Fixed         1.0B        23.0       0.874
+Al-Rfou et al. (2019)          Word                           0.8B        21.8       0.859
+Ours                           Word          Arbitrary        0.2B        40.6       1.033
+                                Byte            Fixed         0.8B        23.0       0.874
+                                Byte            Fixed
+
+                     Table 2: Comparing recent language model results on lm1b.
+
+3.1 LM1B                                              4 Results and Discussion
+
+We use the One Billion Word benchmark (Chelba         Table 2 shows the perplexity of several models on
+et al., 2013) to compare LM performance. The          lm1b. We observe that tokenizer-free LM perfor-
+dataset consists of shufﬂed short sentences, and      mance improves signiﬁcantly (40.6 to 23.0) when
+doesn’t require modeling long contexts (95% of        the model capacity is increased from 0.2B to 0.8B
+the training sentences are under 256 bytes and over   parameters. With sufﬁcient capacity our byte-level
+99.78% are under 512 bytes). The corpus is tok-       LM is competitive with word based models (rang-
+enized, and a small percentage of rare words are      ing from 21.8 to 28.0). Note, our model is able to
+replaced with UNK tokens. The data gets split into    achieve comparable performance without any ex-
+100 shards, and the ﬁrst one (00) is held out while   plicit signal of word boundaries.
+the rest (01-99) are used for training. The holdout
+set is split again into 50 shards, and historically      Because of the large symbol space that word-
+shard 00 of the holdout has been used as the test     based LMs address, they rely on sparse opera-
+set. There is no standard dev set, so we use shard    tions running on heterogeneous devices to run ef-
+01 of the holdout as dev. See the corpus statistics   ﬁciently (e.g. running sparse embedding lookups
+in Table 1 for details.                               on CPU as opposed to GPU/TPU). By contrast,
+                                                      byte LMs are dense, and all operations can be ex-
+3.2 Metrics                                           ecuted on specialized accelerators efﬁciently. We
+                                                      expect that with advances in accelerated hardware,
+Word LMs typically report their results in terms of   byte-level text processing will become a popular
+perplexity per word (ppl) while byte LMs report       choice.
+their results in bits per byte (bpb). We report both
+metrics to make our results more accessible.             Of all the baseline models we reference, only
+                                                      Dai et al. (2019) uses recurrence to model arbitrary
+   Conversion between those metrics are based on      length history. This technique could be added to
+the following observation: The amount of infor-       tokenizer-free models as well. Indeed, we expect
+mation in the test dataset is the same independent    this approach to be particularly well-suited to byte
+of segmentation.                                      and character models where text gets mapped onto
+                                                      longer token sequences, as Dai et al. (2019) show
+I(text) = |words| ×  bits                 bits        that adding recurrence increases the length of con-
+                           = |bytes| × ,              text their model can effectively use.
+                     word                 byte
+                                                      5 Extracting Word Representations
+                                          (2)
+                                                      In this section, we test our model’s ability to pro-
+where I(x) is the information contained in x,         duce meaningful word-level representations. We
+                                                      investigate this by feeding the model single words,
+which is − log2 P (x; model). Equation 2 allows       and evaluating its intermediate activations on word
+us to convert bits/word to bits/byte. Then straight-  similarity tasks.
+
+forwardly, using Equation 3 we can convert bpb to        Since our model is trained to predict each in-
+                                                      dividual character, activations within a word only
+ppl:                                                  have partial information about that word. To get
+                                                      a word representation, we append an empty space
+      perplexity     =  2 |bytes|   ×bpb  (3)
+                           |words|
+
+   We train our model to minimize bpb over the
+training set and convert bpb on the test set to ppl
+for comparison. For the test dataset, we use the
+|words| and |bytes| values reported in Table 1.
+Figure 1: Performance on word similarity tasks described in Shazeer et al. (2016): Spearman’s ρ measuring
+correlation between human annotation and cosine similarities on word representations generated from activations
+on different transformer layers.
+
+character at the end of the input word. The activa-    tween layers 4-6, but picks up again and improves
+tion at the space position from the transformer’s      with depth (layers 6-40). We hypothesize that the
+feed-forward layer takes all characters into ac-       model may be storing words at different depths ac-
+count, given the causal attention. To predict what     cording to their frequency. It would be interesting
+follows the space, the model must have a good un-      to investigate to what degree the improved perfor-
+derstanding of the preceding word, so this activa-     mance of deeper LMs is due to better modeling of
+tion can be used as a proxy for a word representa-     rare words/phrases.
+tion.
+                                                          Table 3 shows the best performance of our
+   To evaluate our extracted word representations,     model across all layers compared to the state-of-
+we use the word similarity tasks described in          the-art model on word similarity. The gap here is
+Swivel (Shazeer et al., 2016). Following their         a reminder that work remains to be done on im-
+evaluation methodology, we score word pairs us-        proving methods for extracting word representa-
+ing cosine similarity, and then measure the corre-     tions from character models.
+lation with human ratings using Spearman’s ρ.
+                                                       Dataset                   Ours Swivel
+   We do not expect these results to be competi-
+tive, given that our model is never trained to repre-  men (Bruni et al., 2012)  0.35 0.76
+sent words. Moreover, the Swivel model is trained
+on a combination of Wikipedia and the Gigaword5        mturk (Radinsky et al., 2011) 0.32 0.72
+corpus (Parker et al., 2011) which is composed of
+3.3 billion lowercased words with discarded punc-      rarewords (Luong et al., 2013) 0.46 0.48
+tuation. They discard out-of-vocabulary words
+for evaluation, while we use all word pairs in the     simlex999 (Hill et al., 2014) 0.31 0.40
+benchmark. Nevertheless, this evaluation is valu-
+able for comparing the relative quality of repre-      ws353 (Finkelstein et al., 2002) 0.38 -
+sentation across different layers.
+                                                       ws353rel (Zesch et al., 2008) 0.31 0.62
+   Figure 1 shows Spearman’s ρ across different
+layers of the model. We observe two main phases        ws353sim (Agirre et al., 2009) 0.43 0.75
+of performance. In the ﬁrst phrase (layers 1-
+10), all task metrics improve with depth. In the       Table 3: Spearman’s ρ for different datasets using our
+second phase (layers 11-40), performance either        model activations. We report the best value achieved
+plateaus or degrades slightly with depth. We sus-      across all layers versus Swivel (Shazeer et al., 2016).
+pect that the earlier layers learn general-purpose
+features which are linguistically relevant, while      6 Conclusion
+the ﬁnal layers ﬁne-tune speciﬁcally to the task
+of next character prediction. Interestingly, the       We show that a tokenizer-free language model
+Rare Word and SimLex999 datasets do not fol-           with sufﬁcient capacity can achieve results that
+low this paradigm. Their performance drops be-         are competitive with word-based LMs. Our model
+                                                       reads raw byte-level input without the use of any
+                                                       text preprocessing. As such, the model has no di-
+                                                       rect access to word boundary information. Finally,
+                                                       we show that our model’s intermediate represen-
+                                                       tations capture word-level semantic similarity and
+                                                       relatedness across layers.
+References                                                Jeremy Howard and Sebastian Ruder. 2018. Universal
+                                                             language model ﬁne-tuning for text classiﬁcation.
+Eneko Agirre, Enrique Alfonseca, Keith Hall, Jana            arXiv preprint arXiv:1801.06146.
+   Kravalova, Marius Pas¸ca, and Aitor Soroa. 2009. A
+   study on similarity and relatedness using distribu-    Yoon Kim, Yacine Jernite, David Sontag, and Alexan-
+   tional and wordnet-based approaches. In Proceed-          der M. Rush. 2016. Character-aware neural lan-
+   ings of Human Language Technologies: The 2009             guage models. In Proceedings of the Thirtieth AAAI
+   Annual Conference of the North American Chap-             Conference on Artiﬁcial Intelligence, AAAI’16,
+   ter of the Association for Computational Linguistics,     pages 2741–2749. AAAI Press.
+   NAACL ’09, pages 19–27, Stroudsburg, PA, USA.
+   Association for Computational Linguistics.             Diederik P Kingma and Jimmy Ba. 2014. Adam: A
+                                                             method for stochastic optimization. arXiv preprint
+Rami Al-Rfou, Dokook Choe, Noah Constant, Mandy              arXiv:1412.6980.
+   Guo, and Llion Jones. 2019. Character-level lan-
+   guage modeling with deeper self-attention. In          Jason Lee, Kyunghyun Cho, and Thomas Hof-
+   Thirty-Third AAAI Conference on Artiﬁcial Intelli-        mann. 2016. Fully character-level neural machine
+   gence.                                                    translation without explicit segmentation. CoRR,
+                                                             abs/1610.03017.
+Alexei Baevski and Michael Auli. 2018. Adaptive in-
+   put representations for neural language modeling.      Thang Luong, Richard Socher, and Christopher Man-
+   arXiv preprint arXiv:1809.10853.                          ning. 2013. Better word representations with recur-
+                                                             sive neural networks for morphology. In Proceed-
+Piotr Bojanowski, Edouard Grave, Armand Joulin, and          ings of the Seventeenth Conference on Computa-
+   Tomas Mikolov. 2017. Enriching word vectors with          tional Natural Language Learning, pages 104–113,
+   subword information. Transactions of the Associa-         Soﬁa, Bulgaria. Association for Computational Lin-
+   tion for Computational Linguistics, 5:135–146.            guistics.
+
+Elia Bruni, Gemma Boleda, Marco Baroni, and Nam-          Rovert Parker, David Graff, Junbo Kong, Ke Chen, and
+   Khanh Tran. 2012. Distributional semantics in tech-       Kazuaki Maeda. 2011. English gigaword ﬁfth edi-
+   nicolor. In Proceedings of the 50th Annual Meet-          tion. Philadelphia. Linguistic Data Consortium.
+   ing of the Association for Computational Linguis-
+   tics: Long Papers - Volume 1, ACL ’12, pages 136–      Matthew E Peters, Mark Neumann, Mohit Iyyer, Matt
+   145, Stroudsburg, PA, USA. Association for Com-           Gardner, Christopher Clark, Kenton Lee, and Luke
+   putational Linguistics.                                   Zettlemoyer. 2018. Deep contextualized word rep-
+                                                             resentations. arXiv preprint arXiv:1802.05365.
+Ciprian Chelba, Tomas Mikolov, Mike Schuster, Qi Ge,
+   Thorsten Brants, Phillipp Koehn, and Tony Robin-       Alec Radford, Karthik Narasimhan, Tim Salimans, and
+   son. 2013. One billion word benchmark for measur-         Ilya Sutskever. 2018. Improving language under-
+   ing progress in statistical language modeling. arXiv      standing by generative pre-training.
+   preprint arXiv:1312.3005.
+                                                          Alec Radford, Jeffrey Wu, Rewon Child, David Luan,
+Zihang Dai, Zhilin Yang, Yiming Yang, William W              Dario Amodei, and Ilya Sutskever. 2019. Language
+   Cohen, Jaime Carbonell, Quoc V Le, and Ruslan             models are unsupervised multitask learners. OpenAI
+   Salakhutdinov. 2019. Transformer-xl: Attentive lan-       Blog, 1:8.
+   guage models beyond a ﬁxed-length context. arXiv
+   preprint arXiv:1901.02860.                             Kira Radinsky, Eugene Agichtein, Evgeniy
+                                                             Gabrilovich, and Shaul Markovitch. 2011. A
+Jacob Devlin, Ming-Wei Chang, Kenton Lee, and                word at a time: Computing word relatedness using
+   Kristina Toutanova. 2018. BERT: pre-training of           temporal semantic analysis. In Proceedings of the
+   deep bidirectional transformers for language under-       20th International Conference on World Wide Web,
+   standing. CoRR, abs/1810.04805.                           WWW ’11, pages 337–346, New York, NY, USA.
+                                                             ACM.
+Lev Finkelstein, Evgeniy Gabrilovich, Yossi Matias,
+   Ehud Rivlin, Zach Solan, Gadi Wolfman, and Ey-         Rico Sennrich, Barry Haddow, and Alexandra Birch.
+   tan Ruppin. 2002. Placing search in context: The          2016. Neural machine translation of rare words
+   concept revisited. ACM Trans. Inf. Syst., 20(1):116–      with subword units. In Proceedings of the 54th An-
+   131.                                                      nual Meeting of the Association for Computational
+                                                             Linguistics (Volume 1: Long Papers), pages 1715–
+Philip Gage. 1994. A new algorithm for data compres-         1725, Berlin, Germany. Association for Computa-
+   sion. C Users J., 12(2):23–38.                            tional Linguistics.
+
+Felix Hill, Roi Reichart, and Anna Korhonen. 2014.        Noam Shazeer, Youlong Cheng, Niki Parmar, Dustin
+   Simlex-999: Evaluating semantic models with (gen-         Tran, Ashish Vaswani, Penporn Koanantakool, Peter
+   uine) similarity estimation. CoRR, abs/1408.3456.         Hawkins, HyoukJoong Lee, Mingsheng Hong, Cliff
+                                                             Young, et al. 2018. Mesh-tensorﬂow: Deep learning
+                                                             for supercomputers. In Advances in Neural Infor-
+                                                             mation Processing Systems, pages 10414–10423.
+Noam Shazeer, Ryan Doherty, Colin Evans, and Chris
+   Waterson. 2016. Swivel: Improving embeddings by
+   noticing what’s missing. CoRR, abs/1602.02215.
+
+Noam Shazeer, Azalia Mirhoseini, Krzysztof Maziarz,
+   Andy Davis, Quoc Le, Geoffrey Hinton, and Jeff
+   Dean. 2017. Outrageously large neural networks:
+   The sparsely-gated mixture-of-experts layer. arXiv
+   preprint arXiv:1701.06538.
+
+Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob
+   Uszkoreit, Llion Jones, Aidan N Gomez, Łukasz
+   Kaiser, and Illia Polosukhin. 2017. Attention is all
+   you need. In Advances in neural information pro-
+   cessing systems, pages 5998–6008.
+
+Torsten Zesch, Christof Mu¨ller, and Iryna Gurevych.
+   2008. Using wiktionary for computing semantic
+   relatedness. In Proceedings of the 23rd National
+   Conference on Artiﬁcial Intelligence - Volume 2,
+   AAAI’08, pages 861–866. AAAI Press.
+

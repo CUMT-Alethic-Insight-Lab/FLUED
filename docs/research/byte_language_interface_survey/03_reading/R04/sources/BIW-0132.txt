@@ -1,0 +1,1207 @@
+                                       Understanding and Mitigating Tokenization Bias in Language Models
+
+                                                           Buu Phan * 1 Marton Havasi 2 Matthew Muckley 2 Karen Ullrich 2
+
+arXiv:2406.16829v2 [cs.CL] 5 Jul 2024                     Abstract                                       2023; Galle´, 2019; Goldman et al., 2024) have focused on
+                                                                                                         enhancing vocabulary design and encoding algorithms for
+                                       State-of-the-art language models are autoregres-                  better performance in downstream tasks. However, the re-
+                                       sive and operate on subword units known as to-                    lationship between compression and model performance
+                                       kens. Specifically, one must encode the condi-                    remains unclear. Some research suggests the impact of com-
+                                       tioning string into a list of tokens before passing               pression is not always positive (Schmidt et al., 2024; Dagan
+                                       to the language models for next-token prediction.                 et al., 2024; Goyal et al., 2023). Consequently, understand-
+                                       We show that popular encoding schemes, such                       ing tokenization’s effect on model performance continues
+                                       as maximum prefix encoding (MPE) and byte-                        to be an open question.
+                                       pair-encoding (BPE), induce a sampling bias that
+                                       cannot be mitigated with more training or data.                   Tokenization has been criticized for introducing many short-
+                                       To counter this universal problem, for each encod-                comings in LMs. These include sensitivity to spelling and
+                                       ing scheme above, we propose a novel algorithm                    morphological structure (Xue et al., 2022), language-based
+                                       to obtain unbiased estimates from any language                    biases (Petrov et al., 2024), subpar performance in specific
+                                       model trained on tokenized data. Our methods do                   tasks such as arithmetic (Singh & Strouse, 2024), or new
+                                       not require finetuning the model, and the complex-                domains (Liu et al., 2023a). One approach to address these
+                                       ity, defined as the number of model runs, scales                  issues is through fine-tuning the model with new vocabu-
+                                       linearly with the sequence length in the case of                  laries; however, this often complicates the training process
+                                       MPE. As a result, we show that one can simulate                   and requires domain-specific expertise (Chen et al., 2023;
+                                       token-free behavior from a tokenized language                     Liu et al., 2023b). Furthermore, the performance gains do
+                                       model. We empirically verify the correctness of                   not provide a theoretical understanding of whether these
+                                       our method through a Markov-chain setup, where                    limitations truly arise from the tokenization process or re-
+                                       it accurately recovers the transition probabilities,              sult from suboptimal model training. Another direction is
+                                       as opposed to the conventional method of directly                 to develop token-free LMs (Yu et al., 2024; Nawrot et al.,
+                                       prompting tokens into the language model.                         2022; Tay et al., 2021). While this approach has potential
+                                                                                                         as it eliminates tokenization-related issues, it significantly
+                                       1. Introduction                                                   increases the context length, resulting in performance that
+                                                                                                         still lags behind the SOTA tokenized LMs 1(Yu et al., 2024).
+                                       Tokenization is a preprocessing procedure used in many
+                                       state-of-the-art (SOTA) language models (LMs) such as             In this work we offer new theoretical insights on the behav-
+                                       GPTs (Brown et al., 2020), Llama (Touvron et al., 2023) and       ior of tokenized LMs. We show that they are statistically
+                                       Gemini (Gemini, 2023). It divides the input text into smaller     equivalent to their token-free counterparts. Specifically,
+                                       subword units while retaining linguistic importance, helping      we examine the maximum prefix encoding (MPE) scheme
+                                       to address vocabulary limitations such as unknown words.          employed in the WordPiece tokenization method (Devlin
+                                       Tokenization also shortens (compresses) the input context         et al., 2018; Song et al., 2020) and find that this process not
+                                       length (Sennrich et al., 2015; Kudo & Richardson, 2018).          only results in biased estimates of next token probabilities,
+                                       Since effective compression allows transformer-based LMs          but also leads to overall skewed estimates of subsequent
+                                       to handle longer context strings, many works (Zouhar et al.,      character probabilities. In general, this bias persists despite
+                                                                                                         an increase in training data, even within the simple setting
+                                          *Work done during internship at Meta FAIR 1University          of a 1st-order Markov chain. Such bias occurs due to the
+                                       of Toronto 2Meta AI. Correspondence to: Buu Phan                  implicit disparity between the domain of the conditioning
+                                                                                                         context, namely, characters versus tokens. Nevertheless,
+                                       <truong.phan@mail.utoronto.ca>,  Karen  Ullrich                   we will show that it is possible to correct this bias without
+
+                                       <karenu@meta.com>.                                                    1We refer language models that process tokenized texts as
+                                                                                                         tokenized language models (tokenized LMs).
+                                       Accepted in ICML 2024 Workshop on Theoretical Foundations
+                                       of Foundation Models, Vienna, Austria. Copyright 2024 by the
+                                       author(s).
+
+                                                                                                      1
+Understanding and Mitigating Tokenization Bias in Language Models
+
+resorting to finetuning. Once adjusted, it becomes possi-              setup, where each string s in the dataset is first tokenized
+ble to simulate the token-free behavior learned implicitly             with the encoding function encode(.) and vocabulary V, and
+by the tokenized LM and even (theoretically) mimic the                 the parameters θ are optimized to maximize the predictive
+behavior of another tokenized model employing a distinct               likelihood of the next token in the tokenized dataset.
+vocabulary set, all without requiring finetuning. Our specific
+contributions are as follows:                                          2.2. Next-Character Sampling Bias
+
+• We show the presence of a bias in the next-token distribu-           We first define the (next-character) sampling bias problem
+  tion that arises as a result of the tokenization process.            that describes the discrepancy between the character level
+                                                                       and token level predictions for tokenized LMs.
+• We present two novel algorithms to correct this bias for
+  MPE and Byte-Pair-Encoding (BPE) respectively. Due                   Definition 2.1. (Next-Character Sampling Bias) Let the in-
+  to space limit, the analysis and algorithm for BPE are               put prompt string x1n has ti1=encode(x1n) as the correspond-
+  presented in Appendix H.                                             ing encoding. The next-character sampling bias occurs
+                                                                       for this prompt when Pgt(xn+1|x1n)̸=Pgt(xn+1|t1i ) where
+• We verify the correctness of our algorithms on learning              Pgt(xn+1|t1i )= t∈E Pgt(ti+1=t|t1i ) where E = {t ∈
+  the transition matrix of a k-th order Markov chain.                  V|decode(t) ∈ S(xn+1)}.
+
+2. Problem Setup                                                       In other words, the probability of the next character being
+                                                                       “c” may be different from the sum of the probabilities of
+We begin by establishing the tokenization and language mod-            all tokens that start with “c”. Note that this character-level
+els setup in our paper. We then describe the next-character            probability offers a broader perspective compared to the
+sampling bias problem due to tokenization.                             probability of the subsequent token being exactly “c”.
+
+2.1. Notations and Setup.                                              Example. Consider a first order Markov chain with two
+                                                                       states {“A”, “B”} as shown in Figure 1 (left). Each string
+String Notations. For any string s, we denote its sub-                 is tokenized with V={“AA”, “A”, “B”}, which leads to
+string from i to j as xij:=xixi+1..xj, where each x is                 a new Markov chain whose states and transition matrix
+a character of the alphabet A. For a given string x1N ,                is shown in Figure 1 (right). Details on computing the
+we define the prefix function that generates a set con-                transition matrix of the new Markov chain is in Appendix
+taining all possible prefix strings of xN1 , represented as            F. We first observe that for the prompt s1=“AA” and
+prefix(xN1 )={x11, x21, x13, ..., xN1 }. Also, we define a con-        s2=”B”, there is no bias problem after marginalization2.
+catenation function concat(.) that concatenates the given              However, for the prompt s3=“A”, the sampling bias oc-
+list of strings, e.g given s1=x1N1 and s2=y1N2 , we obtain             curs as Pgt(x2=“B”|t1=“A”)=1.0, which is not equal to
+concat(s1, s2)=concat(xN1 1 , y1N2 )=x1...xN1 y1...yN2 . Fi-           Pgt(x2=“B”|x1=“A”)=α, i.e. the optimally trained LM
+nally, we denote the set of all strings that start with a prefix       will always output “B”. In fact, for any context string that
+xn1 as S(xn1 )={s|x1n∈prefix(s)}.                                      ends with token “A”, e.g “AA|A” and “B|A” (tokens are
+                                                                       separated by “|”), such LM will always output “B”.
+Tokenization Setting. We assume having a predefined
+vocabulary V constructed using any tokenization algorithm              Since this applies to any optimally trained LM, increasing
+such as BPE, with the condition that A⊆V. We use t to                  the training set size does not mitigate this problem. The
+denote a token in V, i.e. t∈V. Importantly, we use the                 reason for this sampling bias is that, during the tokenization
+longest prefix matching strategy for tokenization (encoding),          process with longest prefix matching, the token “A” must
+denoted as encode(.), similar to the approach used in the              be followed by the token “B”. Else, MPE encoding will
+Wordpiece algorithm (Devlin et al., 2018; Song et al., 2020).          merge to create a longer token “AA”. We generalize this
+Given a sequence of tokens t1k, the function decode(.) re-             phenomenon with the definition of invalid encodings.
+turns the concatenated string resulting from processing each
+token in the sequence. Finally, the set of all strings that starts     Definition 2.2. (Invalid Encodings) The list of tokens (an
+with the tokens tk1 is defined as S(tk1)={s|t1k=encode(s)1k}.          encoding) ti1 is invalid if encode(decode(ti1))≠ t1i . Other-
+                                                                       wise, it is a valid encoding.
+Tokenized LMs. We assume having access to a tok-
+enized autoregressive LM with parameters θ that is trained             For example, let V={“c”, “a”, “t”, “at”, “cat”} then
+with tokens from V and maximum prefix matching. The                    [“c”,“at”,“t”] and [“c”,“a”,“t”,“t”] are invalid encodings
+target distributions on the character domain is denoted as             of “catt”. We now show in Proposition 2.3 that the exis-
+Pgt(xnN+1|x1n) and on the token domain is Pgt(ti+1|t1i ). For          tence of invalid encodings introduces sampling bias, gen-
+simplicity, unless otherwise stated, we implicitly assume              eralizing the observed phenomenon in the Markov chain
+each probability term involves θ. Using the model, we as-              example to any autoregressive distribution.
+sume that one can compute P (ti+1|ti1) for any integer i > 0.
+In this work, we consider LMs trained under the standard                   2For example, we have Pgt(ti+1=“AA”|ti=“AA”) +
+                                                                       Pgt(ti+1=“A”|ti=“AA”) = α = Pgt(xn+1=“A”|xn=“A”)
+
+                                                                    2
+              Understanding and Mitigating Tokenization Bias in Language Models
+
+                                                                   (1−α)2                  α                      1−β
+
+        α                      Token Vocabulary                            AA                     B
+
+1−α  A     B              1−β     ID Token                                           (1−α)β        1.0
+                                   1A                                                 0.0αβ
+                                   2B                                 α(1−α)
+                                   3 AA
+        β                                                                                  A
+
+     Before Tokenization                                                                        0.0
+
+Input String: “AABABAAAABAAB” | −→ WordPiece Encoding −→ Output Tokens: “AA|B|A|B|AA|AA|B|AA|B”
+
+Figure 1: Next-Character sampling bias introduced by the WordPiece encoding algorithm. In this example, given the context token “A”,
+the model will always predict the next token as “B” with probability 1.0. We present a technique that, given a language model trained on
+tokenized domain, eliminate this bias and recover the accurate unbiased sampling distribution.
+
+Proposition 2.3. (Token-Induced Zero Probability) Let              this corresponds to the tokens “AA” and “B”. Also, we
+ti1 be a sequence of input tokens. For any invalid en-             assume that any string x1N has the first token t1 ∈ V∗3.
+coding ti1, we have Pgt(ti1)=0.0 and the conditional               Consider the input string xn1 and its corresponding encod-
+probability Pgt(ti+1|t1i ) is undefined. In the case t1i           ing t1i =encode(xn1 ), Proposition 3.1 shows the sufficient
+is valid, then Pgt(ti+1|ti1)=0.0 if t1i+1 is invalid. Fur-         condition for S(ti1)=S(x1n).
+thermore, let xn1 =decode(ti1), then for any string xnN+1          Proposition 3.1. Let s∗ = x1n, where t1i = encode(s∗) =
+such that encode(concat(decode(t1i ), xnN+1))̸=ti1, we have        encode(xn1 ). Then we have S(ti1) ⊂ S(x1n), i.e. for any
+Pgt(xNn+1|t1i )=0.0.                                               string s where ti1 = encode(s)i1, we have P (xn1 |ti1) = 1.0.
+                                                                   In the case ti ∈ V∗, then we also have that S(ti1) = S(x1n),
+Proof. See Appendix C.                                             i.e. any string s where x1n ∈ prefix(s) must have the first i
+                                                                   tokens as ti1 and P (t1i |xn1 ) = 1.0.
+Remark 1. Proposition 2.3 implies that LMs may not func-
+tion as expected when presented with invalid encodings,            Proof. See Appendix D.
+because these models will never be exposed to such inputs
+within the dataset. This directly implies that the practice of     The intuition for Proposition 3.1 is that the subsequent string
+evaluating LMs under different encodings (Cao & Rimell,            after ti∈V∗ cannot change the tokenization for xn1 . We now
+2021; Chirkova et al., 2023) is suboptimal.                        establish one of the main results in Corollary 3.2.
+
+3. Alleviating Sampling Bias                                       Corollary 3.2. Following Proposition 3.1, suppose ti ∈ V∗
+                                                                   then we have P (xNn+1|xn1 )=P (xNn+1|t1i ). Similarly, we also
+We propose a method to remove the described bias and               have P (tij+1|x1n)=P (tji+1|ti1).
+recover the original token-free autoregressive model, i.e.
+expressing the implicitly learned P (xnN+1|x1n) using the          Proof. See Appendix D.
+tokenized LM that outputs the conditional probability
+P (ti+1|t1i ). For N =n+1, this captures the behavior of           We note that Proposition 3.1 and Corollary 3.2 always hold,
+a token-free model, i.e. sampling the next character instead
+of a whole token. We assume our LM follows Proposition             regardless of the value of θ. In general, consider when
+2.3 on zero probability events and undefined conditional
+probability for invalid encodings. Appendix G justifies this       the last token of encode(x1n) is not in V∗, we can refactor
+assumption and provides its practical implementation.              P (xNn+1|x1n) as follow:
+
+Our method consists of two stages. In the first stage,             P  (xnN+1  |xn1  )=  P  (xnNk  +1  |t1k  )  ,       (1)
+the idea is to identify the condition when P (xNn+1|ti1) =                              P  (xnnk  +1  |tk1  )
+P (xnN+1|xn1 ) where ti1 = encode(xn1 ). Once identified, we
+can refactor the conditional probability to match the condi-       where k is the last token in encode(x1n) such that tk∈V∗
+tioning events. In the second stage, we compute P (xnN+1|t1i )     and x1nk =decode(tk1), where nk ≤ n. Proof details of this
+using the LM output probability, i.e. P (ti+1|t1i ), through       step can be found in the Appendix E. We then use the MPC
+the novel Maximum Prefix Correction (MPC) Algorithm.               algorithm to compute each term in the RHS individually.
+
+3.1. Refactoring                                                   3.2. Maximum Prefix Correction Algorithm
+
+Our method removes the bias by connecting character                We present the MPC algorithm in Algorithm 1, that al-
+and token domains through a special subset of tokens               lows us to compute the probabilities P (xnNk+1|tk1) and
+V∗⊂V, whose elements t∗∈V∗ are not a substring of                  P (xnnk+1|tk1) in Equation (1). Note that this algorithm does
+any other tokens in V but itself. For example, given               not require tk∈V∗. Details on the algorithmic correctness
+V={“AAA”, “AA”, “CB”, “A”, “B”, “C”}, then V∗ =                    are shown in Appendix E.
+{“AAA”, “CB”}. In the Markov example in Section 2,
+                                                                       3Many current language models begins with a start token
+                                                                   <start> in V∗, e.g. in SentencePiece (Kudo & Richardson, 2018).
+
+                                                                3
+                                     Understanding and Mitigating Tokenization Bias in Language Models
+
+Algorithm 1 Maximum Prefix Correction Algorithm. This algo-                         Vocabulary: ������= {������, ������, ������, ������, ������, ������������, ������������������, ������������������������} Language Model: ������(������#$!|������!# )
+rithm recursively computes P (xnNk+1|tk1 ).                                         Encoding Algorithm: Maximum Prefix Matching
+
+1: procedure COMPUTE(xnNk+1, tk1 )                                                  Query String: “������������������”                                    Recursive  Recursive                          Base
+2: // Branching Step:                                                               Input Tokens: ������!"                                          Call 1     Call 2                           Case
+3: B = {t ∈ V|xnNk+1∈prefix(decode(t))}                                             Output Probability:
+4: bval = P (tk+1 = t t1k)                                                          ������(������%%!!$$!& = “������������������”|������!")                            ������������������������   ������������������                             ������������������
+
+                          t∈B                                                       Note: Only selected                                  Branchbval           bval
+                                                                                    tokens by the MPC                                                          Branch          ������������
+5: // Base Case:                                                                    Algorithm are shown at                                                                          Branch������ Pass
+                                                                                    each recursive call                                       pval                     Branch
+6: if encode(xNi ) ∈ V then                                                                                                ������!" Pass
+                                                                                                                                                              ������ Branch ������
+7:              return bval                                                                                             Previous
+                                                                                                                         Tokens                               pval                          bval
+8: end if
+
+9: //Extract the Next Token:
+
+10:         tk+1 = encode(xnNk+1)1                                                  Figure 2: MPC Visualization. At each recursive call, the Branch
+                                                                                    step finds tokens that starts with the query string while the Pass
+11: // Passing Step:                                                                step extracts and employs the next token and leftover string for the
+                                                                                    next recursive call until meeting the base case.
+12:         pval = P (tk+1 tk1 )
+
+13:         pval = pval × COMPUTE(xNnk+1+1, t1k+1)
+
+14: return bval + pval                                                                                    1.0
+
+15: end procedure                                                                                              Ground Truth: Pgt(xn+1|xnn−2)  Baseline: P (xn+1|ti1)
+                                                                                                               Our Method: P (xn+1|x1n)
+                                                                                    Probability of Next   0.8
+                                                                                       Character being A
+The idea is to marginalize out P (xNnk+1|t1k) by considering                                              0.6
+two complementary events: when the next token tk+1 has
+a prefix xNnk+1 (bval in the Branch Step) versus when the                                                 0.4
+next token tk+1 is contained within xnNk+1 (pval in the Pass
+Step). Formally, MPC computes the following probabilities:                                                0.2
+
+                                                                                                          0.0 AAA  AAB  ABA              ABB  BAA        BAB          BBA                   BBB
+                                                                                                                                         Input States
+
+            bval = P (xNnk+1, tk+1 ∈ B(xnNk+1)) tk1 ),                     (2)      Figure 3: Our method accurately estimates the transition probabil-
+                                                                                    ity of a 3rd order Markov chain while the baseline method fails to.
+            pval = P (xnNk+1, tk+1 ∈/ B(xNnk+1)) t1k),                     (3)
+
+where B(xNnk+1)={t∈V|xNnk+1∈prefix(decode(t))} and                                  construct the transition matrix and the vocabulary
+we immediately see that P (xNnk+1|t1k)=bval+pval.                                   V={“A”, “B”, “AA”, “BAAB”, “BBAA”, “BBBA”,
+                                                                                    “BA”, “BBA”}. We train a LM model using GPT-2
+We provide an intuitive explanation for the algorithm fol-                          architecture with 6 hidden layers. Since the model is
+                                                                                    agnostic to the Markov chain order, we average the
+lowing the example in Figure 2. Here, we would like to                              probability from 100 runs on different context length
+                                                                                    while fixing the last 3 characters. We compare our method
+compute     the  probability  P   (xnnkk  +3  =“bee”|t1k   ).  The  first  pos-     with the baseline estimator P (xn+1|ti1), equivalent to one
+                                          +1                                        Branch step in the MPC algorithm. Figure 3 shows the
+                                                                                    results where the baseline method exhibits significant
+sibility is that “bee” is a prefix of the next token, so we                         sampling bias due to tokenization. Following Proposition
+                                                                                    2.3, one can clarify the zero probability events output from
+search for all such tokens (line 3 in the algorithm) and sum                        the baseline estimator. Our method, in contrast, accurately
+up their probability (line 4), i.e. bval=P (tk+1=“beer”|t1k).                       estimates the ground truth probability used to generate the
+Figure 2 visualizes this step as branching out the tree by                          data, showing that it is possible to recover the implicitly
+                                                                                    learned character information from the tokenized LMs.
+finding all tokens completing the string. Since “beer” is
+
+not the only string that contains “bee”, e.g. “beep”, “been”,
+
+etc. we need to compute the probability for these other
+
+scenarios, each of which has tk+1=“b” (the first token in
+
+“bee”, line 10 and 12) due to maximum prefix encoding.
+
+Then, we want to compute the probability that the subse-
+
+quent string is “ee” (line 13), given the previous t1k and                          5. Conclusion
+
+tk+1=“b”, which is the output of the MPC algorithm but                              This work identifies the next-character sampling gap be-
+     xnnkk  +3                                                                      tween a tokenized model and a token-free one, which per-
+for         +2  =“ee”  and   t1k+1.  Formally,  in      the    Passing  step:       sists even for optimally trained models. We present a proba-
+                                                                                    bilistic approach to effectively eliminate this bias without
+pval  =P    (tk+1  =“b”|tk1  )P  (xnnkk  +3  =“ee”|t1k  ,  tk+1=“b”).      We       requiring additional training. This closes the sampling gap
+                                         +2                                         between tokenized and token-free models, suggesting that
+                                                                                    language models implicitly absorb character-level informa-
+continue the procedure until meeting the base case, where                           tion despite being trained solely on tokenized text. This
+                                                                                    result implies that it is theoretically possible to simulate the
+the string must be a prefix of the next token (usually, when                        behavior of another language model trained using different
+                                                                                    vocabulary without any fine-tuning, since it is possible to
+there is only a single character left). Finally, by computing                       transfer from token-free models to tokenized counterparts.
+
+the sum of the branch and pass steps, we obtain the desired
+
+conditional     probability   bval+pval=P     (xnnkk    +3  =“bee”|t1k     ).
+                                                        +1
+
+4. Experiments
+
+We validate our method on a 3rd order Markov chain
+experiment with A={“A”,“B”}, where we randomly
+
+                                                                                 4
+Understanding and Mitigating Tokenization Bias in Language Models
+
+References                                                        guidance ai. Guidance ai, 2023. URL https://github.
+                                                                     com/guidance-ai/guidance. GitHub repository.
+Brown, T., Mann, B., Ryder, N., Subbiah, M., Kaplan, J. D.,
+   Dhariwal, P., Neelakantan, A., Shyam, P., Sastry, G.,          Gutierrez-Vasques, X., Bentz, C., and Samardzˇic´, T. Lan-
+  Askell, A., et al. Language models are few-shot learners.          guages through the looking glass of bpe compression.
+  Advances in neural information processing systems, 33:            Computational Linguistics, 49(4):943–1001, 2023.
+  1877–1901, 2020.
+                                                                  Kudo, T. and Richardson, J. Sentencepiece: A sim-
+Cao, K. and Rimell, L. You should evaluate your language             ple and language independent subword tokenizer and
+   model on marginal likelihood over tokenisations. In Pro-          detokenizer for neural text processing. arXiv preprint
+   ceedings of the 2021 Conference on Empirical Methods              arXiv:1808.06226, 2018.
+   in Natural Language Processing, pp. 2104–2114, 2021.
+                                                                  Liu, S., Deng, N., Sabour, S., Jia, Y., Huang, M., and Mihal-
+Chen, Y., Marchisio, K., Raileanu, R., Adelani, D.,                  cea, R. Task-adaptive tokenization: Enhancing long-form
+   Saito Stenetorp, P. L. E., Riedel, S., and Artetxe, M.            text generation efficacy in mental health and beyond. In
+   Improving language plasticity via pretraining with active        The 2023 Conference on Empirical Methods in Natural
+   forgetting. Advances in Neural Information Processing            Language Processing, 2023a.
+  Systems, 36:31543–31557, 2023.
+                                                                  Liu, Y., Lin, P., Wang, M., and Schu¨tze, H. Ofa: A
+Chirkova, N., Kruszewski, G., Rozen, J., and Dymetman,               framework of initializing unseen subword embeddings for
+   M. Should you marginalize over possible tokenizations?            efficient large-scale multilingual continued pretraining.
+   In The 61st Annual Meeting Of The Association For Com-            arXiv preprint arXiv:2311.08849, 2023b.
+   putational Linguistics, 2023.
+                                                                  Makkuva, A. V., Bondaschi, M., Girish, A., Nagle, A., Jaggi,
+Cleary, J. and Witten, I. Data compression using adaptive            M., Kim, H., and Gastpar, M. Attention with markov:
+   coding and partial string matching. IEEE transactions on         A framework for principled analysis of transformers via
+  Communications, 32(4):396–402, 1984.                               markov chains. arXiv preprint arXiv:2402.04161, 2024.
+
+Cognetta, M., Zouhar, V., Moon, S., and Okazaki, N. Two           Minixhofer, B., Ponti, E. M., and Vulic´, I. Zero-shot tok-
+   counterexamples to\textit {Tokenization and the Noise-            enizer transfer. arXiv preprint arXiv:2405.07883, 2024.
+   less Channel}. arXiv preprint arXiv:2402.14614, 2024.
+                                                                  Nawrot, P., Chorowski, J., Łan´cucki, A., and Ponti, E. M.
+Dagan, G., Synnaeve, G., and Rozie`re, B. Getting the                Efficient transformers with dynamic token pooling. arXiv
+   most out of your tokenizer for pre-training and domain            preprint arXiv:2211.09761, 2022.
+   adaptation. arXiv preprint arXiv:2402.01035, 2024.
+                                                                  Petrov, A., La Malfa, E., Torr, P., and Bibi, A. Language
+Devlin, J., Chang, M.-W., Lee, K., and Toutanova, K. Bert:           model tokenizers introduce unfairness between languages.
+   Pre-training of deep bidirectional transformers for lan-         Advances in Neural Information Processing Systems, 36,
+   guage understanding. arXiv preprint arXiv:1810.04805,             2024.
+   2018.
+                                                                  Provilkov, I., Emelianenko, D., and Voita, E. Bpe-dropout:
+Galle´, M. Investigating the effectiveness of bpe: The power         Simple and effective subword regularization. arXiv
+   of shorter sequences. In Proceedings of the 2019 confer-          preprint arXiv:1910.13267, 2019.
+   ence on empirical methods in natural language process-
+   ing and the 9th international joint conference on natural      Rajaraman, N., Jiao, J., and Ramchandran, K. To-
+   language processing (EMNLP-IJCNLP), pp. 1375–1381,               ward a theory of tokenization in llms. arXiv preprint
+   2019.                                                             arXiv:2404.08335, 2024.
+
+Gemini, T. Gemini: a family of highly capable multimodal          Schmidt, C. W., Reddy, V., Zhang, H., Alameddine, A.,
+   models. arXiv preprint arXiv:2312.11805, 2023.                    Uzan, O., Pinter, Y., and Tanner, C. Tokenization is more
+                                                                     than compression. arXiv preprint arXiv:2402.18376,
+Goldman, O., Caciularu, A., Eyal, M., Cao, K., Szpektor, I.,         2024.
+   and Tsarfaty, R. Unpacking tokenization: Evaluating text
+   compression and its correlation with model performance.        Sennrich, R., Haddow, B., and Birch, A. Neural machine
+   arXiv preprint arXiv:2403.06265, 2024.                            translation of rare words with subword units. arXiv
+                                                                     preprint arXiv:1508.07909, 2015.
+Goyal, S., Ji, Z., Rawat, A. S., Menon, A. K., Kumar, S., and
+   Nagarajan, V. Think before you speak: Training language
+   models with pause tokens. In The Twelfth International
+  Conference on Learning Representations, 2023.
+
+                                                               5
+                                     Understanding and Mitigating Tokenization Bias in Language Models
+Singh, A. K. and Strouse, D. Tokenization counts: the im-
+
+   pact of tokenization on arithmetic in frontier llms. arXiv
+   preprint arXiv:2402.14903, 2024.
+Song, X., Salcianu, A., Song, Y., Dopson, D., and
+   Zhou, D. Fast wordpiece tokenization. arXiv preprint
+   arXiv:2012.15524, 2020.
+Tay, Y., Tran, V. Q., Ruder, S., Gupta, J., Chung, H. W.,
+   Bahri, D., Qin, Z., Baumgartner, S., Yu, C., and Metzler,
+   D. Charformer: Fast character transformers via gradient-
+   based subword tokenization. In International Conference
+   on Learning Representations, 2021.
+Touvron, H., Lavril, T., Izacard, G., Martinet, X., Lachaux,
+   M.-A., Lacroix, T., Rozie`re, B., Goyal, N., Hambro, E.,
+  Azhar, F., et al. Llama: Open and efficient foundation lan-
+   guage models. arXiv preprint arXiv:2302.13971, 2023.
+Willems, F. M., Shtarkov, Y. M., and Tjalkens, T. J. The
+   context-tree weighting method: Basic properties. IEEE
+   transactions on information theory, 41(3):653–664, 1995.
+Xue, L., Barua, A., Constant, N., Al-Rfou, R., Narang, S.,
+   Kale, M., Roberts, A., and Raffel, C. Byt5: Towards
+   a token-free future with pre-trained byte-to-byte mod-
+   els. Transactions of the Association for Computational
+  Linguistics, 10:291–306, 2022.
+Yu, L., Simig, D., Flaherty, C., Aghajanyan, A., Zettlemoyer,
+   L., and Lewis, M. Megabyte: Predicting million-byte
+   sequences with multiscale transformers. Advances in
+  Neural Information Processing Systems, 36, 2024.
+Zouhar, V., Meister, C., Gastaldi, J., Du, L., Sachan, M.,
+   and Cotterell, R. Tokenization and the noiseless channel.
+   In Proceedings of the 61st Annual Meeting of the Asso-
+   ciation for Computational Linguistics (Volume 1: Long
+  Papers), pp. 5184–5207, 2023.
+
+                                                                         6
+                                     Understanding and Mitigating Tokenization Bias in Language Models
+
+A. Related Work
+
+Theory of Tokenization. Existing works on tokenization generally support the idea that compressing tokens enhances
+model performance (Galle´, 2019; Gutierrez-Vasques et al., 2023; Zouhar et al., 2023). However, these emperically findings
+are in conflicted with other later studies Cognetta et al. (2024); Schmidt et al. (2024). On the theoretical side, Rajaraman
+et al. (2024) examined tokenization through the lens of unigram models, motivated by the observation made by Makkuva
+et al. (2024) that transformers struggles to learn 2nd-order Markov chains. We, however, do not observe this phenomenon in
+our experiment. As such, our work on bias due to tokenization is not affected by their observation.
+
+Tokenization and Perplexity. Our work relates to the statistical evaluation of LMs, where we provide an algorithm
+to directly evaluate the character-level perplexity p(xNn+1|xn1 ), using a tokenized LM. In terms of token-level perplexity
+evaluation, some recent studies (Cao & Rimell, 2021; Chirkova et al., 2023) have suggested using stochastic tokenization
+(Provilkov et al., 2019) at test time to evaluate perplexity scores of LMs (p(ti1)). However, these evaluations were done on
+LMs trained with deterministic tokenization which could be suboptimal as demonstrated by our examination of undefined
+states in Section 2. As such, by utilizing our approach, one can obtain a much more accurate insights on LMs evaluation.
+
+Related Algorithms. Our algorithm is inspired from the literature of universal compression such as prediction by partial
+matching (Cleary & Witten, 1984) and context-tree weighting (Willems et al., 1995), which have been applied for text
+prediction but for much simpler settings without any tokenization involved. Recently, Minixhofer et al. (2024); Liu et al.
+(2023a) propose tokenization adaptation methods, which still requires a heuristic optimization that complicates the training
+pipeline. Some recent studies have proposed method to target the problem of language models encountering difficulties
+generating text near prompt boundaries (Dagan et al., 2024; guidance ai, 2023), which bears some resemblance to our
+proposed algorithm. These methods, however, are heuristic and only applicable to certain scenarios. On the other hand, our
+bias removal algorithm is theoretically correct, versatile for various situations, and enables conversion between token-free
+and tokenized LMs due to its accurate representation of conditional sampling distributions.
+
+B. Supporting Theorems on Maximum Prefix Encoding
+
+This section provides supporting theorems for the proof of the main results. We first remind the readers that the set S(x1n)
+corresponds to the set of all strings that contain xn1 as a prefix. Similarly, the event set S(t1i ) corresponds to the set of all
+strings whose first i tokens are ti1. Consider when t1i = encode(x1n), it should be noted that the two sets S(ti1) and S(xn1 )
+are not guaranteed to be equivalent. That is because the subsequent characters after xn1 can affect the tokenization within the
+first n character. We illustrate this in more detail in the following example.
+
+Example. Consider the Markov chain example in Section 2, where V = {“AA”, “A”, “B”}. Then, the string s1 =
+“AABAABAB”, then s1 ∈ S(x1 = “A”) and s1 ∈ S(t1 = “AA”) since the first character of s1 is “A” and the first token
+of s1 is “AA”. On the other hand, s1 ∈/ S(t1 = encode(x1) = “A”) since its first token is “AA”, not “A”.
+
+We introduce the Proposition B.1 that contains two facts regarding the MPE process, visually presented in Figure 4.
+Proposition B.1. Let s be a string with the prefix x1n (x1n ∈ prefix(s)). Define the minimal superstring r to be the prefix of
+s with the fewest tokens that contains xn1 as a prefix: r = argminr(k|t1k = encode(r) ∧ xn1 ∈ prefix(r) ∧ r ∈ prefix(s)).
+Then, we have the followings:
+
+1. For 1 ≤ i < k, encode(s)i = encode(x1n)i. Furthermore, when r = x1n, we also have encode(s)k = encode(xn1 )k.
+
+2. Let ℓ be the number of tokens in encode(xn1 ), then we have decode(encode(xn1 )ℓk) ∈ prefix(decode(encode(s)k)).
+
+Proof. (Result 1.) Proof by contradiction. Let s be the counter-example with the fewest number of tokens. Assume that for
+1 ≤ i < k, encode(s)i ̸= encode(xn1 )i. Let j be the smallest of such i.
+Consider encode(s)j and encode(x1n)j.
+• Case 1: |decode(encode(s)1j )| < |x1n|.
+
+   – Case 1.a: |decode(encode(s)j)| < |decode(encode(x1n)j)|. This leads to a contradiction, since xn1 is a prefix of s,
+      therefore a longest prefix matching algorithm would always generate the longer token (encode(xn1 )j) over the shorter
+      one (encode(s)j) when it is available.
+
+   – Case 1.b: |decode(encode(s)j)| > |decode(encode(x1n)j)|. This leads to a contradiction, since concat(encode(s)1j )
+
+                                                                         7
+                Understanding and Mitigating Tokenization Bias in Language Models
+
+Vocabulary ������   Prefix ������!"
+
+ID Tokens         ������ ������ ������ ������ ������
+
+1  ������           encode(������!")                               In the case of MPE, there is no string ������ with prefix ������!" that
+                                                           does not follow the MPE Merge Rule.
+                 ������ ������ ������ ������ ������
+2  ������
+
+3  ������                                                      Probabilistic Interpretations
+
+4  ������������         ������ ������ ������ ������ ������ ������                          Example 1 (See Invalid Encoding):
+                ������ ������ ������ ������ ������ ������                          ������(������!# = {“������������”, “������”, “������������”}) = 0.0
+5  ������������������       ������ ������ ������ ������ ������ ������ ������     Examples of
+                                                           Example 2:
+6  ������������                               encode(������), where    ������(������!$ = “������������”, “������” , ������!% = “������������������������������”) = 0.0
+                                        ������!" ∈ pre-ix(������)  since ������# does not start at the designated position.
+
+7  ������������������
+
+8 ������������������������������������
+
+                                      MPE Merge Rule: Tokens within ������!" of ������ must begin
+                                      at these positions, else the encoding is not valid.
+                                      The positions are determined by encode(������!").
+
+Figure 4: Interpretations of Proposition B.1, which shows that for any string s with prefix xn1 , its token within x1n must start at a certain
+designated positions. For each encoding, same color denotes belonging to the same token. This would later allows us to construct an
+efficient algorithm to correct the bias. See Corollary B.3 for details on invalid encoding.
+
+     is a prefix of x1n (Case 1 assumption), therefore a longest prefix matching algorithm would always generate the longer
+     token (encode(s)j) over the shorter one (encode(xn1 )j) when it is available.
+  – Case 1.c: |decode(encode(s)j)| = |decode(encode(x1n)j)|. This means that the two tokens are the same, contradicting
+     our initial assumption.
+
+• Case 2: |decode(encode(s)1j )| ≥ |xn1 |. In this case, r = decode(encode(s)1j ) is a superstring of x1n implying that k is at
+  most j, which contradicts our initial assumption that 1 ≤ j < k.
+
+Finally, in the case r = x1n, this means decode(encode(s)k) is a suffix of x1n. Since all the tokens before k within x1n has
+been matched, i.e. encode(s)i = encode(x1n)i for 1 ≤ i < k, the last token must also match as the result (else, |r| ̸= |x1n|,
+leads to contradiction), we have encode(s)k = encode(xn1 )k.
+(Result 2.) The proof idea is that since r contains xn1 and any tokens within r and x1n has been matched up to k−1,
+then what is left in xn1 must be in the last token in r (which is the kth token of r). Formally, following Result 1,
+we have decode(encode(x1n)1k−1) = decode(encode(s)k1−1). Since r has k tokens in total and xn1 ∈ prefix(r), this
+means that decode(encode(s)k) must cover the rest of xn1 , i.e. decode(encode(xn1 )ℓk). As the result, we must have
+decode(encode(xn1 )kℓ ) ∈ prefix(decode(encode(s)k)).
+
+We remind the reader the definition of invalid encoding below.
+
+Definition B.2. (Invalid Encodings) The list of tokens (an encoding) tk1 is invalid if encode(decode(t1k))̸=tk1. Otherwise, it
+is a valid encoding.
+
+Corollary B.3. S(tk1) = ∅ if and only if t1k is invalid.
+
+Proof. We prove each direction as follow.
+• If S(tk1) = ∅ then t1k is invalid: Since S(tk1) = ∅, we know that there exist no string s such that encode(s)k1 = tk1. As
+
+  such, for s = decode(tk1), we do not have encode(decode(tk1)) = t1k, which proves the result.
+
+• If t1k is invalid then S(t1k) = ∅: Let xn1 = decode(tk1) and t1i = encode(x1n). Let s1 ∈ S(t1i ) and suppose there exist a
+  string s2 ∈ S(t1k). Re-running the MPE procedure on s1 and s2 in parallel, then every time a token is selected within x1n
+  in s1, it must also be selected at the same position in s2 as well. Thus, we cannot have ti1 ̸= tk1, which proves the result.
+
+                                      8
+                                     Understanding and Mitigating Tokenization Bias in Language Models
+
+C. Proof of Proposition 2.3 in the Main Paper
+
+Proposition 2.3 (Token-Induced Zero Probability) Let ti1 be a sequence of input tokens. For any invalid encoding ti1, we have
+Pgt(t1i )=0.0 and the conditional probability Pgt(ti+1|t1i ) is undefined. In the case ti1 is valid, then Pgt(ti+1|t1i )=0.0 if ti1+1
+is invalid. Furthermore, let x1n=decode(ti1), then for any string xnN+1 such that encode(concat(decode(ti1), xNn+1))̸=ti1,
+we have Pgt(xNn+1|t1i )=0.0.
+
+Proof. For the first two statements, we have:
+• For an invalid ti1 where ti1 ̸= encode(decode(ti1)), we have S(t1i ) = ∅, as implied by Corollary B.3. As such, we have
+
+  Pgt(t1i )=0.0 which leads Pgt(ti+1|ti1) to be an undefined conditional probability .
+• For a valid t1i but invalid t1i+1, we know that Pgt(ti1+1)=0.0, which results in Pgt(ti+1|t1i ) = 0.0.
+For the last statement, we first note the following:
+1. Note that Pgt(xNn+1, t1i ) = Pgt(xN1 , t1i ) where concat(xn1 , xNn+1) = x1N .
+2. Consider Pgt(x1N , t1i ) = Pgt(x1N )Pgt(t1i |x1N ), we will prove that Pgt(ti1|xN1 ) = 0.0 if encode(xN1 )1i ≠ t1i .
+The proof idea for this is shown in Figure 4 (Example 2, Right). Formally:
+• Let j be the first position such that encode(x1N )j ≠ tj then we know that |decode(encode(xN1 )j))| > |decode(tj)|
+
+  (Proposition B.1 (Result 2)).
+
+• Following Proposition B.1 (Result 2), let s ∈ S(xN1 ), then we know that decode(encode(x1N )j) must be a substring
+  of within another longer token (it cannot be broken down) in s. Hence, no string s will have a j-th token as tj, so
+  Pgt(ti1|xN1 ) = 0.0. This completes the proof.
+
+Finally, we note that Pgt(t1i ) = 0.0 does not implies encode(decode(t1i )) ∈ V, since it can be due to the original distribution
+on the character domain. A classic example for this is a Markov model with an absorption state.
+
+D. Proof of Proposition 3.1 and Corollary 3.2 in the Main Paper
+
+Proposition 3.1 Let s∗ = x1n, where ti1 = encode(s∗) = encode(xn1 ). Then we have S(ti1) ⊂ S(xn1 ), i.e. for any string
+s where ti1 = encode(s)1i , we have P (xn1 |t1i ) = 1.0. In the case ti ∈ V∗, then we also have that S(ti1) = S(x1n), i.e. any
+string s where x1n ∈ prefix(s) must have the first i tokens as t1i and P (ti1|xn1 ) = 1.0.
+
+Proof. We prove each case as follow.
+1) General Case: There exists a string s ∈ S(x1n) where encode(s)1i ≠ t1i , following directly from our 1st order Markov
+chain example in the main paper, i.e. the string s = “AA” has “A” as prefix but have the t1 = “AA” ≠ “A”. Also, any
+string s that has the first i tokens as ti1 must have the first n characters as xn1 , hence S(t1i ) ⊂ S(xn1 ) and P (xn1 |ti1) = 1.0.
+2) ti ∈ V∗: The proof idea is that, since ti cannot be a part of any token in V, it is impossible to merge it by appending
+additional characters after ti. Formally, similar to Proposition B.1:
+• For any string s ∈ S(decode(t1i )), let ℓ be the number of tokens in the minimal superstring r of s that contains x1n as a
+
+  prefix.
+
+• Following Proposition B.1 (Result 2), we know that ti must be a substring of decode(encode(s)ℓ).
+
+• Due to ti ∈ V∗, then ti = encode(s)ℓ. We also know from Proposition B.1 (Result 1) that encode(s)i = ti for 1 ≤ i < ℓ,
+  this means that ℓ = i. This gives us t1i = encode(s)1i and P (ti1|xn1 ) = 1.0.
+
+This completes the proof.
+
+Remarks. We briefly note that the condition ti ∈ V∗ is the sufficient condition. In general, any token sequence t1i that
+satisfies S(t1i ) = S(xn1 ) will have P (t1i |xn1 ) = 1.0. One potential strategy is to find the first index i = 0, 1, ...k − 1 such
+that tkk−i cannot be merged into another token in V.
+
+                                                                         9
+                            Understanding and Mitigating Tokenization Bias in Language Models
+
+Corollary 3.2 Following Proposition 3.1, suppose ti ∈ V∗ then we have P (xnN+1|xn1 )=P (xNn+1|ti1). Similarly, we also
+have P (tij+1|xn1 )=P (tji+1|ti1).
+
+Proof. For the first case, we prove through the following equations:
+
+                               P (xnN+1|t1i ) = P (xNn+1|ti1, x1n)                                                      (4)
+
+                                          =     P (xnN+1, t1i |xn1 )                                                    (5)
+                                                   P (ti1|x1n)
+
+                                          =     P (xNn+1|xn1 )P (ti1|x1n, xnN+1)                                        (6)
+                                                           P (ti1|x1n)
+
+                                          = P (xNn+1|x1n)                                                               (7)
+
+where the first equality is due to P (xn1 |t1i ) = 1.0 and the last equality is due to P (t1i |x1n) = 1.0 for ti ∈ V∗.
+
+Similarly, for the second case, we have:
+
+                                          P (tji+1|t1i ) = P (tij+1|x1n, ti1)                                           (8)
+
+                                          =     P (tji+1|xn1 )P (ti1|x1n, tij+1)                                        (9)
+                                                          P (t1i |xn1 )
+
+                                          = P (tji+1|xn1 ),                                                             (10)
+
+which completes the proof.
+
+E. Proof for The Bias Removal Method
+
+E.1. Refactoring
+Our goal is to express the quantity P (xNn+1|xn1 ) using the tokenized LM that outputs the conditional probability P (ti|ti1−1).
+Let xn1 k ∈ prefix(xn1 ) where tk1 = encode(xn1 k ) and tk ∈ V∗. Following Proposition 3.1, any string s with prefix x1nk must
+have the first k tokens as tk1. We now perform the following factorization:
+
+                                          P (xnN+1|x1n) = P (xNn+1|xn1 k , xnnk+1)                                      (11)
+                                                                                                                        (12)
+                                                =  P (xNn+1, xnnk+1|x1nk )                                              (13)
+                                                      P (xnnk+1|xn1 k )                                                 (14)
+
+                                                =  P (xnNk+1|xn1 k )
+                                                   P (xnnk+1|xn1 k )
+
+                                                =  P  (xNnk         +1  |tk1   )  ,
+                                                   P  (xnnk         +1  |t1k   )
+
+where the last inequality is due to Corollary 3.2. Finally, we will use the Maximum Prefix Correction (MPE) Algorithm to
+
+compute each term in (14) individually. Note that the algorithm does not require tk ∈ V∗. Here, we explicitly highlight the
+importance of having tk ∈ V∗, as it bridges between the character and token domain through Equation (14).
+
+E.2. Maximum Prefix Correction Algorithm
+
+Overview. The MPC algorithm computes P (xNnk+1|t1k). Note that we do not require tk ∈ V∗ in the MPC algorithm. Using
+marginalization, we have the following:
+
+P (xnNk+1|tk1 ) =                         P (xnNk+1, tk+1 = t|t1k)                                                      (15)
+                                                                                                                        (16)
+                               t∈V
+
+                            =             P (xNnk+1, tk+1 = t|t1k) +                    P (xnNk+1, tk+1 = t|tk1 )
+
+                               t∈Tbval                                         t∈Tpval
+
+                                          bval                                          pval
+
+                                                   10
+             Understanding and Mitigating Tokenization Bias in Language Models
+
+where:
+
+• Tbval = {t ∈ V|xnNk+1 ∈ prefix(decode(t))} is the set of tokens that have a prefix xnNk+1.
+
+• Tpval = {t ∈ V|xNnk+1 ∈/ prefix(decode(t))} is the ones that do not.
+and Tbval ∩ Tpval = ∅.
+Branch Step. Here, bval is the probability that, given the list of previous tokens t1k, the next token of the string s has xNnk+1
+as a prefix. To compute this term, we obtain P (tk+1 = t|t1k) for all t ∈ V using one model run, then sum the probabilities
+corresponds to all tokens whose prefix is xNnk+1.
+
+                                               bval =            P (tk+1 = t|t1k),                                                (17)
+
+                                                       t∈Tbval
+
+Proof. To see this, for each summand of bval in Eq.(16), we have:
+
+             P (xNnk+1, tk+1 = t|t1k) = P (tk+1 = t|t1k) × P (xnNk+1|tk1 , tk+1=t)                                                (18)
+
+                                                    = P (tk+1 = t|tk1 ),                                                          (19)
+
+where P (xnNk+1|t1k, tk+1=t) = 1.0 is due to xnNk+1 ∈ prefix(t). This concludes the proof.
+
+Pass Step. Here, pval is the probability that, given the list of previous tokens t1k, the subsequent string xnNk+1 is not a prefix
+of the next token. Under the MPE, we compute the value pval as follow:
+
+                                   pval = P (tk+1 = t|tk1 ) × P (xNnk+1+1|t1k, tk+1 = t),                                         (20)
+
+where  t  =  encode(xNnk+1)1  and  xnk+1    =  decode(t).  That  is,  during  the  passing  step,  there  are  two  subroutines:
+
+                                     nk +1
+
+1. Extract the next token t within xNnk+1 and compute P (tk+1 = t|t1k). If xNnk+1 = decode(t), then returns 0.0 since this is
+   not allowed according to the condition required in Tpval .
+
+2. Recursively compute P (xNnk+1+1|t1k, tk+1 = t).
+
+Proof. Following Proposition 2.3 for invalid encodings, we only need to consider t such that tk1+1 is valid. Under Proposition
+B.1 for MPE on xN1 , only first token of encode(xnNk+1) is allowed (also see Example 2 in Figure 4(Right)). Finally, applying
+the chain rule of probability, we obtain Equation 20. For the case of non-optimal LM, see Section G.2 for non-optimal LM.
+
+This completes the proof.
+
+Base Case. We note that the base case of our algorithm corresponds to the situation where xNnk+1 = decode(t). In this
+scenario, we only needs to compute bval (branching step) while pval = 0.0.
+
+Complexity Analysis. The complexity of our algorithm (number of inferences on the language model) scales with the
+length of the the query string, i.e. N − nk. Note that the complexity of the summation at the Branching step is relatively
+cheap compared to the runtime of the language model.
+
+F. Converting Token-Free Language Model to Tokenized Language Model for MPE.
+
+We introduce an algorithm to compute P (tk+1|tk1) using a token-free language model P (xNn+1|x1n), despite having no access
+to any tokenized LM. This approach enables theoretical conversion of a token-free model to a tokenized one. The method
+involves two stages. First, we refactor the conditional probability similar to the technique presented in Section E. Next, we
+aggregate the probabilities of all possible strings leading to the desired tokenization. It is important to note that a Markov
+chain is a special type of autoregressive model, meaning this method can be employed to effortlessly calculate Markov chain
+transition matrices within the tokenized domain.
+
+                                                                        11
+                           Understanding and Mitigating Tokenization Bias in Language Models
+
+F.1. Refactoring
+Consider the probability P (ti+1|t1i ) that we would like to expressed using P (xNn+1|xn1 ). Let tk be the last token within ti1
+such that tk ∈ V∗. We now perform the following factorization:
+
+                                              P (ti+1|ti1)  =    P (tki++11|t1k)                        (21)
+                                                                 P (tik+1|t1k)
+
+                                                            =    P  (tik++11  |xn1 k  )  ,              (22)
+                                                                 P  (tki +1   |xn1 k  )
+
+where xn1k = decode(tk1). The second equality is due to Corollary 3.2. Each term can then be computed using the
+aggregation procedure shown next.
+
+F.2. Aggregation.
+
+In this step, we would like to compute P (tki +1|xn1 k ) where encode(x1nk ) = t1k and tk ∈ V∗, using the token-free
+representation P (xn+1|xn1 ). Here, we denote decode(tki +1) = xnnki +1 and M = maxt∈V |decode(t)| be the length of the
+longest token in V and Ω = AM is the enumeration of all string of length M .
+
+Computing P (tki +1|xn1 k ) involves considering all possible strings s with prefix x1ni and tik+1 = encode(s)ik+1. Although
+iterating through every possible string is infeasible, we can restrict our search by only examining strings with length
+|s| = ni + M , as any additional string beyond this point will not impact the tokenization of prefix xn1i due to M being the
+maximum token length. Formally, we will show that one can express P (tik+1|xn1k ) as follows:
+
+                 P (tki +1|xn1 k )=           P (xnnki++M1 =c1(s′)|x1nk )1(tki +1=encode(c2(s′))ik+1),  (23)
+
+                                     s′ ∈AM
+
+where c1(s′) := concat(xnnik+1, s′) and c2(s′) := concat(xn1 i , s′). The first term can be computed using the given token-
+free LM, i.e. P (xnnik++M1 |x1nk ). The second term is an indicator function that checks whether tik+1 = encode(s)ki +1 and can
+be computed deterministically.
+
+Proof. We have:
+
+                 P (tki +1|xn1 k ) = P (tki +1, xnnki +1|x1nk )                                         (24)
+                                                                                                        (25)
+                           =                  P (tik+1, xnnik++M1 =c1(s′)|xn1 k )                       (26)
+                                                                                                        (27)
+                                     s′ ∈AM
+
+                           =                  P (xnnik++M1 =c1(s′)|xn1 k )P (tki +1|xn1 i+M = c2(s′))
+
+                                     s′ ∈AM
+
+                           =                  P (xnnik++M1 =c1(s′)|x1nk )1(tik+1=encode(c2(s′))ki +1)
+
+                                     s′ ∈AM
+
+The rest is to prove the following equality:
+
+                           P (tki +1|xn1 i+M = c2(s′)) = 1(tik+1=encode(c2(s′))ki +1)                   (28)
+
+We first note that the first k tokens must be t1k = encode(xn1k ) due to our condition that tk ∈ V∗. Since M is the length of
+the longest token in V, appending extra characters cannot change the tokenization happened for xn1i . In other words, any
+string s with prefix c2(s′) must have the same minimal superstring r containing xn1i (see Proposition B.1). We then apply
+this principle to the two cases:
+
+• tik+1=encode(c2(s′))ki +1: In this case, we know that the string must contains the first i tokens as t1i , hence
+  P (tki +1|x1ni+M = c2(s′)) = 1.0
+
+• tki +1̸=encode(c2(s′))ik+1: In contrast, this case is equivalent to P (tki +1|x1ni+M = c2(s′)) = 0.0 since we are sure that
+  the string do not contains the tokens tik+1.
+
+This concludes the proof.
+
+                                                            12
+Understanding and Mitigating Tokenization Bias in Language Models
+
+F.3. The Markov Chain Example.
+
+We provide a detail computation of the Markov chain example in the main paper. Recall that in the original chain (in the
+character domain), we have the following:
+
+              P (x2 = “A”|x1 = “A”) = α                                                (29)
+
+              P (x2 = “B”|x1 = “A”) = 1 − α                                            (30)
+
+              P (x2 = “A”|x1 = “B”) = β                                                (31)
+
+              P (x2 = “B”|x1 = “B”) = 1 − β                                            (32)
+
+We also assume the initial probability π = {γ, 1 − γ} for “A” and “B” respectively. In the token domain, let first compute
+P (t2 = “A”|t1 = “AA”), where we do not have to do the refactoring step since we know that t1 ∈ V∗. Following the
+
+Aggregation step, we have:
+
+P (t2 = “A”|t1 = “AA”) = P (x63 = “ABA”|x12 = “AA”) + P (x63 = “ABB”|x12 = “AA”)       (33)
+
+           = P (x35 = “AB”|x12 = “AA”)                                                 (34)
+
+           = α(1 − α),                                                                 (35)
+
+where in the first equality, we do not include the case x63 = ”AAA” and x63 = ”AAB” since encode(”AAA”)1 = “AA”
+and encode(”AAB”)1 = “AA”, which are not the token “A” that we are interested in. For other tokens and when
+t1 = “B”, the computation follows the same arguments.
+
+We now consider the case P (t2 = “B”|t1 = “A”), we can refactor it as:
+
+P (t2      =  “B”|t1  =  “A”)                              =  P (t2  = “B”, t1 = “A”)  (36)
+                                                                     P (t1 = “A”)
+
+We first compute P (t1 = “A”) using the aggregation step:
+
+P (t1 = “A”) = P (x31 = “ABB”) + P (x31 = “ABA”)                                       (37)
+
+                 = P (x12 = “AB”)                                                      (38)
+
+                 = γ(1 − α),                                                           (39)
+
+where we do again include the case x63 = ”AAA” and x36 = ”AAB” for the same reason above. For P (t2 = “A”, t1 = “A”)
+we have:
+
+P (t2=“B”, t1=“A”)=P (x14=“ABAA”) + P (x14=“ABAB”) + P (x41=“ABBA”) + P (x41=“ABBB”) (40)
+
+=P (x21 = “AB”)                                                                        (41)
+
+=γ(1 − α)                                                                              (42)
+
+which gives us P (t2 = “B”|t1 = “A”) = 1.0. Finally, in this specific case, since order of the Markov chain in the character
+domain is 1, we do not need to consider the higher order of the Markov chain in the token domain.
+
+G. On Predictive Distribution of Language Models
+
+In practice, LMs often do not follow Proposition 2.3 due to softmax activations. As such, in our MPC algorithm, when
+t ∈ Tpval and t ̸= encode(xnNk+1)1, then Pθ(xNnk+1, tk+1 = t|tk1 ) may not be 0.0 (where θ is the model weights). Eventually,
+this can potentially increase the complexity of our MPC algorithm during the Passing step.
+
+In this section, we show that given any tokenized LM, we can force its output probabilities to obey Proposition 2.3, without
+any loss in terms of perplexity score on the token domain. This means that a tokenized LM satisfying Proposition 2.3 will
+guarantee the correctness of the Passing step in our MPC algorithm.
+
+Finally, before going to the method, we remind the readers that Proposition 3.1 and Corollary 3.2 are factually correct and
+hold for all θ. As such, the refactoring step holds regardless.
+
+                                                                        13
+                            Understanding and Mitigating Tokenization Bias in Language Models
+
+G.1. Truncate-Renormalization Process
+
+We justify the assumption that our tokenized language model Pθ(ti+1|t1i ) follows Proposition 2.3. The idea is that we can
+turn a language model that does not follow Proposition 2.3 to the one that does while guaranteeing that the new model will
+
+always result in a lower token-level perplexity score.
+
+We first introduce Proposition G.1. In this proposition, we are given a target discrete probability distribution p where we
+know some of the values will not happen, says Φ∗. Assume that we have another distribution q that approximates p, then we
+can produce another distribution q∗ that is closer to p in terms of KL divergence by setting corresponding probabilities of q
+in Φ∗ to 0.0 and renormalize it (similar to rejection sampling).
+
+Proposition G.1. Given a discrete distribution p = {p1, p2, ..., pm} and q = {q1, q2, ..., qm} with qi > 0.0 for all i. Let
+
+Φ = {i ∈ Z|pi = 0.0} and Φ∗ ⊆ Φ, we define q∗ = {q1∗, q2∗, ..., qm∗ } where qi∗ = 0.0 for i ∈ Φ∗, and qj∗ = qj/( l∈/Φ∗ ql).
+
+Then we have:
+
+                                       DKL(p||q∗) ≤ DKL(p||q),                                                          (43)
+
+which implies that q∗ is closer to p than q. We refer to the process of producing q∗ as truncate-renormalization (TR).
+
+Proof. Let Z = ( l∈/Φ ql) is the normalizing factor in q∗. Note that Z ≤ 1 and as such log(Z) ≤ 0. Then:
+
+                            DKL(p||q∗) =     pi log      pi                                                             (44)
+                                                         qi∗
+                                          i
+
+                                       = pi log          pi       , use 0 log 0 = 0.0                                   (45)
+                                                         qi∗
+                                           i∈/Φ∗
+
+                                       = pi log           pi                                                            (46)
+                                                         qi/Z
+                                           i∈/Φ∗
+
+                                       =         pi log       pi  + log(Z)                                              (47)
+                                                              qi
+                                          i∈/Φ∗
+
+                                       ≤ pi log          pi       = DKL(p||q),                                          (48)
+                                                         qi
+                                           i∈/Φ∗
+
+which completes the proof.
+
+Applying to our scenario, for any autoregressive language models Pˆθ(ti+1|t1i ) that does not follow Proposition 2.3 (due to
+
+the softmax activations), we can perform the TR process (since we know which encoding is invalid) to obtain a new LM
+
+Pθ(ti+1|t1i ), which is guaranteed to better approximate the ground-truth model Pgt(ti+1|ti1). Thus, we are guaranteed that
+the token-level perplexity score of Pθ(ti+1|t1i ) is always lower than or equal to Pˆθ(ti+1|t1i ).
+
+G.2. On Passing Step in Maximum Prefix Correction Algorithm.
+
+Once our tokenized LM follows Proposition 2.3, it does not alternate the correctness of the Passing step. In other words,
+under Proposition 2.3, the LM will always output zero probability for invalid encodings t1k. As a result, the Passing step in
+the MPC algorithm remains the same in this case.
+
+H. Algorithms for Byte Pair Encoding
+
+H.1. Overview
+
+We begin by introducing the Byte-Pair Correction (BPC) Algorithm for bias correction in Byte-Pair Encoding, which is
+more general than the MPC algorithm and also works for case of MPE. We then follow with a detail analysis to show the
+correctness of the algorithm.
+Here, we introduce the definitions of invalid encodings (for BPE) and cover encodings.
+Definition H.1. (Invalid Encodings) The list of tokens (an encoding) t1k is invalid if encode(decode(tk1))≠ tk1. Otherwise, it
+is a valid encoding. We denote a valid tk1 as valid(t1k).
+
+                                                                        14
+    Understanding and Mitigating Tokenization Bias in Language Models
+
+          Representation of ������ ������!" under     Vocabulary ������                                              Byte-Pair Correction
+      Tokenized Language Model ������ ������#$!|������!#                                 (Efficient Search Algorithm for Cover Encodings by Backward Tokenization)
+                                               ID Tokens
+Query String (������ = 7)                                                                 Iteration 1:
+  ������ ������ ������ ������ ������
+                                              1  ������                                   ������            ������ ������ ������  ������ ❌
+Cover Encodings
+  ������ ������ ������ ������ ������                              2  ������
+
+                                              3  ������                                   ������            ������ ������ ������ ������     u❌
+
+                                              4  ������ ⋅ ������                              ������            ������ ������ ������ ������     u m✓
+
+������  ������ ������ ������ ������  u                            5 ������������ ⋅ ������        Extract cover
+
+                                              6  ������ ⋅ ������         encodings from Iteration 2:
+
+                                              7 ������ ⋅ ������������         right to left       ������            ������ ������ ������  ������ ✓
+                                                                 (blue arrow).
+������  ������ ������ ������ ������  um
+
+                                              8 ������ ⋅ ������������                             ������            ������ ������ ������ ������     u✓
+
+               Valid Encoding ✓                                                       Iteration 3:
+
+                 ������ ������ ������ ������ ������ u = encode ������ ������ ������ ������ ������ u                           ������            ������ ������ ������  ������ ❌
+
+Accept/Reject                                                                         Terminate – No token contains more than 3 characters
+    Criteria Invalid Encoding ❌
+
+                 ������ ������ ������ ������ ������ u ≠encode ������ ������ ������ ������ ������ u
+
+Figure 5: (Left) Representation of P (x1n) using tokenized LM. We also show an example of cover encodings and valid/invalid encoding.
+(Right) Illustration of the Byte-Pair Correction Algorithm for BPE encoding. Green tick and red cross denotes valid and invalid encodings
+respectively, which can be checked using Definition H.1. The termination step does not appear in the original algorithm (for simplicity)
+but can be easily implemented.
+
+Definition H.2. (Cover Encodings) Given a string xn1 , an encoding tk1 is said to be covering x1n when all the following
+conditions satisfied:
+1. t1k is valid.
+
+2. xn1 ∈ prefix(decode(t1k)).
+
+3. xin ∈ tk for some 1 ≤ i ≤ n, i.e. the last token ti covers a part of the string xn1 .
+We denote cover(xn1 ) to be the set of all cover encodings of x1n and ⃗t ∈ cover(x1n) is an encoding in cover(x1n).
+
+Having established these two definitions, we will later show that for BPE (and MPE), the probability P (xn1 ) can be
+represented using a tokenized LM P (ti+1|t1i ) as follows:
+
+                                                 P (x1n) =                   P (⃗t),                                                                    (49)
+
+                                                             ⃗t∈cover(x1n )
+
+and the main goal of the BPC algorithm is to search through all cover encodings of xn1 . We can then apply this algorithm
+and compute any conditional probability P (xnN+1|x1n) through factorization. Figure 5 (Left) illustrates this with examples
+cover encodings and invalid/valid encodings.
+
+H.2. Byte-Pair Correction Algorithm
+
+For MPE, the MPC algorithm computes P (x1n) by searching all possible valid encodings that cover xn1 , where the probability
+of each encoding are computed using the LMs P (ti+1|t1i ) through greedy search. However, this does not work for the case
+of BPE. For example, under the BPE encoding rule of Llama 2, the string “hello” is tokenized as an individual token while
+the string “hellow” is tokenized into 2 tokens “h and “ellow”. Note that naive search for all tokens within V from left to
+right that cover x1n is computationally expensive.
+
+The Byte-Pair Correction (BPC) algorithm, shown in Algorithm 2 and visualized in Figure 5 (right), which is an efficient
+algorithm that can search all valid encodings covering x1n. The idea is that, for each cover encoding ⃗t, once the starting
+position of the last token is determined (say xi+1), we are guaranteed the prior tokens is unique and must be encode(x1i ).
+Then one will accept the extracted ⃗t if it is valid, otherwise reject it. Corollary H.3 provides justification for this procedure.
+Here, we assume P (⃗t) = 0.0 for invalid ⃗t, see Proposition H.4 and justifications as well as implementation in Appendix G.
+
+Remark. The BPC algorithm can also be applied for the case of MPE. In fact, it is more general than the original MPC
+algorithm as it only relies on the property of invalid encodings.
+
+                                                             15
+                         Understanding and Mitigating Tokenization Bias in Language Models
+
+Algorithm 2 Byte-Pair Correction Algorithm. This algorithm computes P (xn1 ) by gradually reducing the search space.
+
+1: procedure COMPUTE(xN1 )
+2: //Initialize P (x1n):
+3: Pout = 0.0
+
+4: //Probability Aggregation
+
+5: for i = n − 1...0 do
+
+6:   //The last token that partially covers x1n begins with xin+1
+
+7:   B = {t ∈ V|xin+1∈prefix(decode(t))}
+
+8:   //Once the last token position is known, the remaining previous tokens can be determined
+
+9:   t1k−1 = encode(x1i )
+
+10:  //Similar to the branching step in MPC
+
+11:  bval = P (tk = t t1k−1)
+
+                 t∈B
+
+12:  Pout = Pout + P (tk1−1) × bval
+
+13: end for
+
+14: return Pout
+
+15: end procedure
+
+H.3. Analysis
+
+Notations. We extend the notation of the vocabulary V for the case of BPE. Here, V is an ordered list that determines the
+merging order in the BPE algorithm. Each v ∈ V is a triplet of (tleft, tright, tnew) which corresponds to the merging tokens
+(left and right) and the new token. For simplicity, when we write t ∈ V, it corresponds to the merged token, i.e. tnew ∈ v.
+Finally, the first |A| entries in V correspond to the alphabet A, where no merging will happen.
+
+Byte-Pair Encoding. We revise the encoding rule for BPE, shown in Algorithm 3. In practice, pre-tokenization is often
+used, where tokens are separated by whitespace or special characters. In this case, we can adjust our vocabulary V by
+removing tokens with special characters in the middle of the string.
+
+Overview. We begin our analysis with theoretical results on invalid encodings (Corollary H.3 and Proposition H.4),
+
+which characterizes the zero probability events for an optimal tokenized LM. This will allow us to prove the representation
+of P (xn1 ), i.e. Proposition H.5, previously shown in Equation (49). Finally, we conclude this section with the proof of
+correctness of the BPC algorithm, using Proposition H.5 and H.6.
+
+We begin with theoretical results on invalid encodings in the case of BPE.
+Corollary H.3. S(tk1) = ∅ if and only if tk1 is invalid.
+
+Proof. We prove each direction as follows.
+
+• If S(t1k) = ∅ then tk1 is invalid: Since S(tk1) = ∅, we know that there exist no string s such that encode(s)k1 = t1k. As
+  such, for s = decode(t1k), we do not have encode(decode(tk1)) = tk1, which proves the result.
+
+• If tk1 is invalid then S(t1k) = ∅: Let xn1 = decode(tk1), we consider two string s1 and s2 that both have prefix xn1 .
+  Furthermore, we assume the first i tokens of s1 covers exactly xn1 , i.e. xn1 = decode(t1i ) and similarly, the first j tokens
+  of s2 covers exactly x1n, i.e. xn1 = decode(t1j ). Then:
+  1. Proving invalid tk1 leads to S(t1k) = ∅ is equivalently to proving ti1 = tj1 for any s1, s2.
+  2. Re-running the BPE algorithm for s1 and s2 in parallel, we know that there will be no merge between any suffix of x1n
+      and the rest of strings, i.e. s1\xn1 and s2\x1n due to the condition above (See Algorithm 3, line 6).
+  3. Furthermore, for s1, any time a merge happens within x1n then the same merge must also happen within xn1 for s2 and
+      vice versa.
+  As the result, we have ti1 = tj1 and they must be equal to encode(xn1 ).
+
+Proposition H.4. (Token-Induced Zero Probability-BPE) Let ti1 be a sequence of input tokens. For any invalid encoding ti1,
+we have Pgt(ti1)=0.0 and the conditional probability Pgt(ti+1|t1i ) is undefined. In the case ti1 is valid, then Pgt(ti+1|t1i )=0.0
+if ti1+1 is invalid.
+Proof. The proof is the same as the MPE version (Proposition 2.3).
+
+                                                                        16
+                       Understanding and Mitigating Tokenization Bias in Language Models
+
+Algorithm 3 Byte Pair Encoding Algorithm .
+
+1: procedure ENCODE BPE(xN1 , V)
+
+2: //Set initial encodings:
+3: c tokens = x1N
+
+4: //Iterate over merging order in V, the first |A| entries correspond the the alphabet (no merge happens):
+
+5: for i = |A| + 1, ...|V| do
+
+6:   c tokens ←− find merge(c tokens, V[i])
+
+7: end for
+
+8: return c tokens
+
+9: end procedure
+
+10:
+
+11: procedure find merge(c tokens, v)
+
+12: // Left and right tokens for merging
+
+13: tleft, tright, tnew = v[1], v[2], v[3]
+14: old tokens = c tokens
+
+15: new tokens = []
+
+16: // Find and merge tokens from left to right
+
+17: j = 1
+
+18: while j < |old tokens| do
+
+19:  if old tokens[i, i + 1] = tleft, tright then
+
+20:         new tokens.append(tnew)
+
+21:         j =j+2
+
+22:  else
+
+23:         new tokens.append(old tokens[i])
+
+24:         j =j+1
+
+25:  end if
+
+26: end while
+
+27: return new tokens
+
+28: end procedure
+
+Correctness of BPC Algorithm. We show in Proposition H.5 that computing the string probability P (x1n) is equivalent to
+marginalizing the probability of all covering tokens of x1n. As such, the main task of computing P (xn1 ) is to iterate all the
+valid encodings that cover x1n.
+Proposition H.5. (Prefix Probability Representation) Given a prefix x1n, we have the followings:
+1. For any distinct ⃗ti, ⃗tj ∈ cover(xn1 ), then S(⃗ti) ∩ S(⃗tj)=∅.
+
+2. S(x1n) = S(⃗t).
+
+               ⃗t∈cover(x1n )
+
+As a result, P (x1n) can be expressed as the marginal probability of all covering tokens of xn1
+
+                                                 P (xn1 ) =                  P (⃗t)                          (50)
+
+                                                             ⃗t∈cover(x1n )
+
+Proof. We prove each point as follows:
+1. Proof by contradiction, suppose that S(⃗ti) ∩ S(⃗tj) ≠ ∅, then there exists a string s that has two different cover encodings
+
+   ⃗t1 and ⃗t2. This is impossible since each string s has only one unique encoding.
+
+2. This follows the definition of cover encodings.
+Since each S(⃗t) is pair-wise disjoint, we arrive at the final equation. We illustrate this Proposition in Figure 6.
+
+Finally, we prove that BPC extracts all the cover encodings of x1n. Proposition H.6 shows the correctness of line 9 in
+the algorithm, where suppose that the last token starts from xi+1, then encode(x1i ) must be the encoding before that last
+token. Since each cover encoding ⃗t must have a last token cover a suffix within xn1 , iterating over all positions from 1 to n
+guarantees that we extract all possible encodings.
+Proposition H.6. Let ⃗t ∈ cover(xN1 ) and k = |⃗t| is the number of tokens in ⃗t. Suppose that xjN+1 is a prefix of the tk for
+some 0 ≤ j ≤ N , i.e. xNj ∈ prefix(⃗tk), then tk1−1 = encode(xj1).
+
+                                                                        17
+Understanding and Mitigating Tokenization Bias in Language Models
+
+                                                                                           1.0     Ground Truth: Pgt(xn+1|xnn−2)
+
+   Proof Idea: (Set) Relationship                                    Probability of Next   0.8     Our Method: P (xn+1|x1n)
+   between Query String and its                                         Character being A          Baseline: P (xn+1|ti1)
+
+           Cover Encodings                                                                 0.6
+
+Figure 6: Illustration of Proposition H.5 when |cover(xn1 )|=3.                            0.4
+
+                                                                                           0.2
+
+                                                                                           0.0     AAA  AAB  ABA                  ABB  BAA      BAB  BBA  BBB
+
+                                                                                                                                  Input States
+
+                                                                     Figure 7: Our method accurately estimates the transition prob-
+
+                                                                     ability of a 3rd order Markov chain while the baseline method
+
+                                                                     fails to.
+
+Proof. Since ⃗t = tk1 ∈ cover(x1N ), then t1k−1 must be a valid encoding. As a result, we must have tk1−1 = encode(xj1).
+
+Refactoring. Unlike the case for MPE, identifying the case when P (xnN+1|t1i ) = P (xNn+1|x1n) is nontrivial in general for
+BPE. Nevertheless, the refactoring step aims to reduce the computational complexity, and in general, we can still compute
+P (xnN+1|x1n) by refactoring.
+
+P (xNn+1|x1n)                                                    =   P (x1N )                   ,                                                         (51)
+                                                                     P (x1n)
+
+and we use the BPC algorithm to compute P (x1N ) and P (x1n) respectively. Note that this is equivalent to assuming t1 is a
+<start> token within V∗ (and consider P (xN2 |t1), P (xn2 |t1) instead of P (x1N ), P (xn1 )). When pretokenization is used, e.g.
+split by white spaces, we can identify when P (xNn+1|ti1) = P (xnN+1|xn1 ) by using the pretokenization pattern.
+
+H.4. Experiments
+
+The experiment setup for BPE is the same as the one in Section 4, except we use the vocabulary V =
+{“A”, “B”, “B·A”, “BA·A”, “B·BAA”, “A·A”, “BA·BA”, “B·B”}, where the order within V is the merging order
+for the BPE encoding process and the “·” separates the merging tokens. The result is shown in Figure 7, where our method
+can accurately recover the ground truth probability P (xn+1|x1n) while the baseline fails to. Notice that for the state “BAA”,
+the baseline approach can output the correct probability, which is because the merging for the token “BAA” happens before
+any mergs where “A” is the left token happens. This experiment also shows the existence of bias within the BPE process
+and our method can recover the exact ground truth probability.
+
+                                                                 18
+

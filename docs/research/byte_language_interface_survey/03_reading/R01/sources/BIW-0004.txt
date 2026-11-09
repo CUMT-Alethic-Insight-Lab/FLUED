@@ -1,0 +1,1063 @@
+                                        CANINE: Pre-training an Efﬁcient Tokenization-Free Encoder
+                                                             for Language Representation
+
+                                                  Jonathan H. Clark, Dan Garrette, Iulia Turc, John Wieting
+                                                                              Google Research
+
+                                           {jhclark,dhgarrette,iuliaturc,jwieting}@google.com
+
+arXiv:2103.06874v4 [cs.CL] 18 May 2022                        Abstract                                string into a sequence of discrete model inputs.
+                                                                                                      Broadly speaking, tokenizers are generally either
+                                              Pipelined NLP systems have largely been                 carefully constructed systems of language-speciﬁc
+                                              superseded by end-to-end neural model-                  rules, which are costly, requiring both manual
+                                              ing, yet nearly all commonly-used models                feature engineering and linguistic expertise, or
+                                              still require an explicit tokenization step.            data-driven algorithms such as Byte Pair Encod-
+                                              While recent tokenization approaches based              ing (Sennrich et al., 2016), WordPiece (Wu et al.,
+                                              on data-derived subword lexicons are less               2016), or SentencePiece (Kudo and Richardson,
+                                              brittle than manually engineered tokenizers,            2018) that split strings based on frequencies in a
+                                              these techniques are not equally suited to all          corpus, which are less brittle and easier to scale,
+                                              languages, and the use of any ﬁxed vocab-               but are ultimately too simplistic to properly handle
+                                              ulary may limit a model’s ability to adapt.             the wide range of linguistic phenomena that can’t
+                                              In this paper, we present CANINE, a neural              be captured by mere string-splitting (§2.1).
+                                              encoder that operates directly on character
+                                              sequences—without explicit tokenization or                 The degree of sophistication required to accu-
+                                              vocabulary—and a pre-training strategy that             rately capture the full breadth of linguistic phe-
+                                              operates either directly on characters or op-           nomena, along with the infeasibility of writing
+                                              tionally uses subwords as a soft inductive              such rules by hand across all languages and do-
+                                              bias. To use its ﬁner-grained input ef-                 mains, suggests that explicit tokenization itself is
+                                              fectively and efﬁciently, CANINE combines               problematic. In contrast, an end-to-end model
+                                              downsampling, which reduces the input se-               that operates directly on raw text strings would
+                                              quence length, with a deep transformer                  avoid these issues, instead learning to compose in-
+                                              stack, which encodes context. CANINE out-               dividual characters into its own arbitrarily com-
+                                              performs a comparable mBERT model by                    plex features, with potential beneﬁts for both ac-
+                                              5.7 F1 on TYDI QA, a challenging mul-                   curacy and ease of use. While this change is con-
+                                              tilingual benchmark, despite having fewer               ceptually very simple—one could replace the sub-
+                                              model parameters.                                       word vocabulary in a model like BERT (Devlin
+                                                                                                      et al., 2019) with a vocabulary made solely of indi-
+                                        1 Introduction                                                vidual characters—doing so leads to two immedi-
+                                                                                                      ate problems. First, the computational complexity
+                                        End-to-end neural models have generally replaced              of a transformer (Vaswani et al., 2017), the main
+                                        the traditional NLP pipeline, and with it, the                components in BERT as well as other models such
+                                        error cascades and feature engineering common                 as GPT (Radford et al., 2019; Brown et al., 2020)
+                                        to such systems, preferring instead to let the                and T5 (Raffel et al., 2020), grows quadratically
+                                        model automatically induce its own sophisticated              with the length of the input. Since standard sub-
+                                        representations. Tokenization, however, is one                word models have roughly four characters per sub-
+                                        of few holdovers from that era, with nearly all               word on average, the 4x increase in input sequence
+                                        commonly-used models today requiring an ex-                   length would result is a signiﬁcantly slower model.
+                                        plicit preprocessing stage to segment a raw text              Second, simply switching to a character vocabu-
+                                                                                                      lary yields empirically poor results (§4.2).
+                                             CANINE: Character Architecture with No tokenization
+                                        In Neural Encoders.                                              In order to enable tokenization-free model-
+                                                                                                      ing that overcomes these obstacles, we present
+                                             Code and checkpoints are available on GitHub at
+                                        http://caninemodel.page.link/code.
+
+                                             Published in Transactions of the Association for Compu-
+                                        tational Linguistics (TACL), 2022.
+CANINE. CANINE is a large language encoder                     k-t-b     “write” (root form)
+with a deep transformer stack at its core. Inputs to           kataba    “he wrote”
+the model are sequences of Unicode characters.1                kattaba   “he made (someone) write”
+To represent the full space of Unicode characters2             iktataba  “he signed up”
+without a vocabulary, we employ a hashing strat-
+egy. To avoid the slowdown from increasing the                 Table 1: Non-concatenative morphology in Arabic.4
+sequence length, CANINE uses strided convolu-                  When conjugating, letters are interleaved within the
+tions to downsample input sequences to a shorter               root. The root is therefore not separable from its in-
+length before the deep transformer stack.                      ﬂection via any contiguous split.
+
+   Like BERT, we pre-train CANINE on the                       concatenative morphology, consonant mutation,
+Masked Language Model (MLM) and Next Sen-                      vowel harmony, etc.
+tence Prediction (NSP) tasks. For the MLM task,
+CANINE offers two options:                                        Even in high-resource languages, subword
+                                                               models still tend to struggle on challenging do-
+  1. A fully character-level loss that autoregres-             mains, such as informal text, which often includes
+      sively predicts characters in masked spans.              typos, spelling variation,5 transliteration, or emoji
+                                                               (O’Connor et al., 2010). BERT, which uses Word-
+  2. A vocabulary-based loss that predicts the                 Piece tokenization, is sensitive to corruptions of
+      identities of masked subword tokens. Crit-               the input, both natural typos (Sun et al., 2020)
+      ically, this tokenization is used only for the           and adversarial manipulations (Pruthi et al., 2019),
+      pre-training loss; tokens are never input to             with some of the loss attributable to corrupted
+      the encoder, and the tokenizer and subword               strings no longer being covered by the vocabulary.
+      vocabulary can be safely discarded after pre-
+      training. This effectively converts the hard                Seemingly safe heuristics used by these algo-
+      constraint of token boundaries found in other            rithms, such as splitting on whitespace and punc-
+      models into a soft inductive bias in CANINE.             tuation, are problematic when applied to lan-
+                                                               guages that do not use spaces between words
+In this article, we contribute:                                (Thai, Chinese) or use punctuation as letters
+                                                               (Hawaiian,6 Twi7). While SentencePiece does of-
+   • the ﬁrst pre-trained tokenization-free deep               fer the option to skip whitespace splitting, it is not
+      encoder;                                                 typically used due to poor empirical performance.
+
+   • an efﬁcient model architecture that directly                 Fixed vocabulary methods can also force mod-
+      encodes long sequences of characters with                elers to choose between difﬁcult preprocessing
+      speed comparable to vanilla BERT; and                    tradeoffs: should one keep accents, casing, etc.
+                                                               and avoid destructive preprocessing?—Or keep
+   • a model that performs no tokenization on the              such orthographic information and risk important
+      input, avoiding the lossy information bottle-            words dropping out of the frequency-based vocab-
+      neck associated with most pre-processing.                ulary altogether due to the presence of multiple
+                                                               variants of otherwise-similar words? For instance,
+2 Motivation                                                   mBERT initially removed all diacritics, thus drop-
+                                                               ping tense information in Spanish8 and conﬂating
+2.1 Linguistic pitfalls of tokenization                        many unrelated words in Vietnamese.9
+
+Subword tokenizers are the de-facto standard in                    4From en.wikipedia.org/wiki/Arabic_verbs
+modern NLP (Devlin et al., 2019; Raffel et al.,                    5e.g. Spanish speakers may drop accents when typing.
+2020; Brown et al., 2020). These algorithms are                    6Hawaiian uses an apostrophe to indicate a glottal stop.
+limited to only simple word-splitting operations.                  7Informal Twi uses a right paren ) to represent the letter O.
+While this is perhaps a reasonable approach for                    8Spanish past tense uses an accented ﬁnal vowel.
+a language with impoverished morphology such                       9Vietnamese uses diacritics to indicate tones—often the
+as English, it is much less appropriate in the face            only difference among several unrelated content words.
+of phenomena like agglutinative morphology, non-
+
+    1We consider splitting on Unicode characters to be
+tokenization-free because it depends only on the (determinis-
+tic) process deﬁned by the Unicode standard, and not on any
+models, hand-crafted rules, or other linguistic knowledge.
+
+    2Unicode deﬁnes 1,114,112 total codepoints, of which
+only 143,698 are assigned to characters as of Unicode 13.0.
+This covers 154 scripts and over 900 languages.
+   Finally, using a ﬁxed vocabulary during pre-                  Modern pre-trained models also have many re-
+training also creates complications for down-                 quirements throughout their lifecycle: Between
+stream tasks, which are subsequently tied to the              the time a model is pre-trained, ﬁne-tuned, and
+same tokenizer and vocabulary used for pre-                   served—potentially months or years apart—its
+training, even if it is not well-suited for the target        weights and model implementation may be con-
+domain and/or end-task. Boukkouri et al. (2020)               verted to be compatible with another toolkit, its
+showed that BERT’s Wikipedia+BooksCorpus                      ﬁne-tuning data may be tokenized in a different
+WordPiece vocabulary results in excessive seg-                way, and the natural distribution of words may be
+mentation when ﬁne-tuning on medical data, di-                quite different. All of these things introduce ample
+minishing the beneﬁt of pre-training as a strategy.           opportunities for mismatches to arise between to-
+                                                              kenization and the vocabulary from pre-training.
+2.2 Enabling better generalization                            Yet this same pre-training paradigm presents an
+                                                              advantage for character models: access to a far
+Much as Tenney et al. (2019) showed that large en-            more (unsupervised) data to learn word compo-
+coders learn elements of the classic NLP pipeline,            sition from characters; without transfer learning,
+it seems natural to let the model discover tokeniza-          this has historically been impractical for many
+tion as well. With this in mind, we seek an ap-               tasks having little supervised data.
+proach that can better generalize beyond the or-
+thographic forms encountered during pre-training.             3 CANINE
+
+   In terms of scientiﬁc inquiry, we would like to            CANINE consists of three primary components:
+know whether we can build models that learn how               (1) a vocabulary-free technique for embedding
+to compose words where appropriate, and memo-                 text; (2) a character-level model that is efﬁcient
+rize them where memorization is needed. Large                 by means of downsampling and upsampling; and
+frequency-derived vocabularies partially mitigate             (3) an effective means of performing masked lan-
+this problem by simply memorizing more, but lan-              guage modeling on a character-level model.
+guage inherently requires aspects of both memo-
+rization and composition. By building a model                 3.1 Model
+that directly engages with these issues within the
+small scale of word composition, we hope to en-               CANINE is designed to be a minimally modiﬁed
+able future work studying these problems at larger            variant of the deep transformer stack found in
+scales such as phrasal constructions.                         modern encoders such as GPT, (m)BERT, XLM,
+                                                              and XLM-R such that its architecture is easily
+   Practically, generalization is hindered for vo-            adoptable by other models in this family. The sim-
+cabulary elements that are slight orthographic                plest implementation of such a character model
+variations, where one is very infrequent. Hypo-               would be to feed characters at each position in
+thetically, a model may estimate a very good em-              place of subwords. However, this approach would
+bedding for a common vocabulary element kitten,               result in far more sequence positions given the
+but a poor embedding for the less frequent element            same input text, leading to linearly more com-
+kittens since the model has no a priori knowledge             pute in feed forward layers and quadratically more
+that they are related. Embeddings that are rarely             compute in self-attention layers.
+touched during pre-training will not be updated
+much beyond their random initializations.                        The overall form of the CANINE model is the
+                                                              composition of a downsampling function DOWN,
+2.3 Reducing engineering effort                               a primary encoder ENCODE, and an upsampling
+                                                              function UP;11 given an input sequence of char-
+Mature tokenizers often include years of hand-                acter embeddings e ∈ Rn×d with length n and
+engineered rules around special cases such as                 dimensionality d:
+email addresses, URLs, and handling unknown
+words;10 even fairly minimal modern tokenizers                        Yseq ← UP (ENCODE (DOWN(e)))
+include initial word-splitting heuristics followed
+by a speciﬁc algorithm and vocabulary for further                11 Enveloping the attention stack between downsampling
+breaking these tokens into subwords.                          and upsampling layers is similar to the Funnel-Transformer
+                                                              (Dai et al., 2020), which operates on WordPiece. However,
+   10For example, should a subword containing an unknown      many of its design choices (e.g., average pooling, their resid-
+character be a separate token, or should the unknown charac-  ual structure) did not work well in CANINE.
+ter be separated as its own token?
+    x             e               hinit                hdown   h'down ycls                                  hup               yseq
+
+                                                                                         Position 0
+
+                                                                                         Used as [CLS]
+
+                                                                                         representation
+
+                                                                                         for classi cation
+
+           Hash
+        Single
+          Downsample                                      Upsampling                 Single
+
+       Embedding         Local
+             (Strided
+                                                            Transformer
+                     Transformer
+                                         Convolution)          ︸ Deep Transformer Stack
+
+Codepoint
+   Character
+  Contextualized
+                                                  Concatenated
+             Final Character
+
+ Integers   Embeddings     Characters                                                       Convolved
+              Representation
+
+                                                                                                                 for Sequence Tasks
+                                                                                         Representations
+
+                                  Figure 1: CANINE neural architecture.
+
+where Yseq ∈ Rn×d is the ﬁnal representation for               single representation of size d:
+sequence prediction tasks. Similarly, for classiﬁ-
+ifcation tasks, the model simply uses the zeroth ele-                               K
+ment of the primary encoder:
+                                                                      ei ← LOOKUP (Hk(xi) % B, Ek)
+           ycls ← [ENCODE (DOWN(e))]0
+                                                                                     k
+Preprocessing Like existing models, the input
+to CANINE must ultimately be represented as a se-              where ⊕ denotes vector concatenation. We refer
+quence of integers, but because the nature of char-            to these as the character embeddings e ∈ Rn×d.
+acters is well-deﬁned and standardized by Uni-                 In our experiments, we use d = 768, K = 8, and
+code, preprocessing code that would typically be               B = 16k.15
+hundreds or thousands of lines can be replaced by
+a very simple procedure: just iterate over the char-              While each individual hash function is subject
+acters in the input string, and return their code-             to hash collisions,16 the overall effect is minimal
+point integer values (e.g., a single line of code12 in         since each function only accounts for a small por-
+Python). Furthermore, because codepoint values                 tion of the codepoint’s overall embedding, and it
+are part of the Unicode Standard, they are docu-               is highly improbable that the other hash functions
+mented publicly, already supported by program-                 will produce the same collisions.
+ming languages, and will not change over time,
+unlike arbitrary vocabulary-based IDs.                            Because the model always supports all code-
+                                                               points, it is possible to learn representations dur-
+Character hash embeddings CANINE uses                          ing ﬁne-tuning for characters (and, by extension,
+hashing (Svenstrup et al., 2017) to support em-                words, scripts, etc.) that were never seen during
+bedding the full space of Unicode codepoints with              pre-training, while still making use of what pre-
+a relatively small number of parameters, but to                training learned about word composition and sen-
+reduce the chance that different codepoints will               tence structure.
+share exactly the same representation, we deﬁne
+a generalization of the standard hashing approach              Optional vocabulary-free n-grams We can
+in which we apply multiple hash functions to each              also redeﬁne the embeddings ei above to include
+codepoint and concatenate the representations as-              character n-grams, again without a ﬁxed vocab-
+sociated with the various hash values.                         ulary, such that each n-gram order contributes
+                                                               equally to a summed embedding:17
+   More formally, given a single codepoint13 xi ∈
+N, we apply K hash functions Hk : N → N, and                                K            N
+look up each hashing result in its own embedding
+matrix14 Ek ∈ RB×d , yielding K embeddings of                  eNi ←                        LOOKUP Hk(xi...j ) % B, Ej,k
+size d = d/K, which are then concatenated into a
+                                                                            k            j
+   12Python preprocessing: [ord(c) for c in text]
+   13Conceptually, a codepoint is a character; however, a      Hk(xi...j ) =             Hk (xi )                                   if i = j
+Unicode codepoint is deﬁned precisely and unambiguously.
+   14CANINE uses learned embeddings, not random embed-                                   Hk xi + Hk(x(i+1)...j ) o/w
+ding as in other hash embeddings (Kaliamoorthi et al., 2019).
+                                                                  15The memory footprint of these hash embeddings is
+
+                                                               equivalent to a vocabulary embedding with 16k items.
+                                                                  16This is not a probing/chaining hash table, but rather as
+
+                                                               an approximate map, where we expect and tolerate collisions,
+
+                                                               similar to a Bloom Map (Talbot and Talbot, 2008).
+                                                                  17We use B = 15k and N = 4 for our n-grams.
+This formulation still admits tokenization-free              hdown ∈ Rm×d:
+modeling, but provides the model with an induc-
+tive bias that favors slightly more memorization                      hdown ← TRANSFORMERL(hdown)
+via a compute-cheap means of adding parameters.                         ycls = [hdown]0
+Notably, it also allows the model’s input signature
+to remain a simple sequence of codepoints.                   We used L = 12 to match mBERT.
+
+Downsampling To make CANINE efﬁcient, we                     Upsampling While the above architecture is
+use a multi-part downsampling strategy. First, we            sufﬁcient for classiﬁcation tasks, sequence predic-
+encode characters using a single-layer block-wise            tion tasks require that the model expose an output
+local attention transformer. This model performs             layer with the same sequence length as the input
+self-attention only within each block of a pre-              (i.e., characters are the model’s input and output
+deﬁned size,18 saving the quadratic cost of atten-           “API” for tasks like tagging and span prediction).
+tion while leveraging the linguistic intuition that
+word composition—i.e., the kind of composition                  We reconstruct a character-wise output repre-
+relevant in the lowest layers of the model (Tenney           sentation by ﬁrst concatenating the output of the
+et al., 2019)—tends to happen at a very local level.         original character transformer (above) with the
+Next, we use a strided convolution to reduce the             downsampled representation produced by the deep
+number of sequence positions to be similar to that           transformer stack. (Note that since each down-
+of a word piece model.19 Given character embed-              sampled position is associated with exactly r char-
+dings e ∈ Rn×d with a sequence length of n char-             acters for a downsampling rate of r, each posi-
+acters and dimensionality d, we use a convolution            tion of downsampled representation is replicated
+with a stride of r to downsample the sequence:               r times before concatenation.) More formally,
+
+         hinit ← LOCALTRANSFORMER1(e)                                  hup ← CONV hinit ⊕ hdown, w
+       hdown ← STRIDEDCONV(hinit, r)                                   yseq ← TRANSFORMER1 hup
+
+We refer to this output as the downsampled po-               where ⊕ indicates vector concatenation of the rep-
+sitions: hdown ∈ Rm×d where m = n/r is the                   resentations (i.e. not sequences) such that CONV
+number of downsampled positions. In our exper-               projects from Rn×2d back to Rn×d across a win-
+iments, we use r = 4 and n = 2048 such that                  dow of w characters.20 Applying a ﬁnal trans-
+m = 512, giving CANINE’s primary encoder—the                 former layer (standard, not local) yields a ﬁnal se-
+transformer stack—the same length as in mBERT.               quence representation yseq ∈ Rn×d.
+
+Deep transformer stack After downsampling,                   Residual connections While the initial charac-
+CANINE applies a deep transformer stack with                 ter encoder (before downsampling) and ﬁnal char-
+L layers to the resulting downsampled positions.             acter encoder (after upsampling) both represent
+This is the same as the core of BERT and deriva-             character positions, they conceptually have very
+tive models, and remains the core of CANINE in               different purposes in the network. Intuitively, we
+that it accounts for the vast majority of its compute        think of the initial character encoder as composing
+and parameters, though we note that this middle              characters to create a more word-like representa-
+portion of the model could easily be replaced with           tion, while the ﬁnal character encoder is extract-
+any other sequence-to-sequence model including               ing the in-context representation that’s relevant for
+those with better compute performance such as                predicting the “meaning” of the content at each
+Performer (Choromanski et al., 2021), Big Bird               position; CANINE must be able to deal with addi-
+(Zaheer et al., 2020), RFA (Peng et al., 2021),              tional ambiguity during upsampling since a single
+ETC (Ainslie et al., 2020), etc. This portion of the         downsampled position may span more than one
+model yields a new downsampled representation                conceptual word. Because of the different roles
+                                                             of these induced features, we do not use residual
+   18We use blocks of 128 characters in our experiments.     connections from hinit to hup.
+   19In our experiments, we found a downsampling rate of 4X
+to result in high quality with a speed comparable to BERT.      20We use w = 4 in our experiments.
+      Shu e
+                           4  7  1                           2     6       5     3
+Prediction Order
+
+     To
+                               big                            sa t.
+Prediction
+
+             T [CLS]  h  e             big                      ca t  [M]   [M]   [M]     … [M] [SEP]
+ Targets
+                  Ⓧ Not selected for
+     Identity
+                      Mask
+
+     To
+             MLM prediction
+      Transform
+                     (90% of predictions)
+  Model
+             (85% of spans)       (10% of predictions)
+  Inputs
+
+             T [CLS]  h  e             big                      ca t  s     a     t       .     … [SEP]
+
+Figure 2: CANINE-C pre-training data preparation (§3.2.1). Character-wise predictions are made by an auto-
+regressive transformer layer that predicts then reveals one character at a time, in a shufﬂed order.
+
+3.2 Pre-traininglff                                             lected for MLM prediction) are concatenated and
+                                                                then fed through a small feed-forward neural net-
+Recent pre-trained models ranging from BERT to                  work to project back to the original dimensional-
+T5 have largely used variations on a masked lan-                ity d; these are ﬁnally shufﬂed and used by a sin-
+guage model (MLM) task (also known as span                      gle layer auto-regressive transformer with a left-
+corruption) as an unsupervised pre-training loss                to-right self-attention mask:23
+function—a means of generating synthetic ex-
+amples that are not from any realistic task, yet                    yˆ ← TRANSFORMERAUTOREG eg ⊕ yseq
+prepare a model to learn realistic tasks in fu-
+ture phases of training (i.e. ﬁne-tuning). The                  This representation yˆ is then used to predict each
+CANINE pre-training procedure retains the MLM                   character. To avoid wasting time on a large out-
+task, and offers two distinct strategies for comput-            put weight matrix and softmax, the gold target
+ing the MLM loss—autoregressive character pre-                  classes t are bucketed codepoint IDs such that
+diction vs. subword prediction—both of which                    ti = gi % B. This is similar to the strategy used
+yield a fully tokenization-free model following                 in the character hash embedder (§3.1). The oc-
+pre-training. In our experiments, we use only one               cassional collisions among characters is less prob-
+of these losses at a time.                                      lematic due (a) the fact that this is an encoder-only
+                                                                model and (b) that the embeddings must still retain
+3.2.1 Autoregressive Character Loss                             contextual information in order to correctly pre-
+                                                                dict characters. Because we’re only predicting a
+Span-wise masking CANINE-C is an autore-                        relatively small subsequence of the input (15% in
+gressive character loss that masks character spans              our experiments), the cost of this layer is small.
+within each sequence. These spans are chosen
+based on whitespace boundaries. No punctuation                  3.2.2 Subword Loss
+splitting nor other heuristics are used. All char-
+acters within the masked span are replaced by a                 We also experiment with CANINE-S, a subword-
+special mask codepoint in the input.21 No random                based loss function, to demonstrate how a token-
+subword replacement is performed as there is no                 aware pre-training loss can still be paired with
+subword vocabulary.22                                           a tokenization-free model such that the tokenizer
+                                                                and vocabulary are discarded after pre-training.
+Span prediction CANINE-C auto-regressively
+predicts the masked characters. The order of the                Span-wise masking Like mBERT’s MLM
+masked positions is shufﬂed such that masked con-               setup, each span in CANINE-S corresponds to a
+text is not necessarily revealed left-to-right, but             single subword. As with the autoregressive loss,
+rather a single character at a time. The pre-training           all characters within the masked span are replaced
+data preparation is shown in Figure 2. Masked in-               with a special “mask” codepoint. Random
+puts are fed to the model as x. The output of the               replacements of subwords are chosen from the
+CANINE model yseq and the embeddings eg of the                  vocabulary of same-length subwords such that
+gold characters g (i.e. the character positions se-             the length of the character sequence remains un-
+                                                                changed; more formally, given a subword selected
+   21We use codepoints in Unicode’s Private Use Area block
+such that the input remains a valid Unicode string.                23The left-to-right self-attention masking is with regard to
+                                                                the shufﬂed sequence.
+   22Though we expect that future work on vocabulary-free
+random replacement may improve quality.
+for random replacement x and a vocabulary of                     cess untokenized data, or even process data that
+subwords V , x’s replacement will be drawn from                  has been pre-processed by different tokenizers, a
+the subset of v ∈ V where LEN(v) = LEN(x).                       situation that would otherwise introduce a signiﬁ-
+                                                                 cant skew between training phases.
+Span prediction Within each masked character
+span, CANINE-S randomly selects a character po-                  4 Experiments
+sition where the model will make a prediction; the
+model predicts the identity of the masked subword                4.1.1 Information-Seeking QA Data
+via softmax. The associated subword embeddings
+are discarded after pre-training.                                TYDI QA: Primary Tasks TYDI QA is a
+                                                                 dataset of information-seeking questions in 11 ty-
+3.2.3 Targeted Upsampling                                        pologically diverse languages (Clark et al., 2020).
+                                                                 Questions are written before answers, leading to
+By design, each ﬁnal character representation (af-               less lexical and morphological overlap between
+ter upsampling) is a function of the output of the               questions and answers, which are drawn from
+initial character encoder (before downsampling)                  Wikipedia. We evaluate on the primary tasks.25
+and the output of the deep transformer stack—
+there are no inter-position dependencies across the              Passage Selection Task (SELECTP) Given a
+upsampled sequence. This depends on the up-                      list of the passages in a Wikipedia article, return
+sampler using position-wise feed-forward projec-                 either the index of the passage that answers the
+tions and a single transformer layer. During pre-                question, or return NULL if the article contains no
+training, we leverage this design to improve speed               acceptable answer.
+by only performing upsampling on the sequence
+positions that will be used by the MLM task p.                   Minimal Answer Span Task (MINSPAN)
+More formally, we use the following equivalent24                 Given a full Wikipedia article, return the start
+form of the UP function during pre-training:                     and end byte indices of the minimal span that
+                                                                 completely answers the question. Alternatively,
+  hu∗p ← GATHER p, hup                                           a system may indicate that the article does not
+ y∗seq ← TRANSFORMER1 Q = hu∗p, KV = hup                         contain an answer, or return YES or NO for yes/no
+                                                                 type questions.
+3.2.4 Modularity
+                                                                 4.1.2 Named Entity Recognition Data
+Unlike previous models, CANINE removes both
+the vocabulary and tokenization algorithm as fos-                We also consider the task of named entity recogni-
+silized parts of the ﬁnal model that must be repli-              tion (NER), which requires the model to identify
+cated during ﬁne-tuning and prediction. Regard-                  which spans of a sentence correspond to entities
+less of which pre-training loss is chosen (char-                 and label the entity type. In all of our experiments,
+acters or subwords), the use of these compo-                     we framed the task as sequence labeling, predict-
+nents in CANINE is limited to a detail of the pre-               ing BIO-encoded span labels.
+training procedure—an inductive bias of the loss
+function—that is then discarded. The ﬁne-tuning                  CoNLL NER We use Spanish and Dutch
+and prediction phases of the model lifecycle never               data from the CoNLL 2002 NER task (Tjong
+have any knowledge of what vocabulary or to-                     Kim Sang, 2002) and English and German from
+kenization algorithm (if any) were used in pre-                  the CoNLL 2003 NER task (Tjong Kim Sang and
+training. This allows the model to natively pro-                 De Meulder, 2003), all from the newswire domain.
+
+   24This highly-effective targeted upsampling optimization      MasakhaNER To widen the scope of our exper-
+is the primary reason that CANINE uses a full Transformer        iments beyond Europoean languages, we also in-
+layer for the ﬁnal full-length character sequence rather than    clude MasakhaNER (Adelani et al., 2021), which
+a local transformer. Because a block-wise local transformer      includes ten African languages (Amharic, Hausa,
+assumes uniform position-wise locality over attention blocks,    Igbo, Kinyarwanda, Luganda, Luo, Nigerian Pid-
+it is not trivial to combine these two optimizations; the lo-    gin, Swahili, Wolof, and Yorùbá) with human an-
+cal self-attention mask would no longer be a simple block        notations on local news text.
+diagonal. However, this ﬁnal upsampling layer is discarded
+for classiﬁcation tasks and so does not contribute any cost.        25As opposed to the simpliﬁed TYDIQA-GOLDP task,
+Hence, while it is possible to combine local attention and tar-  which is part of the XTREME meta-benchmark.
+geted upsampling, this is left as future work.
+                                                                    Examples        TYDIQA       TYDIQA
+                                                                                                 MINSPAN
+Model           Input     MLM       r Length                        / sec Params SELECTP
+                                                                                                 50.5
+mBERT (public)  Subwords Subwords   –                          512      –     179M  63.1         51.3
+                                                               512  9000      179M  63.2         43.7 (-7.5)
+mBERT (ours)    Subwords Subwords   –                         2048            127M  59.5 (-3.7)  50.2 (-1.0)
+                                                              2048   925      127M  63.8 (+0.6)  52.5 (+1.2)
+                Chars     Single Chars 1                      2048   900      127M  66.0 (+2.8)  53.0 (+1.7)
+                                                              2048  6400      127M  65.7 (+2.5)  57.0 (+5.7)
+                Chars     Subwords  1                         2048  6050      167M  68.1 (+4.9)
+                                                                    5600
+CANINE-S        Chars     Subwords  4
+
+CANINE-C        Chars     Autoreg. Chars 4
+
+CANINE-C + n-grams Chars  Autoreg. Chars 4
+
+Table 2: Direct comparison between mBERT (rows 1–2) and CANINE (rows 5–7) on TYDI QA. Public mBERT
+results are taken from the TYDI QA paper. Rows 3 and 4 show simple baselines that yield inefﬁcient / low-quality
+performance. Despite operating on 4x more sequence positions, CANINE remains comparable to mBERT in terms
+of speed. Pre-training example/sec are shown for our reported hardware (see Setup, §4.1). r represents the ratio for
+downsampling. Parameters are calculated at ﬁne-tuning time. All results are averaged over 3 ﬁne-tuning replicas.
+TYDI QA scores are F1 scores, macro-averaged across languages. Deltas from our mBERT (the most comparable
+baseline) are shown in parentheses.
+
+4.1.3 Model Conﬁguration                                      select 15% of subwords for the MLM loss and
+                                                              predict up to 80 output positions; 80% of these
+Direct comparison with mBERT In order to                      are masked in the input, 10% are randomly re-
+determine which pre-training architecture pro-                placed, and 10% are unmodiﬁed. For CANINE-C
+duces better quality downstream predictions, we               (CANINE with the autoregressive character loss),
+compare CANINE to mBERT, which we re-                         we select 15% of contiguous spans for the MLM
+implemented and re-trained in order to hold as                loss and predict up to 320 output characters,
+many variables as possible constant. Note that we             and no random replacement is performed. For
+intentionally do not compare against public pre-              TYDI QA, we use a maximum answer length of
+trained checkpoints that use different pre-training           100 characters, which is approximately the 99th
+corpora since (a) this would be a major confound-             percentile answer length. Sequences longer than
+ing variable and (b) most publicly available pre-             the maximum sequence length are zero-padded,
+trained models are simply instantiations of BERT,             following BERT.29
+including XLM-R26 and X-STILTS.27
+
+Setup We pre-train on the multilingual                        4.2 TYDI QA Results
+Wikipedia data of mBERT, which includes
+104 languages. Similarly, we reuse mBERT’s                    Our main result is shown in Table 2. CANINE-S
+exponential smoothing technique to weight the                 (CANINE with the subword loss) improves over
+languages within the pre-training samples. We                 mBERT in the TYDI QA SELECTP task by 2.8 F1,
+train for 124k steps with batch size 4096 (2.5                while using about 30% fewer parameters. Sim-
+passes over the data) using the LAMB optimizer                ilarly, CANINE-C (CANINE with the autoregres-
+(You et al., 2020) with a linearly decayed learning           sive character loss), improves over mBERT by 2.5
+rate of 0.018 where 2.5% of the steps are used                F1. Adding vocab-free character n-grams leads
+for warm-up. We use a sequence length of 512                  to even further gains over mBERT (+3.8 F1) and
+for mBERT, and 2048 for CANINE, which results                 even more on the MINSPAN task (+6.9 F1). A
+in 512 downsampled positions in its core deep                 language-wise breakdown is provided in Table 7
+transformer stack. We pre-train on 64 Cloud                   in the appendix.
+TPUs v328 for approximately one day (see results
+for precise timings). For both mBERT and                         29Each pre-training uses approximately 24 hours on 64
+CANINE-S (CANINE with the subword loss), we                   TPUs (1.5k TPU-hours), so the 18 pre-trainings in Tables
+                                                              2/3/4 required about 28k TPU-hours. The 18 TyDi QA ex-
+   26XLM-R instantiates BERT with a larger pre-training cor-  periments in these tables, each take about 1 hour on 16 TPUs,
+pus, larger model size, and larger vocabulary size.           each with 3 replicas (48 TPU-hours), about 1k TPU-hours to-
+                                                              tal. The 3 NER experiments in Table 5 each took 3 hours on
+   27X-STILTS performs English ﬁne-tuning on an existing      4 TPUs with 3 replicas each (36 TPU-hours), 108 TPU-hours
+XLM-R checkpoint. (Phang et al., 2020)                        total. Thus replicating the experiments in this paper would
+                                                              take approximately 29k TPU-hours.
+   28v3 TPUs have 16 GiB memory / core (128 GiB total).
+Question                                   Passage Answer
+Chelsea ina milikiwa na nani?
+                                           Kwa kawaida Chelsea huvaa jezi ya blu, kaptula blu na soksi nyeupe. Nembo ya klabu ime-
+Who owns Chelsea?                          badilishwa mara nyingi kulingana na wakati na kuboresha muonekano wa klabu. Nembo ya
+                                           sasa inaonesha picha ya simba akiwa amebeba mkuki. Tangu Julai 2003, Chelsea imekuwa
+Kampuni isambazayo umeme nchini Kenya      ikimilikiwa na Bilionea wa Kirusi, Roman Abramovich.
+inaitwaje?                                 Chelsea usually wear blue jerseys, blue shorts and white socks. The club logo has been
+What is the name of the company that dis-  changed many times over time and improved the club’s appearance. The current emblem
+tributes electricity in Kenya?             shows a picture of a lion carrying a spear. Since July 2003, Chelsea has been owned by
+                                           Russian billionaire Roman Abramovich.
+
+                                           Kenya Power and Lighting (KPLC) ni kampuni inayohusika na maambukizi ya umeme na
+                                           usambazaji wa umeme nchini Kenya.
+                                           Kenya Power and Lighting (KPLC) is a company responsible for electricity transmission
+                                           and distribution in Kenya.
+
+Table 3: Kiswahili examples in which CANINE improved over mBERT in the TYDI QA SELECTP task. On
+examining the mBERT’s subword tokenization, we observe that the segmentations do not align well, putting more
+pressure on the model to combine them and more opportunities for some embeddings to be poorly estimated.
+Top: The model must match a key word in the question milikiwa (own) to a morphological variant in the an-
+swer iki-milikiwa (to be owned). mBERT’s WordPiece segmentation produces milik -iwa and iki -mi -iki -wa for
+these, respectively. Bottom: The model must match i-sambaza-yo (distributes) in the question with u-sambaza-ji
+(distribution). mBERT’s WordPiece segmentation produces isam -ba -za -yo and usa -mba -zaj -i.
+
+   We also present results from some ablation                   4.3 Ablations
+models as additional baselines in rows 3-4 of Ta-
+ble 2. First, for row 3, we simply replace BERT’s               In Table 6, we consider minor modiﬁcations to the
+subword vocabulary with a pure character vocabu-                ﬁnal CANINE architecture, and evaluate the effect
+lary, which makes characters both the input gran-               of each on the downstream quality of the model.30
+ularity and the unit of masking and prediction for
+the MLM task, and observe that not only is the                  Attending directly to hdown Instead of attend-
+model 10X slower than subword-based BERT, but                   ing to the character-wise sequence hup, we attend
+the quality also suffers greatly. Then, for row 4,              to the downsampled sequence:
+we modify that model to use subwords for mask-
+ing and MLM predictions, while keeping charac-                  y+seq = TRANSFORMER1 Q = hup, KV = hdown
+ters as the input granularity, and we see a substan-
+tial quality improvement, though pre-training re-               While this change reduces the overall FLOPS of
+mains extremely slow. Finally, by comparing to                  the model due to the reduced attention computa-
+the full CANINE model in row 5, we can see that                 tion, it does not have a major effect on pre-training
+adding the downsampling strategy improves speed                 throughput. However, it does substantially de-
+by 700%, and also leads to an additional small                  grade quality.
+bump in quality. We speculate that this additional
+quality gain comes from giving the model a better               Number of hash buckets We reduce the num-
+inductive bias toward more word-like units within               ber of hash buckets (B) from 16k to 8k, meaning
+the deep transformer stack.                                     more (partial) collisions in embedding lookups.
+                                                                This signiﬁcantly hinders the MINSPAN task.
+Analysis CANINE fares particularly well on
+morphologically rich languages such as Kiswahili.               Character vocab We switch from our hash-
+Table 3 shows examples where CANINE out-                        based no-vocabulary strategy to using a normal
+performs mBERT on the TYDI QA SELECTP                           character vocabulary (which we derive from the
+task. In particular, we observe examples where                  pre-training corpus). We observe that this under-
+Kiswahili’s rich morphology does not hinder the                 performs the hashing approach. We speculate that
+matching process for CANINE.                                    this might be due to skew between the pre-training
+                                                                corpus and the ﬁnal downstream task since not all
+   30These ablations were carried out during initial model de-  codepoints can be included in the vocabulary.
+velopment, hence comparisons to a non-ﬁnal model.
+                                                                Input character dimension We reduced the
+                                                                embedding size of the initial character encoder
+                                                                (i.e. the embedding size of hinit and e—not hup
+                                                                nor yseq) and observe that quality falls off rapidly.
+Model                         SELECTP MINSPAN          Model               CoNLL         MasakhaNER
+
+CANINE-C                      65.7  53.0               mBERT (ours)        87.8          72.4
+No concatenation                                       CANINE-C            74.0 (-13.8)  65.5 (-6.9)
++Final-to-initial resid.      17.2  35.6               CANINE-C + n-grams  86.7 (-1.1)   76.8 (+4.3)
++Final-to-downsampled resid.
+                              17.3  35.9
+
+                              62.0  50.2
+
+                                                       Table 5: F1 scores on NER tasks.
+
+Table 4: Ablations for residuals and feature concate-  boost a model’s memorization ability while re-
+nation on TYDI QA. Rows are cumulative (each row       maining fully tokenization-free.
+contains all changes from the previous).
+                                                          A full language-wise breakdown is provided in
+No initial transformer We remove the local             the appendix (Table 8). It’s worth noting that part
+transformer from hinit and similarly observed a        of the performance difference on MasakhaNER is
+marked reduction in quality.                           due to mBERT producing no usable outputs for
+                                                       Amharic. The mBERT pre-training data does not
+Increased downsampling While more aggres-              contain Amharic (or any Amharic-script text), so
+sive downsampling (a factor of 5X or 6X, rather        it has no vocabulary entries to Amharic’s script
+than 4X) brings substantial speed gains, the           (meaning that mBERT sees only sequences of
+passage-level quality degrades substantially and       [UNK] on Amharic inputs). However, since
+the minimal span predictions suffer even more.         CANINE always supports the full Unicode space,
+                                                       it is able to achieve 50 F1 even though it, too, had
+No position-limited MLM When we do not use             never seen Amharic text during pre-training. We
+the trick of applying the ﬁnal character trans-        take this as validation of CANINE’s vocabulary-
+former (yseq) only to the positions that will be       free approach. It may also be evidence that
+computed by the MLM task, we observe a large           CANINE exhibits cross-script transfer abilities
+reduction in speed. Since this model is theoreti-      analogous to those in mBERT (Pires et al., 2019).
+cally equivalent in terms of operations, we show
+only the speed for exposition.                         Error analysis CANINE-C tends not to label
+                                                       rarer lexical items that mBERT appears to have
+   We also performed ablations aimed at explor-        memorized. For example, with CANINE-C,
+ing the effect of feature concatenation and residu-    JCPenney (a relatively rare lexical item) is not rec-
+als; results are in Table 4. Not concatenating the     ognized as an entity. CANINE-C also tends to sep-
+downsampled representation with the initial char-      arate long entities; for example, “State Street Bank
+acter representation when computing hup causes         and Trust Company” is labeled as two separate
+the model to become unstable (row 2); adding a         spans: “State Street Bank” and “Trust Company”;
+residual from hup back to hinit does not help (row     and the location TAMPA BAY is recognized only
+3). However, additionally inserting a residual from    as TAMPA. However, adding n-grams features ap-
+hup back to hdown does stabilize the model (row 4)     pears to mostly resolve this issue.
+though it does not recover the original quality.
+                                                       5 Related Work
+4.4 NER Results
+                                                       5.1 Improvements to subword tokenization
+Named entity recognition is a task in which mem-
+orization is often a very effective strategy. For ex-  Further improvements to standard subword tok-
+ample, if a model has London in its vocabulary         enization like Byte Pair Encoding (BPE) (Sennrich
+and sees it with the label LOCATION during train-      et al., 2016), WordPiece (Wu et al., 2016), and
+ing, then it simply has to retrieve this memorized     SentencePiece (Kudo and Richardson, 2018) have
+association when it sees the token London at test      been proposed. Subword regularization (Kudo,
+time. Therefore, evaluating on NER is helpful for      2018) and BPE-dropout (Provilkov et al., 2020)
+understanding the ways in which different models       recognize that deterministic segmentation during
+emphasize memorization vs. generalization.             training limits the ability to leverage morphol-
+                                                       ogy and word composition; instead, they sam-
+   As shown in Table 5, CANINE-C performs              ple at random one of the multiple tokenizations
+signiﬁcantly worse than mBERT on NER, likely           of the training input, made possible by the in-
+due to mBERT’s memorization-friendly vocabu-           herent ambiguity of subword vocabularies. Wang
+lary. However, when (tokenization-free) n-gram
+features are added to CANINE-C, performance re-
+bounds, showing that it is possible to cheaply
+Condition                                                Examples  TYDI QA      TYDI QA
+                                                         / sec     SELECTP      MINSPAN
+Attend to hdown (instead of hup)
+8k codepoint hash buckets (instead of 16k)               6400      64.5         52.2
+Character vocab (no hashing)                             6400      64.1 (-0.4)  50.5 (-1.7)
+Input character dim 384 (instead of 768)                 6400      64.6 (+/-)   51.2 (-1.0)
+Input character dim 192 (instead of 768)                 6600      62.9 (-1.2)  49.3 (-1.2)
+No initial character transformer                         6400      61.7 (-2.4)  47.3 (-3.2)
+Downsample by a factor of 5 (instead of 4)               6700      63.2 (-1.4)  48.3 (-2.9)
+Downsample by a factor of 6 (instead of 4)               7000      62.9 (-1.7)  49.2 (-2.0)
+Don’t limit ﬁnal character transformer to MLM positions  9200      62.7 (-1.9)  47.6 (-3.6)
+                                                         5200      —            —
+CANINE-S
+                                                         6400      66.0         52.5
+
+Table 6: Ablation experiments on the CANINE model with TYDI QA F1 scores. Deltas are shown in parentheses
+with regard to the top-most experiment, which serves as the baseline conﬁguration for all experiments in this table.
+Each result is averaged over 3 ﬁne-tuning and evaluation replicas.
+
+et al. (2021) recently expanded on this paradigm         Some hybrid models processed the input at char-
+to enforce consistency of predictions over differ-       acter level, but predicted words from a closed vo-
+ent segmentations. Unigram LM (Kudo, 2018),              cabulary (Kim et al., 2016; Gerz et al., 2018).
+which builds its vocabulary top-down, was shown          Others reintroduced explicit tokenization on the
+to align with morphology better than BPE on pre-         input side, and either generated bursts of char-
+trained encoders (Bostrom and Durrett, 2020).            acter sequences that formed an open vocabulary
+                                                         (Kawakami et al., 2017) or used a character-only
+   Others have built hybrid models that use mul-         generator as a fallback when the main closed-
+tiple granularities, combining characters with to-       vocabulary word generator produced a rare or un-
+kens (Luong and Manning, 2016) or different sub-         known token (Matthews et al., 2019; Mielke and
+word vocabularies (Zhang and Li, 2021).                  Eisner, 2019). Especially after the popularization
+                                                         of the inherently ambiguous subword vocabularies
+5.2 Character-level models                               like BPE, several studies moved beyond a single
+                                                         input segmentation and marginalized over all pos-
+Following the larger NLP trend, character-level          sible segmentations (van Merriënboer et al., 2017;
+n-gram models (Huang et al., 2013; Wieting               Buckman and Neubig, 2018; Grave et al., 2019).
+et al., 2016; Bojanowski et al., 2017) have mostly
+been replaced by neural networks. While gener-              Coming full circle, Kawakami et al. (2019) in-
+ally lagging behind their word-level counterparts,       duced a lexicon without any explicit supervision,
+character-level features are important for mor-          reverting back to pure CLMs. In a revitalized ef-
+phologically rich languages, particularly in low-        fort to bring them on-par with coarser granulari-
+resource settings (Garrette and Baldridge, 2013).        ties, researchers leveraged external resources such
+                                                         as grounding in vision (Kawakami et al., 2019) or
+For language modeling Character language                 multi-task learning together with supervised mor-
+models (CLMs) have used vanilla RNN architec-            phology tasks (Blevins and Zettlemoyer, 2019).
+tures to produce distributions over sequences of
+characters in a purely tokenization-free manner             After the transformer (Vaswani et al., 2017) re-
+(Sutskever et al., 2011; Graves, 2013; Hwang and         placed RNNs as the dominant architecture in NLP,
+Sung, 2017; Radford et al.). Hierarchical RNNs           character-level models followed. Al-Rfou et al.
+modeled the assumption that language operates            (2019) showed that byte-level vanilla Transform-
+on increasing layers of abstraction: Chung et al.        ers signiﬁcantly underperform their word-level
+(2017) jointly trained a sub-module to segment the       counterparts. A similar ﬁnding was reported by
+character-level input into larger spans at each layer    Radford et al. (2019). Although the gap has been
+of a stacked LSTM.                                       reduced (Choe et al., 2019), subword transformers
+                                                         remain the status quo for pure language modeling.
+   Due to the consistent lag in performance behind
+their word-level counterparts, attention shifted         For speciﬁc tasks In parallel with LM efforts,
+from pure CLMs towards merely character-aware            the neural machine translation (NMT) commu-
+models, still reliant on traditional tokenization.
+nity sought to solve its open-vocabulary problem         based approaches (Al-Rfou et al., 2019), a BERT
+via character-level modeling. Luong and Man-             model ﬁne-tuned for semantic parsing achieved
+ning (2016) proposed a hybrid model that operated        gains only when characters complemented sub-
+mainly at the word level, but consulted a character-     words (van Noord et al., 2020).
+level LSTM for unknown words; this was a prac-
+tical compromise, as their character-only model          5.3 Multilingual models
+took 3 months to train. Lee et al. (2017) en-
+abled pure character NMT by shortening the in-           Multilingual NLP has been dominated by deep
+put length via convolutional, pooling, and high-         pre-trained multilingual models whose subword
+way layers. Notably, their many-to-English model         vocabularies are shared across languages. Such
+outperformed its subword counterpart and most            models borrow their architectures from monolin-
+bilingual baselines, with a 35% increase in train-       gual predecessors and apply joint training in 100+
+ing time (on a single GPU) compared to a baseline        languages, either with unsupervised LM losses:
+BPE-to-char model. CANINE has a similar moti-            mBERT, mT5 (Xue et al., 2021), or with additional
+vation, but operates in the context of pre-trained       translation losses: XLM (Lample and Conneau,
+transformers; training is 7x faster compared to a        2019), XLM-R (Conneau et al., 2020). Chung
+char-to-char baseline (on TPU v3), and has a 28%         et al. (2020) extended this by forming language
+increase in training time over mBERT (Table 2).          clusters with per-cluster vocabularies. To ac-
+                                                         commodate languages unseen during pre-training,
+   Character information has been leveraged for          Wang et al. (2020) extended the vocabulary and
+many other end tasks as well, including: text clas-      continued pre-training.
+siﬁcation (Zhang et al., 2015; Zhang and LeCun,
+2017), part-of-speech tagging and NER (Gillick           6 Conclusion
+et al., 2016; Akbik et al., 2018; Pinter et al., 2019),
+named entity detection (Yu et al., 2018), depen-         In this article, we described CANINE, which
+dency parsing (Vania et al., 2018), and machine          is, to our knowledge, the ﬁrst pre-trained deep
+reading comprehension (Hewlett et al., 2018).            encoder for language understanding that uses a
+Character information proved particularly useful         tokenization-free, vocabulary-free model, while
+for low-resource languages (Xie et al., 2018), phe-      surpassing the quality of models built on top of
+nomena such as code-switching and translitera-           heuristic tokenizers. CANINE eliminates many en-
+tion (Ball and Garrette, 2018), and rich morphol-        gineering pitfalls for practitioners and opens up
+ogy (Vania and Lopez, 2017), previously receiv-          new research directions for the community.
+ing special modeling including adaptor grammars
+(Botha and Blunsom, 2013).                               Acknowledgements
+
+For transfer learning Token-based models                 The authors wish to thank Noah Constant, Rami
+have also been augmented with character-level            Al-Rfou, Kristina Toutanova, Kenton Lee, Ming-
+information in the context of transfer learn-            Wei Chang, and Tim Dozat for their feedback on
+ing, where encoders trained with unsupervised            this work. We would also like to thank Martin
+objectives are repurposed to solve downstream            Njoroge and Nanjala Misiko for their consulta-
+tasks. Pinter et al. (2017) addressed the out-of-        tions on the Kiswahili examples, Diana Akrong
+vocabulary problem of static pre-trained word em-        for consulting on Twi orthography, and Waleed
+beddings by training a model to map the surface of       Ammar for consulting on Arabic morphology.
+a word to its pre-trained representation, and used it
+on unknown words. ELMo (Peters et al., 2018), a
+bidirectional LSTM model, applied character con-
+volutions to its whitespace-separated input tokens.
+CharacterBERT (Boukkouri et al., 2020) ported
+this technique to BERT, augmenting its existing
+WordPiece-tokenized input. Consistent with pre-
+vious observations that feeding characters into a
+transformer stack comes with a huge computa-
+tional cost while not improving over tokenization-
+References                                         Terra Blevins and Luke Zettlemoyer. 2019. Better
+                                                      character language modeling through morphol-
+David Ifeoluwa Adelani, Jade Abbott, Gra-             ogy. In Proc. of ACL.
+   ham Neubig, Daniel D’souza, Julia Kreutzer,
+   Constantine Lignos, Chester Palen-Michel,       Piotr Bojanowski, Edouard Grave, Armand Joulin,
+   Happy Buzaaba, Shruti Rijhwani, Sebastian          and Tomas Mikolov. 2017. Enriching word vec-
+   Ruder, Stephen Mayhew, Israel Abebe Az-            tors with subword information. TACL.
+   ime, Shamsuddeen H. Muhammad, Chris Chi-
+   nenye Emezue, Joyce Nakatumba-Nabende,          Kaj Bostrom and Greg Durrett. 2020. Byte pair
+   Perez Ogayo, Aremu Anuoluwapo, Cather-             encoding is suboptimal for language model pre-
+   ine Gitau, Derguene Mbaye, Jesujoba Alabi,         training. In Findings of the Association for
+   Seid Muhie Yimam, Tajuddeen Rabiu Gwad-            Computational Linguistics: EMNLP.
+   abe, Ignatius Ezeani, Rubungo Andre Niy-
+   ongabo, Jonathan Mukiibi, Verrah Otiende,       Jan A. Botha and Phil Blunsom. 2013. Adaptor
+   Iroro Orife, Davis David, Samba Ngom,              Grammars for learning non-concatenative mor-
+   Tosin Adewumi, Paul Rayson, Mofetoluwa             phology. In Proc. of EMNLP.
+   Adeyemi, Gerald Muriuki, Emmanuel Anebi,
+   Chiamaka Chukwuneke, Nkiruka Odu, Eric Pe-      Hicham El Boukkouri, Olivier Ferret, Thomas
+   ter Wairagala, Samuel Oyerinde, Clemencia          Lavergne, Hiroshi Noji, Pierre Zweigenbaum,
+   Siro, Tobius Saul Bateesa, Temilola Oloyede,       and Junichi Tsujii. 2020. CharacterBERT:
+   Yvonne Wambui, Victor Akinode, Debo-               Reconciling ELMo and BERT for Word-Level
+   rah Nabagereka, Maurice Katusiime, Ayodele         Open-Vocabulary Representations From Char-
+   Awokoya, Mouhamadane MBOUP, Dibora Ge-             acters. In Proc. of COLING.
+   breyohannes, Henok Tilaye, Kelechi Nwaike,
+   Degaga Wolde, Abdoulaye Faye, Blessing          Tom Brown, Benjamin Mann, Nick Ryder,
+   Sibanda, Orevaoghene Ahia, Bonaventure F. P.       Melanie Subbiah, Jared D Kaplan, Prafulla
+   Dossou, Kelechi Ogueji, Thierno Ibrahima           Dhariwal, Arvind Neelakantan, Pranav Shyam,
+   DIOP, Abdoulaye Diallo, Adewale Akinfaderin,       Girish Sastry, Amanda Askell, Sandhini Agar-
+   Tendai Marengereke, and Salomey Osei. 2021.        wal, Ariel Herbert-Voss, Gretchen Krueger,
+   MasakhaNER: Named Entity Recognition for           Tom Henighan, Rewon Child, Aditya Ramesh,
+   African Languages. TACL.                           Daniel Ziegler, Jeffrey Wu, Clemens Winter,
+                                                      Chris Hesse, Mark Chen, Eric Sigler, Ma-
+Joshua Ainslie, Santiago Ontanon, Chris Alberti,      teusz Litwin, Scott Gray, Benjamin Chess,
+   Vaclav Cvicek, Zachary Fisher, Philip Pham,        Jack Clark, Christopher Berner, Sam McCan-
+   Anirudh Ravula, Sumit Sanghai, Qifan Wang,         dlish, Alec Radford, Ilya Sutskever, and Dario
+   and Li Yang. 2020. ETC: Encoding Long and          Amodei. 2020. Language models are few-shot
+   Structured Inputs in Transformers. In Proc. of     learners. In Proc. of NeurIPS.
+   EMNLP.
+                                                   Jacob Buckman and Graham Neubig. 2018. Neu-
+Alan Akbik, Duncan Blythe, and Roland Vollgraf.       ral lattice language models. TACL.
+   2018. Contextual String Embeddings for Se-
+   quence Labeling. In Proc. of COLING.            Dokook Choe, Rami Al-Rfou, Mandy Guo, Heey-
+                                                      oung Lee, and Noah Constant. 2019. Bridging
+Rami Al-Rfou, Dokook Choe, Noah Constant,             the Gap for Tokenizer-Free Language Models.
+   Mandy Guo, and Llion Jones. 2019. Character-       arXiv preprint arXiv:1908.10322.
+   level language modeling with deeper self-
+   attention. In Proc. of AAAI.                    Krzysztof Choromanski, Valerii Likhosherstov,
+                                                      David Dohan, Xingyou Song, Andreea Gane,
+Kelsey Ball and Dan Garrette. 2018. Part-of-          Tamas Sarlos, Peter Hawkins, Jared Davis,
+   Speech Tagging for Code-Switched, Transliter-      Afroz Mohiuddin, Lukasz Kaiser, David Be-
+   ated Texts without Explicit Language Identiﬁ-      langer, Lucy Colwell, and Adrian Weller. 2021.
+   cation. In Proc. of EMNLP.                         Rethinking Attention with Performers. In Proc.
+                                                      of ICLR.
+Hyung Won Chung, Dan Garrette, Kiat Chuan         Daniel Hewlett, Alexandre Lacoste, Llion Jones,
+   Tan, and Jason Riesa. 2020. Improving Mul-        Illia Polosukhin, Andrew Fandrianto, Jay Han,
+   tilingual Models with Language-Clustered Vo-      Matthew Kelcey, and David Berthelot. 2018.
+   cabularies. In Proc. of EMNLP.                    Byte-Level Machine Reading across Morpho-
+                                                     logically Varied Languages. In Proc. of AAAI.
+Junyoung Chung, Sungjin Ahn, and Yoshua Ben-
+   gio. 2017. Hierarchical Multiscale Recurrent   Po-Sen Huang, Xiaodong He, Jianfeng Gao,
+   Neural Networks. In Proc. of ICLR.                Li Deng, Alex Acero, and Larry Heck. 2013.
+                                                     Learning deep structured semantic models for
+Jonathan H. Clark, Eunsol Choi, Michael Collins,     web search using clickthrough data. In Proc. of
+   Dan Garrette, Tom Kwiatkowski, Vitaly Niko-       the ACM International Conference on Informa-
+   laev, and Jennimaria Palomaki. 2020. TyDi QA:     tion and Knowledge Management (CIKM).
+   A benchmark for Information-Seeking Ques-
+   tion Answering in Typologically Diverse Lan-   Kyuyeon Hwang and Wonyong Sung. 2017.
+   guages. TACL.                                     Character-Level Language Modeling with Hier-
+                                                     archical Recurrent Neural Networks. In Proc.
+Alexis Conneau, Kartikay Khandelwal, Naman           of ICASSP.
+   Goyal, Vishrav Chaudhary, Guillaume Wen-
+   zek, Francisco Guzmán, Edouard Grave, Myle     Prabhu Kaliamoorthi, Sujith Ravi, and Zornitsa
+   Ott, Luke Zettlemoyer, and Veselin Stoyanov.      Kozareva. 2019. PRADO: Projection attention
+   2020. Unsupervised Cross-lingual Representa-      networks for document classiﬁcation on-device.
+   tion Learning at Scale. In Proc. of ACL.          In Proc. of EMNLP.
+
+Zihang Dai, Guokun Lai, Yiming Yang, and          Kazuya Kawakami, Chris Dyer, and Phil Blun-
+   Quoc V. Le. 2020. Funnel-Transformer: Fil-        som. 2017. Learning to create and reuse words
+   tering out Sequential Redundancy for Efﬁcient     in open-vocabulary neural language modeling.
+   Language Processing. In Proc. of NeurIPS.         In Proc. of ACL.
+
+Jacob Devlin, Ming-Wei Chang, Kenton Lee, and     Kazuya Kawakami, Chris Dyer, and Phil Blun-
+   Kristina Toutanova. 2019. BERT: Pre-training      som. 2019. Learning to Discover, Ground and
+   of Deep Bidirectional Transformers for Lan-       Use Words with Segmental Neural Language
+   guage Understanding. In Proc. of NAACL.           Models. In Proc. of ACL.
+
+Dan Garrette and Jason Baldridge. 2013. Learn-    Yoon Kim, Yacine Jernite, David Sontag, and
+   ing a part-of-speech tagger from two hours of     Alexander M Rush. 2016. Character-Aware
+   annotation. In Proc. of NAACL.                    Neural Language Models. In Proc. of AAAI.
+
+Daniela Gerz, Ivan Vulic´, Edoardo Ponti, Jason   Taku Kudo. 2018. Subword Regularization: Im-
+   Naradowsky, Roi Reichart, and Anna Korho-         proving Neural Network Translation Models
+   nen. 2018. Language Modeling for Morpholog-       with Multiple Subword Candidates. In Proc. of
+   ically Rich Languages: Character-Aware Mod-       ACL.
+   eling for Word-Level Prediction. TACL.
+                                                  Taku Kudo and John Richardson. 2018. Senten-
+Dan Gillick, Cliff Brunk, Oriol Vinyals, and         cePiece: A simple and language independent
+   Amarnag Subramanya. 2016. Multilingual            subword tokenizer and detokenizer for Neural
+   Language Processing From Bytes. In Proc. of       Text Processing. In Proc. of EMNLP: System
+   NAACL.                                            Demonstrations.
+
+Edouard Grave, Sainbayar Sukhbaatar, Piotr Bo-    Guillaume Lample and Alexis Conneau. 2019.
+   janowski, and Armand Joulin. 2019. Training       Cross-lingual Language Model Pretraining. In
+   hybrid language models by marginalizing over      Proc. of NeurIPS.
+   segmentations. In Proc. of ACL.
+                                                  Jason Lee, Eth Zürich, Kyunghyun Cho, and
+Alex Graves. 2013. Generating sequences with         Thomas Hofmann. 2017. Fully Character-Level
+   recurrent neural networks. arXiv preprint         Neural Machine Translation without Explicit
+   arXiv:1308.0850.                                  Segmentation. TACL.
+Minh-Thang Luong and Christopher D. Manning.       Ivan Provilkov, Dmitrii Emelianenko, and Elena
+   2016. Achieving open vocabulary neural ma-         Voita. 2020. BPE-Dropout: Simple and Effec-
+   chine translation with hybrid word-character       tive Subword Regularization. In Proc. of ACL.
+   models. In Proc. of ACL.
+                                                   Danish Pruthi, Bhuwan Dhingra, and Zachary C.
+Austin Matthews, Graham Neubig, and Chris             Lipton. 2019. Combating adversarial mis-
+   Dyer. 2019. Using Morphological Knowledge          spellings with robust word recognition. In Proc.
+   in Open-Vocabulary Neural Language Models.         of ACL.
+   In Proc. of NAACL.
+                                                   Alec Radford, Rafal Jozefowicz, and Ilya
+Sebastian J. Mielke and Jason Eisner. 2019. Spell     Sutskever. Learning to Generate Reviews
+   once, summon anywhere: A two-level open-           and Discovering Sentiment. arXiv preprint
+   vocabulary language model. In Proc. of AAAI.       arXiv:1704.01444.
+
+Rik van Noord, Antonio Toral, and Johan Bos.       Alec Radford, Jeff Wu, Rewon Child, David Luan,
+   2020. Character-level Representations Improve      Dario Amodei, and Ilya Sutskever. 2019. Lan-
+   DRS-based Semantic Parsing Even in the Age         guage models are unsupervised multitask learn-
+   of BERT. In Proc. of EMNLP.                        ers.
+
+Brendan O’Connor, Michel Krieger, and David        Colin Raffel, Noam Shazeer, Adam Roberts,
+   Ahn. 2010. TweetMotif: Exploratory Search          Katherine Lee, Sharan Narang, Michael
+   and Topic Summarization for Twitter Introduc-      Matena, Yanqi Zhou, Wei Li, and Peter J. Liu.
+   tion and Description. In Proc. of the Interna-     2020. Exploring the limits of transfer learning
+   tional AAAI Conference on Web and Social Me-       with a uniﬁed text-to-text transformer. JMLR.
+   dia.
+                                                   Rico Sennrich, Barry Haddow, and Alexandra
+Hao Peng, Nikolaos Pappas, Dani Yogatama, Roy         Birch. 2016. Neural Machine Translation of
+   Schwartz, Noah Smith, and Lingpeng Kong.           Rare Words with Subword Units. In Proc. of
+   2021. Random feature attention. In Proc. of        ACL.
+   ICLR.
+                                                   Lichao Sun, Kazuma Hashimoto, Wenpeng Yin,
+Matthew E. Peters, Mark Neumann, Mohit Iyyer,         Akari Asai, Jia Li, Philip Yu, and Caiming
+   Matt Gardner, Christopher Clark, Kenton Lee,       Xiong. 2020. Adv-BERT: BERT is not ro-
+   and Luke Zettlemoyer. 2018. Deep contextual-       bust on misspellings! Generating nature ad-
+   ized word representations. In Proc. of NAACL.      versarial samples on BERT. arXiv preprint
+                                                      arXiv:2003.04985.
+Jason Phang, Iacer Calixto, Phu Mon Htut,
+   Yada Pruksachatkun, Haokun Liu, Clara Va-       Ilya Sutskever, James Martens, and Geoffrey E
+   nia, Katharina Kann, and Samuel R Bowman.          Hinton. 2011. Generating text with recurrent
+   2020. English Intermediate-Task Training Im-       neural networks. In Proc. of ICML.
+   proves Zero-Shot Cross-Lingual Transfer Too.
+   In Proc. of AACL.                               Dan Svenstrup, Jonas Meinertz Hansen, and Ole
+                                                      Winther. 2017. Hash Embeddings for Efﬁcient
+Yuval Pinter, Robert Guthrie, and Jacob Eisen-        Word Representations. In Proc. of NeurIPS.
+   stein. 2017. Mimicking word embeddings us-
+   ing subword RNNs. In Proc. of EMNLP.            David Talbot and John Talbot. 2008. Bloom maps.
+                                                      In Proc. of the Workshop on Analytic Algorith-
+Yuval Pinter, Marc Marone, and Jacob Eisen-           mics and Combinatorics (ANALCO).
+   stein. 2019. Character Eyes: Seeing Language
+   through Character-Level Taggers. In Proc. of    Ian Tenney, Dipanjan Das, and Ellie Pavlick. 2019.
+   BlackboxNLP.                                       BERT rediscovers the classical NLP pipeline.
+                                                      In Proc. of ACL.
+Telmo Pires, Eva Schlinger, and Dan Garrette.
+   2019. How multilingual is Multilingual BERT?    Erik F. Tjong Kim Sang. 2002. Introduction
+   In Proc. of ACL.                                   to the CoNLL-2002 shared task: Language-
+                                                      independent named entity recognition. In Proc.
+                                                      of CoNLL.
+Erik F. Tjong Kim Sang and Fien De Meul-              Neural cross-lingual named entity recognition
+   der. 2003. Introduction to the CoNLL-2003          with minimal resources. In Proc. of EMNLP.
+   shared task: Language-independent named en-
+   tity recognition. In Proc. of NAACL.            Linting Xue, Noah Constant, Adam Roberts,
+                                                      Mihir Kale, Rami Al-Rfou, Aditya Siddhant,
+Bart van Merriënboer, Amartya Sanyal,                 Aditya Barua, and Colin Raffel. 2021. mT5: A
+   H. Larochelle, and Yoshua Bengio. 2017.            massively multilingual pre-trained text-to-text
+   Multiscale sequence modeling with a learned        transformer. In Proc. of NAACL.
+   dictionary. arXiv preprint arXiv:1707.00762.
+                                                   Yang You, Jing Li, Sashank Reddi, Jonathan Hseu,
+Clara Vania, Andreas Grivas, and Adam Lopez.          Sanjiv Kumar, Srinadh Bhojanapalli, Xiaodan
+   2018. What do character-level models learn         Song, James Demmel, Kurt Keutzer, and Cho-
+   about morphology? The case of dependency           Jui Hsieh. 2020. Large Batch Optimization for
+   parsing. In Proc. of EMNLP.                        Deep Learning: Training BERT in 76 minutes.
+                                                      In Proc. of ICLR.
+Clara Vania and Adam Lopez. 2017. From Char-
+   acters to Words to in Between: Do We Capture    Xiaodong Yu, Stephen Mayhew, Mark Sammons,
+   Morphology? In Proc. of ACL.                       and Dan Roth. 2018. On the strength of char-
+                                                      acter language models for multilingual named
+Ashish Vaswani, Noam Shazeer, Niki Parmar,            entity recognition. In Proc. of EMNLP.
+   Jakob Uszkoreit, Llion Jones, Aidan N. Gomez,
+   Lukasz Kaiser, and Illia Polosukhin. 2017. At-  Manzil Zaheer, Guru Guruganesh, Avinava
+   tention is all you need. In Proc. of NeurIPS.      Dubey, Joshua Ainslie, Chris Alberti, Santiago
+                                                      Ontanon, Philip Pham, Anirudh Ravula, Qifan
+Xinyi Wang, Sebastian Ruder, and Graham Neu-          Wang, Li Yang, and Amr Ahmed. 2020. Big
+   big. 2021. Multi-view subword regularization.      Bird: Transformers for Longer Sequences. In
+   In Proc. of NAACL.                                 Proc. of NeurIPS.
+
+Zihan Wang, Karthikeyan K, Stephen Mayhew,         Xiang Zhang and Yann LeCun. 2017. Which En-
+   and Dan Roth. 2020. Extending multilingual         coding is the Best for Text Classiﬁcation in Chi-
+   BERT to low-resource languages. In Findings        nese, English, Japanese and Korean? arXiv
+   of EMNLP.                                          preprint arXiv:1708.02657v2.
+
+John Wieting, Mohit Bansal, Kevin Gimpel, and      Xiang Zhang, Junbo Zhao, and Yann LeCun.
+   Karen Livescu. 2016. Charagram: Embedding          2015. Character-level convolutional networks
+   words and sentences via character n-grams. In      for text classiﬁcation. In Proc. of NeurIPS.
+   Proc. of EMNLP.
+                                                   Xinsong Zhang and Hang Li. 2021. AMBERT:
+Yonghui Wu, Mike Schuster, Zhifeng Chen,              A Pre-trained Language Model with Multi-
+   Quoc V Le, Mohammad Norouzi, Wolfgang              Grained Tokenization. In Findings of ACL.
+   Macherey, Maxim Krikun, Yuan Cao, Qin Gao,
+   Klaus Macherey, Jeff Klingner, Apurva Shah,
+   Melvin Johnson, Xiaobing Liu, Łukasz Kaiser,
+   Stephan Gouws, Yoshikiyo Kato, Taku Kudo,
+   Hideto Kazawa, Keith Stevens, George Kurian,
+   Nishant Patil, Wei Wang, Cliff Young, Ja-
+   son Smith, Jason Riesa, Alex Rudnick, Oriol
+   Vinyals, Greg Corrado, Macduff Hughes, and
+   Jeffrey Dean. 2016. Google’s Neural Ma-
+   chine Translation System: Bridging the Gap be-
+   tween Human and Machine Translation. arXiv
+   preprint arXiv:1609.08144.
+
+Jiateng Xie, Zhilin Yang, Graham Neubig,
+   Noah A. Smith, and Jaime Carbonell. 2018.
+A Appendix
+
+            Language    mBERT CANINE-S     CANINE-C     CANINE-C
+                                                        + n-grams
+            (English)         SELECTP      61.6 (-0.6)
+            Arabic                         82.5 (+0.2)  64.6 (+2.4)
+            Bengali     62.2  58.6 (-3.6)  62.5 (+4.0)  84.3 (+2.0)
+            Finnish                        63.6 (+3.2)  66.0 (+7.5)
+            Indonesian  82.3  82.8 (+0.5)  64.2 (+2.9)  66.7 (+6.3)
+            Japanese                       49.7 (+3.5)  65.9 (+4.6)
+            Korean      58.5  61.8 (+3.3)  59.7 (-0.5)  51.2 (+5.0)
+            Russian                        65.6 (+3.4)  60.6 (+0.4)
+            Swahili     60.4  62.2 (+1.8)  67.0 (+8.2)  68.5 (+6.3)
+            Telugu                         81.1 (+0.1)  67.2 (+8.4)
+            Thai        61.3  63.5 (+2.2)  61.2 (+0.1)  84.6 (+3.6)
+            Macro Avg                      65.7 (+2.5)  65.8 (+4.7)
+                        46.2  51.7 (+5.5)               68.1 (+4.9)
+            (English)                      49.0 (+3.0)
+            Arabic      60.2  60.3 (+0.1)  65.6 (-5.1)  51.8 (+5.8)
+            Bengali                        52.5 (+5.2)  73.0 (+2.3)
+            Finnish     62.2  64.6 (+2.4)  53.8 (+2.7)  57.1 (+9.8)
+            Indonesian                     54.4 (+2.2)  57.1 (+6.0)
+            Japanese    58.8  67.8 (+9.0)  40.7 (+4.6)  56.8 (+4.6)
+            Korean                         36.5 (-0.3)  42.0 (+5.9)
+            Russian     81.0  82.5 (+1.5)  47.2 (+1.6)  39.9 (+3.1)
+            Swahili                        57.6 (+8.2)  51.5 (+5.9)
+            Telugu      61.1  62.8 (+1.7)  74.2 (-1.4)  59.2 (+9.8)
+            Thai                           47.1 (-1.3)  79.7 (+4.1)
+            Macro Avg   63.2  66.0 (+2.8)  53.0 (+1.7)  54.2 (+5.8)
+                                                        57.0 (+5.7)
+                              MINSPAN
+
+                        46.0  46.3 (+0.3)
+
+                        70.7  66.9 (-3.8)
+
+                        47.3  46.7 (-0.6)
+
+                        51.1  53.0 (+1.9)
+
+                        52.2  53.6 (+1.4)
+
+                        36.1  40.3 (+4.2)
+
+                        36.8  35.7 (-1.1)
+
+                        45.6  46.7 (+1.1)
+
+                        49.4  59.0 (+9.6)
+
+                        75.6  75.2 (-0.4)
+
+                        48.4  47.9 (-0.5)
+
+                        51.3  52.5 (+1.2)
+
+Table 7: Language-wise breakdown for TYDI QA primary tasks. English is parenthesized because it is not
+included in the overall score calculation for TYDI QA.
+Language         mBERT CANINE-C      CANINE-C
+                                     + n-grams
+                       CONLL
+                                     88.5 (-1.7)
+Dutch            90.2  74.7 (-15.5)  89.8 (-1.3)
+English                              82.1 (-0.4)
+German           91.1  79.8 (-11.3)  86.5 (-1.1)
+Spanish                              86.7 (-1.1)
+Macro Avg        82.5  64.1 (-18.4)
+                                     50.0 (+50.0)
+Amharic          87.6  77.4 (-10.2)  88.0 (-1.3)
+Hausa                                85.0 (+0.4)
+Igbo             87.8  74.0 (-13.8)  72.8 (-1.1)
+Kinyarwanda                          79.6 (-0.6)
+Luganda          MASAKHANER          74.2 (-1.6)
+Luo                                  88.7 (-1.1)
+Nigerian Pidgin  0.0   44.6 (+44.6)  83.7 (-3.4)
+Swahili                              66.5 (+1.6)
+Wolof            89.3  76.1 (-13.2)  79.1 (+0.4)
+Yorùbá                               76.8 (+4.3)
+Macro Avg        84.6  75.6 (-9.0)
+
+                 73.9  58.3 (-15.6)
+
+                 80.2  69.4 (-10.8)
+
+                 75.8  63.4 (-12.4)
+
+                 89.8  66.6 (-23.2)
+
+                 87.1  72.7 (-14.4)
+
+                 64.9  60.7 (-4.2)
+
+                 78.7  67.9 (-10.8)
+
+                 72.4  65.5 (-6.9)
+
+Table 8: Language-wise breakdown for Named Entity Recognition for the CoNLL and MasakhaNER datasets
+(labeled F1). mBERT obtains a score of zero on Amharic due to having no vocabulary entries in the Amharic
+script.
+

@@ -1,0 +1,1600 @@
+Tokenization Is More Than Compression
+
+Craig W. Schmidt† Varshini Reddy† Haoran Zhang†,‡ Alec Alameddine†
+                    Omri Uzan§ Yuval Pinter§ Chris Tanner†,¶
+
+†Kensho Technologies ‡Harvard Univ §Dept of Computer Science                 ¶MIT
+Cambridge, MA Cambridge, MA Ben-Gurion Univ of the Negev Cambridge, MA
+                                                         Beer Sheva, Israel
+
+{craig.schmidt,varshini.reddy,alec.alameddine,chris.tanner}@kensho.com
+
+haoran_zhang@g.harvard.edu {omriuz@post,uvp@cs}.bgu.ac.il
+
+                      Abstract                              rules that restricts or enforces the creation
+                                                            of certain tokens (e.g., splitting a corpus on
+     Tokenization is a foundational step in natural         whitespace, thus preventing any tokens from
+     language processing (NLP) tasks, bridging raw          containing whitespace).
+     text and language models. Existing tokeniza-
+     tion approaches like Byte-Pair Encoding (BPE)       2. Vocabulary Construction: the core algo-
+     originate from the field of data compression,          rithm that, given a text corpus C and desired
+     and it has been suggested that the effectiveness       vocabulary size m, constructs a vocabulary
+     of BPE stems from its ability to condense text         of tokens tk ∈ V, such that |V| = m, while
+     into a relatively small number of tokens. We           adhering to the pre-tokenization rules.
+     test the hypothesis that fewer tokens lead to
+     better downstream performance by introducing        3. Segmentation: given a vocabulary V and
+     PathPiece, a new tokenizer that segments a doc-        a document d, segmentation determines
+     ument’s text into the minimum number of to-            how to split d into a series of Kd tokens
+     kens for a given vocabulary. Through extensive         t1, . . . , tk, . . . , tKd, with all tk ∈ V, such that
+     experimentation we find this hypothesis not to         the concatenation of the tokens strictly equals
+     be the case, casting doubt on the understanding        d. Given a corpus of documents C, we will de-
+     of the reasons for effective tokenization. To ex-      fine the corpus token count (CTC) as the total
+     amine which other factors play a role, we eval-        number of tokens used in each segmentation,
+     uate design decisions across all three phases          CTC(C) = d∈C Kd.
+     of tokenization: pre-tokenization, vocabulary
+     construction, and segmentation, offering new           As an example, segmentation might decide
+     insights into the design of effective tokenizers.      to split the text intractable into “int
+     Specifically, we illustrate the importance of pre-     ract able”, “in trac table”, “in
+     tokenization and the benefits of using BPE to          tractable”, or “int r act able”.
+     initialize vocabulary construction. We train
+     64 language models with varying tokenization,          We will refer to this step as segmentation, al-
+     ranging in size from 350M to 2.4B parameters,          though in other works it is also called “infer-
+     all of which are made publicly available.              ence” or even “tokenization”.
+
+1 Introduction
+
+Tokenization is an essential step in NLP that trans-        The widely used Byte-Pair Encoding (BPE) tok-
+lates human-readable text into a sequence of dis-        enizer (Sennrich et al., 2016) originated in the field
+tinct tokens that can be subsequently used by statis-    of data compression (Gage, 1994). Gallé (2019)
+tical models (Grefenstette, 1999). Recently, a grow-     argues that it is effective because it compresses
+ing number of studies have researched the effects        text to a short sequence of tokens. Goldman et al.
+of tokenization, both in an intrinsic manner and as      (2024) varied the number of documents in the tok-
+it affects downstream model performance (Singh           enizer training data for BPE, and found a correla-
+et al., 2019; Bostrom and Durrett, 2020; Hofmann         tion between CTC and downstream performance.
+et al., 2021, 2022; Limisiewicz et al., 2023; Zouhar     To investigate the hypothesis that having fewer to-
+et al., 2023b). To rigorously inspect the impact         kens necessarily leads to better downstream perfor-
+of tokenization, we consider tokenization as three       mance, we design a novel tokenizer, PATHPIECE,
+distinct, sequential stages:                             that, for a given document d and vocabulary V,
+                                                         finds a segmentation with the minimum possible
+  1. Pre-tokenization: an optional set of initial
+
+                                                    678
+
+Proceedings of the 2024 Conference on Empirical Methods in Natural Language Processing, pages 678–702
+                     November 12-16, 2024 ©2024 Association for Computational Linguistics
+Kd. The PATHPIECE vocabulary construction rou-        text into word and subword units based on their
+tine is a top-down procedure that heuristically min-  frequency and co-occurrence patterns from their
+imizes CTC on a training corpus. PATHPIECE is         “training” data, effectively capturing morphologi-
+ideal for studying the effect of CTC on downstream    cal and semantic nuances in the tokenization pro-
+performance, as we can vary decisions at each tok-    cess (Mikolov et al., 2011).
+enization stage.
+                                                         We analyze BPE, WordPiece, and Unigram as
+   We extend these experiments to the most com-       baseline subword tokenizers, using the implemen-
+monly used tokenizers, focusing on how down-          tations from HuggingFace3 with ByteLevel pre-
+stream task performance is impacted by the ma-        tokenization enabled. We additionally study SaGe,
+jor stages of tokenization and vocabulary sizes.      a context-sensitive subword tokenizer, using ver-
+Toward this aim, we conducted experiments by          sion 2.0.4
+training 64 language models (LMs): 54 LMs with
+350M parameters; 6 LMs with 1.3B parameters;          Byte-Pair Encoding Sennrich et al. (2016) in-
+and 4 LMs with 2.4B parameters. We provide            troduced Byte-Pair Encoding (BPE), a bottom-up
+open-source, public access to PATHPIECE1, and         method where the vocabulary construction starts
+our trained vocabularies and LMs2.                    with single bytes as tokens. It then merges the most
+                                                      commonly occurring pair of adjacent tokens in a
+2 Preliminaries                                       training corpus into a single new token in the vocab-
+                                                      ulary. This process repeats until the desired vocab-
+Ali et al. (2024) and Goldman et al. (2024) ex-       ulary size is reached. Issues with BPE and analyses
+amined the effect of tokenization on downstream       of its properties are discussed in Bostrom and Dur-
+performance of LLM tasks, reaching opposite con-      rett (2020); Klein and Tsarfaty (2020); Gutierrez-
+clusions on the importance of CTC. Zouhar et al.      Vasques et al. (2021); Yehezkel and Pinter (2023);
+(2023a) also find that low token count alone does     Saleva and Lignos (2023); Liang et al. (2023); Lian
+not necessarily improve performance. Mielke et al.    et al. (2024); Chizhov et al. (2024); Bauwens and
+(2021) give a survey of subword tokenization.         Delobelle (2024). Zouhar et al. (2023b) build an
+                                                      “exact” algorithm which optimizes compression for
+2.1 Pre-tokenization Methods                          BPE-constructed vocabularies.
+
+Pre-tokenization is a process of breaking text into   WordPiece WordPiece is similar to BPE, ex-
+chunks, which are then tokenized independently. A     cept that it uses Pointwise Mutual Information
+token is not allowed to cross these pre-tokenization  (PMI) (Bouma, 2009) as the criteria to identify
+boundaries. BPE, WordPiece, and Unigram all re-       candidates to merge, rather than a count (Wu et al.,
+quire new chunks to begin whenever a space is         2016; Schuster and Nakajima, 2012). PMI prior-
+encountered. If a space appears in a chunk, it        itizes merging pairs that occur together more fre-
+must be the first character; hence, we will call      quently than expected, relative to the individual
+this “FirstSpace”. Thus “ New” is allowed but         token frequencies.
+“New York” is not. Gow-Smith et al. (2022) ex-
+amine treating spaces as individual tokens, which     Unigram Language Model Unigram works in
+we will call “Space” pre-tokenization, while Jacobs   a top-down manner, starting from a large initial
+and Pinter (2022) suggest marking spaces at the       vocabulary and progressively pruning groups of to-
+end of tokens, and Gow-Smith et al. (2024) pro-       kens that induce the minimum likelihood decrease
+pose dispensing them altogether in some settings.     of the corpus (Kudo, 2018). This selects tokens to
+Llama (Touvron et al., 2023) popularized the idea     maximize the likelihood of the corpus, according
+of having each digit always be an individual token,   to a simple unigram language model.
+which we call “Digit” pre-tokenization.
+                                                      SaGe Yehezkel and Pinter (2023) proposed SaGe,
+2.2 Vocabulary Construction                           a subword tokenization algorithm incorporating
+                                                      contextual information into an ablation loss via a
+We focus on byte-level, lossless subword tok-         skipgram objective. SaGe also operates top-down,
+enization. Subword tokenization algorithms split      pruning from an initial vocabulary to a desired size.
+
+    1https://github.com/                                  3https://github.com/huggingface/
+kensho-technologies/pathpiece                         tokenizers
+
+    2https://github.com/                                  4https://github.com/MeLeLBGU/SaGe
+kensho-technologies/timtc_vocabs_models
+
+679
+2.3 Segmentation Methods                               O(nL), which follows directly from the two nested
+                                                       for-loops. For each byte i in d, it computes the
+Given a tokenizer and a vocabulary of tokens, seg-     shortest path length pl[i] in tokens up to and includ-
+mentation converts text into a series of tokens. We    ing byte i, and the width wid[i] of a token with that
+included all 256 single-byte tokens in the vocabu-     shortest path length. In choosing wid[i], ties be-
+lary of all our experiments, ensuring any text can     tween multiple tokens with the same shortest path
+be segmented without out-of-vocabulary issues.         length pl[i] can be broken randomly, or the one
+                                                       with the longest wid[i] can be chosen, as shown
+   Certain segmentation methods are tightly cou-       here.6 Then, a backward pass constructs the short-
+pled to the vocabulary construction step, such as      est possible segmentation from the wid[i] values
+merge rules for BPE or the maximum likelihood ap-      computed in the forward pass.
+proach for Unigram. Others, such as the WordPiece
+approach of greedily taking the longest prefix token   Algorithm 1 PATHPIECE segmentation.
+in the vocabulary at each point, can be applied to
+any vocabulary; indeed, there is no guarantee that     1: procedure PATHPIECE(d, V, L)    ▷ document length
+a vocabulary will perform best downstream with         2: n ← len(d)
+the segmentation method used to train it (Uzan         3: pl[1 : n] ← ∞                 ▷ shortest path length
+et al., 2024). Additional segmentation schemes         4: wid[1 : n] ← 0         ▷ shortest path tok width
+include Dynamic Programming BPE (He et al.,            5: for e ← 1, n do                      ▷ token end
+2020), BPE-Dropout (Provilkov et al., 2020), and       6:   for w ← 1, L do                    ▷ token width
+FLOTA (Hofmann et al., 2022).                          7:                                      ▷ token start
+                                                                  s←e−w+1
+3 PATHPIECE                                            8:         if s ≥ 1 then                ▷ s in range
+                                                       9:           if d[s : e] ∈ V then
+Several efforts over the last few years (Gallé, 2019;  10:            if s = 1 then            ▷ 1 tok path
+Zouhar et al., 2023a, inter alia) have suggested that  11:
+the empirical advantage of BPE as a tokenizer in       12:                 pl[e] ← 1
+many NLP applications, despite its unawareness
+of language structure, can be traced to its superior   13:            else wid[e] ← w
+compression abilities, providing models with over-
+all shorter sequences during learning and inference.   14:                 nl ← pl[s − 1] + 1
+Inspired by this claim we introduce PATHPIECE,         15:                 if nl ≤ pl[e] then
+a lossless subword tokenizer that, given a vocabu-     16:
+lary V and document d, produces a segmentation         17:                       pl[e] ← nl
+minimizing the total number of tokens needed to
+split d. We additionally provide a vocabulary con-                               wid[e] ← w
+struction procedure that, using this segmentation,
+attempts to find a V minimizing the corpus token       18: T ← [ ]                           ▷ output token list
+count (CTC).5 PATHPIECE provides an ideal test-        19: e ← n                             ▷ start at end of d
+ing laboratory for the compression hypothesis by       20: while e ≥ 1 do
+virtue of its maximally efficient segmentation.        21:  s ← e − wid[e] + 1                     ▷ token start
+                                                       22:                                      ▷ append token
+3.1 Segmentation                                       23:  T. append(d[s : e])              ▷ back up a token
+
+PATHPIECE requires that all single-byte tokens are          e ← e − wid[e]
+included in vocabulary V to run correctly. PATH-
+PIECE works by finding a shortest path through         24: return reversed(T )                 ▷ reverse order
+a directed acyclic graph (DAG), where each byte
+i of training data forms a node in the graph, and      3.2 Vocabulary Construction
+two nodes j and i contain a directed edge if the
+byte segment [j, i] is a token in V. We describe       PATHPIECE’s vocabulary is built in a top-down
+PATHPIECE segmentation in Algorithm 1, where           manner, attempting to minimize the corpus token
+L is a limit on the maximum width of a token in        count (CTC), by starting from a large initial vocab-
+bytes, which we set to 16. It has a complexity of      ulary V0 and iteratively omitting batches of tokens.
+                                                       The V0 may be initialized from the most frequently
+    5An extended description is given in Appendix A.   occurring byte n-grams in the corpus, or from a
+                                                       large vocabulary trained by BPE or Unigram. We
+                                                       enforce that all single-byte tokens remain in the vo-
+                                                       cabulary and that all tokens are L bytes or shorter.
+
+                                                          For a PATHPIECE segmentation t1, . . . , tKd of a
+                                                       document d in the training corpus C, we would like
+                                                       to know the increase in the overall length of the
+                                                       segmentation Kd after omitting each token t from
+                                                       our vocabulary and then recomputing the segmen-
+
+                                                           6Random tie-breaking, which can be viewed as a form of
+                                                       subword regularization, is presented in Appendix A. Some
+                                                       motivation for selecting the longest token is due to the success
+                                                       of FLOTA (Hofmann et al., 2022).
+
+680
+tation. Tokens with a low overall increase are good     backwards to the byte after tk′ , plus 1 for the token
+candidates to remove from the vocabulary.               t′k itself.
+
+   To avoid the very expensive O(nL|V|) computa-           We retain a list of the widths of the tokens end-
+tion of each segmentation from scratch, we make a       ing at each byte.7 The set of superset tokens S
+
+simplifying assumption that allows us to compute can be found by examining the potential e′, and
+
+these increases more efficiently: we omit a specific then seeing if the tokens ending at e′ form a strict
+
+token tk, for k ∈ [1, . . . , Kd] in the segmentation   superset. Similar to the previous case, we can com-
+of a particular document d, and compute the min-        pute the minimum increase from replacing tk with
+imum increase M Ikd ≥ 0 in the total tokens Kd          a superset token by taking the minimum increase
+from not having that token tk in the segmentation       over the superset tokens S:
+of d. We then aggregate these token count increases
+M Ikd for each token t ∈ V. We can compute the                       M Iksd  =  min     Kts′k  −  Kd.  (4)
+M Ikd without actually re-segmenting any docu-
+ments, by reusing the shortest path information                                 t′k ∈S
+computed by Algorithm 1 during segmentation.
+                                                             We then aggregate over the documents to get the
+   Any segmentation not containing tk must either
+contain a token boundary somewhere inside of tk         overall increase for each t ∈ V:
+breaking it in two, or it must contain a token that
+entirely contains tk as a superset. We enumerate             M It =  Kd
+all occurrences for these two cases, and we find the
+                                                                           min(M Ikbd, M Iksd). (5)
+
+                                                                     d∈C k=1|tk=t
+
+                                                           One iteration of this vocabulary construction pro-
+                                                        cedure will have complexity O(nL2).7
+
+minimum increase M Ikd among them. Let tk start         3.3 Connecting PATHPIECE and Unigram
+at index s and end at index e, inclusive. Path length
+pl[j] represents the number of tokens required for      We note a connection between PATHPIECE and
+the shortest path up to and including byte j. We        Unigram. In Unigram, the probability of a segmen-
+also run Algorithm 1 backwards on d, computing          tation t1, . . . , tKd is the product of the unigram
+a similar vector of backwards path lengths bpl[j],      token probabilities p(tk):
+
+representing the number of tokens on a path from                                        Kd
+the end of the data up to and including byte j. The
+minimum length of a segmentation with a token                        P (t1, . . . , tKd) = p(tk).      (6)
+
+                                                                                        k=1
+
+boundary after byte j is thus:                               Taking the negative log of this product converts
+
+Kjb = pl[j] + bpl[j + 1].                    (1)        the objective from maximizing the likelihood to
+                                                        minimizing the sum of − log(p(tk)) terms. While
+We have added an extra constraint on the shortest       Unigram is solved by the Viterbi (1967) algorithm,
+path, that there is a break at j, so clearly Kjb ≥ Kd.  it can also be solved by a weighted version of PATH-
+The minimum increase for the case of having a           PIECE with weights of − log(p(tk)). Conversely,
+token boundary within tk is thus:                       a solution minimizing the number of tokens can be
+                                                        found in Unigram by taking all p(tk) := 1/|V|.
+M Ikbd  =     min               Kjb  −  Kd.  (2)
+                                                        4 Experiments
+           j=s,...,e−1
+
+   The minimum increase from omitting tk could          We used the Pile corpus (Gao et al., 2020; Bider-
+also be from a segmentation containing a strict         man et al., 2022) for language model pre-training,
+superset of tk. Let this superset token be t′k, with    which contains 825GB of English text data from 22
+start s′ and end e′ inclusive. To be a strict superset  high-quality datasets. We constructed the tokenizer
+entirely containing tk, then either s′ < s and e′ ≥     vocabularies over the MiniPile dataset (Kaddour,
+e, or s′ ≤ s and e′ > e, subject to the constraint      2023), a 6GB subset of the Pile. We use the Mo-
+that the width w′ = e′ − s′ + 1 ≤ L. In this case,      saicML Pretrained Transformers (MPT) decoder-
+the minimum length when using the superset token        only language model architecture.8 Appendix B
+tk′ would be:                                           gives the full set of model parameters, and Ap-
+
+        Ktsk′ = pl[s′ − 1] + bpl[e′ + 1] + 1, (3)       pendix D discusses model convergence.
+
+which is the path length to get to the byte before          7See the expanded explanation in Appendix A for details.
+tk′ , plus the path length from the end of the data         8https://github.com/mosaicml/
+                                                        llm-foundry
+
+                                                        681
+4.1 Downstream Evaluation Tasks                                 5 Results
+
+To evaluate and analyze the performance of                      Table 1 reports the downstream performance across
+our tokenization process, we select 10 bench-                   all our experimental settings.11 A random baseline
+marks from lm-evaluation-harness (Gao                           for these 10 tasks yields 32%. The OVERALL AVG
+et al., 2023).9 These are all multiple-choice                   column indicates the average results over the three
+tasks with 2, 4, or 5 options, and were run                     vocabulary sizes. The RANK column refers to the
+with 5-shot prompting. We use arc_easy (Clark                   rank of each variant with respect to the OVERALL
+et al., 2018), copa (Brassard et al., 2022),                    AVG column (Rank 1 is best), which we will some-
+hendrycksTests-marketing (Hendrycks et al., 2021),              times use as a succinct way to refer to a variant.
+hendrycksTests-sociology (Hendrycks et al., 2021),
+mathqa (Amini et al., 2019), piqa (Bisk et al.,                 5.1 Vocabulary Size
+2019), qa4mre_2013 (Peñas et al., 2013), race (Lai
+et al., 2017), sciq (Welbl et al., 2017), and                                          Overall Avg  32,768 Avg  40,960 Avg  49,152 Avg
+wsc273 (Levesque et al., 2012). Appendix C gives                                  0.52
+a full description of these tasks.
+
+                                                                                  0.50
+
+                                                                Average Accuracy  0.48
+
+4.2 Tokenization Stage Variants                                                   0.46
+
+We conduct the 18 experimental variants listed in                   0.44
+Table 1, each repeated at the vocabulary sizes of
+32,768, 40,960, and 49,152.10 For baseline vo-                      0.42
+cabulary creation methods, we used BPE, Uni-
+gram, WordPiece, and SaGe. We also consider                         0.40 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18
+two variants of PATHPIECE where ties in the short-                                                    Rank
+est path are broken either by the longest token
+(PATHPIECEL), or randomly (PATHPIECER). For                     Figure 1: Effect of vocabulary size on downstream per-
+the vocabulary initialization required by PATH-                 formance. For each tokenizer variant, we show the
+PIECE and SaGe, we experimented with the most                   overall average, along with the three averages by vocab-
+common n-grams, as well as with a large initial                 ulary size, labeled according to the ranks in Table 1.
+vocabulary trained with BPE or Unigram. We
+also varied the pre-tokenization schemes for PATH-                 Figure 1 gives the overall average, along with the
+PIECE and SaGe, using either no pre-tokenization                individual averages, for each of the three vocabu-
+or combinations of “FirstSpace”, “Space”, and                   lary sizes for each variant, labeled according to the
+“Digit” described in §2.1. Tokenizers usually use               rank from Table 1. We observe that there is a high
+the same segmentation approach used in vocabulary               correlation between downstream performance at
+construction. PATHPIECEL’s shortest path segmen-                different vocabulary sizes. The pairwise R2 values
+tation can be used with any vocabulary, so we apply             for the accuracy of the 32,768 and 40,960 runs was
+it to vocabularies trained by BPE and Unigram. We               0.750; between 40,960 and 49,152 it was 0.801;
+also apply a Greedy left-to-right longest-token seg-            and between 32,768 and 49,152 it was 0.834. This
+mentation approach to these vocabularies.                       corroborates the effect shown graphically in Fig-
+                                                                ure 1 that vocabulary size is not a crucial decision
+    9https://github.com/EleutherAI/                             over this range of sizes. Given this high degree of
+lm-evaluation-harness                                           correlation, we focus our analysis on the overall
+                                                                average accuracy. This averaging removes some of
+   10These sizes were selected because vocabularies in the 30k  the variance amongst individual language model
+to 50k range are the most common amongst language models        runs. Thus, unless specified otherwise, our analy-
+within the HuggingFace Transformers library, https://           ses present performance averaged over vocabulary
+huggingface.co/docs/transformers/. Ali et al.                   sizes.
+(2024) recently examined the effect of vocabulary sizes and
+found 33k and 50k sizes performed better on English language       11The same table sorted by rank is in Table 10 of Ap-
+tasks than larger sizes.                                        pendix G. The comprehensive results for the ten downstream
+                                                                tasks, for each of the 350M parameter models, are given in
+                                                                Appendix G.
+
+                                 682
+Rank  Vocab Constr  Init Voc  Pre-tok                                                 Segment     Overall   32,768   40,960   49,152
+  1   PathPieceL    BPE       FirstSpace                                              PathPieceL      49.4     49.3     49.4     49.4
+  9                 Unigram   FirstSpace                                              Likelihood      48.0     47.0     48.5     48.4
+  15  Unigram       n-gram    FirstSpDigit                                            Greedy          44.8     44.6     44.9     45.0
+  16  BPE           n-gram    FirstSpace                                              PathPieceL      44.7     44.8     45.5     43.9
+  2   WordPiece                                                                       Merge           49.0     49.2     49.1     48.8
+  7   SaGe          BPE       FirstSpace                                              Greedy          48.3     47.9     48.5     48.6
+  17                n-gram                                                            PathPieceL      43.6     43.6     43.1     44.0
+  3   PathPieceR    Unigram   FirstSpace                                              Greedy          49.0     49.0     50.0     48.1
+  4   Random        n-gram                                                            Greedy          49.0     48.3     49.1     49.5
+  13                n-gram    FirstSpace                                                              46.5     45.6     46.7     47.2
+  5                           FirstSpace                                              PathPieceR      48.8     48.5     49.1     48.8
+  6                           FirstSpace                                                              48.6     48.0     49.2     48.8
+  8                           FirstSpace                                                              48.0     47.5     48.5     48.0
+  10                          FirstSpDigit                                                            47.7     48.4     46.9     47.8
+  11                          SpaceDigit                                                              47.5     48.4     46.9     47.2
+  12                          FirstSpDigit                                                            46.7     47.5     45.4     47.3
+  14                          None                                                                    45.5     45.3     45.8     45.5
+  18                                                                                                  43.2     43.5     44.0     42.2
+                                                                                                      32.0     32.0     32.0     32.0
+
+Table 1: Summary of 350M parameter model downstream accuracy (%) across 10 tasks. The “Overall” column
+averages across the three vocabulary sizes. The “Rank” column refers to the Overall column, best to worst.
+
+p-value vs. Lower Ranked Tokenizers5.2 Overall performance                               Figure 2 displays all pairwise p-values in a color
+  18 17 16 15 14 13 12 11 10 9 8 7 6 5 4 3 2 1                                        map. Each column designates a tokenization vari-
+To determine which of the differences in the overall                                  ant by its rank in Table 1, compared to all the ranks
+                                                                             p-valueaverage accuracy in Table 1 are statistically signifi-below it. A box is outlined in black if p > 0.05,
+cant, we conduct a one-sided Wilcoxon signed-rank                                     where we cannot reject the null. While PATHPIE-
+test (Wilcoxon, 1945) on the paired differences of                                    CEL-BPE had the highest overall average on these
+the 30 accuracy scores (three vocabulary sizes over                                   tasks, the top five tokenizers, PATHPIECEL-BPE,
+ten tasks), for each pair of variants. All p-values                                   Unigram, BPE, BPE-Greedy, and WordPiece do
+reported in this paper use this test.                                                 not have any other row in Figure 2 significantly dif-
+                                                                                      ferent from them. Additionally, SaGe-BPE (rank
+                                                                          1.00        6) is only barely worse than PATHPIECEL-BPE
+                                                                          0.90        (p = 0.047), and should probably be included in the
+                                                                          0.80        list of competitive tokenizers. Thus, our first key
+                                                                          0.70        result is that there is no tokenizer algorithm better
+                                                                          0.60        than all others to a statistically significant degree.
+                                                                          0.50
+                                                                          0.40           All the results reported thus far are for language
+                                                                          0.30        models with identical architectures and 350M pa-
+                                                                          0.20        rameters. To examine the dependency on model
+                                                                          00..0150    size, we trained larger models of 1.3B parameters
+                                                                                      for six of our experiments, and 2.4B parameters for
+                                                                          0.04        four of them. In the interest of computational time,
+                                                                                      these larger models were only trained with a single
+                                                                          0.03        vocabulary size of 40,960. In Figure 6 in subsec-
+                                                                                      tion 6.4, we report models’ average performance
+                                                                          0.02        across 10 tasks. See Figure 7 in Appendix D for an
+                                                                                      example checkpoint graph at each model size. The
+                                                                          0.01        main result from these models is that the relative
+                                                                                      performance of the tokenizers does vary by model
+        1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 0.00                             size, and that there is a group of high performing to-
+                               Tokenizer Rank
+
+Figure 2: Pairwise p-values for 350M model results.
+Boxes outlined in black represent p > 0.05. The top 6
+tokenizers are all competitive, and there is no statisti-
+cally significantly best approach.
+
+                                                                                      683
+                          BPE WordPiece SaGe Unigram PathPiece                           Comparison                     Pearson Correlation
+
+                      50        3                                                        CTC and Ave Acc                0.241
+                      48
+Average Accuracy (%)            11434154535       8  99612627172  10  1212               Rényi Eff and Ave Acc (α=1.5)  −0.221
+                                13                8    67         10                     Rényi Eff and Ave Acc (α=2.0)  −0.169
+                                13                8               10                     Rényi Eff and Ave Acc (α=2.5)  −0.151
+                                                      91111                              Rényi Eff and Ave Acc (α=3.0)  −0.144
+                                                                                         Rényi Eff and Ave Acc (α=3.5)  −0.141
+                                                                                         CTC and Rényi Eff (α=2.5)      −0.891
+
+                      46      161611114514514513                      12            Table 2: Pearson Correlation of CTC and Average Accu-
+
+                      44                                                            racy, or Rényi efficiency for various orders α with Aver-
+                                                                                    age Accuracy, or CTC and Rényi efficiency at α = 2.5.
+                          1816                       1717
+                          18                         17
+
+                      42  18                                                        the range of CTC is quite narrow within each vo-
+                                                                                    cabulary construction method, even while changes
+                      1.0 1.2Corpu1s.4Token1C.6ount (1C.T8C), in2B.0illions2.2 2.4  in pre-tokenization and segmentation lead to sig-
+                                                                                    nificant accuracy differences. While there are con-
+Figure 3: Effect of corpus token count (CTC) vs average                             founding factors present in this chart (e.g., pre-
+accuracy of individual vocabulary sizes.                                            tokenization, vocabulary initialization, and that
+                                                                                    more tokens allow for additional computations by
+kenizers that yield comparable results. This aligns                                 the downstream model) it is difficult to discern any
+with our finding that the top six tokenizers are not                                trend that lower CTC leads to improved perfor-
+statistically better than one another at the 350M                                   mance. If anything, there seems to be an inverted
+model size.                                                                         U-shaped curve with respect to the CTC and down-
+                                                                                    stream performance. The Pearson correlation co-
+5.3 Corpus Token Count vs Accuracy                                                  efficient between CTC and average accuracy was
+                                                                                    found to be 0.241. Given that a lower CTC value
+Figure 3 shows the corpus token count (CTC) ver-                                    signifies greater compression, this result suggests a
+sus the accuracy of each vocabulary size, given in                                  weak negative relationship between the amount of
+Table 11. We do not find a straightforward rela-                                    compression and average accuracy.
+tionship between the two. Ali et al. (2024) recently
+examined the relationship between CTC and down-                                        Zouhar et al. (2023a) introduced an information-
+stream performance for three different tokenizers,                                  theoretic measure based on Rényi efficiency that
+and also found it was not correlated on English                                     correlates with downstream performance for their
+language tasks.                                                                     application.12 It has an order parameter α, with a
+                                                                                    recommended value of 2.5. We present the Rényi
+   The two models with the highest CTC are PATH-                                    efficiencies and CTC for all models in Table 11 in
+PIECE with Space pre-tokenization (12), which is                                    Appendix G, and summarize their Pearson corre-
+to be expected given each space is its own token,                                   lation with average accuracy in Table 2. For the
+and SaGe with an initial Unigram vocabulary (10).                                   data of Figure 3, all the correlations for various α
+The Huggingface Unigram models in Figure 3 had                                      also have a weak negative association. They are
+significantly higher CTC than the corresponding                                     slightly less negative than the association for CTC,
+BPE models, unlike Bostrom and Durrett (2020)                                       although it is not nearly as large as the benefit they
+and Gow-Smith et al. (2022), which report a dif-                                    saw over sequence length in their application. We
+ference of only a few percent with SentencePiece                                    note the strong relationship between compression
+Unigram. Ali et al. (2024) point out that due to                                    and Rényi efficiency, as the Pearson correlation of
+differences in pre-processing, the Huggingface Un-                                  CTC and Rényi efficiency with α=2.5 is −0.891.
+igram tokenizer behaves quite differently than the
+SentencePiece Unigram tokenizer, which may ex-                                         By varying aspects of BPE, Gallé (2019) and
+plain this discrepancy.                                                             Goldman et al. (2024) suggests we should expect
+                                                                                    downstream performance to decrease with CTC,
+   In terms of accuracy, PATHPIECE with no pre-                                     while in contrast Ali et al. (2024) did not find a
+tokenization (18) and Unigram with PATHPIECE
+segmentation (17) both did quite poorly. Notably,                                      12Except, so far, for a family of adversarially-created tok-
+                                                                                    enizers (Cognetta et al., 2024).
+
+                                                                                    684
+strong relation when varying the tokenizer. Our                                 50.0
+extensive results varying a number of stages of
+tokenization suggest it is not inherently beneficial           Overall Acc (%)  47.5
+to use fewer tokens. Rather, the particular way that
+the CTC is varied can lead to different conclusions.                            45.0
+
+6 Analysis                                                                      42.5                           SpaceDigits (12)
+                                                                                                               FirstSpDigits (14)
+We now analyze the results across the various ex-                               40.0                           None (18)
+periments in a more controlled manner. Our exper-
+iments allow us to examine changes in each stage                                      1.4 1.6 1.8 2.0 2.2
+of tokenization, holding the rest constant, revealing                                   Corpus Token Count (CTC), in Billions
+design decisions making a significant difference.13
+                                                               Figure 4: The impact of pre-tokenization on Corpus
+                                                               Token Count (CTC) and Overall Accuracy. Ranks in
+                                                               parentheses refer to performance in Table 1.
+
+6.1 Pre-tokenization                                                                  BPE                PathPiece-initBPE
+
+For PATHPIECER with an n-gram initial vocabu-                                         6273        12158  4847
+lary, we can isolate pre-tokenization. PATHPIECE
+is efficient enough to process entire documents with                                              21250
+no pre-tokenization, giving it full freedom to mini-
+mize the corpus token count (CTC).                                                          1279         2705
+
+   Adding pre-tokenization constrains PATH-                                                    15726
+PIECE’s ability to minimize tokens, giving a nat-
+ural way to vary the number of tokens. Figure 4                                     SaGe-initBPE
+shows that PATHPIECE minimizes the number of
+tokens used over a corpus when trained with no                 Figure 5: Venn diagram comparing 40,960 token vocab-
+pre-tokenization (18). The other variants restrict             ularies of BPE, PathPieceL and SaGe – the latter two
+spaces to either be the first character of a token (14),       were both initialized from a BPE vocabulary of 262,144.
+or their own token (12).14 Consider the example
+PATHPIECE tokenization in Table 3 for the three                area-proportional Venn diagram of the overlap in
+pre-tokenization methods. The NONE mode uses                   40,960-sized vocabularies between BPE (6) and
+the word-boundary-spanning tokens “ation is”,                  variants of PATHPIECEL (1) and SaGe (6) that
+“ to b”, and “e $”. The lack of morphological                  were trained using an initial BPE vocabulary of
+alignment demonstrated in this example is likely               size 218 = 262, 144.16 While BPE and PATHPIE-
+more important to downstream model performance                 CEL overlap considerably, SaGe produces a more
+than a simple token count.                                     distinct set of tokens.
+
+   In Figure 4 we observe a statistically signifi-             6.3 Initial Vocabulary
+cant increase in overall accuracy for our down-
+stream tasks, as a function of CTC. Gow-Smith                  PATHPIECE, SaGe, and Unigram all require an
+et al. (2022) found that Space pre-tokenization lead           initial vocabulary.17 For PATHPIECE and SaGe,
+to worse performance, while removing the spaces                we experimented with initial vocabularies of size
+entirely helps15. Thus, this particular result may be          262,144 constructed from either the most frequent
+specific to PATHPIECER.                                        n-grams, or trained using either BPE or Unigram.
+                                                               For PATHPIECEL, using a BPE initial vocabulary
+6.2 Vocabulary Construction                                    (1) is statistically better than both Unigram (9) and
+                                                               n-grams (16), with p ≤ 0.01. Using an n-gram
+One way to examine the effects of vocabulary con-
+struction is to compare the resulting vocabularies                16See Figure 12 in Appendix E.3 for analogous results for
+of top-down methods trained using an initial vo-               Unigram, which behaves similarly.
+cabulary to the method itself. Figure 5 presents an
+                                                                  17The HuggingFace Unigram implementation starts with
+   13Appendix E contains additional analysis                   the one million top n-grams, but sorted according to the count
+   14These two runs also used Digit pre-tokenization where     times the length of the token, introducing a bias toward longer
+each digit is its own token.                                   tokens.
+   15Although omitting the spaces entirely does not lead to a
+reversible tokenization as we have been considering.
+
+685
+                           Rank    Pre-tokenization  Example
+                               12  SpaceDigit
+                               14  FirstSpDigit      The valuation is estimated to be $ 2 1 3 M
+                               18  None              The valuation is estimated to be $ 2 1 3 M
+                                                     The valu ation is estimated to b e $ 2 1 3 M
+
+Table 3: Example PATHPIECE tokenizations of “The valuation is estimated to be $213M”; vocabulary size of 32,768.
+
+initial vocabulary leads to the lowest performance,                      performance, as suggested by Gallé (2019) and
+with statistical significance. Comparing ranks 6, 8,                     Goldman et al. (2024) when they varied aspects of
+and 10 reveals the same pattern for SaGe, although                       BPE. When comparing CTC and downstream accu-
+the difference between 8 and 10 is not significant.                      racy across all our experimental settings in Figure 3,
+                                                                         we do not find a clear relationship between the two.
+6.4 Effect of Model Size                                                 We expand on the findings of Ali et al. (2024) who
+                                                                         did not find a strong relation when comparing 3
+To examine the dependency on model size, we                              tokenizers, as we run 18 experiments varying the
+build larger models of 1.3B parameters for 6 of our                      tokenizer, initial vocabulary, pre-tokenizer, and in-
+experiments, and 2.4B parameters for 4 of them.                          ference method. Our results suggest compression
+These models were trained over the same 200 bil-                         is not a straightforward explanation of what makes
+lion tokens. In the interest of computational time,                      a tokenizer effective.
+these larger models were only run at a single vo-
+cabulary size of 40,960. The average results over                           Finally, this work makes several practical con-
+the 10 task accuracies for these models is given                         tributions: (1) vocabulary size has little impact on
+in Figure 6. See Table 14 in Appendix G for the                          downstream performance over the range of sizes
+numerical values.                                                        we examined (§5.1); (2) five different tokenizers
+                                                                         all perform comparably, with none outperforming
+                                   bpe  pathpl_bpe sage_ngram            at statistical significance (§5.2); (3) BPE initial
+                                   unigram sage_bpe  pathpl_ngram        vocabularies work best for top-down vocabulary
+                       56                                                construction (§6.3). To further encourage research
+                                                                         in this direction, we make all of our trained vo-
+40,960 Vocab Accuracy  54                                                cabularies publicly available, along with the model
+                                                                         weights from our 64 language models.
+                       52
+                                                                         Limitations
+                       50
+
+                       48
+
+                       46
+
+                       44                                                The objective of this work is to offer a comprehen-
+                                                                         sive analysis of the tokenization process. However,
+                       42 350M          1.3B                       2.4B  our findings were constrained to particular tasks
+                                        Model Size (Not to Scale)        and models. Given the degrees of freedom, such
+                                                                         as choice of downstream tasks, model, vocabulary
+Figure 6: 40,960 vocab average accuracy at various                       size, etc., there is a potential risk of inadvertently
+models sizes                                                             considering our results as universally applicable to
+                                                                         all NLP tasks; results may not generalize to other
+   It is noteworthy from the prevalence of crossing                      domains of tasks.
+lines in Figure 6 that the relative performance of the
+tokenizers do vary by model size, and that there is                         Additionally, our experiments were exclusively
+a group of tokenizers that are trading places being                      with English language text, and it is not clear how
+at the top for various model sizes. This aligns                          these results will extend to other languages. In par-
+with our observation that the top 6 tokenizers were                      ticular, our finding that pre-tokenization is crucial
+within the noise, and not significantly better than                      for effective downstream accuracy is not applicable
+each other in the 350M models.                                           to languages without space-delimited words.
+
+7 Conclusion                                                                We conducted experiments for three district vo-
+                                                                         cabulary sizes, and we reported averaged results
+We investigate the hypothesis that reducing the cor-                     across these experiments. With additional compute
+pus token count (CTC) would improve downstream                           resources and time, it could be beneficial to con-
+
+                                                                         686
+duct further experiments to gain a better estimate         Kesselheim, and Nicolas Flores-Herr. 2024. Tok-
+of any potential noise. For example, in Figure 7           enizer choice for llm training: Negligible or crucial?
+of Appendix D, the 100k checkpoint at the 1.3B          Aida Amini, Saadia Gabriel, Peter Lin, Rik Koncel-
+model size is worse than expected, indicating that         Kedziorski, Yejin Choi, and Hannaneh Hajishirzi.
+noise could be an issue.                                   2019. Mathqa: Towards interpretable math word
+                                                           problem solving with operation-based formalisms.
+   Finally, the selection of downstream tasks can       Thomas Bauwens and Pieter Delobelle. 2024. BPE-
+have a strong impact on results. To allow for mean-        knockout: Pruning pre-existing BPE tokenisers
+ingful results, we attempted to select tasks that          with backwards-compatible morphological semi-
+were neither too difficult nor too easy for the 350M       supervision. In Proceedings of the 2024 Conference
+parameter models, but other choices could lead to          of the North American Chapter of the Association for
+different outcomes. There does not seem to be a            Computational Linguistics: Human Language Tech-
+good, objective criteria for selecting a finite set of     nologies (Volume 1: Long Papers), pages 5810–5832,
+task to well-represent global performance.                 Mexico City, Mexico. Association for Computational
+                                                           Linguistics.
+Ethics Statement                                        Stella Biderman, Kieran Bicheno, and Leo Gao. 2022.
+                                                           Datasheet for the pile. CoRR, abs/2201.07311.
+We have used the commonly used public dataset           Yonatan Bisk, Rowan Zellers, Ronan Le Bras, Jianfeng
+The Pile, which has not undergone a formal ethics          Gao, and Yejin Choi. 2019. Piqa: Reasoning about
+review (Biderman et al., 2022). Our models may             physical commonsense in natural language.
+include biases from the training data.                  Kaj Bostrom and Greg Durrett. 2020. Byte pair encod-
+                                                           ing is suboptimal for language model pretraining. In
+   Our experimentation has used considerable en-           Findings of the Association for Computational Lin-
+ergy. Each 350M parameter run took approxi-                guistics: EMNLP 2020, pages 4617–4624, Online.
+mately 48 hours on (4) p4de nodes, each containing         Association for Computational Linguistics.
+8 NVIDIA A100 GPUs. We trained 62 models, in-           Gerlof Bouma. 2009. Normalized (pointwise) mutual
+cluding the 8 RandTrain runs in Appendix F. The            information in collocation extraction. Proceedings
+(6) 1.3B parameters models took approximately 69           of GSCL, 30:31–40.
+hours to train on (4) p4de nodes, while the (4) 2.4B    Ana Brassard, Benjamin Heinzerling, Pride Kavumba,
+models took approximately 117 hours to train on            and Kentaro Inui. 2022. Copa-sse: Semi-structured
+(8) p4de nodes. In total, training required 17,304         explanations for commonsense reasoning.
+hours of p4de usage (138,432 GPU hours).
+
+Acknowledgments
+
+Thanks to Charles Lovering at Kensho for his in-        Pavel Chizhov, Catherine Arnett, Elizaveta Korotkova,
+sightful suggestions, and to Michael Krumdick,             and Ivan P. Yamshchikov. 2024. Bpe gets picky: Ef-
+Mike Arov, and Brian Chen at Kensho for their              ficient vocabulary refinement during tokenizer train-
+help with the language model development process.          ing.
+This research was supported in part by the Israel
+Science Foundation (grant No. 1166/23). Thanks          Peter Clark, Isaac Cowhey, Oren Etzioni, Tushar Khot,
+to an anonymous reviewer who pointed out the               Ashish Sabharwal, Carissa Schoenick, and Oyvind
+large change in CTC when comparing Hugging-                Tafjord. 2018. Think you have solved question an-
+face BPE and Unigram, in contrast to the previous          swering? try arc, the ai2 reasoning challenge. ArXiv,
+literature using the SentencePiece implementations         abs/1803.05457.
+(Kudo and Richardson, 2018).
+                                                        Marco Cognetta, Vilém Zouhar, Sangwhan Moon, and
+References                                                 Naoaki Okazaki. 2024. Two counterexamples to tok-
+                                                           enization and the noiseless channel. In Proceedings
+Mehdi Ali, Michael Fromm, Klaudia Thellmann,               of the 2024 Joint International Conference on Compu-
+   Richard Rutmann, Max Lübbering, Johannes                tational Linguistics, Language Resources and Evalu-
+   Leveling, Katrin Klug, Jan Ebert, Niclas Doll,          ation (LREC-COLING 2024), pages 16897–16906,
+   Jasper Schulze Buschhoff, Charvi Jain, Alexan-          Torino, Italia. ELRA and ICCL.
+   der Arno Weber, Lena Jurkschat, Hammam Abdel-
+   wahab, Chelsea John, Pedro Ortiz Suarez, Malte       Pavlos S. Efraimidis. 2010. Weighted random sampling
+   Ostendorff, Samuel Weinbach, Rafet Sifa, Stefan         over data streams. CoRR, abs/1012.0256.
+
+                                                        Philip Gage. 1994. A new algorithm for data compres-
+                                                           sion. C Users J., 12(2):23–38.
+
+687
+Matthias Gallé. 2019. Investigating the effectiveness of  Dan Hendrycks, Collin Burns, Steven Basart, Andy Zou,
+   BPE: The power of shorter sequences. In Proceed-          Mantas Mazeika, Dawn Song, and Jacob Steinhardt.
+   ings of the 2019 Conference on Empirical Methods          2021. Measuring massive multitask language under-
+   in Natural Language Processing and the 9th Inter-         standing.
+   national Joint Conference on Natural Language Pro-
+   cessing (EMNLP-IJCNLP), pages 1375–1381, Hong          Valentin Hofmann, Janet Pierrehumbert, and Hinrich
+   Kong, China. Association for Computational Linguis-       Schütze. 2021. Superbizarre is not superb: Deriva-
+   tics.                                                     tional morphology improves BERT’s interpretation
+                                                             of complex words. In Proceedings of the 59th Annual
+Leo Gao, Stella Biderman, Sid Black, Laurence Gold-          Meeting of the Association for Computational Lin-
+   ing, Travis Hoppe, Charles Foster, Jason Phang,           guistics and the 11th International Joint Conference
+   Horace He, Anish Thite, Noa Nabeshima, Shawn              on Natural Language Processing (Volume 1: Long
+   Presser, and Connor Leahy. 2020. The pile: An             Papers), pages 3594–3608, Online. Association for
+   800gb dataset of diverse text for language modeling.      Computational Linguistics.
+
+Leo Gao, Jonathan Tow, Baber Abbasi, Stella Biderman,     Valentin Hofmann, Hinrich Schuetze, and Janet Pierre-
+   Sid Black, Anthony DiPofi, Charles Foster, Laurence       humbert. 2022. An embarrassingly simple method
+   Golding, Jeffrey Hsu, Alain Le Noac’h, Haonan Li,         to mitigate undesirable properties of pretrained lan-
+   Kyle McDonell, Niklas Muennighoff, Chris Ociepa,          guage model tokenizers. In Proceedings of the 60th
+   Jason Phang, Laria Reynolds, Hailey Schoelkopf,           Annual Meeting of the Association for Computational
+   Aviya Skowron, Lintang Sutawika, Eric Tang, An-           Linguistics (Volume 2: Short Papers), pages 385–393,
+   ish Thite, Ben Wang, Kevin Wang, and Andy Zou.            Dublin, Ireland. Association for Computational Lin-
+   2023. A framework for few-shot language model             guistics.
+   evaluation.
+                                                          Cassandra L Jacobs and Yuval Pinter. 2022. Lost in
+Omer Goldman, Avi Caciularu, Matan Eyal, Kris Cao,           space marking. arXiv preprint arXiv:2208.01561.
+   Idan Szpektor, and Reut Tsarfaty. 2024. Unpacking
+   tokenization: Evaluating text compression and its      Jean Kaddour. 2023. The minipile challenge for data-
+   correlation with model performance.                       efficient language models.
+
+Edward Gow-Smith, Dylan Phelps, Harish Tayyar Mad-        Stav Klein and Reut Tsarfaty. 2020. Getting the ##life
+   abushi, Carolina Scarton, and Aline Villavicencio.        out of living: How adequate are word-pieces for mod-
+   2024. Word boundary information isn’t useful for          elling complex morphology? In Proceedings of the
+   encoder language models. In Proceedings of the            17th SIGMORPHON Workshop on Computational
+   9th Workshop on Representation Learning for NLP           Research in Phonetics, Phonology, and Morphology,
+   (RepL4NLP-2024), pages 118–135, Bangkok, Thai-            pages 204–209, Online. Association for Computa-
+   land. Association for Computational Linguistics.          tional Linguistics.
+
+Edward Gow-Smith, Harish Tayyar Madabushi, Car-           Taku Kudo. 2018. Subword regularization: Improv-
+   olina Scarton, and Aline Villavicencio. 2022. Improv-     ing neural network translation models with multiple
+   ing tokenisation by alternative treatment of spaces.      subword candidates. In Proceedings of the 56th An-
+   In Proceedings of the 2022 Conference on Empiri-          nual Meeting of the Association for Computational
+   cal Methods in Natural Language Processing, pages         Linguistics (Volume 1: Long Papers), pages 66–75,
+   11430–11443, Abu Dhabi, United Arab Emirates. As-         Melbourne, Australia. Association for Computational
+   sociation for Computational Linguistics.                  Linguistics.
+
+Gregory Grefenstette. 1999. Tokenization, pages 117–      Taku Kudo and John Richardson. 2018. SentencePiece:
+   133. Springer Netherlands, Dordrecht.                     A simple and language independent subword tok-
+                                                             enizer and detokenizer for neural text processing. In
+Ximena Gutierrez-Vasques, Christian Bentz, Olga Sozi-        Proceedings of the 2018 Conference on Empirical
+   nova, and Tanja Samardzic. 2021. From characters          Methods in Natural Language Processing: System
+   to words: the turning point of BPE merges. In Pro-        Demonstrations, pages 66–71, Brussels, Belgium.
+   ceedings of the 16th Conference of the European           Association for Computational Linguistics.
+   Chapter of the Association for Computational Lin-
+   guistics: Main Volume, pages 3454–3468, Online.        Guokun Lai, Qizhe Xie, Hanxiao Liu, Yiming Yang,
+   Association for Computational Linguistics.                and Eduard Hovy. 2017. Race: Large-scale reading
+                                                             comprehension dataset from examinations.
+Xuanli He, Gholamreza Haffari, and Mohammad
+   Norouzi. 2020. Dynamic programming encoding            Hector J. Levesque, Ernest Davis, and Leora Morgen-
+   for subword segmentation in neural machine transla-       stern. 2012. The winograd schema challenge. In 13th
+   tion. In Proceedings of the 58th Annual Meeting of        International Conference on the Principles of Knowl-
+   the Association for Computational Linguistics, pages      edge Representation and Reasoning, KR 2012, Pro-
+   3042–3051, Online. Association for Computational          ceedings of the International Conference on Knowl-
+   Linguistics.                                              edge Representation and Reasoning, pages 552–561.
+                                                             Institute of Electrical and Electronics Engineers Inc.
+                                                             13th International Conference on the Principles of
+
+688
+Knowledge Representation and Reasoning, KR 2012              Rico Sennrich, Barry Haddow, and Alexandra Birch.
+; Conference date: 10-06-2012 Through 14-06-2012.               2016. Neural machine translation of rare words with
+                                                                subword units. In Proceedings of the 54th Annual
+Haoran Lian, Yizhe Xiong, Jianwei Niu, Shasha Mo,               Meeting of the Association for Computational Lin-
+   Zhenpeng Su, Zijia Lin, Peng Liu, Hui Chen, and              guistics (Volume 1: Long Papers), pages 1715–1725,
+   Guiguang Ding. 2024. Scaffold-bpe: Enhancing byte            Berlin, Germany. Association for Computational Lin-
+   pair encoding with simple and effective scaffold to-         guistics.
+   ken removal.
+                                                             Jasdeep Singh, Bryan McCann, Richard Socher, and
+Davis Liang, Hila Gonen, Yuning Mao, Rui Hou, Na-               Caiming Xiong. 2019. BERT is not an interlingua
+   man Goyal, Marjan Ghazvininejad, Luke Zettle-                and the bias of tokenization. In Proceedings of the
+   moyer, and Madian Khabsa. 2023. XLM-V: Over-                 2nd Workshop on Deep Learning Approaches for
+   coming the vocabulary bottleneck in multilingual             Low-Resource NLP (DeepLo 2019), pages 47–55,
+   masked language models. In Proceedings of the 2023           Hong Kong, China. Association for Computational
+   Conference on Empirical Methods in Natural Lan-              Linguistics.
+   guage Processing, pages 13142–13152, Singapore.
+   Association for Computational Linguistics.                Hugo Touvron, Thibaut Lavril, Gautier Izacard, Xavier
+                                                                Martinet, Marie-Anne Lachaux, Timothée Lacroix,
+Tomasz Limisiewicz, Jiˇrí Balhar, and David Marecˇek.           Baptiste Rozière, Naman Goyal, Eric Hambro, Faisal
+   2023. Tokenization impacts multilingual language             Azhar, Aurelien Rodriguez, Armand Joulin, Edouard
+   modeling: Assessing vocabulary allocation and over-          Grave, and Guillaume Lample. 2023. Llama: Open
+   lap across languages. In Findings of the Association         and efficient foundation language models.
+   for Computational Linguistics: ACL 2023, pages
+   5661–5681, Toronto, Canada. Association for Com-          Omri Uzan, Craig W. Schmidt, Chris Tanner, and Yuval
+   putational Linguistics.                                      Pinter. 2024. Greed is all you need: An evaluation of
+                                                                tokenizer inference methods. In Proceedings of the
+Sabrina J. Mielke, Zaid Alyafeai, Elizabeth Salesky,            62nd Annual Meeting of the Association for Compu-
+   Colin Raffel, Manan Dey, Matthias Gallé, Arun Raja,          tational Linguistics (Volume 2: Short Papers), pages
+   Chenglei Si, Wilson Y. Lee, Benoît Sagot, and Sam-           813–822, Bangkok, Thailand. Association for Com-
+   son Tan. 2021. Between words and characters: A               putational Linguistics.
+   brief history of open-vocabulary modeling and tok-
+   enization in nlp.                                         A. Viterbi. 1967. Error bounds for convolutional
+                                                                codes and an asymptotically optimum decoding al-
+Tomas Mikolov, Ilya Sutskever, Anoop Deoras,                    gorithm. IEEE Transactions on Information Theory,
+CHˇ earinoScokný.Le2,01S1te. fan  Kombrink, and Jan  Honza      13(2):260–269.
+                                  Subword language   model-
+ing with neural networks. Preprint available                 Jeffrey S. Vitter. 1985. Random sampling with a reser-
+at: https://api.semanticscholar.org/                            voir. ACM Transactions on Mathematical Software,
+CorpusID:46542477.                                              11(1):37–57.
+
+Anselmo Peñas, Eduard Hovy, Pamela Forner, Álvaro            Johannes Welbl, Nelson F. Liu, and Matt Gardner. 2017.
+   Rodrigo, Richard Sutcliffe, and Roser Morante. 2013.         Crowdsourcing multiple choice science questions.
+   Qa4mre 2011-2013: Overview of question answer-               ArXiv, abs/1707.06209.
+   ing for machine reading evaluation. In CLEF 2013,
+   LNCS 8138, pages 303–320.                                 F Wilcoxon. 1945. Individual comparisons by ranking
+                                                                methods. biom. bull., 1, 80–83.
+Ivan Provilkov, Dmitrii Emelianenko, and Elena Voita.
+   2020. BPE-dropout: Simple and effective subword           Yonghui Wu, Mike Schuster, Zhifeng Chen, Quoc V. Le,
+   regularization. In Proceedings of the 58th Annual            Mohammad Norouzi, Wolfgang Macherey, Maxim
+   Meeting of the Association for Computational Lin-            Krikun, Yuan Cao, Qin Gao, Klaus Macherey, Jeff
+   guistics, pages 1882–1892, Online. Association for           Klingner, Apurva Shah, Melvin Johnson, Xiaobing
+   Computational Linguistics.                                   Liu, Łukasz Kaiser, Stephan Gouws, Yoshikiyo Kato,
+                                                                Taku Kudo, Hideto Kazawa, Keith Stevens, George
+Jonne Saleva and Constantine Lignos. 2023. What                 Kurian, Nishant Patil, Wei Wang, Cliff Young, Jason
+   changes when you randomly choose BPE merge op-               Smith, Jason Riesa, Alex Rudnick, Oriol Vinyals,
+   erations? not much. In Proceedings of the Fourth             Greg Corrado, Macduff Hughes, and Jeffrey Dean.
+   Workshop on Insights from Negative Results in NLP,           2016. Google’s neural machine translation system:
+   pages 59–66, Dubrovnik, Croatia. Association for             Bridging the gap between human and machine trans-
+   Computational Linguistics.                                   lation.
+
+Mike Schuster and Kaisuke Nakajima. 2012. Japanese           Shaked Yehezkel and Yuval Pinter. 2023. Incorporating
+   and korean voice search. In 2012 IEEE International          context into subword vocabularies. In Proceedings
+   Conference on Acoustics, Speech and Signal Process-          of the 17th Conference of the European Chapter of
+   ing (ICASSP), pages 5149–5152.                               the Association for Computational Linguistics, pages
+                                                                623–635, Dubrovnik, Croatia. Association for Com-
+                                                                putational Linguistics.
+
+                                                     689
+Vilém Zouhar, Clara Meister, Juan Gastaldi, Li Du,       n bytes, V is a given vocabulary, and L is a limit
+   Mrinmaya Sachan, and Ryan Cotterell. 2023a. Tok-      on the maximum width of a token in bytes. It
+   enization and the noiseless channel. In Proceedings   has complexity O(nL), following directly from the
+   of the 61st Annual Meeting of the Association for     two nested for-loops. It iterates over the bytes
+   Computational Linguistics (Volume 1: Long Papers),    i in d, computing 4 values for each. It computes
+   pages 5184–5207, Toronto, Canada. Association for     the shortest path length pl[i] in tokens up to and
+   Computational Linguistics.                            including byte i, the width wid[i] of a token with
+                                                         that shortest path length, and the solution count
+Vilém Zouhar, Clara Meister, Juan Gastaldi, Li Du, Tim   sc[i] of optimal solutions found thus far with that
+   Vieira, Mrinmaya Sachan, and Ryan Cotterell. 2023b.   shortest length. We also remember the valid tokens
+   A formal perspective on byte-pair encoding. In Find-  of width 2 or more ending at each location i in vt[i],
+   ings of the Association for Computational Linguis-    which will be used in the next section.
+   tics: ACL 2023, pages 598–614, Toronto, Canada.
+   Association for Computational Linguistics.               There will be multiple tokenizations with the
+                                                         same optimal length, so some sort of tiebreaker is
+A Expanded description of PATHPIECE                      needed. The longest token or a randomly selected
+                                                         token are obvious choices. We have presented the
+This section provides a self-contained explanation       random tiebreaker method here, where a random
+of PATHPIECE, expanding on the one in §3, with           solution is selected in a single pass in lines 29-32
+additional details on the vocabulary construction        of the listing using an idea from reservoir sampling
+and complexity.                                          (Vitter, 1985).
+
+   In order to design an optimal vocabulary V, it is        A backward pass through d constructs the opti-
+first necessary to know how the vocabulary will be       mal tokenization from the wid[e] values from the
+used to tokenize. There can be no best vocabulary        forward pass.
+in the abstract. Thus, we first present a new lossless
+subword tokenizer PATHPIECE. This tokenization           A.2 Optimal Vocabulary Construction
+over our training corpus will provide the context to
+design a coherent vocabulary.
+
+A.1 Tokenization for a given vocabulary                  A.2.1 Vocabulary Initialization
+
+We work at the byte level, and require that all 256      We will build an optimal vocabulary by starting
+single byte tokens are included in any given vocab-      from a large initial one, and sequentially omitting
+ulary V. This avoids any out-of-vocabulary tokens        batches of tokens. We start with the most frequently
+by falling back to single bytes in the worst case.       occurring byte n-grams in a training corpus, of
+                                                         width 1 to L, or a large vocabulary trained by BPE
+   Tokenization can be viewed as a compression           or Unigram. We then add any single byte tokens
+problem, where we would like to tokenize text in a       that were not already included, making room by
+few tokens as possible. This has direct benefits, as     dropping the tokens with the lowest counts. In our
+it allows more text to fit in a given context window.    experiments we used an initial vocabulary size of
+A Minimum Description Length (MDL) argument              |V| = 218 = 262, 144.
+can also be made that the tokenization using the
+fewest tokens best describes the data, although we       A.2.2 Increase from omitting a token
+saw in Subsection 6.1 this may not always hold in
+practice.                                                Given a PATHPIECE tokenization t1, . . . , tKd,
+                                                         ∀d ∈ C for training corpus C, we would like to
+   Tokenizers such as BPE and WordPiece make             know the increase in the overall length of a tok-
+greedy decisions, such as choosing which pair of         enization K = d Kd from omitting a given token
+current tokens to merge to create a new one, which       t from our vocabulary, V \ {t} and recomputing the
+results in tokenizations that may use more tokens        tokenization. Tokens with a low increase are good
+than necessary. In contrast, PATHPIECE will find         candidates to remove from the vocabulary (Kudo,
+an optimal tokenization by finding a shortest path       2018). However, doing this from scratch for each t
+through a Directed Acyclic Graph (DAG). Infor-           would be a very expensive O(nL|V|) operation.
+mally, each byte i of training data forms a node
+in the graph, and there is an edge if the w byte            We make a simplifying assumption that allows
+sequence ending at i is a token in V.                    us to compute these increases more efficiently. We
+                                                         omit a specific token tk in the tokenization of docu-
+   An implementation of PATHPIECE is given in            ment d, and compute the minimum increase M Ikd
+Algorithm 2, where input d is a text document of
+
+                                         690
+Algorithm 2 PATHPIECE segmentation.                           Before considering these two cases, there is a
+                                                           shortcut that often tells us that there would be no
+1: procedure PATHPIECE(d, V, L)    ▷ document length       increase due to omitting tk ending at index e. We
+2: n ← len(d)                    ▷ shortest path token     computed the solution count vector sc[e] when run-
+3: for i ← 1, n do                                         ning Algorithm 2. If sc[e] > 1 for a token ending
+4:   wid[i] ← 0                     ▷ shortest path len    at e, then the backward pass could simply select
+5:                                    ▷ solution count     one of the alternate optimal tokens, and find an
+6:   pl[i] ← ∞                       ▷ valid token list    overall tokenization of the same length.
+
+7:   sc[i] ← 0                                                Let tk start at index s and end at index e, inclu-
+                                                           sive. Remember that path length pl[i] represents
+     vt[i] ← [ ]                                           the number of tokens required for shortest path
+                                                           up to and including byte i. We can also run Algo-
+8: for e ← 1, n do                        ▷ token end      rithm 2 backwards on d, computing a similar vector
+9:   for w ← 1, L do                      ▷ token width    of backwards path lengths bpl[i], representing the
+10:                                       ▷ token start    number of tokens on a path from the end of the data
+           s←e−w+1                                         up to and including byte i. The overall minimum
+11:        if s ≥ 1 then                  ▷ s in range     length of a tokenization with a token boundary after
+12:                                            ▷ token     byte j is thus:
+             t ← d[s : e]
+13:          if t ∈ V then
+14:               if s = 1 then           ▷ 1 tok path
+15:
+16:                   wid[e] ← w
+
+17:                   pl[e] ← 1
+
+18:               elsesc[e] ← 1
+
+19:                   if w ≥ 2 then
+20:
+                          vt[e]. append(w)
+
+21:                   nl ← pl[s − 1] + 1
+22:                   if nl < pl[e] then
+23:
+24:                       pl[e] ← nl
+
+25:                       wid[e] ← w                            Kjb = pl[j] + bpl[j + 1].               (8)
+
+                          sc[e] ← 1
+26:                   else if nl = pl[e] then
+27:                                                        We have added an extra constraint on the shortest
+28:                       sc[e] ← sc[e] + 1                path, that there is a break at j, so clearly Kjbr ≥
+                                                           pl[n]. The minimum increase for the case of having
+                          r ← rand()                       a token boundary within tk is thus:
+29:                       if r ≤ 1/sc[e] then
+30:
+                              wid[e] ← w
+
+31: T ← [ ]                          ▷ output token list
+32: e ← n                             ▷ start at end of d
+33: while e ≥ 1 do            ▷ width of short path tok         M Ikbd                  Kjb             (9)
+34:  w ← wid[e]                                                         =     min            −  pl[n].
+                                            ▷ token start
+                                                  ▷ token                  j=s,...,e−1
+
+35:  s←e−w+1                          ▷ back up a token    Each token tk will have no more than L − 1 poten-
+36:                                                        tial internal breaks, so the complexity of computing
+37:  t ← d[s : e]                                          M Ikbd is O(L).
+
+38:  T. append(t)                                             The minimum increase from omitting tk could
+                                                           also be on a tokenization containing a strict super-
+     e←e−w                                                 set of tk. Let this superset token be tk′ , with start s′
+                                                           and end e′ inclusive. To be a strict superset jumping
+39: return reversed(T )                   ▷ reverse order  over tk, we must have s′ < s and e′ ≥ e, or s′ ≤ s
+                                                           and e′ > e, subject to the constraint that the width
+in Kd from not having that token tk in the tokeniza-       w′ = e′ − s′ + 1 ≤ L. In this case, the minimum
+tion of d. We then aggregate over the documents            length of using the superset token t′k would be:
+to get the overall increase for t:
+
+                          Kd
+
+     M It =                      M Ikd.        (7)
+
+                  d∈C k=1|tk=t
+
+This is similar to computing the increase from V \              Ktsk′ = pl[s′ − 1] + bpl[e′ + 1] + 1,   (10)
+{t}, but ignores interaction effects from having
+several occurrences of the same token t close to           which is the path length to get to the byte before tk′ ,
+each other in a given document.                            plus the path length go backwards to the byte after
+                                                           t′k, plus 1 for the token tk′ itself.
+   With PATHPIECE, it turns out we can compute
+the minimum increase in tokenization length with-             We remembered a list of the widths of the tokens
+out actually recomputing the tokenization. Any             ending at each byte, vt[e] in Algorithm 2. The set
+tokenization not containing tk must either contain         of superset tokens S can be found by examining the
+a token boundary somewhere inside of tk breaking           O(L) potential e′, and then seeing if the w′ ∈ vt[e′]
+it in two, or it must contain a token that entirely        give tokens forming a strict superset. There are
+contains tk as a superset. Our approach will be to         O(L) potential tokens ending at e′ in vt[e′], so the
+enumerate all the occurrences for these two cases,         overall complexity of finding the superset tokens is
+and to find the minimum increase M Ikd overall.
+                                                           O(L2)
+
+                                                           691
+   Similar to the previous case, we can compute       The 1.3B parameter models simply changes:
+the minimum increase from replacing tk with a
+superset token by taking the minimum increase      d_model: 1024
+over the superset tokens:
+                                                      The 2.4B parameter models updates:
+
+M Iksd  =  min       Ktsk′  −  pl[n].      (11)    d_model: 2560
+                                                   n_heads: 20
+           t′k ∈S                                  n_layers: 32
+
+   Finally, the overall minimum increase M Ikd     C Description of Downstream Tasks
+from omitting tk is simply
+                                                   To evaluate the performance of our various tok-
+M Ikd = min(M Ikbd, M Iksd).               (12)    enization experiments, we select ten competitive
+                                                   benchmarks from lm-evaluation-harness
+   When aggregating over all tk according to eq    (Gao et al., 2023)19, that we broadly categorize
+(7), one iteration of the vocabulary construction  into three types of Question Answering (QA) tasks:
+procedure will have complexity O(nL2).             Knowledge-based, Common-sense Reasoning and
+                                                   Context-based.
+B Language Model Parameters
+                                                      Knowledge Based Tasks Knowledge based
+The 350M parameter models were trained using the   tasks in this study expect LLMs to answer ques-
+MPT architecture18 with the following parameters:  tions based on domain-specific internal retrieval.
+                                                   Our Knowledge-based baselines in this work in-
+# Model                                            clude:
+model:
+                                                      SciQ: The SciQ task, proposed by Welbl et al.
+   name: mpt_causal_lm                             (2017) contains a total of 13,679 science exam ques-
+   init_deice: meta                                tions. The questions are in multiple-choice format
+   d_model: 1024                                   with 4 answer options each. An additional text is
+   n_heads: 16                                     provided as supporting evidence for a majority of
+   n_layers: 24                                    the answers.
+   expansion_ratio: 4
+   max_seq_len: 2048                                  ARC (AI2 Reasoning Challenge): Clark et al.
+   attn_config:                                    (2018) compiles grade-school level, multiple-
+                                                   choice science question dataset consists of 7,787
+       alibi: true                                 science exam questions that are split into “easy”
+       attn_impl: triton                           and “hard” sets. For this study, we employ the
+       clip_qkv: 6                                 easy set of 5,197 questions, each having 4 answer
+                                                   choices.
+# Optimization
+device_eval_batch_size: 5                             MathQA: Amini et al. (2019) introduce a dataset
+device_train_microbatch_size: 32                   of math word problems that require LLMs to use
+global_train_batch_size: 1024 # ~2M tokens         their internal understanding of mathematical equa-
+max_duration: 100000ba # ~200B tokens              tions and arithmetic comprehension. Similar to
+                                                   SciQ, this dataset consists of 37k multiple-choice
+optimizer:                                         questions with the equations for each used anno-
+   name: decoupled_adamw                           tated.
+   lr: 3.0e-4
+   betas:                                             HendrycksTest: Hendrycks et al. (2021) provide
+   - 0.9                                           a comprehensive suite of of multiple-choice tests
+   - 0.95                                          for assessing text models in multi-task contexts. It
+   eps: 1.0e-08                                    comprises of 57 tasks such as elementary mathe-
+   weight_decay: 0.0001                            matics, US history, law of which we use the sociol-
+                                                   ogy and marketing tests.
+scheduler:
+   name: cosine_with_warmup                           Commonsense Reasoning Tasks These tasks
+   t_warmup: 0.05dur                               assess the model’s capability to infer and reason
+   alpha_f: 0.1
+
+# System
+precision: amp_bf16
+
+# Algos and Callbacks
+algorithms:
+
+   gradient_clipping:
+       clipping_threshold: 1
+       clipping_type: norm
+
+18https://github.com/mosaicml/llm-foundry                  19https://github.com/EleutherAI/lm-evaluation-harness
+
+                                                   692
+about everyday scenarios based on implicit knowl-       ing, hendrycksTest-sociology to sociology, and
+edge.                                                   qa4mre_2013 to qa4mre.
+
+   COPA (Choice of Plausible Alternatives): COPA        D Effect of model convergence
+proposed by Brassard et al. (2022) is a benchmark
+for assessing progress in open-domain common-           Each model was trained on around 200 billion to-
+sense causal reasoning. It consists of 1000 ques-       kens. Figure 7 gives a plot of the average accuracy
+tions where each question is composed of a premise      for PathPieceL with a BPE initial vocabulary and a
+and two alternatives. The task is to select the al-     vocabulary size of 40,960 at various checkpoints in
+ternative that more plausibly has a causal relation     the language model training process. It also shows
+with the premise.                                       checkpoints for the larger 1.3B and 2.4B models
+                                                        discussed in the Limitations section. With the ex-
+   PiQA (Physical Interaction Question Answer-          ception of the 100k checkpoint at 1.3B, the model
+                                                        appears to be continually improving. It is unclear
+ing): Bisk et al. (2019) introduce a task that assess   why the 100k checkpoint did so poorly.
+the understanding of physical commonsense by lan-
+guage models. Comprised of everyday situation                                                 350M  1.3B             2.4B
+with a preference for atypical solutions, this dataset
+is formulated as multiple choice question with two      40,960 Vocab Avg Accuracy  0.52       40k Batc6h0Ckount 80k        100k
+possible solutions choices for each question.                                      0.50
+                                                                                   0.48
+   Winograd Schema Challenge: Levesque et al.                                      0.46
+(2012) define a task with a pair of sentences that
+differ only in one or two words and that contain a                                       20k
+referential ambiguity that is resolved in opposite
+directions in the two sentences. This dataset of        Figure 7: Checkpoint accuracy values for PathPieceL
+273 tasks test language model understanding of the      with an initial vocabulary from BPE and a vocabulary
+content of the text and disambiguation ability.         size of 40,960, evaluated at 5 checkpoints.
+
+   Context Based Tasks These tasks are reliant          E Additional Analysis
+on understanding context and drawing conclusions
+from it.                                                Here we additional details for results from §6 that
+                                                        are just summarized in the text in the interest of
+   RACE (Reading Comprehension from Examina-            space.
+
+tions): RACE proposed by Lai et al. (2017) is a         E.1 Segmentation
+collection of English questions set aside to Chi-
+nese school students. Each item is divided into two     Tokenizers often use the segmentation strategy that
+parts, a passage that the student must read and a       is used in vocabulary construction. However, any
+set of 4 potential answers, requiring extraction and    vocabulary can also be used with PATHPIECE and
+reasoning capabilities.                                 with the greedy left-to-right segmentation methods.
+
+   QA4MRE (Question Answering for Machine                  We find that BPE works quite well with greedy
+                                                        segmentation (overall rank 4, insignificantly differ-
+Reading Evaluation): QA4MRE by Peñas et al.             ent from the top rank), but not with the shortest-
+(2013) is a benchmark designed to resolve reading       path segmentation of PATHPIECEL (13).
+comprehension challenges. This task focuses on
+reading of single documents and identifying the            Unigram, on the other hand, seems to be more
+answers to a set of questions. Questions are in the     tightly tied to its default maximum likelihood seg-
+form of multiple choice with one correct option.        mentation (2), which was significantly better than
+                                                        both Greedy (7) and PATHPIECEL (17).
+   Our goal was to select tasks where a 350M pa-
+rameter model could do significantly better than        E.2 Digit Pre-tokenization
+random chance, avoiding evaluation right at the
+noisier random threshold. We started with the tasks     We have two examples isolating Digit pre-token-
+that had a non-zero random score (indicating mul-       ization, when a digit must always be its own token.
+tiple choice), and then chose tasks where BPE at
+a vocabulary size 40,960 could do well above ran-
+dom. In the end, the average accuracy across mod-
+els was more than 15% above random on all tasks.
+
+   Note that in results tables we have shortened
+the name hendrycksTest-marketing to market-
+
+693
+             50  48.99                   48.97                                  50
+                                                          46.49
+Overall Acc  45                                                    Overall Acc  45              44.82                 44.74
+                                       Greedy (4) PathPieceL (13)                                                 FirstSpace (16)
+             40                                                                 40
+                     Merge (3)                                                           FirstSpDigit (15)
+
+                      Figure 8: Segmentation of BPE.                    Figure 11: Pre-tokenization of PathPieceL n-gram,
+             Pairwise p-values between the pairs of runs are                                      p=0.54.
+              p(3,4)=0.52, p(3,13)=4.4e-5, p(4,13)=8.8e-6.
+
+                                                                        Unigram                             PathPiece-initUnigram
+
+             50  49.04                   48.33
+                                                          43.56
+Overall Acc  45                                                                     9243        10200       8230
+                                       Greedy (7) PathPieceL (17)
+             40                                                                                 17667
+                   Likelihood (2)
+
+                                                                                          3850              4863
+
+                    Figure 9: Segmentation of Unigram.                                          14580
+             Pairwise p-values between the pairs of runs are
+             p(2,7)=0.041, p(2,17)=2.9e-06, p(7,17)=2.9e-06
+
+Figure 10 shows Digit hurts for Sage with an n-                                 SaGe-initUnigram
+gram initial vocabulary, while Figure 11 shows no
+significant differences for PathPieceL, also with an                 Figure 12: Venn diagrams comparing 40,960 token
+n-gram initial vocabulary.                                         vocabularies of Unigram, PathPieceL and SaGe, where
+                                                                   the latter two were both trained from a initial Unigram
+
+                                                                                   vocabulary of size 262,144
+
+Overall Acc  50  47.99                     47.49                   E.4 PathPiece tie breaking
+                                       FirstSpDigit (11)
+             45                                                    The difference in tie breaking between choosing
+                                                                   the longest token with PathPieceL versus choos-
+             40                                                    ing randomly with PathPieceR turns out not to be
+                       FirstSpace (8)                              significant, as seen in in Figure 13.
+
+  Figure 10: Pre-tokenization of Sage, n-gram initial,             Overall Acc  50
+                           p=0.025.
+                                                                                45              45.53             44.82
+   With the exception of mathqa, none of our down-
+stream tasks were particularly mathematical in na-                              40                                PathPieceL (15)
+ture. It is likely this makes it hard to make a defini-                                  PathPieceR (14)
+tive judgement on Digit with our experiments.
+                                                                        Figure 13: Tiebreaking PathPieceL vs PathPieceR
+E.3 Vocabulary Construction                                                             with n-gram, p=0.067.
+
+Figure 12 gives a Venn diagram of the overlap in                   F RandTrain
+vocabularies between Unigram, PathPieceL, and
+SaGe, when both PathPieceL and SaGe were con-                      None of our experiments completely isolate the ef-
+structed from a large initial vocabulary of size                   fect of the vocabulary construction step. We created
+262,144 from Unigram. As with Figure 5, we see                     a new baseline random vocabulary construction ap-
+that PathPiece is more similar to Unigram, while                   proach, RandTrain, in an attempt to do so. It is
+SaGe chose more distinct tokens.                                   meant to work with a top-down method like SaGe
+
+                                                                   694
+or PathPieceL, and uses the same initial vocabu-        Overall Acc  50  48.596             46.46
+lary, pre-tokenization, and segmentation as either                                        PathPieceL
+of those, with a simple vocabulary construction                      45
+algorithm.
+                                                                     40
+   We compute a count for each token in the vo-                                   Greedy
+cabulary. For the top n-gram initial vocabulary it
+is simply the n-gram count from the training cor-         Figure 14: Comparison of Greedy and PathPieceL
+pus. For a BPE initial vocabulary we tokenized          segmentation, with RandTrain vocabulary construction,
+the training corpus with BPE and the large initial
+vocabulary, and then use the occurrence counts of         BPE initial vocab, and FirstSpace pre-tokenization,
+each token. We normalize these counts into target                                  p=0.0273
+selection probabilities pk for token tk.
+                                                        Overall Acc  50  48.339
+   The RandTrain vocabulary construction process
+is simply to randomly sample our desired vocabu-                     45
+lary size m of tokens from the initial vocabulary,
+proportionally to pk, without replacement. Sam-                      40                    40.049
+pling without replacement is necessary to avoid                                   Greedy  PathPieceL
+have duplicate words in the vocabulary. Interest-
+ingly, this is not possible if there are any pk >         Figure 15: Comparison of Greedy and PathPieceL
+1/m, which are termed infeasible or overweight          segmentation, with RandTrain vocabulary construction,
+items (Efraimidis, 2010). The intuition behind this     n-gram initial vocab, and FirstSpace pre-tokenization,
+is when selecting m items without replacement, it
+is not possible to select a given item more than once.                            p=0.00195
+So even if an item is always selected in a sample,
+the selection probability will be pk = 1/m.             vocabulary construction, n-gram initial vocabulary,
+                                                        and PathPieceL segmentation interact somehow to
+   We sampled without replacement using the A-          give accuracies well below any others.
+ES Algorithm described in Efraimidis (2010). A
+significant number the most common tokens in the           This makes the comparison of RandTrain to Path-
+vocabulary were infeasible and hence were unable        PieceL less informative. We can see in Figure 17
+to reach their target pk. A token with a higher pk      that PathPieceL is significantly better than Rand-
+is more likely to be sampled than a token with a        Train with a BPE initial vocabulary.
+lower one, but they may significantly differ from
+their target pk.                                           However, the other two comparisons in Figure 18
+                                                        are Figure 19 are not that meaningful. They are
+   We build 6 RandTrain models with 3 different         significantly better, but that is more about the weak
+types of pre-tokenization, and with Greedy seg-         baseline of RandTrain with PathPieceL segmenta-
+mentation to compare to SaGe, and PathPieceL            tion than anything positive about PathPieceL.
+segmentation to compare to PathPieceL. We only
+used a single vocabulary size of 40,960, so p-values       The remaining comparison between SaGe and
+are only computed on the 10 task accuracies, rather     RandTrain is more interesting. In Figure 20 and
+than the 30 used elsewhere. Task level accuracies       Figure 21 SaGe was not significantly better than
+are given in Table 6 and Table 7 in Appendix G.         RandTrain, with a p-value of 0.0645.
+
+   Before comparing RandTrain to SaGe and Path-            The cases is even worse for the two n-gram ini-
+PieceL, we will compare our RandTrain runs to           tial vocabulary cases. In Figure 21 the p-value was
+each other, with different segmentation approaches.     a 0.688, and in Figure 22 RandTrain was actually
+In Figure 14 and Figure 16 we have pairs of Rand-       better, although not significantly.
+Train runs that only vary by the segmentation
+method.                                                    We saw in Table 1 that both PathPieceL-BPE and
+                                                        SaGe-BPE are effective tokenizers. In attempting
+   In line with Subsection E.1, Greedy performs         to isolate the benefit from the vocabulary construc-
+significantly better than PathPieceL segmentation       tion step, we see that PathPieceL-BPE outperforms
+in all 3 cases. However, for the two cases with         our simple baseline. However, SaGe was unable
+an n-gram initial vocabulary the PathPieceL seg-        to outperform the baseline, perhaps implying that
+mentation did extremely poorly. The RandTrain           RandTrain may actually be a simple but fairly ef-
+                                                        fective vocabulary construction method.
+
+695
+Overall Acc  50  47.861                                                50
+
+             45                                           Overall Acc  45  45.507
+
+             40                    38.761                              40                     40.049
+                          Greedy  PathPieceL                                         PathL   RandTrain
+
+  Figure 16: Comparison of Greedy and PathPieceL          Figure 18: Comparison of PathPieceL and RandTrain,
+segmentation, with RandTrain vocabulary construction,            with n-gram initial vocab, and FirstSpace
+                                                                         pre-tokenization, p=9.77e-4
+       n-gram initial vocab, and FirstSpaceDigit
+               pre-tokenization, p=0.00293
+
+             50  49.373                                   Overall Acc  50
+
+Overall Acc                        46.46                               45  44.864
+                                  RandTrain
+             45                                                        40                     38.761
+                                                                                     PathL   RandTrain
+             40
+                           PathL
+
+Figure 17: Comparison of PathPieceL and RandTrain,        Figure 19: Comparison of PathPieceL and RandTrain,
+with BPE initial vocab, and FirstSpace pre-tokenization,     with n-gram initial vocab, and FirstSpaceDigits
+                                                                         pre-tokenization, p=0.00977
+                           p=0.0137
+
+                                                                       50  49.154             48.596
+                                                                                             RandTrain
+G Detailed Experimental Results                           Overall Acc  45
+
+This section gives the detailed accuracy results for                   40
+the 10 downstream evaluation tasks on each model                                     SaGe
+that was trained. The tables are divided by the
+vocabulary size used, with Table 4 and Table 5 for        Figure 20: Comparison of SaGe and RandTrain, with
+32,768; Table 6 and Table 7 for 40,960; and Table 8        BPE initial vocab, and FirstSpace pre-tokenization,
+and Table 9 for 49,152. The highest value or values
+(in the case of ties) are shown in bold. Table 10                                   p=0.0645
+show the same results as Table 1, but are sorted
+from best to worst by rank. The corpus token count        Overall Acc  50  48.498             48.339
+(CTC), Rényi efficiencies, and average accuracies                                            RandTrain
+for the 54 runs in Figure 3 are given in Table 11.                     45
+
+   The detailed accuracy results for our 1.3B param-                   40
+eter models, which were all performed at a single                                    SaGe
+vocabulary size of 40,960, are given in Table 12
+and Table 13. Average accuracy results for larger         Figure 21: Comparison of SaGe and RandTrain, with
+models of 1.3B and 2.4B parameters are given in           n-gram initial vocab, and FirstSpace pre-tokenization,
+Table 14. See §7 for more discussion of this table.
+                                                                                     p=0.688
+
+                                                          Overall Acc  50  47.861            46.884
+                                                                                             SaGe
+                                                                       45
+
+                                                                       40
+                                                                                  RandTrain
+
+                                                               Figure 22: Comparison of RandTrain and SaGe, with
+                                                                      n-gram initial vocab, and FirstSpaceDigit
+                                                                                pre-tokenization, p=0.15
+
+                                                          696
+Vocab Constr Init Voc Pre-tok    Segment       Avg arc_easy copa mktg mathqa piqa
+
+BPE                 FirstSpace Merge           48.8  51.2 69.0 32.9        23.9 66.3
+                    FirstSpace Greedy          48.3  51.9 66.0 32.9        23.7 65.6
+                    FirstSpace PathPieceL 45.6       45.6 61.0 29.9        23.0 60.5
+
+                    FirstSpace   Likelihood 49.2     50.7 73.0 30.8        23.1 66.3
+Unigram             FirstSpace   Greedy        47.9  50.3 68.0 31.2        23.1 65.2
+                    FirstSpace   PathPieceL 43.6     41.2 57.0 31.6        22.0 60.6
+
+WordPiece           FirstSpace Greedy          48.5  52.5 64.0 32.5        23.9 65.6
+
+            BPE     FirstSpace Greedy          47.9  49.7 67.0 26.5        23.2 65.9
+            n-gram FirstSpDigit Greedy         48.4  50.3 71.0 29.5        22.0 65.1
+SaGe        n-gram FirstSpace Greedy           47.5  48.8 64.0 29.5        23.0 66.6
+                                                     52.0 74.0 27.8        22.7 65.7
+            Unigram FirstSpace Greedy          48.4
+
+            BPE     FirstSpace PathPieceL 49.3       50.8 68.0 34.2        23.0 66.4
+            n-gram FirstSpace PathPieceL 44.8        42.3 61.0 27.4        23.0 61.2
+PathPieceL  n-gram FirstSpDigit PathPieceL 44.6      42.3 62.0 31.2        22.8 61.2
+                                                     50.4 64.0 24.8        23.5 66.2
+            Unigram FirstSpace PathPieceL 46.9
+
+PathPieceR  n-gram  FirstSpDigit PathPieceR 45.3     46.9 67.0 26.9        22.4 59.9
+            n-gram  None         PathPieceR 43.5     42.5 65.0 26.1        22.8 61.7
+            n-gram  SpaceDigit PathPieceR 47.5       48.6 68.0 32.9        23.3 65.0
+
+Random                                         32.0  25.0 50.0 25.0        20.0 50.00
+
+Table 4: 350M parameter model, 32,768 token vocabulary, accuracy (%) on average and initial 5 tasks
+
+Vocab Constr Init Voc Pre-tok      Segment qa4mre race sciq sociology wsc273
+
+                     FirstSpace Merge                29.6 29.2 87.3  30.9  67.8
+BPE                  FirstSpace Greedy               27.5 30.7 88.0  30.9  66.3
+                     FirstSpace PathPieceL           28.2 29.0 83.8  28.4  66.3
+
+                     FirstSpace    Likelihood        31.0 30.2 86.4  31.8  68.5
+Unigram              FirstSpace    Greedy            28.9 30.6 86.9  31.8  62.6
+                     FirstSpace    PathPieceL        29.9 27.5 74.6  26.4  65.6
+
+WordPiece            FirstSpace Greedy               32.0 30.7 88.5  27.9  67.4
+
+            BPE      FirstSpace    Greedy            31.7 30.2 89.0  28.4  67.8
+            n-gram   FirstSpDigit  Greedy            31.0 30.3 86.6  32.3  66.0
+SaGe        n-gram   FirstSpace    Greedy            30.0 31.0 87.8  25.9  68.5
+            Unigram  FirstSpace    Greedy            29.6 28.9 88.2
+                                                                     32.3  63.0
+
+            BPE      FirstSpace    PathPieceL        28.5 31.1 88.8  35.3  67.0
+            n-gram   FirstSpace    PathPieceL        30.3 27.3 80.0  32.8  62.6
+PathPieceL  n-gram   FirstSpDigit  PathPieceL        27.8 25.5 79.2  31.3  62.6
+            Unigram  FirstSpace    PathPieceL        29.6 30.6 87.6
+                                                                     24.4  68.1
+
+            n-gram   FirstSpDigit  PathPieceR        28.5 29.4 78.6  28.9  64.5
+PathPieceR  n-gram   None          PathPieceR        27.1 27.0 77.7  28.9  56.0
+            n-gram   SpaceDigit    PathPieceR        25.0 29.4 85.7  32.3  64.8
+
+Random                                               25.0 25.0 25.0  25.0  50.0
+
+      Table 5: 350M parameter model, 32,768 token vocabulary, accuracy (%) on remaining 5 tasks
+
+                                          697
+Vocab Constr Init Voc Pre-tok   Segment       Avg arc_easy copa mktg mathqa piqa
+
+                    FirstSpace Merge          50.0  52.7 70.0 31.6  24.3 66.9
+BPE                 FirstSpace Greedy         49.1  52.3 66.0 27.4  22.9 66.9
+                    FirstSpace PathPieceL 46.7      48.0 58.0 27.4  23.4 62.1
+
+Unigram             FirstSpace  Likelihood 49.1     51.4 71.0 32.1  23.4 66.1
+Unigram             FirstSpace  Greedy        48.5  49.9 64.0 30.3  23.3 65.7
+                    FirstSpace  PathPieceL 43.1     40.5 56.0 28.6  23.0 60.3
+
+WordPiece           FirstSpace Greedy         49.1  52.3 70.0 28.6  23.7 66.5
+
+            BPE     FirstSpace Greedy         49.2  50.8 70.0 29.9  23.2 66.4
+SaGe        n-gram FirstSpDigit Greedy        46.9  48.4 67.0 30.3  22.6 64.0
+            n-gram FirstSpace Greedy          48.5  49.8 68.0 32.9  22.8 65.4
+            Unigram FirstSpace Greedy         46.9  51.7 65.0 28.6  23.9 65.2
+
+            BPE     FirstSpace PathPieceL 49.4      52.1 71.0 29.9  23.9 66.9
+            n-gram FirstSpace PathPieceL 45.5       42.6 63.0 30.3  22.7 60.9
+PathPieceL  n-gram FirstSpDigit PathPieceL 44.9     44.0 60.0 29.9  22.6 60.8
+                                                    51.7 71.0 31.2  24.2 66.2
+            Unigram FirstSpace PathPieceL 48.5
+
+            n-gram  FirstSpDigit PathPieceR 45.8    47.5 63.0 28.2  22.4 60.7
+PathPieceR  n-gram  None        PathPieceR 44.0     41.2 66.0 26.5  21.6 62.4
+            n-gram  SpaceDigit PathPieceR 45.4      46.3 64.0 32.1  22.7 60.0
+
+            BPE     FirstSpace Greedy         48.6  50.5 70.0 29.5  23.4 65.8
+            n-gram  FirstSpDigit Greedy       47.9  50.0 63.0 29.5  23.3 65.3
+            n-gram  FirstSpace Greedy         48.3  50.3 70.0 28.2  24.3 65.8
+            n-gram  None        Greedy        42.2  41.3 55.0 27.4  21.7 63.2
+RandTrain   BPE     FirstSpace PathPieceL 46.5      45.8 65.0 30.8  23.3 62.8
+            n-gram                                  31.2 48.0 27.8  22.6 54.7
+            n-gram  FirstSpDigit PathPieceL 38.8    30.7 55.0 26.5  20.8 55.4
+            n-gram  FirstSpace PathPieceL 40.0      27.7 56.0 28.6  22.8 54.5
+                    None        PathPieceL 36.8
+
+random                                        32.0  25.0 50.0 25.0  20.0 50.0
+
+Table 6: 350M parameter model, 40,960 token vocabulary, accuracy (%) on average and initial 5 tasks
+
+                                         698
+Vocab Constr Init Voc Pre-tok      Segment qa4mre race sciq sociology wsc273
+
+                     FirstSpace Merge                  32.4 30.1 87.7  35.3  69.2
+BPE                  FirstSpace Greedy                 31.7 30.9 88.3  35.8  68.9
+                     FirstSpace PathPieceL             30.3 30.2 83.8  35.3  68.1
+
+                     FirstSpace    Likelihood          29.6 30.8 86.4  32.8  67.8
+Unigram              FirstSpace    Greedy              32.4 29.6 86.7  32.8  70.3
+                     FirstSpace    PathPieceL          30.3 27.4 75.0  27.4  62.3
+
+WordPiece            FirstSpace Greedy                 31.0 30.3 87.7  32.8  68.1
+
+            BPE      FirstSpace    Greedy              28.9 30.2 89.5  34.8  67.8
+            n-gram   FirstSpDigit  Greedy              30.6 28.1 85.8  32.3  59.7
+SaGe        n-gram   FirstSpace    Greedy              29.2 30.0 88.4  33.3  65.2
+            Unigram  FirstSpace    Greedy              26.8 29.1 86.9
+                                                                       31.3  60.1
+
+            BPE      FirstSpace    PathPieceL          31.0 29.6 87.3  34.3  67.8
+            n-gram   FirstSpace    PathPieceL          29.9 27.9 81.0  34.8  61.9
+PathPieceL  n-gram   FirstSpDigit  PathPieceL          27.5 28.2 80.7  30.9  64.1
+            Unigram  FirstSpace    PathPieceL          31.3 29.7 86.3
+                                                                       29.9  63.7
+
+            n-gram   FirstSpDigit  PathPieceR          29.9 30.8 82.1  27.4  66.3
+PathPieceR  n-gram   None          PathPieceR          23.6 28.3 73.8  35.8  60.4
+            n-gram   SpaceDigit    PathPieceR          27.5 28.7 78.2  31.3  63.0
+
+            BPE      FirstSpace    Greedy              32.0 29.6 86.9  30.9  67.4
+            n-gram   FirstSpDigit  Greedy              30.6 30.0 87.5  31.3  68.1
+            n-gram   FirstSpace    Greedy              29.9 29.7 85.3  32.8  67.0
+            n-gram   None          Greedy              28.2 27.8 75.9  26.4  55.0
+RandTrain   BPE      FirstSpace    PathPieceL          32.8 28.5 80.3  30.9  64.5
+            n-gram   FirstSpDigit  PathPieceL          31.3 24.2 62.1
+            n-gram   FirstSpace    PathPieceL          28.9 23.6 66.8  30.4  55.3
+            n-gram   None          PathPieceL          21.5 24.9 51.8  33.8  59.0
+                                                                       28.9  51.7
+
+random                                                 25.0 25.0 25.0  25.0  50.0
+
+     Table 7: 350M parameter model, 40,960 token vocabulary, accuracy (%) on remaining 5 tasks
+
+Vocab Constr Init Voc Pre-tok      Segment       Avg arc_easy copa mktg mathqa piqa
+
+                     FirstSpace Merge            48.1  52.3 65.0 31.6        23.7 65.7
+BPE                  FirstSpace Greedy           49.5  53.9 72.0 31.6        24.2 68.4
+                     FirstSpace PathPieceL 47.2        48.6 69.0 26.9        22.8 63.1
+
+Unigram              FirstSpace    Likelihood 48.8     52.3 69.0 35.0        23.9 66.1
+                     FirstSpace    Greedy        48.6  51.6 68.0 32.1        24.4 65.7
+                     FirstSpace    PathPieceL 44.0     39.4 57.0 30.3        23.3 61.2
+
+WordPiece            FirstSpace Greedy           48.8  52.6 68.0 28.2        23.5 66.2
+
+            BPE      FirstSpace Greedy           48.8  51.9 71.0 29.9        22.6 65.5
+            n-gram FirstSpDigit Greedy           47.2  46.6 67.0 31.2        22.7 63.4
+SaGe        n-gram FirstSpace Greedy             48.0  49.7 66.0 31.6        21.6 65.7
+                                                       49.7 68.0 29.9        23.5 64.6
+            Unigram FirstSpace Greedy            47.8
+
+            BPE      FirstSpace PathPieceL 49.4        51.9 69.0 29.9        24.5 66.6
+            n-gram FirstSpace PathPieceL 43.9          42.4 56.0 28.6        23.8 60.3
+PathPieceL  n-gram FirstSpDigit PathPieceL 45.0        44.5 59.0 28.2        22.3 59.5
+                                                       51.4 67.0 29.5        24.7 65.2
+            Unigram FirstSpace PathPieceL 48.4
+
+PathPieceR  n-gram   FirstSpDigit PathPieceR 45.5      46.0 62.0 25.6        22.1 61.6
+            n-gram   None          PathPieceR 42.2     42.6 64.0 22.2        22.4 60.9
+            n-gram   SpaceDigit PathPieceR 47.3        48.7 68.0 34.2        21.9 65.1
+
+random                                           32.0  25.0 50.0 25.0        20.0 50.0
+
+Table 8: 350M parameter model, 49,152 token vocabulary, accuracy (%) on average and initial 5 tasks
+
+                                            699
+        Vocab Constr Init Voc Pre-tok         Segment qa4mre race sciq sociology wsc273
+
+                                FirstSpace Merge          28.9 31.0 87.3               28.9          67.0
+        BPE                     FirstSpace Greedy         29.6 31.2 88.4               29.4          66.3
+                                FirstSpace PathPieceL     31.0 30.7 85.4               31.8          63.0
+
+                                FirstSpace    Likelihood  27.5 30.3 89.1               28.9          65.9
+        Unigram                 FirstSpace    Greedy      32.4 29.5 86.7               32.3          63.7
+                                FirstSpace    PathPieceL  33.1 26.0 74.5               27.9          67.0
+
+        WordPiece               FirstSpace Greedy         29.2 31.1 88.0               34.3          66.7
+
+                      BPE       FirstSpace    Greedy      29.6 31.2 87.5               32.3          65.9
+                      n-gram    FirstSpDigit  Greedy      29.2 28.8 86.4               34.3          61.9
+        SaGe          n-gram    FirstSpace    Greedy      28.8 30.2 87.5               33.8          64.5
+                      Unigram   FirstSpace    Greedy      28.9 31.4 87.0
+                                                                                       29.9          65.6
+
+                      BPE       FirstSpace    PathPieceL  31.0 31.4 87.5               31.3          70.7
+                      n-gram    FirstSpace    PathPieceL  27.5 26.7 80.8               32.3          60.8
+        PathPieceL    n-gram    FirstSpDigit  PathPieceL  28.9 30.0 80.6               35.8          61.2
+                      Unigram   FirstSpace    PathPieceL  29.2 30.5 88.5
+                                                                                       32.8          65.6
+
+                      n-gram    FirstSpDigit  PathPieceR  29.6 29.5 82.8               30.9          64.5
+        PathPieceR    n-gram    None          PathPieceR  25.7 27.5 72.5               27.4          57.1
+                      n-gram    SpaceDigit    PathPieceR  27.5 28.7 84.0               28.9          66.3
+
+        Random                                            25.0 25.0 25.0               25.0          50.0
+
+        Table 9: 350M parameter model, 49,152 token vocabulary, accuracy (%) on remaining 5 tasks
+
+Rank    Vocab Constr  Init Voc  Pre-tok       Segment     Overall avg    32,768 avg    40,960 avg    49,152 avg
+     1  PathPieceL    BPE       FirstSpace    PathPieceL           49.4          49.3          49.4          49.4
+     2  Unigram                 FirstSpace    Likelihood           49.0          49.2          49.1          48.8
+     3  BPE           BPE       FirstSpace    Merge                49.0          48.8          50.0          48.1
+     4  BPE           n-gram    FirstSpace    Greedy               49.0          48.3          49.1          49.5
+     5  WordPiece     Unigram   FirstSpace    Greedy               48.8          48.5          49.1          48.8
+     6  SaGe          Unigram   FirstSpace    Greedy               48.6          47.9          49.2          48.8
+     7  Unigram       n-gram    FirstSpace    Greedy               48.3          47.9          48.5          48.6
+     8  SaGe          n-gram    FirstSpace    Greedy               48.0          47.5          48.5          48.0
+     9  PathPieceL    n-gram    FirstSpace    PathPieceL           48.0          46.9          48.5          48.4
+    10  SaGe          n-gram    FirstSpace    Greedy               47.7          48.4          46.9          47.8
+    11  SaGe          n-gram    FirstSpDigit  Greedy               47.5          48.4          46.9          47.2
+    12  PathPieceR    n-gram    SpaceDigit    PathPieceR           46.7          47.5          45.4          47.3
+    13  BPE                     FirstSpace    PathPieceL           46.5          45.6          46.7          47.2
+    14  PathPieceR              FirstSpDigit  PathPieceR           45.5          45.3          45.8          45.5
+    15  PathPieceL              FirstSpDigit  PathPieceL           44.8          44.6          44.9          45.0
+    16  PathPieceL              FirstSpace    PathPieceL           44.7          44.8          45.5          43.9
+    17  Unigram                 FirstSpace    PathPieceL           43.6          43.6          43.1          44.0
+    18  PathPieceR              None          PathPieceR           43.2          43.5          44.0          42.2
+        Random                                                     32.0          32.0          32.0          32.0
+
+             Table 10: Summary of 350M parameter model downstream accuracy (%), sorted by rank
+
+                                              700
+Rank    Vocab Size   Avg Acc    CTC    Eff α=1.5   Eff α=2   Eff α=2.5   Eff α=3   Eff α=3.5
+     1       32,768       49.3   1.48       0.604     0.516       0.469     0.441       0.422
+     1       40,960       49.4   1.46       0.589     0.503       0.457     0.429       0.411
+     1       49,152       49.4   1.44       0.578     0.492       0.448     0.420       0.402
+     2       32,768       49.2   1.79       0.461     0.371       0.324     0.295       0.277
+     2       40,960       49.1   1.77       0.451     0.362       0.316     0.289       0.271
+     2       49,152       48.8   1.76       0.444     0.356       0.311     0.284       0.266
+     3       32,768       48.8   1.52       0.594     0.505       0.459     0.431       0.414
+     3       40,960       50.0   1.49       0.579     0.491       0.446     0.420       0.403
+     3       49,152       48.1   1.47       0.567     0.481       0.437     0.411       0.394
+     4       32,768       48.3   1.50       0.605     0.517       0.471     0.442       0.423
+     4       40,960       49.1   1.48       0.590     0.504       0.458     0.430       0.412
+     4       49,152       49.5   1.46       0.579     0.494       0.449     0.421       0.403
+     5       32,768       48.5   1.54       0.598     0.507       0.461     0.433       0.415
+     5       40,960       49.1   1.51       0.583     0.494       0.448     0.421       0.404
+     5       49,152       48.8   1.49       0.571     0.483       0.439     0.412       0.396
+     6       32,768       47.9   1.78       0.545     0.466       0.422     0.396       0.378
+     6       40,960       49.2   1.76       0.533     0.455       0.413     0.387       0.369
+     6       49,152       48.7   1.75       0.523     0.447       0.405     0.379       0.362
+     7       32,768       47.9   1.81       0.510     0.431       0.387     0.359       0.340
+     7       40,960       48.5   1.79       0.500     0.423       0.381     0.354       0.335
+     7       49,152       48.6   1.77       0.493     0.416       0.375     0.348       0.330
+     8       32,768       47.5   1.63       0.629     0.536       0.482     0.447       0.424
+     8       40,960       48.5   1.62       0.615     0.524       0.470     0.437       0.415
+     8       49,152       48.0   1.62       0.605     0.515       0.462     0.429       0.407
+     9       32,768       46.9   1.74       0.508     0.419       0.372     0.343       0.323
+     9       40,960       48.5   1.72       0.491     0.403       0.356     0.328       0.309
+     9       49,152       48.4   1.72       0.477     0.389       0.343     0.315       0.296
+    10       32,768       48.4   2.02       0.485     0.409       0.366     0.339       0.320
+    10       40,960       46.9   2.01       0.474     0.401       0.358     0.331       0.313
+    10       49,152       47.8   2.01       0.466     0.393       0.352     0.325       0.307
+    11       32,768       48.4   1.77       0.587     0.512       0.470     0.443       0.425
+    11       40,960       46.9   1.76       0.575     0.501       0.460     0.433       0.415
+    11       49,152       47.2   1.76       0.565     0.492       0.452     0.426       0.408
+    12       32,768       47.5   2.33       0.236     0.164       0.138     0.124       0.116
+    12       40,960       45.4   2.30       0.228     0.159       0.133     0.120       0.112
+    12       49,152       47.3   2.29       0.223     0.155       0.130     0.117       0.109
+    13       32,768       45.6   1.50       0.606     0.518       0.470     0.442       0.423
+    13       40,960       46.7   1.47       0.591     0.504       0.458     0.430       0.412
+    13       49,152       47.2   1.45       0.579     0.494       0.449     0.421       0.403
+    14       32,768       45.3   1.46       0.616     0.532       0.490     0.465       0.448
+    14       40,960       45.8   1.43       0.602     0.519       0.478     0.453       0.437
+    14       49,152       45.5   1.42       0.591     0.508       0.468     0.444       0.428
+    15       32,768       44.6   1.47       0.620     0.533       0.490     0.464       0.447
+    15       40,960       44.9   1.44       0.605     0.520       0.478     0.453       0.436
+    15       49,152       45.0   1.42       0.594     0.509       0.468     0.443       0.427
+    16       32,768       44.8   1.36       0.677     0.571       0.514     0.480       0.457
+    16       40,960       45.5   1.33       0.662     0.556       0.500     0.466       0.444
+    16       49,152       43.9   1.31       0.650     0.544       0.489     0.456       0.435
+    17       32,768       43.6   1.77       0.471     0.380       0.333     0.304       0.285
+    17       40,960       43.1   1.75       0.462     0.372       0.326     0.298       0.280
+    17       49,152       44.0   1.74       0.455     0.366       0.320     0.293       0.275
+    18       32,768       43.5   1.29       0.747     0.617       0.549     0.511       0.486
+    18       40,960       44.0   1.26       0.736     0.603       0.535     0.497       0.474
+    18       49,152       42.2   1.25       0.728     0.591       0.524     0.487       0.464
+
+Table 11: Average Accuracy (%) vs. Corpus Token Count (CTC, in billions) by vocabulary size, for Figure 3. Also
+includes the corresponding Rényi efficiency (Zouhar et al., 2023a) for various orders α.
+
+                                       701
+Vocab Constr Init Voc Pre-tok           Segment Avg arc_easy copa mktg mathqa piqa
+
+BPE                       FirstSpace Merge          53.1     62.0 77.0 32.1               25.0 71.1
+
+Unigram                   FirstSpace Likelihood 52.4         60.6 71.0 30.3               25.2 71.0
+
+SaGe             BPE      FirstSpace Greedy         52.2     62.0 72.0 27.4               24.5 71.6
+                 n-gram FirstSpDigit Greedy         50.7     60.3 71.0 28.6               22.8 69.4
+
+PathPieceL       BPE      FirstSpace PathPieceL 49.2         57.4 66.0 27.8               24.3 65.9
+                 n-gram   FirstSpDigit PathPieceL 47.6       49.7 67.0 24.8               23.4 63.2
+                 n-gram   SpaceDigit PathPieceL 46.3         51.1 59.0 28.6               23.3 63.8
+
+Random                                              32.0     25.0 50.0 25.0               20.0 50.0
+
+Table 12: 1.3B parameter model, 40,960 token vocabulary, accuracy (%) on average and initial 5 tasks
+
+Vocab Constr Init Voc Pre-tok           Segment qa4mre race sciq sociology wsc273
+
+BPE                       FirstSpace Merge                   32.4 34.9 93.0         26.4       76.9
+
+Unigram                   FirstSpace Likelihood              37.7 33.0 91.8         28.9       74.4
+
+SaGe             BPE      FirstSpace Greedy                  34.9 34.8 92.5         25.9       76.2
+                 n-gram FirstSpDigit Greedy                  29.9 32.9 91.5         29.4       71.1
+
+                 BPE      FirstSpace    PathPieceL           31.0 33.3 89.4         26.4       70.7
+PathPieceL       n-gram   FirstSpDigit  PathPieceL           31.0 31.6 86.1         29.4       70.0
+                 n-gram   SpaceDigit    PathPieceL           28.9 31.3 87.1         22.4       67.0
+
+Random                                                       25.0 25.0 25.0         25.0       50.0
+
+     Table 13: 1.3B parameter model, 40,960 token vocabulary, accuracy (%) on remaining 5 tasks
+
+Voc Con  Init V  Pre-tok  Seg     350M avg     350M rnk      1.3B avg   1.3B rnk    2.4B avg   2.4B rnk
+BPE              FirSp    Merge          50.0             1       53.1           1       54.2           3
+PathPL   BPE     FirSp    PathPL         49.4             3       49.2           5       52.7           4
+PathPL   n-gram  FirSpD   PathPL         44.9             6       47.6           6
+SaGe     BPE     FirSp    Greedy         49.2             2       52.2           3       55.0           1
+SaGe     n-gram  FirSpD   Greedy         46.9             5       50.7           4
+Unigram          FirSp    Likeli         49.1             4       52.4           2       54.7           2
+
+Table 14: Downstream accuracy (%) of 10 tasks with vocab size 40,960, for various model sizes
+
+                                               702
+

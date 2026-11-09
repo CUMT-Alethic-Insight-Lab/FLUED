@@ -1,0 +1,1222 @@
+Beyond Text Compression: Evaluating Tokenizers Across Scales
+
+Jonas F. Lotz*                                          António V. Lopes Stephan Peitz
+University of Copenhagen, Denmark & Hendra Setiawan Leonardo Emili
+ROCKWOOL Foundation Research Unit                       Apple
+
+jonasf.lotz@di.ku.dk                                    {avlopes, speitz, hendra, lemili}
+
+                                                        @apple.com
+
+                      Abstract                          Cognetta et al., 2024). Extrinsic tokenizer
+                                                        assessments, which involve training a model
+     The choice of tokenizer can profoundly impact      to measure the impact on performance, are
+     language model performance, yet accessible         prohibitively expensive for rapid iteration. As a
+     and reliable evaluations of tokenizer quality      result, intrinsic indicators are commonly utilized,
+     remain an open challenge. Inspired by scaling      with text compression often presented as a strong
+     consistency, we show that smaller models can       predictor of performance (Gallé, 2019; Klein and
+     accurately predict significant differences in to-  Tsarfaty, 2020; Rust et al., 2021). However, recent
+     kenizer impact on larger models at a fraction of   studies question the robustness of only considering
+     the compute cost. By systematically evaluating     text compression (Zouhar et al., 2023; Ali et al.,
+     both English-centric and multilingual tokeniz-     2024; Schmidt et al., 2024), motivating the search
+     ers, we find that tokenizer choice has negligible  for more reliable frameworks.
+     effects on tasks in English but results in con-
+     sistent performance differences in multilingual       In this work, we address the practical question
+     settings. We propose new intrinsic tokenizer       of how to select a tokenizer for training a decoder-
+     metrics inspired by Zipf’s law that correlate      only language model. We focus on how significant
+     more strongly with downstream performance          differences in tokenizer quality manifest across
+     than text compression when modeling unseen         both smaller and larger models, informed by
+     languages. By combining several metrics to         evidence that variations in design choices can be
+     capture multiple aspects of tokenizer behavior,    traced across model scales (Zohar et al., 2024;
+     we develop a reliable framework for intrinsic      Choshen et al., 2024). Concretely, we examine
+     tokenizer evaluations. Our work offers a more      whether performance patterns observed in 350M-
+     efficient path to informed tokenizer selection     parameter models, varying only in their choice of
+     in future language model development.              tokenizer, can predict those at the 2.7B-parameter
+                                                        scale. This approach reduces the computational
+1 Introduction                                          cost of extrinsic evaluation by 85% while isolating
+                                                        tokenizer impact, allowing for a methodical anal-
+Language models rely on tokenizers to convert text      ysis of the relationship between intrinsic tokenizer
+into machine-interpretable tokens (Grefenstette,        characteristics and downstream performance.
+1999). As tokenizers determine how text is
+segmented, typically into subword units (Sennrich          Recent work has largely confined tokenizer eval-
+et al., 2016; Kudo, 2018), they fundamentally           uations to monolingual settings (Goldman et al.,
+shape the statistical patterns that language models     2024; Schmidt et al., 2024) or limited multilingual
+learn to estimate, thereby impacting both efficiency    comparisons to classification tasks (Ali et al.,
+and downstream performance (Domingo et al.,             2024). However, as large language models (LLMs)
+2019; Bostrom and Durrett, 2020; Ali et al., 2024).     emerge as universal task solvers (OpenAI, 2023),
+Since updating the tokenizer after model training is    we argue that tokenizer evaluation should also
+more cumbersome than ablating other architectural       extend to a broader range of applications (Dagan
+or training decisions (Yong et al., 2023; Zhao et al.,  et al., 2024). To understand when tokenizer choice
+2024), understanding tokenizer impact on model          matters, we first pretrain 350M-parameter and
+performance prior to large-scale training is crucial.   2.7B-parameter models on English-centric data.
+                                                        We then systematically evaluate tokenizer impact
+   Tokenizer design and evaluation remain open          across four English-centric and two multilingual
+challenges in NLP (Gowda and May, 2020;
+
+*Work done during an internship at Apple.
+
+                                                                32155
+
+Proceedings of the 63rd Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers), pages 32155–32173
+                                     July 27 - August 1, 2025 ©2025 Association for Computational Linguistics
+tokenizers on multiple-choice benchmarks, sum-          explains why some models simply borrow a
+marization, and machine translation into and out of     pretrained one from an existing language model.
+multiple languages and scripts. Our experiments         Unfortunately, the exact rationale behind such
+show that tokenizer choice does not have a scale-       decisions is rarely documented, leaving the
+consistent impact on English-language tasks (likely     impression that a choice was made after little or
+due to sufficient vocabulary coverage), yet pro-        no systematic testing. This lack of transparency
+duces persistent differences in translation scenarios.  underscores the need for more reliable yet low-cost
+We find that a 350M-parameter model with a multi-       methods to guide tokenizer selection.
+lingual tokenizer can outperform a 2.7B-parameter
+model that uses an English-centric tokenizer,              For our experiments, we evaluate the tokenizers
+demonstrating that careful tokenizer selection can      from the following published language models:
+offset substantial increases in model size.
+                                                        PHI-3-MINI English-centric; used by Llama
+   To address the need for more reliable intrinsic      and Llama 2 (Touvron et al., 2023a,b), ALMA
+evaluations, we hypothesize that tokenizers             (Xu et al., 2024a), Mistral (Jiang et al., 2023),
+yielding token distributions closely aligned with       OpenELM (Mehta et al., 2024), and Phi-3-mini
+the statistical patterns of natural language are        (Abdin et al., 2024).1
+especially well-suited for generative tasks in
+that language. Accordingly, we propose four             GPT-2 English-centric; used by GPT-2 (Radford
+new metrics based on different properties of the        et al., 2019), GPT-3 (Brown et al., 2020), Megatron
+token distributions produced on downstream              (Shoeybi et al., 2020), OPT (Zhang et al., 2022),
+tasks. Although these metrics do not significantly      and RoBERTa (Liu et al., 2019).
+correlate with generative performance in English,
+they offer more reliable predictions of performance     GPT-NEOX English-centric; used by GPT-
+than text compression when modeling previously          NeoX (Black et al., 2022), DCLM (Li et al., 2024),
+unseen languages. Finally, we propose a two-stage       OLMo (Groeneveld et al., 2024), and Pythia (Bi-
+predictive framework for intrinsic evaluation,          derman et al., 2023).
+combining several tokenizer metrics to produce
+consistent tokenizer rankings. Our findings offer       FALCON English-centric; used by the Falcon
+a practical path toward better-informed tokenizer       models (Almazrouei et al., 2023).
+selection in future language model development.
+                                                        TIKTOKEN Multilingual; used by GPT-4
+2 Tokenizer Choice                                      (OpenAI, 2023) and the basis for Llama 3 (Dubey
+                                                        et al., 2024).
+The choice of tokenizer is a fundamental decision
+when developing a new language model. Although          AYA 23 Multilingual coverage spanning 23 ma-
+several aspects of tokenizer creation remain active     jor Asian, European, and Middle Eastern lan-
+areas of research (Schmidt et al., 2024; Ali et al.,    guages; used by Aya 23 (Aryabumi et al., 2024).
+2024), there is broad consensus that a language
+model and its tokenizer should ideally be trained on    3 Proposed Approach
+the same data distribution (BigScience Workshop
+et al., 2023; Hayase et al., 2024). Simply adopting     Our experimental approach involves pretraining
+an existing tokenizer can jeopardize this alignment,    language models with the chosen tokenizers at two
+potentially leading to sub-optimal text encoding        scales, assessing their downstream performance
+(Ahia et al., 2023) and, in severe cases, degraded      across multiple tasks, and comparing these results
+performance and unintended model behavior (Land         with intrinsic tokenizer metrics.
+and Bartolo, 2024; Geiping et al., 2024). At the
+same time, developing a custom tokenizer without        3.1 Model Architecture and Scales
+careful design and validation can introduce severe
+inequalities and limitations across languages (Ahia     NLP has largely shifted toward decoder-only archi-
+et al., 2023; Petrov et al., 2023).                     tectures, driven by their emergent applicability to
+                                                        diverse tasks (Wei et al., 2022; Chowdhery et al.,
+   In practice, the resource cost of designing          2023; Tay et al., 2023). Notably, recent advances in
+and thoroughly evaluating a new tokenizer likely        machine translation (Xu et al., 2024a,b) challenge
+
+                                                        1For our experiments, we rely on the MIT-licensed implemen-
+                                                         tation provided with the Phi-3-mini model.
+
+32156
+PHI-3-MINI  Vocab       350M         2.7B               with modifications for improved stability and
+GPT-2        size                                       performance. For 350M-parameter models, we
+GPT-NEOX             |θ| Hours   |θ| Hours              increase the maximum learning rate from 3e−4
+FALCON        32k                                       to 9e−4 based on pilot results showing improved
+              50k  337M 220     2.6B 1840               downstream performance. We adopt the weight
+TIKTOKEN      50k  356M 210     2.7B 1650               initialization scheme of Le Scao et al. (2022),
+              65k  356M 210     2.7B 1650               whose setup closely resembles ours. Unlike the
+AYA 23      100k   371M 210     2.7B 1670               original GPT-3 architecture, which employs alter-
+            256k   407M 220     2.8B 2050               nating dense and locally banded sparse attention
+                   566M 490     3.2B 2120               (Child et al., 2019), all models utilize full attention
+                                                        in every layer. All models are trained on the
+Table 1: Vocabulary size, number of trainable param-    100B GPT-2 tokens subset of the English-centric
+eters (|θ|), and cost of pretraining measured in H100   FineWeb dataset (Penedo et al., 2024) with a
+GPU hours. For simplicity, we refer to the smaller and  fixed batch size of 2M tokens, exceeding the
+larger model scales as "350M" and "2.7B" respectively.  20× parameter-count guideline of Hoffmann et al.
+                                                        (2022) and Besiroglu et al. (2024). To improve
+the traditional dominance of encoder-decoder sys-       training stability, beyond the increased batch
+tems (Bojar et al., 2018; Barrault et al., 2019, 2020;  size, we add an auxiliary z-loss to constrain logit
+Akhbardeh et al., 2021; Kocmi et al., 2022). Fol-       magnitudes (Chowdhery et al., 2023).2 As reported
+lowing this trend, we restrict our focus to decoder-    in Table 1, most 350M-parameter models require
+only transformer models (Vaswani et al., 2017).         around 85% fewer H100 GPU hours to train
+                                                        than their 2.7B-parameter counterpart. Table 7
+   We conjecture that if a tokenizer significantly af-  (Appendix A) presents a complementary analysis
+fects model quality, its impact will manifest consis-   based on FLOPs, leading to the same insights.
+tently across different model scales. Although dif-
+ferences only revealed at specific scales may be rel-   3.3 Downstream Tasks
+evant (Tao et al., 2024), we are primarily concerned
+with identifying consistent patterns since the same     We evaluate our models on three task categories:
+tokenizer is often employed for models of various       multiple-choice benchmarks, summarization, and
+sizes (Brown et al., 2020; Touvron et al., 2023b;       machine translation. The emphasis on generative
+Dubey et al., 2024). Smaller models, with limited       tasks is motivated by their demonstrated sensitivity
+representational capacity (Kaplan et al., 2020), are    to tokenizer quality (Goldman et al., 2024).
+less able to compensate for sub-optimal tokeniza-
+tion (Chai et al., 2024a), making them particularly     Multiple-choice Benchmarks Multiple-choice
+effective at revealing differences in tokenizer qual-   tasks represent a cornerstone of modern language
+ity. This emphasis on scaling consistency is key to     model evaluations, serving as the primary frame-
+efficient model development (Choshen et al., 2024).     work for assessing zero- and few-shot capabilities
+                                                        across LLMs. We take inspiration from the Open
+   We consider two architecture configurations:         LLM Leaderboard (v1)3 and LLM360 (Liu et al.,
+a 350M-parameter model aligned with GPT-3               2024) and rely on the LM Evaluation Harness
+Medium and a model following the GPT-3 config-          (Gao et al., 2024)4 to measure performance on:
+uration for 2.7B trainable parameters. The exact
+parameter count, shown in Table 1, varies with          • Reasoning (R): ARC (Clark et al., 2018), HEL-
+vocabulary size. Our choice of 350M parameters             LASWAG (Zellers et al., 2019), PIQA (Bisk
+is inspired by Li et al. (2024), who show that             et al., 2020), and WINOGRANDE (Sakaguchi
+400M-parameter models can effectively forecast             et al., 2021).
+performance trends in larger architectures. Mean-
+while, 2.7B-parameter models align with recent          2We  explored  scaling  the  embeddings  by  √    as  suggested  by
+studies demonstrating the practical efficiency of                                                      d
+the 3B-parameter range (Gunasekar et al., 2023; Li      Takase et al. (2024), but found this approach significantly
+et al., 2023; Abdin et al., 2024; Mehta et al., 2024).  degraded downstream performance on generative tasks.
+                                                        3This version of the Open LLM Leaderboard was
+3.2 Pretraining                                         archived in June 2024. Relevant information can be
+                                                        found at https://huggingface.co/docs/leaderboards/
+For each tokenizer, we pretrain models at the two       en/open_llm_leaderboard/archive.
+scales. Our pretraining methodology follows the         4Commit dc90fec at https://github.com/EleutherAI/
+GPT-3 configurations for next-token prediction,         lm-evaluation-harness.
+
+                                            32157
+                12                                                      10
+
+log(Frequency)  10                                      log(Frequency)  8
+
+                8                                                       6
+
+                6         Tokenizer                                     4
+
+                4      Phi-3-mini     Falcon
+
+                2      GPT-2          tiktoken                          2
+                                      Aya 23
+                0      GPT-NeoX                                         0
+                                      6 8 10
+                    024                                                                0  2  4       6  8  10
+
+                                   log(Rank)                                                 log(Rank)
+
+                                   (a) X-SUM                                                 (b) CS
+
+                12                                                      10
+
+log(Frequency)  10                                      log(Frequency)  8
+
+                8
+                                                                                    6
+                6
+
+                4                                                       4
+
+                2                                                       2
+
+                0   0  2           4          6  8  10                  0              0  2  4       6  8  10
+
+                                   log(Rank)                                                 log(Rank)
+
+                                   (c) RU                                                    (d) ZH
+
+Figure 1: Token frequency plotted against frequency rank in log-log scale for English (X-SUM), Czech (CS), Russian
+(RU), and Chinese (ZH). The dashed lines with a slope of −1 reference a Zipfian power-law distribution.
+
+• Knowledge understanding (KU): MMLU                    nese (ZH ↔EN). We finetune our models on the
+   (Hendrycks et al., 2021), and RACE (Lai et al.,      translation data from Xu et al. (2024a) and evalu-
+   2017).                                               ate performance on the WMT21 test set. Transla-
+                                                        tion quality is assessed using two complementary
+• Misinformation and bias (M&B): CROWS-                 metrics: the model-based MetricX (Juraska et al.,
+   PAIRS (Nangia et al., 2020), and TRUTHFULQA          2023) and the string-based chrF (Popovic´, 2015).
+   (Lin et al., 2022).                                  See Table 10 (Appendix A) for details.
+
+We rely on the same experimental settings as used       3.4 Intrinsic Metrics
+by Mehta et al. (2024).
+                                                        Intrinsic evaluation offers a computationally
+Summarization We finetune our models on the             efficient way to assess tokenizer quality without
+X-SUM dataset (Narayan et al., 2018), which tasks       the cost of model training. Throughout, we
+models with generating single-sentence summaries        measure text compression as the number of tokens
+of news articles in English. We evaluate the sum-       after tokenizing a sequence (COMPRESSION). To
+maries with SL-BLEURT (Amplayo et al., 2023;            broaden our understanding of tokenizer behavior,
+Sellam et al., 2020), which offers robust measures      we examine multiple aspects of tokenization
+of coherence, factuality, fluency, and informative-     beyond compression alone.
+ness. See Table 9 (Appendix A) for details.
+                                                           From statistical linguistics, word frequency
+Machine Translation To evaluate a tokenizer’s           distributions of natural language follow Zipf’s
+contribution to downstream performance when             law (Zipf, 1935, 1949), a pattern that holds
+modeling unseen languages and scripts, we per-          across languages (Piantadosi, 2014). However, it
+form bi-directional translation experiments across      remains unclear how well tokenizers capture this
+four language pairs with English: Czech (CS ↔EN),       fundamental corpus statistic (Gerz et al., 2018),
+German (DE ↔EN), Russian (RU ↔EN), and Chi-
+
+                                                    32158
+        Model                     0-shot                                     5-shot                      25-shot       Avg. Avg. Avg.
+
+        size ARC HELLASWAG PIQA WINOGRANDE RACE TRUTHFULQA MMLU CROWS-PAIRS R KU M&B
+
+PHI-3-MINI 350M 25.3  44.9  69.8  51.9                           31.1  38.5  25.9                             63.9     48.0 28.5 51.2
+
+GPT-2   350M 25.3     45.9  71.2  53.7                           31.4  40.7  26.2                             63.1     49.0 28.8 51.9
+
+GPT-NEOX 350M 25.4    45.9  70.5  53.2                           32.8  37.4  26.7                             62.4     48.8 29.8 49.9
+
+FALCON  350M 24.7     46.7  70.1  53.4                           31.9  39.1  25.8                             62.6     48.7 28.9 50.9
+
+TIKTOKEN 350M 25.2    45.8  71.2  53.4                           31.8  39.5  24.7                             59.3     48.9 28.3 49.4
+
+AYA 23  350M 26.7     46.9  70.7  52.3                           32.2  40.2  25.1                             63.0     49.2 28.7 51.6
+
+PHI-3-MINI 2.7B 28.7  60.0  74.2  56.0                           34.6  36.0  25.4                             67.1     54.7 30.0 51.6
+
+GPT-2   2.7B 28.9     60.2  75.1  56.8                           35.2  34.1  26.8                             67.1     55.3 31.0 50.6
+
+GPT-NEOX 2.7B 28.2    60.4  75.3  58.3                           35.6  34.0  26.8                             66.9     55.6 31.2 50.5
+
+FALCON  2.7B 28.6     61.9  75.8  59.0                           35.9  36.3  27.0                             68.5     56.3 31.5 52.4
+
+TIKTOKEN 2.7B 30.0    60.6  75.4  57.5                           36.9  37.3  26.7                             62.5     55.9 31.2 49.9
+
+AYA 23  2.7B 30.4     61.4  75.6  56.6                           34.4  35.5  26.0                             68.0     56.0 30.2 51.8
+
+Table 2: Downstream results on the multiple-choice benchmarks (higher is better). The metrics are normalized
+accuracy for ARC (on the Challenge Set), HELLASWAG, and PIQA; accuracy for WINOGRANDE, RACE, TRUTH-
+FULQA (on the multi-true/MC2 task), and MMLU; and PCT stereotype for CROWS-PAIRS (English version).
+
+and whether preserving the natural rank-frequency                Number of unique tokens (CARDINALITY)
+distribution in the token space benefits model                   The cardinality of the token set after tokenization.
+learning (Wei et al., 2021). We hypothesize that
+tokenizers yielding token distributions closely                  Rank-frequency AUC (AUC) The area under the
+aligned with a Zipfian power law may be better                   curve of sorted token frequency against frequency
+suited for downstream modeling of natural                        rank in log-log scale (as illustrated in Figure 1),
+language. Additionally, the number of unique                     computed using Simpson’s rule.
+tokens produced during tokenization can be seen as
+an indicator for subword coverage and reliance on                Slope of linear function (SLOPE) The slope β1
+fallback units, such as byte-level representations.              from estimating a linear function f (x) = β0 + β1x
+A higher number of unique tokens might therefore                 of token frequency as a function of frequency rank
+indicate a closer match between the tokenizer                    in log-log scale, approximating Zipf’s law.
+vocabulary and the original text distribution.5
+                                                                 Deviation from linear function (POWER LAW)
+   Figure 1 illustrates token frequencies against fre-           The mean absolute error from the estimated lin-
+quency rank on log-log scales for the training split                                                     n
+of X-SUM and for CS, RU, and ZH from Xu et al.                   emaertrfiucnqcutiaonntiffi(exs )h,on1w  i=1  |β0   +  β1xi  − yi|. This
+(2024a).6 Rank-frequency patterns for X-SUM                                                                                  distribution
+differ minimally across tokenizers, suggesting                                                           closely the token
+a potentially smaller performance gap on this                    aligns with a Zipfian power law.7
+task. In contrast, some variation among tokenizers
+can be seen for CS, while the two non-Latin                      4 Experimental Results
+scripts RU and ZH exhibit the largest distributional
+differences. Notably, among the six tokenizers, the              For each task, we evaluate whether intrinsic met-
+AYA 23 tokenizer most closely follows a Zipfian                  rics and model performance at the 350M-parameter
+pattern for ZH without an overrepresentation                     scale can reliably predict the relative downstream
+of high-frequency tokens (Zouhar et al., 2023),                  performances of 2.7B-parameter models. As the
+indicating a potential advantage on Chinese text.                models vary only in their choice of tokenizer, the
+                                                                 experimental setting isolates tokenizer impact on
+   Motivated by these linguistic considerations and              downstream performance. We measure the mono-
+the observed tokenizer behaviors illustrated in Fig-             tonic relationship between intrinsic metrics and
+ure 1, we extend our evaluations beyond text com-                downstream performance using Spearman’s ρ, and
+pression with four additional intrinsic metrics:                 compare rankings across scales with Kendall’s τ .
+
+5Additional aspects of tokenizer quality, such as handling rare  4.1 Multiple-choice Benchmarks
+ words, morphological segmentation, and pre-tokenization         Table 2 reports the results for the multiple-choice
+ (Schmidt et al., 2024; Dagan et al., 2024), warrant dedicated   tasks. As expected, larger models outperform their
+ investigations in future work.
+6DE is plotted in Figure 2a (Appendix A).                        7For AUC, POWER LAW, and SLOPE, motivated by the ev-
+                                                                  idence that power laws only apply above some minimum
+                                                                  (Newman, 2005; Clauset et al., 2009; Moreno-Sánchez et al.,
+                                                                  2016), we restrict our analysis to tokens with log(rank) ≤ 6.
+
+                                          32159
+           Multiple-  Summarization   Machine                       Model  X-SUM            WMT21  Avg.
+            choice                   translation                     size         EN→XX XX→EN
+
+COMPRESSION −0.59∗∗   −0.09            0.77∗∗             PHI-3-MINI 350M 36.0    11.0  8.9 10.0
+CARDINALITY 0.29∗     −0.09          −0.79∗∗
+                                                          GPT-2     350M 37.0     16.9  12.1 14.5
+                        0.14           0.77∗∗
+AUC        0.19         0.14           0.78∗∗             GPT-NEOX 350M 37.3      13.0  9.5 11.3
+                      −0.43          −0.44∗
+POWER LAW  0.0                                            FALCON    350M 37.4     11.9  9.5 10.7
+                      −0.07            0.87∗
+SLOPE      0.0                                            TIKTOKEN 350M 36.5      12.4  10.0 11.2
+
+                                                          AYA 23    350M 37.3     9.3   8.0        8.7
+
+Across scales 0.33                                        PHI-3-MINI 2.7B 42.3    8.5   5.8        7.2
+
+                                                          GPT-2     2.7B 43.0     11.9  7.2        9.6
+
+Table 3: Correlation analysis for all downstream tasks:   GPT-NEOX 2.7B 42.7      10.8  6.5        8.7
+Spearman’s ρ coefficients between intrinsic metrics
+and downstream performance at 2.7B parameters (top);      FALCON    2.7B 42.1     10.2  6.2        8.2
+Kendall’s τ coefficients comparing ranked downstream
+performances between the two scales (bottom). Statis-     TIKTOKEN  2.7B   39.0   9.4   6.2        7.8
+tical significance is denoted as: ∗p < 0.05; ∗∗p < 0.01.
+                                                          AYA 23    2.7B 42.8     8.0   5.5        6.8
+
+smaller counterparts on reasoning tasks (Wei et al.,      Table 4: Downstream results on the generative tasks.
+2022), but the gap narrows for knowledge-based            The metrics are SL-BLEURT (↑) for X-SUM and Met-
+tasks and becomes negligible for misinformation           ricX (↓) for the WMT21 test set. The results for
+and bias tasks. The reduced performance on                XX→EN and EN→XX present averages over all tasks
+TRUTHFULQA for larger models is attributable              for translating into and out of English, respectively.
+to the U-shaped scaling properties of the task as
+identified by Wei et al. (2023). At 2.7B parameters,      explanation is that once compression surpasses a
+the model trained with the FALCON tokenizer               certain threshold, further reductions yield diminish-
+generally outperforms the others; however, no             ing returns and other factors become more decisive.
+clear winner emerges at the 350M scale.
+                                                          4.3 Machine Translation
+   Table 3 summarizes the intrinsic and ex-
+trinsic evaluations across all tasks. For these           Table 4 also summarizes our machine translation
+multiple-choice benchmarks, performance at the            results (chrF scores and detailed outcomes for all
+2.7B scale cannot be reliably extrapolated from           translation directions are presented in Table 11 in
+350M-parameter models, and COMPRESSION                    Appendix A). AYA 23 consistently outperforms
+emerges as the most significant predictor of              the other tokenizers at both model scales for
+average downstream performance.                           translating into and out of English. Furthermore,
+                                                          the 350M-parameter model using the AYA 23 tok-
+4.2 Summarization                                         enizer performs comparably to GPT-NEOX at 2.7B
+                                                          and even surpasses GPT-2, which features five
+Results for X-SUM are shown in Table 4. At both           times more trainable parameters. This underscores
+model scales, most tokenizers yield similar perfor-       that an appropriate tokenizer can compensate for
+mances, except for TIKTOKEN underperforming es-           a substantially smaller parameter count. However,
+pecially at 2.7B. Moreover, the AYA 23 tokenizer          in addition to incurring higher pretraining costs,
+demonstrates that multilingual coverage does not          a larger vocabulary also increases inference time,
+hinder English performance compared to English-           as detailed in Table 12 (Appendix A).
+centric tokenizers.
+                                                             In Table 3, we observe a significant rank corre-
+   In Table 3, we observe an insignificant rank cor-      lation across scales, where only FALCON and TIK-
+relation between the two scales, and none of the in-      TOKEN change places, indicating scale-consistent
+trinsic metrics emerge as predictive of downstream        performance trends when processing non-English
+performance. Indeed, Zipfian patterns may be less         data. In contrast to the English tasks, all intrinsic
+informative in English natural language domains,          metrics exhibit significant correlations with
+where all evaluated token distributions follow sim-       2.7B-parameter performance, with CARDINALITY
+ilar power law trends. This result challenges previ-      demonstrating the strongest correlation overall.8
+ous findings suggesting that a tokenizer’s compres-
+sion efficiency strongly predicts success in English      8Performing the same analysis based on chrF instead of Met-
+generation (Goldman et al., 2024). A plausible             ricX yields similar results. Since MetricX achieves a stronger
+                                                           correlation with human judgment (Freitag et al., 2023), we
+                                                           base the remainder of our analyses on MetricX.
+
+                                               32160
+           COMPRESSION      PHI-3-MINI           GPT-2   GPT-NEOX   FALCON  TIKTOKEN  AYA 23  Avg.
+           AUC                  0.56              0.0        0.86     0.17              0.92  0.53
+                                0.56              0.0        0.40     0.31     0.67     0.92  0.42
+           CARDINALITY (C)      0.36              0.10       0.33     0.73     0.33     0.92  0.51
+           POWER LAW (P)        0.76              0.0        1.0      0.78     0.64     0.85  0.70
+           SLOPE (S)            0.71              0.0        0.67     0.59     0.80     0.64  0.55
+                                0.43              0.67       0.80     0.83     0.67     0.92  0.76
+           C+P+S                                                               0.89
+
+Table 5: Predicting the best tokenizer in pairwise comparisons. For each tokenizer, we report the F1 score
+from a logistic regression model estimated on the remaining tokenizers. The best performing setting combines
+CARDINALITY, POWER LAW, and SLOPE (C + P + S) and is estimated using an SVM with a linear kernel.
+
+1st place           CS          DE          RU       ZH      5.1 Pairwise Comparisons
+
+             PHI-3-MINI  PHI-3-MINI  PHI-3-MINI  AYA 23      We assume that more informative metrics lead
+               AYA 23    PHI-3-MINI  PHI-3-MINI  AYA 23      to better predictive performances in pairwise
+                                                             comparisons. For every pair of tokenizers (i, j),
+2nd place      AYA 23    AYA 23      AYA 23        FALCON    we consider the difference in a given intrinsic
+             PHI-3-MINI  AYA 23      AYA 23      PHI-3-MINI  metric Xi − Xj and define a binary outcome
+                                                             variable Yij that equals 1 if tokenizer i outperforms
+3rd place    FALCON       FALCON     TIKTOKEN    PHI-3-MINI  tokenizer j and 0 otherwise. The log-odds of this
+             FALCON                  TIKTOKEN                outcome is modeled via logistic regression:
+                         TIKTOKEN                TIKTOKEN
+
+4th place    TIKTOKEN    TIKTOKEN    GPT-NEOX    TIKTOKEN
+             TIKTOKEN                  FALCON
+                          FALCON                  FALCON
+
+5th place    GPT-2       GPT-NEOX FALCON GPT-NEOX
+
+             GPT-NEOX GPT-NEOX GPT-NEOX GPT-NEOX
+
+6th place    GPT-NEOX    GPT-2       GPT-2       GPT-2              log  Pr(Yi > Yj)  = β0 + β1(Xi − Xj)
+Kendall’s τ     GPT-2    GPT-2       GPT-2       GPT-2                   Pr(Yi < Yj)
+
+                 0.73∗   0.87∗∗      0.87∗∗       0.73∗
+
+Table 6: Bradley-Terry ranking of tokenizers for each        This formulation allows us to infer the probability
+language. For every rank, we report the ground truth         that tokenizer i outperforms tokenizer j given
+ranking above (marked in grey) and the prediction below.     their difference in tokenizer characteristic. We
+Correct predictions are emphasized in bold. Statistical      iteratively leave out one tokenizer for validation
+significance is denoted as: ∗p < 0.1; ∗∗p < 0.05.            and estimate the logistic model on the remaining
+                                                             five; with four languages (averaging results over
+5 Predicting Relative Performances                           both translating into and out of English), this
+                                                             yields 40 pairwise comparisons per metric.9 This
+Our extrinsic evaluations indicate that tokenizer            setup simulates the scenario of comparing a new
+choice does not consistently affect English-centric          tokenizer against established baselines.
+tasks but plays a more decisive role in multilingual
+settings. Based on our experimental results in ma-              Because the same tokenizers are evaluated across
+chine translation, we propose a framework to iden-           multiple languages, the outcomes are correlated;
+tify the optimal tokenizer from intrinsic metrics.           we therefore focus on predictive success rather than
+                                                             statistical inference. Table 5 reports the F1 score
+   The correlation analysis in Section 4 suggests            (the harmonic mean of precision and recall) on
+that our proposed intrinsic metrics can be as infor-         the held-out tokenizer for each individual metric.
+mative as COMPRESSION. However, correlations                 POWER LAW proves the most informative predictor
+alone lack nuance; for instance, Table 3 might               on average, a finding that contradicts the simpler
+favor the tokenizer that produces the largest set of         correlation patterns in Table 3. Moreover, combin-
+unique tokens. This criteria, taken to the extreme,          ing CARDINALITY, POWER LAW, and SLOPE in a
+would imply constructing vocabularies based on               support vector machine (SVM) estimated with a
+whole words rather than subwords.                            linear kernel improves generalization, particularly
+                                                             when evaluating GPT-2. This underscores the po-
+   To address these limitations, we propose a                tential of more nuanced intrinsic evaluations that
+two-stage predictive framework that first models             capture multiple aspects of tokenizer behavior.
+pairwise differences and then aggregates these into
+global rankings.                                             9For every model, we perform a cross-validated search for
+                                                              optimal hyperparameters.
+
+                                                             32161
+5.2 Global Tokenizer Ranking                                      fian distribution typically achieve efficient compres-
+                                                                  sion by reflecting the natural frequencies of words
+To extend pairwise outcomes into a transitive global              and phrases. Such tokenizers must support ade-
+ranking, we adopt the Bradley-Terry (BT) model                    quate vocabulary coverage to avoid overly relying
+(Bradley and Terry, 1952). BT is widely used to                   on a small set of high-frequency subword tokens
+rank agents in pairwise competitions, including                   (Zouhar et al., 2023) and an excessively long tail
+LLM leaderboards and RLHF algorithms (Chris-                      of low-frequency tokens (Gowda and May, 2020).
+tiano et al., 2017; Ouyang et al., 2022).10,11 Under
+BT, pairwise outcomes are aggregated into latent                     As illustrated in Figure 1a for X-SUM, all eval-
+skill ratings λi > 0 and the probability that tok-                uated tokenizers fall along a similar distributional
+enizer i outperforms tokenizer j is modeled as                    curve, accurately indicating minimal differences
+                                                                  for English generation tasks. While our findings
+Pr(i          >  j)  =  λi  λi    .                               emphasize prioritizing an appropriate token distri-
+                            + λj                                  bution, once tokenizers surpass a certain thresh-
+                                                                  old of distributional alignment—where the choice
+We derive the BT parameters by first estimating the               of tokenizer becomes less critical—optimizing for
+probability that tokenizer i outperforms tokenizer                text compression can become a secondary focus to
+j using an SVM with an RBF kernel over all                        further improve decoding efficiency.
+intrinsic metrics, applying Platt scaling (Platt,
+1999) for calibration. We iteratively leave out                      Future work could explore interactions between
+one language from the estimation for evaluation.                  these intrinsic metrics to provide more detailed
+Table 6 compares the resulting BT rankings to                     guidance. Moreover, our analyses could be ex-
+the ground-truth, demonstrating how intrinsic                     tended to investigate when and how the relative
+metrics can be used to effectively predict tokenizer              importance of these metrics changes for special-
+performance across languages. This approach is                    ized downstream tasks, such as code generation
+particularly appealing when extensive extrinsic                   or biomedical text analysis, where syntactic or
+evaluation would be computationally prohibitive.                  domain-specific properties may take precedence.
+One limitation is that the framework does not
+accommodate ties, which may produce more                          7 Related Work
+granular rankings than practically meaningful.
+                                                                  The most widely adopted algorithms for training
+6 Discussion                                                      a tokenizer include byte-pair encoding (Sennrich
+                                                                  et al., 2016) and unigram language modeling
+The better predictive performance of more nuanced                 (Kudo, 2018). Recently, vocabulary-free ap-
+intrinsic evaluations in §5 emphasizes the impor-                 proaches for decoder-only models have been
+tance of capturing multiple aspects of tokenizer                  proposed (Tai et al., 2024; Chai et al., 2024b) by
+behavior. However, in practice, it is often simpler               rendering text as images (Salesky et al., 2021;
+to assess tokenizer quality based on a single metric              Rust et al., 2023). However, these approaches only
+when the optimal weighting or combination of mul-                 allow for continuous input representations and still
+tiple metrics is unclear. Our results indicate that               rely on a vocabulary and softmax layer for text
+deviations from a Zipfian (power-law) distribution                generation tasks. Alternatively, byte-based tokeniz-
+serve as the single most informative predictor of                 ers (Xue et al., 2022) avoid large vocabularies but
+multilingual performance (Table 5).                               produce prohibitively long sequences (Mielke et al.,
+                                                                  2021). Larger, multilingual vocabularies, while
+   Text compression is a practical measure of ef-                 potentially beneficial for generalization, can be
+ficiency, directly impacting generation speed and                 slower during inference (Hofmann et al., 2022; Sun
+computational cost. Meanwhile, the deviation of a                 et al., 2023; Petrov et al., 2023); our findings high-
+token distribution from a Zipfian power law bench-                light this trade-off as well (Table 12, Appendix A).
+marks a tokenizer’s alignment with the structure
+of natural language. Data-driven subword tokeniz-                    Tokenizers are traditionally evaluated by their
+ers whose token frequencies approximate a Zip-                    impact on downstream tasks (Provilkov et al., 2020;
+                                                                  Saleva and Lignos, 2023; Yehezkel and Pinter,
+10https://lmsys.org/blog/2023-12-07-leaderboard/                  2023) or by how well they meet specific design
+11The main difference between BT and Elo rating, which has        criteria (Klein and Tsarfaty, 2020; Hofmann et al.,
+                                                                  2021; Beinborn and Pinter, 2023). For instance,
+  also been utilized for ranking language models (Askell et al.,
+  2021; Bai et al., 2022), is the assumption that skill levels
+  remain static.
+
+                                     32162
+Schmidt et al. (2024) focus on English multiple-       Limitations
+choice benchmarks, whereas Goldman et al. (2024)
+include generation tasks and find text compression     Our study focuses on decoder-only models up to
+to be a strong predictor of performance. In contrast,  2.7B parameters, chosen for their practical rele-
+Ali et al. (2024) report that compression is not al-   vance. Although our findings provide a strong basis
+ways reliable for multilingual tasks, challenging its  for evaluating tokenizer performance at this scale,
+viability as a sole merit for multilingual tokenizers  we have not verified whether these trends hold for
+(Stollenwerk, 2023; Martins et al., 2024). Dagan       larger architectures. Prior work (Tao et al., 2024)
+et al. (2024) further discuss how to overcome poten-   indicates that vocabulary size may need to grow
+tial pitfalls when applying a tokenizer to a domain    with model size, suggesting that conclusions could
+for which it was not designed.                         differ for models beyond the scales explored here.
+
+   Gowda and May (2020) recommend ensuring                Furthermore, while we systematically evaluate
+that tokens in the long tail of infrequent vocabulary  tokenizer performance on five different languages,
+items from a Zipfian distribution are observed at      covering three different scripts, the scope of our
+least 100 times during training, enabling the model    multilingual experiments remains limited. A wider
+to effectively learn their distributional properties.  range of languages could yield different outcomes,
+Complementary, Zouhar et al. (2023) propose to         especially for scripts or morphological structures
+use Rényi entropy, a generalization of Shannon         not represented in our training data.
+entropy (Shannon, 1948), as an intrinsic metric
+for tokenizer evaluation, arguing that efficient to-      We also note that the considered multiple-choice
+kenizers produce balanced token distributions by       benchmarks are known to exhibit inherent variance
+avoiding an overrepresentation of high-frequency       (Madaan et al., 2024; Alzahrani et al., 2024), which
+tokens. However, Cognetta et al. (2024) present        may amplify or mask performance differences
+counterexamples showing that increasing Rényi          between tokenizers. The results presented here
+effiency by eliminating high-frequency tokens and      should thus be interpreted with caution and ideally
+redistributing their probability mass can negatively   verified by training multiple models with different
+correlate with downstream performance. Further-        random seeds.
+more, Dagan et al. (2024) find that, contrary to
+expectations, higher Rényi entropy correlates with        Finally, we did not explore the sensitivity of our
+lower performance in code generation.                  results to multiple random seeds, hyperparameter
+                                                       configurations during downstream tasks, or varia-
+8 Conclusion                                           tions in the pretraining pipeline. Although these
+                                                       choices kept computational demands in check, they
+We presented a cost-effective approach to tokenizer    may limit the generality of our conclusions. Fu-
+selection by training 350M-parameter decoder-only      ture work could address these gaps by investigating
+models that differ only in tokenizer choice, serving   larger model sizes, additional languages, and more
+as reliable proxies for 2.7B-scale performance.        exhaustive hyperparameter searches.
+Our experiments indicate that tokenizer choice is
+more critical in multilingual scenarios than in tasks  Acknowledgements
+limited to the pretraining language (English).
+                                                       We thank Matthias Sperber, Sarthak Garg, Frederik
+   We proposed new intrinsic tokenizer metrics         Kølby Christensen, and Desmond Elliott for helpful
+that capture how closely token distributions align     discussions and feedback. Jonas F. Lotz is funded
+with a Zipfian power law. These metrics proved         by the ROCKWOOL Foundation (grant 1242).
+especially useful for determining performance on
+previously unseen languages. Our results highlight     References
+the importance of distinguishing between different
+experimental settings when evaluating tokenizers,      Marah Abdin, Jyoti Aneja, Hany Awadalla, Ahmed
+and emphasized that comprehensive intrinsic               Awadallah, Ammar Ahmad Awan, Nguyen Bach,
+evaluations should consider multiple aspects of           Amit Bahree, Arash Bakhtiari, Jianmin Bao, Harkirat
+tokenizer behavior. Finally, we presented a reliable      Behl, Alon Benhaim, Misha Bilenko, Johan Bjorck,
+framework for ranking tokenizers based on their           Sébastien Bubeck, Martin Cai, Qin Cai, Vishrav
+intrinsic metrics.                                        Chaudhary, Dong Chen, Dongdong Chen, and 110
+                                                          others. 2024. Phi-3 technical report: A highly ca-
+                                                          pable language model locally on your phone. arXiv
+                                                          preprint.
+
+32163
+Orevaoghene Ahia, Sachin Kumar, Hila Gonen, Jungo          releases to further multilingual progress. arXiv
+   Kasai, David Mortensen, Noah Smith, and Yulia           preprint.
+   Tsvetkov. 2023. Do all languages cost the same?      Amanda Askell, Yuntao Bai, Anna Chen, Dawn Drain,
+   tokenization in the era of commercial language mod-     Deep Ganguli, Tom Henighan, Andy Jones, Nicholas
+   els. In Proceedings of the 2023 Conference on Em-       Joseph, Ben Mann, Nova DasSarma, Nelson El-
+   pirical Methods in Natural Language Processing,         hage, Zac Hatfield-Dodds, Danny Hernandez, Jack-
+   pages 9904–9923, Singapore. Association for Com-        son Kernion, Kamal Ndousse, Catherine Olsson,
+   putational Linguistics.                                 Dario Amodei, Tom Brown, Jack Clark, and 3 others.
+                                                           2021. A general language assistant as a laboratory
+Farhad Akhbardeh, Arkady Arkhangorodsky, Mag-              for alignment. arXiv preprint.
+   dalena Biesialska, Ondˇrej Bojar, Rajen Chatter-     Yuntao Bai, Andy Jones, Kamal Ndousse, Amanda
+   jee, Vishrav Chaudhary, Marta R. Costa-jussa,           Askell, Anna Chen, Nova DasSarma, Dawn Drain,
+   Cristina España-Bonet, Angela Fan, Christian Fe-        Stanislav Fort, Deep Ganguli, Tom Henighan,
+   dermann, Markus Freitag, Yvette Graham, Roman           Nicholas Joseph, Saurav Kadavath, Jackson Kernion,
+   Grundkiewicz, Barry Haddow, Leonie Harter, Ken-         Tom Conerly, Sheer El-Showk, Nelson Elhage, Zac
+   neth Heafield, Christopher Homan, Matthias Huck,        Hatfield-Dodds, Danny Hernandez, Tristan Hume,
+   Kwabena Amponsah-Kaakyire, and 17 others. 2021.         and 12 others. 2022. Training a helpful and harmless
+   Findings of the 2021 conference on machine trans-       assistant with reinforcement learning from human
+   lation (WMT21). In Proceedings of the Sixth Con-        feedback. arXiv preprint.
+   ference on Machine Translation, pages 1–88, Online.
+   Association for Computational Linguistics.
+
+Mehdi Ali, Michael Fromm, Klaudia Thellmann,            Loïc Barrault, Magdalena Biesialska, Ondrˇej Bo-
+   Richard Rutmann, Max Lübbering, Johannes Lev-           jar, Marta R. Costa-jussà, Christian Federmann,
+   eling, Katrin Klug, Jan Ebert, Niclas Doll, Jasper      Yvette Graham, Roman Grundkiewicz, Barry Had-
+   Buschhoff, Charvi Jain, Alexander Weber, Lena Ju-       dow, Matthias Huck, Eric Joanis, Tom Kocmi,
+   rkschat, Hammam Abdelwahab, Chelsea John, Pedro         Philipp Koehn, Chi-kiu Lo, Nikola Ljubešic´, Christof
+   Ortiz Suarez, Malte Ostendorff, Samuel Weinbach,        Monz, Makoto Morishita, Masaaki Nagata, Toshiaki
+   Rafet Sifa, and 2 others. 2024. Tokenizer choice        Nakazawa, Santanu Pal, and 2 others. 2020. Find-
+   for LLM training: Negligible or crucial? In Find-       ings of the 2020 conference on machine translation
+   ings of the Association for Computational Linguis-      (WMT20). In Proceedings of the Fifth Conference
+   tics: NAACL 2024, pages 3907–3924, Mexico City,         on Machine Translation, pages 1–55, Online. Associ-
+   Mexico. Association for Computational Linguistics.      ation for Computational Linguistics.
+
+Ebtesam Almazrouei, Hamza Alobeidli, Abdulaziz Al-      Loïc Barrault, Ondˇrej Bojar, Marta R. Costa-jussà,
+   shamsi, Alessandro Cappelli, Ruxandra Cojocaru,         Christian Federmann, Mark Fishel, Yvette Gra-
+   Mérouane Debbah, Étienne Goffinet, Daniel Hesslow,      ham, Barry Haddow, Matthias Huck, Philipp Koehn,
+   Julien Launay, Quentin Malartic, Daniele Mazzotta,      Shervin Malmasi, Christof Monz, Mathias Müller,
+   Badreddine Noune, Baptiste Pannier, and Guilherme       Santanu Pal, Matt Post, and Marcos Zampieri. 2019.
+   Penedo. 2023. The falcon series of open language        Findings of the 2019 conference on machine trans-
+   models. arXiv preprint.                                 lation (WMT19). In Proceedings of the Fourth Con-
+                                                           ference on Machine Translation (Volume 2: Shared
+Norah Alzahrani, Hisham Alyahya, Yazeed Alnumay,           Task Papers, Day 1), pages 1–61, Florence, Italy. As-
+   Sultan AlRashed, Shaykhah Alsubaie, Yousef Al-          sociation for Computational Linguistics.
+   mushayqih, Faisal Mirza, Nouf Alotaibi, Nora Al-
+   Twairesh, Areeb Alowisheq, M Saiful Bari, and        Lisa Beinborn and Yuval Pinter. 2023. Analyzing cogni-
+   Haidar Khan. 2024. When benchmarks are targets:         tive plausibility of subword tokenization. In Proceed-
+   Revealing the sensitivity of large language model       ings of the 2023 Conference on Empirical Methods
+   leaderboards. In Proceedings of the 62nd Annual         in Natural Language Processing, pages 4478–4486,
+   Meeting of the Association for Computational Lin-       Singapore. Association for Computational Linguis-
+   guistics (Volume 1: Long Papers), pages 13787–          tics.
+   13805, Bangkok, Thailand. Association for Compu-
+   tational Linguistics.                                Tamay Besiroglu, Ege Erdil, Matthew Barnett, and Josh
+                                                           You. 2024. Chinchilla scaling: A replication attempt.
+Reinald Kim Amplayo, Peter J Liu, Yao Zhao, and            arXiv preprint.
+   Shashi Narayan. 2023. SMART: Sentences as basic
+   units for text evaluation. In The Eleventh Interna-  Stella Biderman, Hailey Schoelkopf, Quentin Gregory
+   tional Conference on Learning Representations.          Anthony, Herbie Bradley, Kyle O’Brien, Eric Hal-
+                                                           lahan, Mohammad Aflah Khan, Shivanshu Purohit,
+Viraat Aryabumi, John Dang, Dwarak Talupuru,               USVSN Sai Prashanth, Edward Raff, and 1 others.
+   Saurabh Dash, David Cairuz, Hangyu Lin, Bharat          2023. Pythia: A suite for analyzing large language
+   Venkitesh, Madeline Smith, Kelly Marchisio, Se-         models across training and scaling. In International
+   bastian Ruder, Acyr Locatelli, Julia Kreutzer, Nick     Conference on Machine Learning, pages 2397–2430.
+   Frosst, Phil Blunsom, Marzieh Fadaee, Ahmet Üstün,      PMLR.
+   and Sara Hooker. 2024. Aya 23: Open weight
+
+32164
+BigScience Workshop, Teven Le Scao, Angela Fan,             Yekun Chai, Qingyi Liu, Jingwu Xiao, Shuohuan Wang,
+   Christopher Akiki, Ellie Pavlick, Suzana Ilic´, Daniel      Yu Sun, and Hua Wu. 2024b. Autoregressive pre-
+   Hesslow, Roman Castagné, Alexandra Sasha Luc-               training on pixels and texts. In Proceedings of the
+   cioni, François Yvon, Matthias Gallé, Jonathan Tow,         2024 Conference on Empirical Methods in Natu-
+   Alexander M. Rush, Stella Biderman, Albert Web-             ral Language Processing, pages 3106–3125, Miami,
+   son, Pawan Sasanka Ammanamanchi, Thomas Wang,               Florida, USA. Association for Computational Lin-
+   Benoît Sagot, Niklas Muennighoff, and 374 others.           guistics.
+   2023. Bloom: A 176b-parameter open-access multi-
+   lingual language model. arXiv preprint.                  Rewon Child, Scott Gray, Alec Radford, and Ilya
+                                                               Sutskever. 2019. Generating long sequences with
+Yonatan Bisk, Rowan Zellers, Jianfeng Gao, Yejin Choi,         sparse transformers. arXiv preprint.
+   and 1 others. 2020. Piqa: Reasoning about physical
+   commonsense in natural language. In Proceedings          Leshem Choshen, Yang Zhang, and Jacob Andreas.
+   of the AAAI conference on artificial intelligence, vol-     2024. A hitchhiker’s guide to scaling law estima-
+   ume 34, pages 7432–7439.                                    tion. arXiv preprint.
+
+Sidney Black, Stella Biderman, Eric Hallahan, Quentin       Aakanksha Chowdhery, Sharan Narang, Jacob Devlin,
+   Anthony, Leo Gao, Laurence Golding, Horace                  Maarten Bosma, Gaurav Mishra, Adam Roberts,
+   He, Connor Leahy, Kyle McDonell, Jason Phang,               Paul Barham, Hyung Won Chung, Charles Sutton,
+   Michael Pieler, Usvsn Sai Prashanth, Shivanshu Puro-        Sebastian Gehrmann, Parker Schuh, Kensen Shi,
+   hit, Laria Reynolds, Jonathan Tow, Ben Wang, and            Sasha Tsvyashchenko, Joshua Maynez, Abhishek
+   Samuel Weinbach. 2022. GPT-NeoX-20B: An open-               Rao, Parker Barnes, Yi Tay, Noam Shazeer, Vinodku-
+   source autoregressive language model. In Proceed-           mar Prabhakaran, and 48 others. 2023. Palm: Scaling
+   ings of BigScience Episode #5 – Workshop on Chal-           language modeling with pathways. Journal of Ma-
+   lenges & Perspectives in Creating Large Language            chine Learning Research, 24(240):1–113.
+   Models, pages 95–136, virtual+Dublin. Association
+   for Computational Linguistics.                           Paul F Christiano, Jan Leike, Tom Brown, Miljan Mar-
+                                                               tic, Shane Legg, and Dario Amodei. 2017. Deep
+Ondˇrej Bojar, Christian Federmann, Mark Fishel, Yvette        reinforcement learning from human preferences. Ad-
+   Graham, Barry Haddow, Matthias Huck, Philipp                vances in Neural Information Processing Systems,
+   Koehn, and Christof Monz. 2018. Findings of the             30.
+   2018 conference on machine translation (WMT18).
+   In Proceedings of the Third Conference on Machine        Peter Clark, Isaac Cowhey, Oren Etzioni, Tushar Khot,
+   Translation: Shared Task Papers, pages 272–303,             Ashish Sabharwal, Carissa Schoenick, and Oyvind
+   Belgium, Brussels. Association for Computational            Tafjord. 2018. Think you have Solved Question An-
+   Linguistics.                                                swering? Try ARC, the AI2 Reasoning Challenge.
+                                                               arXiv preprint.
+Kaj Bostrom and Greg Durrett. 2020. Byte pair encod-
+   ing is suboptimal for language model pretraining. In     Aaron Clauset, Cosma Rohilla Shalizi, and M. E. J.
+   Findings of the Association for Computational Lin-          Newman. 2009. Power-law distributions in empirical
+   guistics: EMNLP 2020, pages 4617–4624, Online.              data. SIAM Review, 51(4):661–703.
+   Association for Computational Linguistics.
+                                                            Marco Cognetta, Vilém Zouhar, Sangwhan Moon, and
+Ralph Allan Bradley and Milton E Terry. 1952. Rank             Naoaki Okazaki. 2024. Two counterexamples to tok-
+   analysis of incomplete block designs i: The method          enization and the noiseless channel. In Proceedings
+   of paired comparisons. Biometrika, 39(3/4):324–             of the 2024 Joint International Conference on Compu-
+   345.                                                        tational Linguistics, Language Resources and Evalu-
+                                                               ation (LREC-COLING 2024), pages 16897–16906,
+Tom Brown, Benjamin Mann, Nick Ryder, Melanie                  Torino, Italia. ELRA and ICCL.
+   Subbiah, Jared D Kaplan, Prafulla Dhariwal, Arvind
+   Neelakantan, Pranav Shyam, Girish Sastry, Amanda         Gautier Dagan, Gabriel Synnaeve, and Baptiste Roz-
+   Askell, Sandhini Agarwal, Ariel Herbert-Voss,               ière. 2024. Getting the most out of your tokenizer
+   Gretchen Krueger, Tom Henighan, Rewon Child,                for pre-training and domain adaptation. In Proceed-
+   Aditya Ramesh, Daniel Ziegler, Jeffrey Wu, Clemens          ings of the 41st International Conference on Machine
+   Winter, and 12 others. 2020. Language models are            Learning, ICML’24. JMLR.org.
+   few-shot learners. In Advances in Neural Information
+   Processing Systems, volume 33, pages 1877–1901.          Miguel Domingo, Mercedes García-Martínez, Alexan-
+   Curran Associates, Inc.                                     dre Helle, Francisco Casacuberta, and Manuel Her-
+                                                               ranz. 2019. How much does tokenization affect neu-
+Yekun Chai, Yewei Fang, Qiwei Peng, and Xuhong Li.             ral machine translation? In International Conference
+   2024a. Tokenization falling short: On subword ro-           on Computational Linguistics and Intelligent Text
+   bustness in large language models. In Findings of the       Processing, pages 545–554. Springer.
+   Association for Computational Linguistics: EMNLP
+   2024, pages 1582–1599, Miami, Florida, USA. Asso-        Abhimanyu Dubey, Abhinav Jauhri, Abhinav Pandey,
+   ciation for Computational Linguistics.                      Abhishek Kadian, Ahmad Al-Dahle, Aiesha Letman,
+                                                               Akhil Mathur, Alan Schelten, Amy Yang, Angela
+
+32165
+   Fan, Anirudh Goyal, Anthony Hartshorn, Aobo Yang,      Dirk Groeneveld, Iz Beltagy, Evan Walsh, Akshita
+   Archi Mitra, Archie Sravankumar, Artem Korenev,           Bhagia, Rodney Kinney, Oyvind Tafjord, Ananya
+   Arthur Hinsvark, Arun Rao, Aston Zhang, and 516           Jha, Hamish Ivison, Ian Magnusson, Yizhong Wang,
+   others. 2024. The Llama 3 Herd of Models. arXiv           Shane Arora, David Atkinson, Russell Authur, Khy-
+   preprint.                                                 athi Chandu, Arman Cohan, Jennifer Dumas, Yanai
+Markus Freitag, Nitika Mathur, Chi-kiu Lo, Elefthe-          Elazar, Yuling Gu, Jack Hessel, and 24 others. 2024.
+   rios Avramidis, Ricardo Rei, Brian Thompson, Tom          OLMo: Accelerating the science of language mod-
+   Kocmi, Frederic Blain, Daniel Deutsch, Craig Stew-        els. In Proceedings of the 62nd Annual Meeting of
+   art, Chrysoula Zerva, Sheila Castilho, Alon Lavie,        the Association for Computational Linguistics (Vol-
+   and George Foster. 2023. Results of WMT23 metrics         ume 1: Long Papers), pages 15789–15809, Bangkok,
+   shared task: Metrics might be guilty but references       Thailand. Association for Computational Linguistics.
+   are not innocent. In Proceedings of the Eighth Con-
+   ference on Machine Translation, pages 578–628, Sin-    Suriya Gunasekar, Yi Zhang, Jyoti Aneja, Caio
+   gapore. Association for Computational Linguistics.        César Teodoro Mendes, Allie Del Giorno, Sivakanth
+Matthias Gallé. 2019. Investigating the effectiveness of     Gopi, Mojan Javaheripi, Piero Kauffmann, Gustavo
+   BPE: The power of shorter sequences. In Proceed-          de Rosa, Olli Saarikivi, Adil Salim, Shital Shah,
+   ings of the 2019 Conference on Empirical Methods          Harkirat Singh Behl, Xin Wang, Sébastien Bubeck,
+   in Natural Language Processing and the 9th Inter-         Ronen Eldan, Adam Tauman Kalai, Yin Tat Lee, and
+   national Joint Conference on Natural Language Pro-        Yuanzhi Li. 2023. Textbooks are all you need. arXiv
+   cessing (EMNLP-IJCNLP), pages 1375–1381, Hong             preprint.
+   Kong, China. Association for Computational Linguis-
+   tics.                                                  Jonathan Hayase, Alisa Liu, Yejin Choi, Sewoong Oh,
+Leo Gao, Jonathan Tow, Baber Abbasi, Stella Bider-           and Noah A. Smith. 2024. Data mixture inference
+   man, Sid Black, Anthony DiPofi, Charles Foster,           attack: BPE tokenizers reveal training data composi-
+   Laurence Golding, Jeffrey Hsu, Alain Le Noac’h,           tions. In ICML 2024 Workshop on Foundation Mod-
+   Haonan Li, Kyle McDonell, Niklas Muennighoff,             els in the Wild.
+   Chris Ociepa, Jason Phang, Laria Reynolds, Hailey
+   Schoelkopf, Aviya Skowron, Lintang Sutawika, and       Dan Hendrycks, Collin Burns, Steven Basart, Andy Zou,
+   5 others. 2024. A framework for few-shot language         Mantas Mazeika, Dawn Song, and Jacob Steinhardt.
+   model evaluation.                                         2021. Measuring massive multitask language under-
+Jonas Geiping, Alex Stein, Manli Shu, Khalid Saifullah,      standing. In International Conference on Learning
+   Yuxin Wen, and Tom Goldstein. 2024. Coercing              Representations.
+   LLMs to do and reveal (almost) anything. In ICLR
+   2024 Workshop on Secure and Trustworthy Large          Jordan Hoffmann, Sebastian Borgeaud, Arthur Mensch,
+   Language Models.                                          Elena Buchatskaya, Trevor Cai, Eliza Rutherford,
+Daniela Gerz, Ivan Vulic´, Edoardo Maria Ponti, Roi          Diego de Las Casas, Lisa Anne Hendricks, Johannes
+   Reichart, and Anna Korhonen. 2018. On the rela-           Welbl, Aidan Clark, Thomas Hennigan, Eric Noland,
+   tion between linguistic typology and (limitations of)     Katherine Millican, George van den Driessche, Bog-
+   multilingual language modeling. In Proceedings of         dan Damoc, Aurelia Guy, Simon Osindero, Karén
+   the 2018 Conference on Empirical Methods in Natu-         Simonyan, Erich Elsen, and 3 others. 2022. An em-
+   ral Language Processing, pages 316–327, Brussels,         pirical analysis of compute-optimal large language
+   Belgium. Association for Computational Linguistics.       model training. In Advances in Neural Information
+Omer Goldman, Avi Caciularu, Matan Eyal, Kris Cao,           Processing Systems, volume 35, pages 30016–30030.
+   Idan Szpektor, and Reut Tsarfaty. 2024. Unpacking         Curran Associates, Inc.
+   tokenization: Evaluating text compression and its
+   correlation with model performance. In Findings of     Valentin Hofmann, Janet Pierrehumbert, and Hinrich
+   the Association for Computational Linguistics: ACL        Schütze. 2021. Superbizarre is not superb: Deriva-
+   2024, pages 2274–2286, Bangkok, Thailand. Associ-         tional morphology improves BERT‘s interpretation
+   ation for Computational Linguistics.                      of complex words. In Proceedings of the 59th Annual
+Thamme Gowda and Jonathan May. 2020. Finding the             Meeting of the Association for Computational Lin-
+   optimal vocabulary size for neural machine transla-       guistics and the 11th International Joint Conference
+   tion. In Findings of the Association for Computa-         on Natural Language Processing (Volume 1: Long
+   tional Linguistics: EMNLP 2020, pages 3955–3964,          Papers), pages 3594–3608, Online. Association for
+   Online. Association for Computational Linguistics.        Computational Linguistics.
+
+                                                          Valentin Hofmann, Hinrich Schuetze, and Janet Pierre-
+                                                             humbert. 2022. An embarrassingly simple method
+                                                             to mitigate undesirable properties of pretrained lan-
+                                                             guage model tokenizers. In Proceedings of the 60th
+                                                             Annual Meeting of the Association for Computational
+                                                             Linguistics (Volume 2: Short Papers), pages 385–393,
+                                                             Dublin, Ireland. Association for Computational Lin-
+                                                             guistics.
+
+Gregory Grefenstette. 1999. Tokenization, pages 117– Albert Q. Jiang, Alexandre Sablayrolles, Arthur Men-
+133. Springer Netherlands, Dordrecht.                     sch, Chris Bamford, Devendra Singh Chaplot, Diego
+
+                                       32166
+   de las Casas, Florian Bressand, Gianna Lengyel, Guil-  Teven Le Scao, Thomas Wang, Daniel Hesslow, Stas
+   laume Lample, Lucile Saulnier, Lélio Renard Lavaud,       Bekman, M Saiful Bari, Stella Biderman, Hady Elsa-
+   Marie-Anne Lachaux, Pierre Stock, Teven Le Scao,          har, Niklas Muennighoff, Jason Phang, Ofir Press,
+   Thibaut Lavril, Thomas Wang, Timothée Lacroix,            Colin Raffel, Victor Sanh, Sheng Shen, Lintang
+   and William El Sayed. 2023. Mistral 7b. arXiv             Sutawika, Jaesung Tae, Zheng Xin Yong, Julien Lau-
+   preprint.                                                 nay, and Iz Beltagy. 2022. What language model to
+Juraj Juraska, Mara Finkelstein, Daniel Deutsch, Aditya      train if you have one million GPU hours? In Find-
+   Siddhant, Mehdi Mirzazadeh, and Markus Freitag.           ings of the Association for Computational Linguistics:
+   2023. MetricX-23: The Google submission to the            EMNLP 2022, pages 765–782, Abu Dhabi, United
+   WMT 2023 metrics shared task. In Proceedings              Arab Emirates. Association for Computational Lin-
+   of the Eighth Conference on Machine Translation,          guistics.
+   pages 756–767, Singapore. Association for Compu-
+   tational Linguistics.                                  Jeffrey Li, Alex Fang, Georgios Smyrnis, Maor Ivgi,
+Jared Kaplan, Sam McCandlish, Tom Henighan, Tom B.           Matt Jordan, Samir Gadre, Hritik Bansal, Etash Guha,
+   Brown, Benjamin Chess, Rewon Child, Scott Gray,           Sedrick Keh, Kushal Arora, Saurabh Garg, Rui Xin,
+   Alec Radford, Jeffrey Wu, and Dario Amodei. 2020.         Niklas Muennighoff, Reinhard Heckel, Jean Mercat,
+   Scaling laws for neural language models. arXiv            Mayee Chen, Suchin Gururangan, Mitchell Worts-
+   preprint.                                                 man, Alon Albalak, and 40 others. 2024. Datacomp-
+Stav Klein and Reut Tsarfaty. 2020. Getting the ##life       lm: In search of the next generation of training sets
+   out of living: How adequate are word-pieces for mod-      for language models. In Advances in Neural Infor-
+   elling complex morphology? In Proceedings of the          mation Processing Systems, volume 37, pages 14200–
+   17th SIGMORPHON Workshop on Computational                 14282. Curran Associates, Inc.
+   Research in Phonetics, Phonology, and Morphology,
+   pages 204–209, Online. Association for Computa-        Yuanzhi Li, Sébastien Bubeck, Ronen Eldan, Allie Del
+   tional Linguistics.                                       Giorno, Suriya Gunasekar, and Yin Tat Lee. 2023.
+Tom Kocmi, Rachel Bawden, Ondrˇej Bojar, Anton               Textbooks are all you need ii: phi-1.5 technical report.
+   Dvorkovich, Christian Federmann, Mark Fishel,             arXiv preprint.
+   Thamme Gowda, Yvette Graham, Roman Grund-
+   kiewicz, Barry Haddow, Rebecca Knowles, Philipp        Stephanie Lin, Jacob Hilton, and Owain Evans. 2022.
+   Koehn, Christof Monz, Makoto Morishita, Masaaki           TruthfulQA: Measuring how models mimic human
+   Nagata, Toshiaki Nakazawa, Michal Novák, Martin           falsehoods. In Proceedings of the 60th Annual Meet-
+   Popel, and Maja Popovic´. 2022. Findings of the 2022      ing of the Association for Computational Linguistics
+   conference on machine translation (WMT22). In             (Volume 1: Long Papers), pages 3214–3252, Dublin,
+   Proceedings of the Seventh Conference on Machine          Ireland. Association for Computational Linguistics.
+   Translation (WMT), pages 1–45, Abu Dhabi, United
+   Arab Emirates (Hybrid). Association for Computa-       Yinhan Liu, Myle Ott, Naman Goyal, Jingfei Du, Man-
+   tional Linguistics.                                       dar Joshi, Danqi Chen, Omer Levy, Mike Lewis,
+Taku Kudo. 2018. Subword regularization: Improv-             Luke Zettlemoyer, and Veselin Stoyanov. 2019.
+   ing neural network translation models with multiple       Roberta: A robustly optimized bert pretraining ap-
+   subword candidates. In Proceedings of the 56th An-        proach. arXiv preprint.
+   nual Meeting of the Association for Computational
+   Linguistics (Volume 1: Long Papers), pages 66–75,      Zhengzhong Liu, Aurick Qiao, Willie Neiswanger,
+   Melbourne, Australia. Association for Computational       Hongyi Wang, Bowen Tan, Tianhua Tao, Junbo Li,
+   Linguistics.                                              Yuqi Wang, Suqi Sun, Omkar Pangarkar, Richard
+Guokun Lai, Qizhe Xie, Hanxiao Liu, Yiming Yang,             Fan, Yi Gu, Victor Miller, Yonghao Zhuang, Guowei
+   and Eduard Hovy. 2017. RACE: Large-scale ReAd-            He, Haonan Li, Fajri Koto, Liping Tang, Nikhil Ran-
+   ing comprehension dataset from examinations. In           jan, and 8 others. 2024. LLM360: Towards fully
+   Proceedings of the 2017 Conference on Empirical           transparent open-source LLMs. In First Conference
+   Methods in Natural Language Processing, pages 785–        on Language Modeling.
+   794, Copenhagen, Denmark. Association for Compu-
+   tational Linguistics.                                  Ilya Loshchilov and Frank Hutter. 2017. SGDR:
+Sander Land and Max Bartolo. 2024. Fishing for               Stochastic gradient descent with warm restarts. In In-
+   magikarp: Automatically detecting under-trained to-       ternational Conference on Learning Representations.
+   kens in large language models. In Proceedings of the
+   2024 Conference on Empirical Methods in Natural        Ilya Loshchilov and Frank Hutter. 2019. Decoupled
+   Language Processing, pages 11631–11646, Miami,            weight decay regularization. In International Confer-
+   Florida, USA. Association for Computational Lin-          ence on Learning Representations.
+   guistics.
+                                                          Lovish Madaan, Aaditya K. Singh, Rylan Schaeffer,
+                                                             Andrew Poulton, Sanmi Koyejo, Pontus Stenetorp,
+                                                             Sharan Narang, and Dieuwke Hupkes. 2024. Quan-
+                                                             tifying variance in evaluation benchmarks. arXiv
+                                                             preprint.
+
+                                                          Pedro Henrique Martins, Patrick Fernandes, João Alves,
+                                                             Nuno M. Guerreiro, Ricardo Rei, Duarte M. Alves,
+
+32167
+José Pombal, Amin Farajian, Manuel Faysse, Ma-            Aleksandar Petrov, Emanuele La Malfa, Philip Torr,
+teusz Klimaszewski, Pierre Colombo, Barry Haddow,            and Adel Bibi. 2023. Language model tokenizers
+José G. C. de Souza, Alexandra Birch, and André              introduce unfairness between languages. In Thirty-
+F. T. Martins. 2024. Eurollm: Multilingual language          seventh Conference on Neural Information Process-
+models for europe. arXiv preprint.                           ing Systems.
+
+Sachin Mehta, Mohammad Sekhavat, Qingqing Cao,            Steven T. Piantadosi. 2014. Zipf’s word frequency
+   Max Horton, Yanzi Jin, Frank Sun, Iman Mirzadeh,          law in natural language: A critical review and fu-
+   Mahyar Najibikohnehshahri, Dmitry Belenko, Pe-            ture directions. Psychonomic Bulletin & Review,
+   ter Zatloukal, and Mohammad Rastegari. 2024.              21(5):1112–1130.
+   Openelm: An efficient language model family with
+   open training and inference framework. In ICML         John C. Platt. 1999. Probabilistic outputs for support
+   Workshop.                                                 vector machines and comparisons to regularized like-
+                                                             lihood methods. In Advances in Large Margin Clas-
+Sabrina J. Mielke, Zaid Alyafeai, Elizabeth Salesky,         sifiers, pages 61–74. MIT Press.
+   Colin Raffel, Manan Dey, Matthias Gallé, Arun Raja,
+   Chenglei Si, Wilson Y. Lee, Benoît Sagot, and Sam-     Maja Popovic´. 2015. chrF: character n-gram F-score
+   son Tan. 2021. Between words and characters: A            for automatic MT evaluation. In Proceedings of the
+   brief history of open-vocabulary modeling and tok-        Tenth Workshop on Statistical Machine Translation,
+   enization in nlp. arXiv preprint.                         pages 392–395, Lisbon, Portugal. Association for
+                                                             Computational Linguistics.
+Isabel Moreno-Sánchez, Francesc Font-Clos, and Ál-
+   varo Corral. 2016. Large-scale analysis of zipf’s law  Ivan Provilkov, Dmitrii Emelianenko, and Elena Voita.
+   in english texts. PLOS ONE, 11(1):1–19.                   2020. BPE-dropout: Simple and effective subword
+                                                             regularization. In Proceedings of the 58th Annual
+Nikita Nangia, Clara Vania, Rasika Bhalerao, and             Meeting of the Association for Computational Lin-
+   Samuel R. Bowman. 2020. CrowS-pairs: A chal-              guistics, pages 1882–1892, Online. Association for
+   lenge dataset for measuring social biases in masked       Computational Linguistics.
+   language models. In Proceedings of the 2020 Con-
+   ference on Empirical Methods in Natural Language       Alec Radford, Jeff Wu, Rewon Child, David Luan,
+   Processing (EMNLP), pages 1953–1967, Online. As-          Dario Amodei, and Ilya Sutskever. 2019. Language
+   sociation for Computational Linguistics.                  models are unsupervised multitask learners.
+
+Shashi Narayan, Shay B. Cohen, and Mirella Lapata.        Phillip Rust, Jonas F. Lotz, Emanuele Bugliarello, Eliz-
+   2018. Don‘t give me the details, just the summary!        abeth Salesky, Miryam de Lhoneux, and Desmond
+   topic-aware convolutional neural networks for ex-         Elliott. 2023. Language modelling with pixels. In
+   treme summarization. In Proceedings of the 2018           The Eleventh International Conference on Learning
+   Conference on Empirical Methods in Natural Lan-           Representations.
+   guage Processing, pages 1797–1807, Brussels, Bel-
+   gium. Association for Computational Linguistics.       Phillip Rust, Jonas Pfeiffer, Ivan Vulic´, Sebastian Ruder,
+                                                             and Iryna Gurevych. 2021. How good is your tok-
+MEJ Newman. 2005. Power laws, pareto distributions           enizer? on the monolingual performance of multilin-
+   and zipf’s law. Contemporary Physics, 46(5):323–          gual language models. In Proceedings of the 59th
+   351.                                                      Annual Meeting of the Association for Computational
+                                                             Linguistics and the 11th International Joint Confer-
+OpenAI. 2023. Gpt-4 technical report.                        ence on Natural Language Processing (Volume 1:
+Long Ouyang, Jeffrey Wu, Xu Jiang, Diogo Almeida,            Long Papers), pages 3118–3135, Online. Association
+                                                             for Computational Linguistics.
+   Carroll Wainwright, Pamela Mishkin, Chong Zhang,
+   Sandhini Agarwal, Katarina Slama, Alex Ray, John       Keisuke Sakaguchi, Ronan Le Bras, Chandra Bhagavat-
+   Schulman, Jacob Hilton, Fraser Kelton, Luke Miller,       ula, and Yejin Choi. 2021. Winogrande: An adver-
+   Maddie Simens, Amanda Askell, Peter Welinder,             sarial winograd schema challenge at scale. Commu-
+   Paul F Christiano, Jan Leike, and Ryan Lowe. 2022.        nications of the ACM, 64(9):99–106.
+   Training language models to follow instructions with
+   human feedback. In Advances in Neural Information      Elizabeth Salesky, David Etter, and Matt Post. 2021.
+   Processing Systems, volume 35, pages 27730–27744.         Robust open-vocabulary translation from visual text
+   Curran Associates, Inc.                                   representations. In Proceedings of the 2021 Confer-
+Guilherme Penedo, Hynek Kydlícˇek, Loubna Ben al-            ence on Empirical Methods in Natural Language Pro-
+   lal, Anton Lozhkov, Margaret Mitchell, Colin Raffel,      cessing, pages 7235–7252, Online and Punta Cana,
+   Leandro Von Werra, and Thomas Wolf. 2024. The             Dominican Republic. Association for Computational
+   fineweb datasets: Decanting the web for the finest        Linguistics.
+   text data at scale. In Advances in Neural Information
+   Processing Systems, volume 37, pages 30811–30849.      Jonne Saleva and Constantine Lignos. 2023. What
+   Curran Associates, Inc.                                   changes when you randomly choose BPE merge op-
+                                                             erations? not much. In Proceedings of the Fourth
+                                                             Workshop on Insights from Negative Results in NLP,
+
+32168
+   pages 59–66, Dubrovnik, Croatia. Association for      Yi Tay, Mostafa Dehghani, Vinh Q. Tran, Xavier Garcia,
+   Computational Linguistics.                               Jason Wei, Xuezhi Wang, Hyung Won Chung, Dara
+Craig W Schmidt, Varshini Reddy, Haoran Zhang, Alec         Bahri, Tal Schuster, Steven Zheng, Denny Zhou, Neil
+   Alameddine, Omri Uzan, Yuval Pinter, and Chris           Houlsby, and Donald Metzler. 2023. UL2: Unifying
+   Tanner. 2024. Tokenization is more than compres-         language learning paradigms. In The Eleventh Inter-
+   sion. In Proceedings of the 2024 Conference on           national Conference on Learning Representations.
+   Empirical Methods in Natural Language Processing,
+   pages 678–702, Miami, Florida, USA. Association       Hugo Touvron, Thibaut Lavril, Gautier Izacard, Xavier
+   for Computational Linguistics.                           Martinet, Marie-Anne Lachaux, Timothée Lacroix,
+Thibault Sellam, Dipanjan Das, and Ankur Parikh. 2020.      Baptiste Rozière, Naman Goyal, Eric Hambro, Faisal
+   BLEURT: Learning robust metrics for text genera-         Azhar, Aurelien Rodriguez, Armand Joulin, Edouard
+   tion. In Proceedings of the 58th Annual Meeting of       Grave, and Guillaume Lample. 2023a. LLaMA:
+   the Association for Computational Linguistics, pages     Open and Efficient Foundation Language Models.
+   7881–7892, Online. Association for Computational         arXiv preprint.
+   Linguistics.
+Rico Sennrich, Barry Haddow, and Alexandra Birch.        Hugo Touvron, Louis Martin, Kevin Stone, Peter Al-
+   2016. Neural machine translation of rare words with      bert, Amjad Almahairi, Yasmine Babaei, Nikolay
+   subword units. In Proceedings of the 54th Annual         Bashlykov, Soumya Batra, Prajjwal Bhargava, Shruti
+   Meeting of the Association for Computational Lin-        Bhosale, Dan Bikel, Lukas Blecher, Cristian Can-
+   guistics (Volume 1: Long Papers), pages 1715–1725,       ton Ferrer, Moya Chen, Guillem Cucurull, David
+   Berlin, Germany. Association for Computational Lin-      Esiobu, Jude Fernandes, Jeremy Fu, Wenyin Fu, and
+   guistics.                                                49 others. 2023b. Llama 2: Open Foundation and
+Claude E. Shannon. 1948. A mathematical theory of           Fine-Tuned Chat Models. arXiv preprint.
+   communication. The Bell System Technical Journal,
+   27(3):379–423.                                        Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob
+Mohammad Shoeybi, Mostofa Patwary, Raul Puri,               Uszkoreit, Llion Jones, Aidan N. Gomez, Lukasz
+   Patrick LeGresley, Jared Casper, and Bryan Catan-        Kaiser, and Illia Polosukhin. 2017. Attention is all
+   zaro. 2020. Megatron-lm: Training multi-billion          you need. In Advances in Neural Information Pro-
+   parameter language models using model parallelism.       cessingSystems 30: Annual Conference on Neural
+   arXiv preprint.                                          Information Processing Systems, pages 5998–6008,
+Felix Stollenwerk. 2023. Training and evaluation of a       Long Beach, CA, USA.
+   multilingual tokenizer for gpt-sw3. arXiv preprint.
+Jimin Sun, Patrick Fernandes, Xinyi Wang, and Gra-       Shibo Wang and Pankaj Kanwar. 2019. Bfloat16: The
+   ham Neubig. 2023. A multi-dimensional evaluation         secret to high performance on cloud tpus. Blog Post.
+   of tokenizer-free multilingual pretrained models. In
+   Findings of the Association for Computational Lin-    Jason Wei, Dan Garrette, Tal Linzen, and Ellie Pavlick.
+   guistics: EACL 2023, pages 1725–1735, Dubrovnik,         2021. Frequency effects on syntactic rule learning
+   Croatia. Association for Computational Linguistics.      in transformers. In Proceedings of the 2021 Con-
+Yintao Tai, Xiyang Liao, Alessandro Suglia, and Anto-       ference on Empirical Methods in Natural Language
+   nio Vergari. 2024. PIXAR: Auto-regressive language       Processing, pages 932–948, Online and Punta Cana,
+   modeling in pixel space. In Findings of the Associa-     Dominican Republic. Association for Computational
+   tion for Computational Linguistics: ACL 2024, pages      Linguistics.
+   14673–14695, Bangkok, Thailand. Association for
+   Computational Linguistics.                            Jason Wei, Najoung Kim, Yi Tay, and Quoc Le. 2023.
+Sho Takase, Shun Kiyono, Sosuke Kobayashi, and Jun          Inverse scaling can become U-shaped. In Proceed-
+   Suzuki. 2024. Spike no more: Stabilizing the pre-        ings of the 2023 Conference on Empirical Methods in
+   training of large language models. arXiv preprint.       Natural Language Processing, pages 15580–15591,
+Chaofan Tao, Qian Liu, Longxu Dou, Niklas Muen-             Singapore. Association for Computational Linguis-
+   nighoff, Zhongwei Wan, Ping Luo, Min Lin, and            tics.
+   Ngai Wong. 2024. Scaling laws with vocabulary:
+   Larger models deserve larger vocabularies. In The     Jason Wei, Yi Tay, Rishi Bommasani, Colin Raffel,
+   Thirty-eighth Annual Conference on Neural Informa-       Barret Zoph, Sebastian Borgeaud, Dani Yogatama,
+   tion Processing Systems.                                 Maarten Bosma, Denny Zhou, Donald Metzler, Ed H.
+                                                            Chi, Tatsunori Hashimoto, Oriol Vinyals, Percy
+                                                            Liang, Jeff Dean, and William Fedus. 2022. Emer-
+                                                            gent abilities of large language models. Transactions
+                                                            on Machine Learning Research.
+
+                                                         Haoran Xu, Young Jin Kim, Amr Sharaf, and Hany Has-
+                                                            san Awadalla. 2024a. A paradigm shift in machine
+                                                            translation: Boosting translation performance of
+                                                            large language models. In The Twelfth International
+                                                            Conference on Learning Representations.
+
+32169
+Haoran Xu, Amr Sharaf, Yunmo Chen, Weiting Tan,           Vilém Zouhar, Clara Meister, Juan Gastaldi, Li Du,
+   Lingfeng Shen, Benjamin Van Durme, Kenton Mur-            Mrinmaya Sachan, and Ryan Cotterell. 2023. To-
+   ray, and Young Jin Kim. 2024b. Contrastive prefer-        kenization and the noiseless channel. In Proceedings
+   ence optimization: Pushing the boundaries of LLM          of the 61st Annual Meeting of the Association for
+   performance in machine translation. In Forty-first        Computational Linguistics (Volume 1: Long Papers),
+   International Conference on Machine Learning.             pages 5184–5207, Toronto, Canada. Association for
+                                                             Computational Linguistics.
+Linting Xue, Aditya Barua, Noah Constant, Rami Al-
+   Rfou, Sharan Narang, Mihir Kale, Adam Roberts,
+   and Colin Raffel. 2022. ByT5: Towards a token-free
+   future with pre-trained byte-to-byte models. Transac-
+   tions of the Association for Computational Linguis-
+   tics, 10:291–306.
+
+Shaked Yehezkel and Yuval Pinter. 2023. Incorporating
+   context into subword vocabularies. In Proceedings
+   of the 17th Conference of the European Chapter of
+   the Association for Computational Linguistics, pages
+   623–635, Dubrovnik, Croatia. Association for Com-
+   putational Linguistics.
+
+Zheng Xin Yong, Hailey Schoelkopf, Niklas Muen-
+   nighoff, Alham Fikri Aji, David Ifeoluwa Adelani,
+   Khalid Almubarak, M Saiful Bari, Lintang Sutawika,
+   Jungo Kasai, Ahmed Baruwa, Genta Winata, Stella
+   Biderman, Edward Raff, Dragomir Radev, and Vas-
+   silina Nikoulina. 2023. BLOOM+1: Adding lan-
+   guage support to BLOOM for zero-shot prompting.
+   In Proceedings of the 61st Annual Meeting of the
+   Association for Computational Linguistics (Volume 1:
+   Long Papers), pages 11682–11703, Toronto, Canada.
+   Association for Computational Linguistics.
+
+Rowan Zellers, Ari Holtzman, Yonatan Bisk, Ali
+   Farhadi, and Yejin Choi. 2019. HellaSwag: Can a ma-
+   chine really finish your sentence? In Proceedings of
+   the 57th Annual Meeting of the Association for Com-
+   putational Linguistics, pages 4791–4800, Florence,
+   Italy. Association for Computational Linguistics.
+
+Susan Zhang, Stephen Roller, Naman Goyal, Mikel
+   Artetxe, Moya Chen, Shuohui Chen, Christopher De-
+   wan, Mona Diab, Xian Li, Xi Victoria Lin, Todor Mi-
+   haylov, Myle Ott, Sam Shleifer, Kurt Shuster, Daniel
+   Simig, Punit Singh Koura, Anjali Sridhar, Tianlu
+   Wang, and Luke Zettlemoyer. 2022. Opt: Open pre-
+   trained transformer language models. arXiv preprint.
+
+Jun Zhao, Zhihao Zhang, Luhui Gao, Qi Zhang, Tao Gui,
+   and Xuanjing Huang. 2024. Llama beyond english:
+   An empirical study on language capability transfer.
+   arXiv preprint.
+
+George K. Zipf. 1949. Human Behaviour and the Prin-
+   ciple of Least Effort. Addison-Wesley.
+
+George Kingsley Zipf. 1935. The Psychobiology of
+   Language. Houghton-Mifflin, New York, NY, USA.
+
+Orr Zohar, Xiaohan Wang, Yann Dubois, Nikhil Mehta,
+   Tong Xiao, Philippe Hansen-Estruch, Licheng Yu, Xi-
+   aofang Wang, Felix Juefei-Xu, Ning Zhang, Serena
+   Yeung-Levy, and Xide Xia. 2024. Apollo: An ex-
+   ploration of video understanding in large multimodal
+   models. arXiv preprint.
+                                                           32170
+A Pretraining and Experimental Details
+
+        Vocab              350M              2.7B
+
+        size        |θ| Hours TFLOPs |θ| Hours TFLOPs
+
+PHI-3-MINI 32k 337M 220           5.35 2.6B 1840 36.06
+                                  5.58 2.7B 1650 36.62
+GPT-2   50k 356M 210              5.58 2.7B 1650 36.62
+                                  5.77 2.7B 1670 37.09
+GPT-NEOX 50k 356M 210             6.21 2.8B 1540 38.19
+                                  8.17 3.2B 2120 43.10
+FALCON  65k 371M 210
+
+TIKTOKEN 100k 407M 220
+
+AYA 23  256k 566M 490
+
+Table 7: Vocabulary size, number of trainable param-
+eters, and cost of pretraining measured in H100 GPU
+hours and TFLOPs following Chowdhery et al. (2023).
+
+                    350M                           2.7B
+
+Optimizer           AdamW (Loshchilov and Hutter, 2019)
+Adam β
+Adam ε              (0.9, 0.999)             (0.9, 0.95)
+Clip gradient norm
+Weight decay                      1e−8
+Peak LR
+Minimum LR                         1.0
+LR schedule                        0.1
+LR warmup ratio
+Batch size          9e−4                           1.6e−4
+Tied embeddings
+Precision           9e−5                           1.6e−5
+Z-loss coefficient
+Training duration   Cosine Decay (Loshchilov and Hutter, 2017)                     350M                         2.7B
+
+                                  0.0
+
+                                  2M tokens                     Peak LR            4.5e−4                       8e−5
+                                                                LR schedule
+                                  Yes                           Batch size                 Inverse Square-root
+                                                                Precision
+                    BFloat16 (Wang and Kanwar, 2019)            Training duration          256
+
+                                    1e−4                        Source prefix              BFloat16
+                    One epoch (100B GPT-2 tokens)
+                                                                Target prefix              3 epochs
+
+Table 8: Pretraining details for both model scales.                                Translate this from {Lang1} to {Lang2}:
+The implementation takes inspiration from https://                                        {Lang1}: {Lang1sentence}
+github.com/karpathy/nanoGPT.                                                                          {Lang2}:
+
+                           350M              2.7B               Table 10: Finetuning details for machine translation,
+                                                                where {Lang1} and {Lang2} are the source and target
+        Peak LR                      1e−4                       language, respectively, and {Lang1sentence} is the
+        Minimum LR                   1e−5                       source sentence.
+        LR schedule             Cosine Decay
+        LR warmup steps               1000
+        Batch size                    128
+        Precision                  BFloat16
+        Training duration          10 epochs
+        Source prefix       "Article: {source}"
+        Target prefix      "Summary: {target}"
+
+        Table 9: Finetuning details for X-SUM.
+
+                                                                32171
+            Model      EN→CS         CS→EN         EN→DE          DE→EN        EN→RU         RU→EN         EN→ZH         ZH→EN         EN→XX         XX→EN           Avg.
+             size  chrF MetricX  chrF MetricX  chrF MetricX  chrF MetricX  chrF MetricX  chrF MetricX  chrF MetricX  chrF MetricX  chrF MetricX  chrF MetricX  chrF MetricX
+
+PHI-3-MINI  350M   34.6 10.87    30.5    8.2   48.9 4.95     40.7 5.88     32.6   14.02  33.9   8.39   13.2   14.22  26.1   13.24  32.4 11.0     32.8 8.9      32.6 10.0
+GPT-2       350M   24.7 17.27    21.2   10.81                29.2 8.00     28.8   20.98  18.7   12.78   9.3   20.96  17.0   16.66  25.8 16.9     21.5 12.1     23.7 14.5
+GPT-NEOX    350M                 26.8   8.91   40.6 8.39     36.5 6.37     28.5   17.56  28.3    9.1   11.1   15.45  23.9   13.79  28.8 13.0     28.9 9.5      28.9 11.3
+FALCON      350M   29.5 13.03    28.4   8.82                 42.1 5.91     32.0   18.16  26.0   10.71  15.8   12.61  28.2   12.66  32.2 11.9     31.1 9.5      31.7 10.7
+            350M                 23.78  9.82   46.2 5.79     35.6 7.01     29.37  16.64  27.95  9.55   14.01  13.52  25.03  13.76  29.6 12.4     28.1 10.0     28.8 11.2
+TIKTOKEN    350M   33.1 11.9     31.3   7.59                 42.6 5.37     27.1   13.87  37.5          17.8   9.02   29.8   11.93  31.7 9.3      35.3 8.0      33.5 8.7
+AYA 23                                         47.8 5.12                                         7.1
+             2.7B   29 13.73                                 49.4 3.39                                                             36.0 8.5      41.0 5.8      38.5 7.2
+PHI-3-MINI   2.7B  32.5 10.09                  46  5.72      47.1 4.03                                                             32.5 11.9     35.4 7.2      33.9 9.6
+GPT-2        2.7B                                            47.3 3.84                                                             31.5 10.8     38.0 6.5      34.8 8.7
+GPT-NEOX     2.7B                              49.3 4.31     48.5 3.77                                                             33.4 10.2     39.7 6.2      36.5 8.2
+FALCON       2.7B                                            49.49 3.78                                                            34.6 9.4      41.0 6.2      37.8 7.8
+             2.7B  37.2   8.98   36.8 5.29     52.3 3.56     49.1 3.41     37.0   11.64  41.8 5.89     17.4   9.85   36.1   8.61   35.2 8.0      42.0 5.5      38.6 6.8
+TIKTOKEN           34.3   11.12  32.8 6.52     50.5 4.23                   31.2   18.08  32.0 7.9      14.0   14.33  29.5   10.46
+AYA 23             30.6   12.28                                            31.0   14.92  37.4 6.53     15.3   11.67  32.2   9.75
+                   34.7   10.04  35.3 5.91     49.2 4.32                   28.7   17.83  35.5 7.34     18.2   9.37   37.3   8.24
+                   35.14  9.97   37.4 5.38     52.1 3.51                   34.34  13.68  41.29 6.23    17.42  10.1   35.26  9.18
+                   35.0   9.47   38.02 5.62    51.69 3.75                  32.8   12.09  41.0 5.74     21.2   6.99   40.7   7.44
+
+                                 37.2 5.36     51.6 3.60
+
+Table 11: Detailed machine translation results on the WMT21 test sets measured with chrF (higher is bet-
+ter; nrefs:2|case:mixed|eff:yes|nc:6|nw:0|space:no|version:2.1.0), and MetricX (lower is better;
+version:metricX23|referenceless:no). Language codes follow ISO 639-1.
+
+Model                     Model size           CS→EN         DE→EN         EN→CS         EN→DE                EN→RU         EN→ZH   RU→EN        ZH→EN
+                             350M                92.1          95.2          75.3          89.5                 65.8          61.1    90.7         79.5
+PHI-3-MINI                   350M                77.6          78.8          58.2          63.5                 55.8          56.0    95.7         73.8
+GPT-2                        350M                83.6          91.6          62.7          74.7                 58.3          59.5    90.4         75.2
+GPT-NEOX                     350M                78.7          86.4          64.9          75.8                 53.6          59.4   104.8         71.9
+FALCON                       350M                77.2          75.7          61.3          70.8                 58.9          59.1    77.1         65.5
+                             350M                70.0          76.1          69.4          83.8                 60.3          71.8    71.6         61.4
+TIKTOKEN                     2.7B                97.9          96.9          65.2          72.2                 57.9          51.0    96.1         84.8
+                             2.7B               115.3         112.2          53.0          61.2                 44.0          45.7   169.0         98.3
+AYA 23                       2.7B                99.0          95.6          48.8          61.6                 44.1          44.9    97.3         71.3
+                             2.7B               100.6          96.2          57.7          71.9                 43.8          50.5   154.3         80.6
+PHI-3-MINI                   2.7B                91.1          87.4          51.3          62.3                 43.9          48.5    97.1         73.1
+GPT-2                        2.7B                74.8          80.3          53.5          64.0                 45.9          63.4    68.2         60.2
+GPT-NEOX
+FALCON
+
+TIKTOKEN
+
+AYA 23
+
+Table 12: Inference speed (tokens per second) on the WMT21 test set with a batch size of 1 on a single H100 GPU.
+
+                                                                                  32172
+                10                                                                       10
+
+                8                                                                                        8
+
+log(Frequency)  6 Tokenizer                             log(Frequency)                                   6
+
+                       Phi-3-mini                                                                        4
+
+                4      GPT-2
+
+                       GPT-NeoX
+
+                2      Falcon                                                                            2
+
+                       tiktoken
+
+                0      Aya 23                                                                            0
+
+                    0  2           4          6  8  10                                                       0  2  4       6     8  10
+
+                                      log(Rank)                                                                    log(Rank)
+
+                                   (a) CS                                                                          (b) DE
+
+                12                                                                                       10
+
+                10                                                                                       8
+
+log(Frequency)  8                                                                        log(Frequency)
+                                                                                        6
+
+                6
+
+                                                                                        4
+                4
+
+                2                                                                                        2
+
+                0   0  2           4       6     8  10                                                   0   0  2  4          6  8  10
+
+                                   log(Rank)                                                                          log(Rank)
+
+                                   (c) RU                                                                          (d) ZH
+
+Figure 2: Token frequency plotted against frequency rank in log-log scale for Czech (CS), German (DE), Russian
+(RU), and Chinese (ZH). The dashed lines with a slope of −1 reference a Zipfian power-law distribution.
+
+                                                    32173
+

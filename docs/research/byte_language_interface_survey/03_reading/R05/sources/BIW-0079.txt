@@ -1,0 +1,1991 @@
+                                                                                                       Fast and Expressive Multi-Byte Prediction with Probabilistic Circuits
+
+                                                                                                       Andreas Grivas 1 Lorenzo Loconte 1 Emile van Krieken 2 Piotr Nawrot 1 Yu Zhao 1 Euan Wielewski 3
+                                                                                                                                   Pasquale Minervini 1 4 Edoardo Ponti 1 * Antonio Vergari 1 *
+
+                                                                                                                               Abstract                                   0.044                                              Throughput (tok/s) ↓
+
+                                                                                                             Multi-token prediction (MTP) is a prominent strat-                       BTree        CP                                     180
+                                                                                                             egy to significantly speed up generation in large
+                                                                                                             language models (LLMs), especially in byte-level                         FF           HMM                           16       185
+                                                                                                             LLMs, which are tokeniser-free but prohibitively
+                                                                                                             slow. However, many existing MTP methods ei-                 0.040 LoRA layers: 0          1            2                    190
+                                                                                                             ther assume independence between future tokens,
+arXiv:2511.11346v2 [cs.LG] 2 Jun 2026                                                                        sacrificing expressiveness, or generate tokens one                  MTP window size: 8 16                                          195
+                                                                                          ← Latency (s)      at a time within the window, increasing latency.                                                                                   200
+                                                                                                             In this work, we investigate the trade-off between                                                                         16 205
+                                                                                                             expressiveness and latency in MTP within the
+                                                                                                             framework of probabilistic circuits (PCs). Our                                                                          16
+                                                                                                             framework, MTPC, allows one to explore differ-
+                                                                                                             ent ways to encode the joint distributions over              0.036                            8
+                                                                                                             future tokens by selecting circuit architectures,                                                  8
+                                                                                                             generalising classical models such as (hierarchi-                                                               16
+                                                                                                             cal) mixture models, hidden Markov models, and
+                                                                                                             tensor networks. We show the efficacy of MTPC                0.032 155 8              16            16
+                                                                                                             by retrofitting existing byte-level LLMs, such as                                               8
+                                                                                                             EvaByte, and byte-fied subword models, such as                      160      16            8
+                                                                                                             Llama3.2 3B. Our experiments show that, when
+                                                                                                             combined with speculative decoding, MTPC sub-                       165 8
+                                                                                                             stantially speeds up generation compared to MTP                     170
+                                                                                                             with independence assumptions, while guaran-                 0.028 175
+                                                                                                             teeing to retain the performance of the original
+                                                                                                             verifier LLM. We also rigorously study the opti-                    5            5.5       6               6.5      7   7.5
+                                                                                                             mal trade-off between expressiveness and latency
+                                                                                                             when exploring the possible parameterisations of                                 Accepted tokens →
+                                                                                                             MTPC, such as PC architectures and partial layer
+                                                                                                             sharing between the verifier and draft LLMs.1                Figure 1. MTPC allows us to trade-off efficiency (latency) and
+                                                                                                                                                                          expressiveness (token acceptance) with different MTP designs
+                                                                                                       1. Introduction                                                    by choosing 1) the probabilistic circuit (PC) architecture (FF, CP,
+                                                                                                                                                                          HMM, BTree); 2) the number of layers shared between draft
+                                                                                                       Autoregressive (AR) large language models (LLMs) can               and verifier models in self-speculative sampling. Dotted lines
+                                                                                                       only perform single-token prediction (STP) as they generate        indicate iso-throughput (bytes/sec) regions, highlighting designs
+                                                                                                       one token at a time, incurring significantly high latency, en-     such as BTree for 16 bytes and 1 LoRA layer that achieve the best
+                                                                                                                                                                          throughput for our retrofitted EvaByte-MTP model (Sec. 4).
+                                                                                                          ∗Joint last authors. 1School of Informatics, University of
+                                                                                                       Edinburgh, UK 2Vrije Universiteit Amsterdam, NL 3NatWest           ergy demand, and deployment costs. This problem affects
+                                                                                                       Group 4Miniml.AI. Correspondence to: Andreas Grivas <agri-         subword models, but is dramatically exacerbated in byte-
+                                                                                                       vas@ed.ac.uk>.                                                     level ones (Minixhofer et al., 2025; Wang et al., 2024; Yu
+                                                                                                       Proceedings of the 43 rd International Conference on Machine       et al., 2023, inter alia) as many more decoding steps are
+                                                                                                       Learning, Seoul, South Korea. PMLR 306, 2026. Copyright 2026       required to generate a text of the same length. Among possi-
+                                                                                                       by the author(s).                                                  ble alternatives to speed up generation (Ankner et al., 2024;
+                                                                                                                                                                          DeepSeek-AI et al., 2024; Nawrot et al., 2023; Pagnoni
+                                                                                                                                                                          et al., 2025; Łan´cucki et al., 2026), multi-token prediction
+                                                                                                                                                                          (MTP) stands out as it promises to predict a window of mul-
+                                                                                                                                                                          tiple tokens all at once, may they be subwords (Gloeckle
+                                                                                                                                                                          et al., 2024; Cai et al., 2024) or bytes (Gloeckle et al., 2024;
+                                                                                                                                                                          Zheng et al., 2025). As such, MTP LLMs can achieve a
+                                                                                                                                                                          significantly higher throughput than STP ones, as they de-
+                                                                                                                                                                          crease the number of passes through the LLM to generate
+                                                                                                                                                                          the same text. While recent works on MTP focuses on sub-
+                                                                                                                                                                          word models (Cai et al., 2024; Li et al., 2024), MTP can
+                                                                                                                                                                          improve throughput the most in byte-level models (Pagnoni
+                                                                                                                                                                          et al., 2025; Wang et al., 2024) due to their increased com-
+                                                                                                                                                                          putational overhead. If one could model large sequences
+
+                                                                                                                                                                              1Code and models available at github.com/april-tools/mtpc.
+
+                                                                                                                                                                       1
+Fast and Expressive Multi-Byte Prediction with Probabilistic Circuits
+
+of future bytes, byte-level LLMs could become more main-            circuits (PCs; Choi et al., 2020; Vergari et al., 2021), which
+stream as they already obviate many limitations of subword          we name MTPC. MTPC uses PCs to parameterise the joint
+tokenizers, such as uneven efficiency (Ahia et al., 2023; Da-       distribution over future tokens as tractable computational
+gan et al., 2024), lack of interoperability (Minixhofer et al.,     graphs that encode hierarchical mixture models. As such,
+2026), and vulnerabilities (Rumbelow & Watkins, 2023;               MTPC offers a way to systematically navigate the spectrum
+Land & Bartolo, 2024; Geiping et al., 2024).                        of MTP architectural variants, encompassing fully factorised
+However, modelling the joint distribution over many future          models (Zheng et al., 2025; Cai et al., 2024; Gloeckle et al.,
+bytes as tokens in a window is challenging, as it requires          2024), shallow mixtures (Basharin et al., 2025), but also
+balancing expressiveness, i.e., representing all the dependen-      more expressive parameterisations: hidden Markov models
+cies between bytes, and efficiency, i.e., minimising latency.       (HMMs) and binary tree factorisations (BTrees), which are
+Many existing MTP approaches favour the latter by making            novel for MTP.
+an unrealistic assumption: they consider all future tokens          Moreover, in contrast to previous work on MTP (Zheng
+to be independent (Zheng et al., 2025; Cai et al., 2024;            et al., 2025; Cai et al., 2024), MTPC guarantees we
+Gloeckle et al., 2024). This clearly comes at the expense           match the quality of an AR LLM via speculative decod-
+of expressiveness (Ankner et al., 2024; Wertheimer et al.,          ing (Leviathan et al., 2022; Chen et al., 2023; Stern et al.,
+2024), as the choice of a byte for a position within the            2018; Xia et al., 2024). For greedy decoding, the output is
+window cannot influence the probability of the others.              guaranteed to be identical to the AR LLM; for sampling, it
+For example, consider the prompt: “Name a capital of South          matches in expectation. This shows that the throughput cost
+Africa”, where Cape Town and Pretoria are equally likely            of the guarantee is not as large as previously suggested. We
+completions. A byte-level MTP model with independence               achieve this by sharing the LLM backbone for the draft and
+assumptions over an 8-token window could return Cretoria            verifier models for different numbers of layers, highlighting
+as an argmax, because replacing P with C cannot change the          how this creates a second dimension to trade-off expressive-
+probability of other tokens. More concerningly, a number            ness (as hidden representations between draft and verifier
+of “byte-salad” continuations, such as Crptoria, Crpt ria           are allowed to differ) and latency (as each non-shared layer
+and Crpt roa, can also have high probability, despite having        requires separate forward passes). We illustrate the two
+almost zero probability under the STP model. Most impor-            trade-offs at the core of MTPC in Fig. 1.
+tantly, the number of these erroneous continuations grows           In summary, we make the following contributions: C1)
+exponentially with respect to the MTP window size, making           we introduce MTPC, a fast MTP framework based on PCs
+the independence assumption problematic.                            that relaxes the independence assumptions of previous work
+Perhaps the dominant paradigm for relaxing independence             and generalises tensor decomposition methods (Basharin
+assumptions in MTP are shallow AR heads (Ankner et al.,             et al., 2025); C2) we rigorously identify trade-offs between
+2024; Li et al., 2024; DeepSeek-AI et al., 2024). How-              the number of accepted tokens in speculative decoding and
+ever, these heads retain autoregressive generation within           the latency of generation, based on different choices of PC
+the prediction window, which we view as closer in spirit to         architectures and partial layer sharing; C3) we empirically
+accelerated AR decoding than to joint MTP. Importantly for          demonstrate the effectiveness of MTPC by repurposing two
+our purposes, we seek methods that satisfy the following two        byte-level LLMs, EvaByte (Zheng et al., 2025) and Llama
+desiderata: a) they yield a joint distribution over the token       3.2 3B Byte (Minixhofer et al., 2025), into our framework.
+window that can be sampled from in parallel, and b) they            We find that MTPC substantially increases the throughput
+expose the dependency structure of the joint as a modelling         of EvaByte by 5.15× and that of Llama by 2.24× with
+choice. Shallow AR heads satisfy neither. Moreover, while           respect to AR generation and both by 1.17× with respect to
+Hydra (Ankner et al., 2024) and EAGLE (Li et al., 2024) are         MTP with independence assumptions, by supporting MTP
+state-of-the-art for subword-level MTP, their reported gains        windows of up to 16 bytes.
+do not necessarily translate to byte-level models; a direct
+empirical comparison is orthogonal to our contribution and          2. Speeding up Generation with MTP and
+faces several technical obstacles, see Appendix D.                     Speculative Decoding
+Satisfying our desiderata, Basharin et al. (2025) introduced
+dependencies into MTP using a mixture over the future               We now introduce MTP and speculative decoding, the two
+token probabilities, but a single mixture can only add limited      main ingredients of MTPC.2 The former accelerates gen-
+expressiveness. Crucially, understanding how to increase            eration from the target LLM; the latter guarantees that its
+expressiveness while optimally trading off efficiency in a          generation quality is preserved.
+systematic way is still an open question. We address this
+gap by proposing an MTP framework based on probabilistic                2We adapt notation from the tensor and circuit literature (Lo-
+                                                                    conte et al., 2025a); see also Appendix A.
+
+                                                                 2
+   Fast and Expressive Multi-Byte Prediction with Probabilistic Circuits
+
+MTP. A classical STP LLM encodes a distribution over                   Speculative decoding (Stern et al., 2018; Leviathan et al.,
+sequences of tokens {xt} defined over a vocabulary V as                2022; Chen et al., 2023; Xia et al., 2024) can be combined
+                                                                       with MTP to speed up generation while guaranteeing no loss
+  t p(xt+1 | x≤t), where x≤t is the context, i.e. the ob-              in generation quality. Given a target STP LLM that we wish
+served tokens at timestep t. MTP (Gloeckle et al., 2024)               to accelerate, speculative decoding consists of a cycle of two
+aims to extend an STP LLM that predicts a single token at              steps: 1) drafting, where a cheaper MTP draft model gen-
+a time through p(xt+1 | x≤t), to an MTP model, qθ , that               erates n future tokens, and 2) verification, where the target
+models the joint probability of a window of n future tokens            STP model accepts or rejects the generated tokens in parallel
+and generates them simultaneously, i.e. we model                       according to a pre-defined consistency criterion. The closer
+                                                                       the distributions of the draft and verifier are, the more of-
+   qθ (xt+1, xt+2, . . . , xt+n | x≤t),  (1)                           ten ‘speculated’ tokens are accepted (Leviathan et al., 2022;
+                                                                       Sun et al., 2023), speeding up generation. With speculative
+where θ denotes a given parameterisation for the joint.3 The           decoding, we quantify the trade-off between expressiveness
+first dimension to trade-off expressiveness and efficiency             and efficiency in MTP models as their throughput:
+in MTP pertains to compactly representing qθ . Unlike for
+p(xt+1 | x≤t), we would need to store more than a vector of            throughput  (tok/s)  =  number  of generated  tokens ,                                      (2)
+logits a ∈ Rv of a single univariate categorical distribution                                          latency (s)
+for a vocabulary size v = |V| for every timestep t. The most
+expressive, but least efficient way to do so, would be to              where the numerator is approximately the number of ac-
+store an n-dimensional tensor A ∈ Rv(1)×...×v(n) of logits             cepted tokens and the denominator captures the wall-clock
+having vn entries, but this scales exponentially in n. Next,           cost of generating the tokens (see Sec. 4.2 for details). While
+we review past attempts to avoid storing A explicitly.                 previous work such as Basharin et al. (2025) reports ac-
+                                                                       cepted token counts and latency separately, we highlight
+Fully factorised. A common way to boost efficiency is to               how both sides of the ratio in Eq. (2) are coupled, creating
+assume all n future tokens are independent (Zheng et al.,              a spectrum. MTPC provides a systematic way to navigate
+2025; Cai et al., 2024; Gloeckle et al., 2024) and factorise           this spectrum (see Fig. 1).
+the distribution qθ in Eq. (1) as
+
+   n                                     (FF)                          3. Probabilistic Circuits for MTP
+
+       qθ (xt+i | x≤t).                                                The idea behind MTPCs is to further decompose the joint
+                                                                       distribution in Eq. (1) into a deep computational graph en-
+   i=1                                                                 coding a hierarchical mixture model, called a probabilistic
+                                                                       circuit (Secs. 3.1 and 3.2), and to parameterise it with LLM
+This comes with the benefit that one needs to store only n             embeddings (Sec. 3.3).
+probability vectors, each of dimension v, to represent the
+joint distribution in Eq. (1). However, as already discussed
+in the introduction, this severely limits the model’s expres-
+siveness (Ankner et al., 2024; Wertheimer et al., 2024).
+
+Canonical polyadic (CP) factorisation. Dependencies be-                3.1. Probabilistic Circuits
+tween future tokens can be recovered by introducing explicit
+latent variables (Lee et al., 2018). To this end, Basharin et al.      A circuit (Darwiche, 2003; Choi et al., 2020; Vergari et al.,
+(2025) propose to factorise Eq. (1) via an r-rank CP decom-            2021), c, is a parameterised computational graph5 over vari-
+position. A CP decomposition introduces one discrete latent            ables X encoding a function, c(X), and comprises three
+variable, z, that encodes a mixture of r fully-factorised com-         kinds of computational units: input, product, and sum units.
+ponents, rewriting Eq. (1) as                                          Each product or sum unit n receives the outputs of other
+
+r  n                                     (CP)                          units as inputs, denoted with the set in(n). Each unit n en-
+z=1 q(z | x≤t) i=1 qθ (xt+i | z, x≤t),
+                                                                       codes a function, cn, defined as: (i) cn(sc(n); ϕ) if n is an in-
+                                                                       put unit, where cn is a function parameterised by ϕ over vari-
+where q(z | x≤t) are the mixture coefficients.4 Before                 ables sc(n) ⊆ X, called its scope; (ii) j∈in(n) cj(sc(j)) if
+showing how we can generalize both FF and CP MTP with                  n is  aunpirto,dwuictthuωnjit;∈anRdd(eiini)otingj∈tihn(ens) uωmj cpj (asrca(mj )e)teirfsn.  is a
+probabilistic circuits, we review how to ensure MTP models             sum                                                                                         The
+match the quality of a given STP model.                                scope of a product or sum unit n is the union of the scopes of
+
+    3We drop the index t from θt for readability when not needed.      iptlseisnopfuctsir,ciu.ei.t,s,scw(hne)re=unijts∈ion(fnt)hsecs(ajm).eFsicgo. p2esahroewgsroeuxpamed-
+    4Basharin et al. (2025) calls CP a mixture of experts (MoE),       into (coloured) layers that can be easily parallelised on a
+but we note this is incorrect as the weights ωj do not depend on       GPU (Mari et al., 2023; Loconte et al., 2025a).
+future tokens, but only on past ones. Moreover, while they argue
+that training CP is challenging and requires insights from the MoE         5In Fig. 2, the directionality of the edges is removed for read-
+literature, we can train them as well as deeper mixture variants       ability, but it is assumed to be from inputs to outputs.
+easily without MoE-tailored losses (see Sec. 4).
+
+                                                                    3
+                                      Fast and Expressive Multi-Byte Prediction with Probabilistic Circuits
+
+q(xt+1 | z)                     q(xt+4 | z4)                                                                                     (BTree)
+q(xt+2 | z)                                         q(z4 | z3)
+q(xt+3 | z)                                                                                                                   q(z3)
+                                         q(xt+3 | z3)                     q(z3 | z2)                   (HMM)
+                                                                   q(xt+2 | z2)                                                        q(z2 | z3)
+                   q(z)                                                                  q(z2 | z1)
+
+                                                                                                       q(z1)      q(z1 | z3)
+
+                                                                                      q(xt+1 | z1)
+
+                   (CP)                                                  (FF)
+
+q(xt+4 | z)                                                                                                       q(xt+1 | z1) q(xt+2 | z1) q(xt+3 | z2) q(xt+4 | z2)
+
+                                         q(xt+1) q(xt+2) q(xt+3) q(xt+4)
+
+Figure 2. PCs allow for modelling a spectrum of dependency structures over sequences of tokens, as shown for the known FF
+and CP and the novel HMM and BTree MTP variants. Input units are grouped in coloured layers, one for each token, while sum and
+product layers encoding (hierarchies of) latent variable distributions are in grey. The output unit of each circuit (in blue) computes
+qθ(xt+1, . . . , xt+n | x≤t). In the figure we omit the dependency on the context x≤t for readability.
+
+For MTPCs, we use probabilistic circuits (PCs), i.e., cir-                                  ϕij), then ii) multiplying them to retrieve the r factorised
+cuits modelling a joint distribution over random variables,                                 mixture components, which we then iii) aggregate in a sum
+in our case tokens. PCs encode Eq. (1) as                                                   unit with weights ωj = q(zj | x≤t) (see also Proposition 1
+                                                                                            in Loconte et al. (2025a)). Fig. 2 shows this construction
+qθ (xt+1,    .  .  . , xt+n  |  x≤t)  =  Zθ−t1  c(xt+1,         .  .  .  , xt+n; θt),       for n = 4 and r = 2. This basic construction suggests
+                                                                                    (3)     that we can create deeper architectures by interleaving sum
+where θt = {ωt, ϕt} denote the set of circuit parameters,                                   and product layers, while overparameterising each layer by
+i.e., all sum unit parameters ωt and input unit parameterisa-                               increasing the number of units r in it. Furthermore, im-
+tions ϕt which depend on the context x≤t; and Zθt denotes                                   plementing CP as a PC unlocks a faster sampling routine
+the partition function of c, i.e.,                                                          (Sec. B.2) than the one used in Basharin et al. (2025).
+
+Zθt =                                    c(xt+1, . . . , xt+n; θt). (4)                     MTPC-HMM. As a further example of the expressiveness
+                                                                                            increase we get by generalising our approach to deeper PCs,
+                   xt+1 ,...,xt+n ∈V n                                                      we introduce a factorisation that realises a hidden Markov
+                                                                                            model (HMM), which better captures distant dependencies
+Note that the PC architectures we are interested in are al-                                 in the sequence by introducing a sequence of latent vari-
+ready normalised or always allow computing the partition                                    ables, in contrast to the single one in CP. More precisely,
+function in a single feed-forward step (see Choi et al. (2020)                              we define an HMM with r hidden states and truncate its
+and Sec. B.1). At the same time, we can easily sample                                       prediction window to n steps into the future. We resort to
+from PCs in a single feedforward pass, as discussed in                                      an inhomogeneous HMM, i.e., we use time-dependent tran-
+Sec. B.2. Crucially, within the framework of PCs, we can re-                                sition matrices, as it is more expressive and worked better in
+cover the FF and CP parameterisations for MTP and several                                   our experiments (Appendix H). This simplifies Eq. (1) into:
+other architectures that generalise tensor factorisations (Lo-
+conte et al., 2025a), each offering a different expressiveness-                                        r          r
+efficiency trade-off. We do so while abstracting away from
+each model’s original formulation and obtain a unified way                                                   ···        q(z1 | x≤t)qθ (xt+1 | z1, x≤t)
+to parameterise MTP LLMs, as discussed next.
+                                                                                                       z1 =1      zn =1
+
+                                                                                                    ×  n                                           (HMM)
+
+                                                                                                       i=2 q(zi | zi−1, x≤t)qθ (xt+i | zi, x≤t).
+
+3.2. PC Architectures for MTP                                                               Fig. 2 illustrates the HMM parameterisation above repre-
+MTPC-FF. Representing the commonly used FF MTP                                              sented as a circuit, comprising n = 4 stacked pairs of sum
+parameterisation as a PC is simple: we introduce n input                                    and product layers, where the parameters ωi of the former
+units, each parameterised by ϕi, its corresponding token                                    are the transition probabilities q(zi | zi−1, x≤t). Similarly
+probabilities, and connect them all to a single product unit,                               to CP, we can increase r to overparameterise the circuit with
+as shown in Fig. 2 for a distribution over n = 4 tokens.                                    more input units per token and sum units overall, and hence
+MTPC-CP. Similarly, we can easily encode a CP factori-                                      increase expressiveness.
+sation in a shallow PC by i) introducing r input units for
+each token (each parameterised by their own probabilities                                   MTPC-BTREE. One drawback of the HMM parameteri-
+                                                                                            sation is the asymmetry of its computational graph, which
+                                                                                            i) provides fewer latent variables for the early tokens, and
+
+                                                                                         4
+Fast and Expressive Multi-Byte Prediction with Probabilistic Circuits
+
+ii) increases latency when predicting the last tokens due            mixture coefficient.6 As such, instead of a single unembed-
+to its autoregressive token dependencies. To solve this,             ding matrix mapping Rd → Rv, we have an unembedding
+we build a PC whose structure resembles that of a bi-                tensor W ∈ Rn×r×v×d, and compute the input distributions
+nary tree (BTree), effectively encoding a hierarchy of la-           with the usual unembedding operation followed by softmax,
+tent variables or a tree tensor factorisation (Grasedyck,            i.e., ϕtij = softmax (Wijet), where i and j index the
+2010; Cheng et al., 2019; Loconte et al., 2025a). This is            position in the MTP window and the rank r.
+done recursively: at each step h of the hierarchy, given             Sum unit parameters. Instead of mapping embeddings
+n tokens, and a parent latent variable Zl, we split the to-          to the vocabulary via W, we map to the rank of the sum
+kens into two sub-sequences (xt+1, . . . , xt+⌊n/2⌋−1) and           unit via R ∈ Rz×r×d, where z is the number of sum units,
+(xt+⌊n/2⌋, . . . , xt+n), then factorise Eq. (1) as the mixture:     r is its rank, and d the dimensionality of et. We compute
+                                                                     ωti = softmax (Riet), where i indexes the sum unit.
+           r
+                                                                     3.4. Speculative Decoding with MTPC
+              q(zh | zl, x≤t)                                        For MTPCs, we design an architecture that is self-
+                                                                     drafting (Zhang et al., 2024b; Cai et al., 2024), i.e. where
+           zh =1                                                     the draft and verifier models share the same LLM backbone.
+                                                                     We use an MTP head (Cai et al., 2024; Ankner et al., 2024)
+           × qθ (xt+1, . . . , xt+⌊n/2⌋−1 | zh, zl, x≤t)             augmented with our circuits to efficiently sample a draft, and
+           × qθ (xt+⌊n/2⌋, . . . , xt+n | zh, zl, x≤t) (BTree)       an autoregressive STP head as the verifier. Optionally, we
+which corresponds to creating a sum unit whose weights are           also keep a few final transformer layers separate in the two
+q(zh | zl, x≤t) followed by products. We repeat the process          models by fine-tuning LoRA adapters for the draft model.
+while caching intermediate units until we reach the base             Unlike previous self-drafting MTP works (Cai et al., 2024;
+case for n = 1, for which we create a layer of input units for       Ankner et al., 2024), we guarantee that the generated tokens
+the corresponding token. Fig. 2 illustrates the BTree circuit        are exactly the same (greedy speculative decoding (Stern
+built in this way. Our experiments (Sec. 4) show that the            et al., 2018)) or the same in expectation (speculative sam-
+BTree parameterisation obtains the optimal throughput by             pling) as those the autoregressive LLM would generate us-
+lowering the latency of the HMM, as it samples more latent           ing speculative decoding (Leviathan et al., 2022; Chen et al.,
+variables and tokens in parallel, while achieving similar            2023), i.e., we only generate the subset of drafted tokens
+acceptance rates. In addition, our experiments show that the         accepted by our verifier. To keep latency low, we make
+BTree parameterisation improves throughput on larger MTP             only a single LLM call per speculative decoding cycle by
+window sizes as the balanced tree structure enables parallel         re-using, where possible, the LLM backbone state computed
+sampling of tokens and latent variables.                             by the verifier for the draft model. Sharing the state forfeits
+                                                                     the bonus token of standard speculative decoding, except
+3.3. Parameterising PCs with LLMs                                    in the rare case where no tokens are accepted; see Alg. 2.
+Parameterising MTPCs requires two functions: an LLM                  The GPU memory overhead of speculative decoding with
+that maps the context x≤t ∈ Vt into contextual features,             our most expressive PCs is only 10-15% more than MTPC-
+and a neural network head that maps the contextual fea-              FF, see Fig. 5. Next, we report results for MTPC both for
+tures to the parameters of the circuit θt, realising a neural        speculative sampling and greedy speculative decoding.
+conditional circuit (Shao et al., 2020; 2022; Ahmed et al.,
+2022). To extract the contextual features et ∈ Rd, we use            4. Retrofitting Byte-Level LLMs with MTPCs
+et = LLMLoRA(k) (x≤t) where LLMLoRA(k) : Vt → Rd is
+the STP backbone with LoRA (Hu et al., 2022) applied to              We evaluate MTPC on the challenging tasks of speeding
+the last k ≥ 0 layers. As we will discuss in Sec. 4.4, the           up byte-level LLMs. We speed-up two models, EvaByte
+number of LoRA layers can impact throughput significantly.           6.5B, which already has MTP capabilities, and Llama 3.2
+Given et, we realise Eq. (3) by computing θt = gc (et),              3B (Byte), which does not and is a byte-fied version of
+where gc is a neural network head that outputs both the              the popular subword-level LLM. Detailed parameters of
+input unit parameters, ϕt, and the sum unit parameters, ωt           both models can be found in Appendix E. We implement
+(Sec. 3.1). Note that our parameterisation in MTPCs allows           our MTPCs variants in the cirkit library (The april Lab,
+us to abstract from the actual structure of the circuit (i.e.,       2024) and provide it in our supplementary materials.
+FF, CP, HMM or BTree) and just focus on these two sets of
+tensorised parameters, as we discuss next.                               6This is efficient even for PCs with high rank due to the small
+Input unit distributions. All MTPCs produce joint dis-               vocabulary size of byte-level LLMs.
+tributions over token windows by combining categorical
+distributions over individual tokens (Fig. 2). We follow
+EvaByte (Zheng et al., 2025) and learn n separate unembed-
+ding layers, one per window position. For models with mix-
+ture coefficients, we also learn one unembedding layer per
+
+                                                                  5
+Fast and Expressive Multi-Byte Prediction with Probabilistic Circuits
+
+EvaByte 6.5B. EvaByte (Zheng et al., 2025) is an open                our MTP models on a similar data mix to that used for
+source, publicly available byte-level model that obtains re-         instruction fine-tuning the target.
+sults that are competitive to subword-level LLMs on bench-           Training data. We fine-tune on the Tu¨lu 3 SFT mix
+marks (Zheng et al., 2025), see Sec. E.1. Importantly, Ev-           dataset (Lambert et al., 2025) which contains 939,344 ex-
+aByte has been pretrained as an MTP model with a predic-             amples of user/assistant interactions on 18 tasks. We split
+tion window of n = 8 bytes. As a result, it can already              the Tu¨lu 3 dataset into training and validation and evaluate
+speed-up generation very effectively with greedy specula-            throughput on the unseen validation examples. We make
+tive decoding. However, its acceptance rate with speculative         sure all tasks are sampled by shuffling the training data
+sampling is hampered by the unrealistic independence as-             before splitting. To make training possible on 2 × 80 GB
+sumptions which we relax with MTPC. Moreover, we will                GPUs, we limit the context length to 8192 bytes and filter
+see that EvaByte’s pretraining enables us to successfully            out 34,067 examples which are longer. We split the remain-
+extend prediction to n = 16 tokens. Thus, we retrofit                ing 905,277 examples into 99% train and 1% validation.
+EvaByte-SFT (Zheng et al., 2025), which has been instruc-            Initialisation. For EvaByte, we initialise our MTP
+tion fine-tuned on a data mix of Tu¨lu 3 (Lambert et al., 2025),     heads from EvaByte-SFT in a way that guarantees that our
+OpenCoder (Huang et al., 2025) stages one and two, and               EvaByte-MTP-CP is equivalent to EvaByte-MTP. This guar-
+OpenHermes 2.5. We note that EvaByte’s solid performance             antees that we leverage previous training: all models start
+on benchmarks is obtained via Medusa-style lossy specu-              from the same loss and we smoothly move in parameter
+lative decoding with the MTP head, which in the case of              space from EvaByte-MTP to our more expressive EvaByte-
+sampling comes with a loss in quality compared to EvaByte-           MTP-CP, EvaByte-MTP-HMM and EvaByte-MTP-BTree.
+STP (n = 1). We therefore set EvaByte-STP as the target              Loss. We train our MTP models on the packed train split of
+model for speculative decoding to accelerate generation              Tu¨lu 3 with a batch size of 256 sequences, or ≈ 2m tokens,
+without sacrificing generation quality.                              which is what EvaByte used. We first train our MTP heads
+Llama 3.2 3B (Byte). We also retrofit a Llama3.2 3B                  for 1 epoch (Sec. 4.3). Then we load the models and con-
+model (Grattafiori et al., 2024) to show that our findings gen-      tinue training for an additional epoch with LoRA (Sec. 4.4).
+eralise. Since we focus on byte-level LLMs, we retrofit the          We apply the target model’s chat template and only train
+byte-level version that has been distilled from the subword-         on the assistant’s answers. We use overlapping prediction
+level model in Minixhofer et al. (2026) while retaining              windows, as we need to be able to begin speculative decod-
+most of Llama’s downstream performance.7 The byte-fied               ing from any position during generation. We minimise the
+Llama3.2 3B model was fine-tuned on Tu¨lu 3 with a context           negative log-likelihood of the observed assistant outputs,
+length of 2048. As opposed to EvaByte, the byte-fied ver-            see Eq. (5), where N is the number of training sequences
+sion of Llama was not pretrained for multi-token prediction.         and L is the sequence length for each token in the window.8
+As such, the boost we can get from MTPC is smaller than
+that for EvaByte, as it is more challenging to adapt it to long      Lj  =  −  1   N1        L     log  pθ  (x(t+i)j  |  x(<i)t+j )  (5)
+windows with LoRA adapters only on the last few layers.                        N   i=1 Vi,j  t=1
+Draft models. Each draft model comprises a backbone
+and an MTP head. We introduce two axes to control the                This involves locally normalising the loss by the number of
+draft model’s expressiveness: i) more expressive circuit             valid tokens for example i and output j in the MTP window,
+heads and ii) more LoRA layers in the draft backbone. For            Vi,j. As in Cai et al. (2024), we apply exponential discount-
+i) we combine the target’s model backbone with one of                ing to the loss Lj of token j in the MTP window, i.e., we
+our MTPCs heads, including our CP implementation and                 minimise L =  n    γj−1Lj .9  We   use  Adam        (Kingma     &
+novel HMM and BTree heads to relax the independence                                j=1
+assumptions of the FF model and increase expressiveness.             Ba, 2015) with a fixed learning rate of 3 × 10−4.
+We note that MTPC-CP with r = 1 is equivalent to MTPC-
+FF, as can be seen from Eq. (CP). For ii) we decouple the            4.2. Metrics
+draft and target backbone by adding LoRA adapters to the             To speed up LLM generation with speculative decoding, we
+last 1, 2 or 4 layers of the draft’s backbone.                       need to balance speed and expressiveness. We measure
+                                                                     speed using mean latency per cycle ( µlat) and expres-
+4.1. Training                                                        siveness via the mean accepted tokens per cycle ( µacc;
+We train 55 draft models in total. We improve throughput by          Li et al., 2024), as defined below. Our goal is to increase
+making our MTP model’s distribution as similar as possible           throughput. We obtain a relative throughput speed-up
+to the target’s in the simplest way: we instruction fine-tune
+                                                                         8Our loss over overlapping windows is a composite log-
+    7http://hf.co/benjamin/Llama3-2-3B-IT-Byte                       likelihood (Varin et al., 2011).
+
+                                                                         9We set γ = 0.9 instead of γ = 0.8 in the case of n > 8.
+
+                                                                  6
+Fast and Expressive Multi-Byte Prediction with Probabilistic Circuits
+
+of one method over another by measuring their wall-time               Table 1. Increasing the mixture components (r) increases
+speedup ratio (Li et al., 2024; Cai et al., 2024). We use             the throughput (µtok/s) as seen for MTPC-CP (n = 8) over
+a batch size of 1 for all evaluations. Metrics for our main           our baseline, EvaByte-MTP (FF) (in gray) where we report the
+experiments are computed on the server-grade NVIDIA                   mean ± std over three sets of 250 prompts of Tu¨lu3 on an L40S
+L40S GPU with complete results in Appendix K. We also                 GPU. MTPC-CP increases throughput: it has a larger acceptance
+run experiments on the desktop-grade NVIDIA RTX 3090                  ( µacc) while latency ( µlat) increases slowly in r.
+in Appendix L. We detail the metrics below.
+Mean latency µlat is the average time of each speculative             µlat ↓  µacc ↑ µtok/s ↑                      maxtok/s
+decoding cycle, i.e., the time needed for the draft model
+to generate a candidate sequence and the verifier to choose           FF 1 0.0299±0.0003 5.19±0.05 176.3±0.9       297.55
+which tokens to accept. µlat is higher for less efficient                   8 0.0314±0.0005 5.67±0.05 184.2±3.9    297.92
+LLMs and MTP heads, and lower for more powerful GPUs.                       16 0.0323±0.0020 5.79±0.08 183.4±13.3  290.71
+Mean accepted tokens µacc is the mean number of drafted                                                            287.88
+tokens that are accepted by the target model per cycle. More          CP 32 0.0314±0.0003 5.88±0.02 191.0±1.6      281.10
+expressive draft models will have higher acceptance as they                 64 0.0327±0.0015 5.96±0.04 185.9±7.7   264.80
+will better approximate the target distribution. µaccdepends                128 0.0337±0.0001 6.02±0.03 182.3±1.1
+on the size of the MTP window, n, as we have µacc ∈ [0, n].
+Mean throughput µtok/s is the total number of generated               expressiveness-latency trade-off is vital for understanding
+tokens across all prompts divided by the total generation la-         the outcome: the best throughput is obtained for r = 32 and
+tency, excluding prefill (Eq. (2)). In the trade-off plots,           not r = 128. We note that our findings for MTPC-CP also
+we cannot directly visualise µtok/s. Instead, we decom-               hold for Llama and greedy speculative decoding, see Ta-
+pose throughput into the ratio µacc / µlat, which approxi-            bles 10, 13 and 16 in the Appendix. In the last column, we
+mates Eq. (2) closely but not exactly: it is a ratio of per-cycle     also show the maximum attainable throughput (maxtok/s),
+means rather than of totals, and accepted tokens slightly un-         i.e., we disable speculative decoding and accept all tokens.
+dercount generated tokens, as one token is still generated in         We see that we pay ≈ 90 tok/s for r = 32, which is not a big
+the rare case where none are accepted (see Alg. 2).                   price to pay for guaranteeing no loss in generation quality.
+Wall-time speed-up ratio is the relative speed-up of a pro-           While MTPC-CP performs well for n = 8, the margin for
+posed model compared to a baseline model, measured as                 further improving throughput is small. This is because for
+the ratio of their µtok/s. As baselines, we use autoregres-           n = 8, we can at best achieve µacc = 8, and we have
+sive generation from the STP target model and MTP with                already achieved µacc = 6.02 and have hit diminishing
+independence assumptions.                                             returns. To obtain substantial boosts in throughput, we need
+                                                                      to find another axis of expressivity to benefit from. We
+                                                                      therefore use MTPC’s more expressive circuits to extend
+                                                                      our model to longer window sizes. As r = 32 worked best,
+                                                                      we keep it fixed for the remaining experiments.
+
+4.3. MTPCs without Adapters                                           RQ2: Do we benefit from more expressive circuit architec-
+RQ1: Can we increase throughput by increasing the num-                         tures for longer MTP windows?
+
+         ber of mixture components?                                   We now consider the more expressive MTPC-HMM and
+                                                                      MTPC-BTREE, and show that they outperform MTPC-CP
+We begin with the simplest PC from our framework, MTPC-               on µacc for longer MTP windows, highlighting the impor-
+CP, which relaxes the independence assumption of the                  tance of our extension to general PCs. We fix r = 32 and
+widely used MTPC-FF (r = 1) by increasing the number of               explore the different PC architectures for both n = 8 and
+mixture coefficients, r. MTPC-CP increases throughput as              the longer window, n = 16. Fig. 3 shows that both MTPC-
+it is more expressive than MTPC-FF, yet still very efficient.         HMM and MTPC-BTREE increase µacc. However, MTPC-
+Table 1 highlights MTPC-CP’s increase in expressivity as ev-          HMM strikes an unfavourable balance in the expressiveness–
+idenced by the increase in µaccas we increase r: MTPC-CP              latency trade-off: Due to being AR, MTPC-HMM has the
+reaches µacc = 6.02 for r = 128, surpassing the MTPC-FF               largest µlat (see Tables 8, 11, 14 and 17), and yields poor
+baseline by .83 for EvaByte with speculative sampling. At             throughput as a result.
+the same time, the µlat introduced by MTPC-CP increases               Interestingly, for greedy decoding EvaByte-MTP achieves
+only slightly as we increase r, because the forward pass              higher throughput than more expressive circuits (see Fig. 3,
+cost of the MTPC-CP head is dominated by the expensive                bottom right). We conjecture this is because EvaByte was
+LLM calls. Nevertheless, as the increase in µacc tails off            pretrained with the independence assumption, so its repre-
+for larger r, even the small µlat increase matters and we             sentations are well-aligned with a factorised head such as
+see the first of three cases in our experiments where the
+
+                                                                   7
+                                              Fast and Expressive Multi-Byte Prediction with Probabilistic Circuits
+
+                            Speculative Sampling                                                                          Speculative Sampling (n=16)
+
+Mean Accepted Tokens                          Throughput (Bytes/s)  200                          Mean Accepted Tokens                       Throughput (Bytes/s)  200
+
+                      6                                                                                                6
+
+                                                                    150     BTREE r=32                                         EvaByte                            150  BTREE r=32
+
+                            EvaByte                                         CP r=32                                    4       Llama                                              FF r=1
+                                                                            FF r=1                                                                                100
+                      4     Llama
+
+                                                                    100     HMM r=32                                   2
+
+                      2                                                                                                   012            4                             012                4
+
+                                                                                                                          # LoRA Layers                                # LoRA Layers
+
+                         8         16                                    8              16
+
+                            Greedy Speculative Decoding                                                                   Greedy Speculative Decoding (n=16)
+
+Mean Accepted Tokens  8                       Throughput (Bytes/s)  250                          Mean Accepted Tokens                       Throughput (Bytes/s)  250
+
+                                                                                                                       8
+
+                      6                                             200                                                6                                          200
+
+                      4                                             150                                                4                                          150
+
+                         8         16                                    8              16                                012            4                             012                4
+
+                         MTP Window size (n)                             MTP Window size (n)                              # LoRA Layers                                # LoRA Layers
+
+Figure 3. Extending the MTP window of expressive PCs such as                                     Figure 4. We increase the expressiveness of the draft model by
+MTPC-HMM and MTPC-BTREE to n = 16 boosts their µacc                                              adding LoRA layers (x-axis) for n = 16. As a result, the µacc
+in all settings, as can be seen from the upward trend on the left                                (left subplots) increases substantially for both EvaByte and Llama
+subplots and in more detail in Fig. 6. Importantly, MTPC-BTREE                                   for both speculative decoding settings. Due to the expressiveness–
+improves µtok/s for all but Llama with speculative sampling, high-                               latency trade-off the optimal µtok/s for EvaByte is obtained with 1
+lighting its strong expressiveness–latency trade-off. In contrast,                               LoRA layer while Llama often benefits further from 2 or more.
+MTPC-HMM lags behind due to high latency from its AR nature.
+
+MTPC-FF. This suggests that expressive circuits are not                                          due to longer training alone. We show that while we can
+always necessary for greedy decoding, which requires only                                        improve throughput, we need to be strategic when choosing
+the correct argmax, but appear more beneficial for sampling,                                     the number of LoRA layers, as the latency introduced can
+which requires approximating the full distribution.                                              rapidly outweigh the expressiveness gained.
+While the gains already obtained by MTPC-BTREE are                                               For example, if we train adapters for the last 16 (out of 32)
+solid, fine-tuning the MTP head alone can only get us so far.                                    layers of EvaByte, we can improve µacc by 37%, but we
+This is because neither Llama nor EvaByte has been trained                                       introduce a µlat of 1.5× the cost of a forward pass of the
+to produce representations that are good for predicting 16                                       LLM.10 As can be seen for n = 8 in Fig. 4, adding LoRA
+tokens ahead, as we discuss next.                                                                layers almost always improves throughput. An exception
+                                                                                                 is EvaByte-MTP with n = 8 where the µacc cannot be
+ TAKEAWAY 1: While increasing the mixture components                                             increased by adding LoRA layers, see Fig. 7. This is likely
+ r in CP is initially beneficial, it soon hits diminishing                                       because the backbone has been pretrained with the MTP
+ returns. Increasing the MTP future token window size                                            loss, and its representations cannot be improved further. In
+ n and adopting more expressive PC architectures un-                                             contrast, EvaByte-MTP-BTree once again obtains larger
+ locks further throughput gains. Moreover, while the                                             increases in µacc, especially for speculative sampling for
+ HMM achieves the highest acceptance rates, it incurs                                            n = 16 where by using 4 LoRA layers we obtain a boost
+ high latency. Instead, non-autoregressive variants such as                                      of .69 in µacc over having no LoRA layers. However,
+ BTREE strike a better trade-off and should be preferred.                                        because of the latency introduced, the best throughput is
+                                                                                                 obtained with EvaByte-MTP-BTree with 1 LoRA layer,
+4.4. MTPCs with Adapters                                                                         having a speed-up ( ×STP) of ×5.15 over EvaByte-STP
+RQ3: Can we further increase throughput by adapting the                                          (see Table 9), while Llama benefits from 2 LoRA layers
+                                                                                                 and obtains ×2.24 speed-up over Llama-STP (see Table 15).
+         draft LLM using LoRA?                                                                   Importantly, both obtain a ×1.17 speed-up over the best
+We now consider our final axis for increasing expressive-                                        FF MTP model, highlighting the importance of relaxing the
+ness: adding LoRA layers to the draft model. We note that                                        independence assumptions to improve speculative sampling.
+we also fine-tune a model with 0 LoRA layers for an ad-
+ditional epoch to highlight that our improvements are not                                           10We found that training more than 16 layers of EvaByte does
+                                                                                                 not lead to improvements in acceptance rates.
+
+                                                                                              8
+Fast and Expressive Multi-Byte Prediction with Probabilistic Circuits
+
+ TAKEAWAY 2: Fine-tuning a few layers of the draft                 almost out-of-the-box as they can represent any word/script
+ model with LoRA increases the number of accepted to-              as a sequence of UTF-8 bytes. However, we only consider
+ kens but also increases latency. The optimal trade-off can        generation in English, as we found that EvaByte tended to
+ be device and backbone specific, but adding LoRAs is              switch between languages during generation and showed a
+ always beneficial compared to a fully shared LLM back-            large variance in throughput for different languages. While
+ bone, as long as we are retrofitting a model to an MTP            exploring the effect of multi-lingual generation is an inter-
+ window size it has not already been pretrained for.               esting avenue for future work, we believe further pretrain-
+                                                                   ing of EvaByte or using other byte-level LLMs would be
+5. Conclusions                                                     needed. EOS Token. In our experiments we restrict our
+                                                                   models from producing the end-of-sequence token, as we
+We have identified key trade-offs between acceptance rates         want to avoid situations where some models obtain better
+and latency within our framework, MTPC. We enhanced                throughput by generating shorter sequences. MTPC on
+the expressiveness of MTP: we relaxed the independence             Subword-level LLMs. While MTPC can be applied to
+assumption (Cai et al., 2024; Zheng et al., 2025) by intro-        subword-level LLMs with vocabulary sizes in the tens to
+ducing an explicit probabilistic model for inter-token depen-      hundreds of thousands, the amount of GPU memory needed
+dencies, and generalised mixture-based methods (Basharin           during training to store the logits scales linearly in the vo-
+et al., 2025) into the PC framework, unlocking a better            cabulary size as s × n × v × r , where s is the context
+expressiveness-latency trade-off. We also showed how to            length, n the MTP window length, v the vocabulary size
+further optimise the trade-off by modulating the number of         and r the number of mixture components. In the paper we
+layers shared between draft and verifier model backbones.          use a context length s = 8192 for byte-level LLMs and we
+We showcased the throughput gains of MTPC LLMs at                  explored r ∈ {8, 16, 32, 64, 128}. However, for subword-
+scale by retrofitting EvaByte (Zheng et al., 2025), a cutting-     level LLMs with a vocabulary size that is 100× larger, we
+edge 6.5B byte-level LLM, and Llama 3.2 3B (Minixhofer             would hit a memory bottleneck with anything more than
+et al., 2025), a byte-fied version of the widely used subword-     r = 4 on a GPU with the same memory (80 GB), as we
+level LLM, into our framework. Overall, our results show           show in Table 5 in Appendix G. We discuss approaches for
+that throughput in MTP byte-level LLMs can be increased            mitigating this memory bottleneck in Appendix G. These
+by 1.17× over MTP with independence assumptions and                are promising for extending MTPC to subword-level LLMs,
+5.15×/2.24× over AR for EvaByte/Llama. Crucially, these            but require additional ablations or non-trivial adaptations
+speed-ups are obtained without sacrificing generation qual-        that were out of scope for this paper.
+ity: we guarantee to match the target AR LLM exactly for
+greedy decoding (Stern et al., 2018) and in expectation for        Acknowledgements
+sampling (Leviathan et al., 2022).
+In future work, our framework can be extended by integrat-         We would like to thank the anonymous reviewers for their
+ing constraints during generation (Ahmed et al., 2025) or          thorough feedback and suggestions. We also thank Lin
+speculative decoding (Nakshatri et al., 2025) via methods          Zheng, author of EvaByte, for help with the EvaByte code-
+such as Gelato (Zhang et al., 2023), Ctrl-G (Zhang et al.,         base and for answering all of our questions on EvaByte.
+2024a) and LTLA (Yidou-Weng et al., 2026). Unlike these            Moreover, we thank Benjamin Minixhofer for making their
+methods, we would not need to train an auxiliary HMM in            models available and for answering questions about the im-
+MTPC and could integrate constraints directly into our PC          plementation. We would also like to thank the members
+head. Moreover, we can further boost expressiveness by             of april lab and Ponti lab for useful feedback during early
+leveraging other PC architectures such as subtractive mix-         presentations of this work.
+tures (Loconte et al., 2024; 2025b) and continuous latent          AG was funded by NatWest Group and ERC grant (“Nu-
+variable circuits (Gala et al., 2024a;b), while reducing la-       merical Analysis for Stable AI”, 101198795). EvK was
+tency via recent advancements in scaling up PCs (Liu et al.,       funded by the ELIAI project “Gradient-based Learning
+2024; Zhang et al., 2025).                                         of Complex Latent Structures” and the NWO AiNed
+                                                                   project “Human-Centric AI Agents with Common Sense”
+Limitations                                                        (NGF.1607.22.044). EP is supported by the ERC Start-
+                                                                   ing Grant AToM-FM (101222956) “Adaptive Memory and
+Batch Size. We do not analyse the effect of using a batch          Tokenization in Foundation Models for Efficient and Long-
+size greater than one as we want to isolate our throughput         Horizon AI”. AG and AV were funded by the “UNREAL:
+gains to the expressiveness/latency trade-off. Languages.          Unified Reasoning Layer for Trustworthy ML” project
+Byte-level LLMs are well-suited for multilingual generation        (EP/Y023838/1) selected by the ERC and funded by UKRI
+                                                                   EPSRC.
+
+                                                                9
+Fast and Expressive Multi-Byte Prediction with Probabilistic Circuits
+
+Impact statement                                                   framework with multiple decoding heads. In Proceed-
+                                                                   ings of the 41st International Conference on Machine
+This paper presents work whose goal is to advance the field       Learning, ICML’24. JMLR.org, 2024.
+of Machine Learning. There are many potential societal          Chen, C., Borgeaud, S., Irving, G., Lespiau, J.-B., Sifre,
+consequences of our work, none which we feel must be               L., and Jumper, J. Accelerating large language model
+specifically highlighted here.                                     decoding with speculative sampling, 2023. URL https:
+                                                                  //arxiv.org/abs/2302.01318.
+Reproducibility statement                                       Cheng, S., Wang, L., Xiang, T., and Zhang, P. Tree tensor
+                                                                   networks for generative modeling. Physical Review B, 99
+To ensure reproducibility for our research, we have re-           (15):155131, 2019.
+leased the code and checkpoints for all model variants          Choi, Y., Vergari, A., and Van den Broeck, G. Probabilistic
+at github.com/april-tools/mtpc. In addition, we have pro-          circuits: A unifying framework for tractable probabilistic
+vided the full details of sampling in circuits in Appendix B       modeling. Technical report, University of California, Los
+and of our algorithms for speculative decoding in Ap-             Angeles (UCLA), 2020. URL http://starai.cs.
+pendix F.                                                          ucla.edu/papers/ProbCirc20.pdf.
+                                                                Dagan, G., Synnaeve, G., and Rozie`re, B. Getting the most
+References                                                         out of your tokenizer for pre-training and domain adapta-
+                                                                   tion. In Proceedings of the 41st International Conference
+Ahia, O., Kumar, S., Gonen, H., Kasai, J., Mortensen, D.,          on Machine Learning, ICML’24. JMLR.org, 2024.
+   Smith, N., and Tsvetkov, Y. Do all languages cost the        Darwiche, A. A differential approach to inference in
+   same? Tokenization in the era of commercial language            bayesian networks. Journal of the ACM (JACM), 50:
+   models. In Bouamor, H., Pino, J., and Bali, K. (eds.), Pro-     280–305, 2003.
+   ceedings of the 2023 Conference on Empirical Methods         Darwiche, A. Modeling and Reasoning with Bayesian Net-
+   in Natural Language Processing, pp. 9904–9923, Sin-             works. Cambridge University Press, 2009.
+   gapore, December 2023. Association for Computational         Darwiche, A. and Marquis, P. A knowledge compilation
+   Linguistics. doi: 10.18653/v1/2023.emnlp-main.614.              map. Journal of Artificial Intelligence Research (JAIR),
+   URL https://aclanthology.org/2023.em                           17:229–264, 2002.
+   nlp-main.614.                                                DeepSeek-AI, Liu, A., Feng, B., Xue, B., Wang, B., Wu, B.,
+                                                                   Lu, C., Zhao, C., Deng, C., Zhang, C., Ruan, C., Dai, D.,
+Ahmed, K., Teso, S., Chang, K.-W., Van den Broeck, G.,             Guo, D., Yang, D., Chen, D., Ji, D., Li, E., Lin, F., Dai,
+   and Vergari, A. Semantic probabilistic layers for neuro-        F., Luo, F., Hao, G., Chen, G., Li, G., Zhang, H., Bao,
+   symbolic learning. In Proceedings of the 36th Interna-          H., Xu, H., Wang, H., Zhang, H., Ding, H., Xin, H., Gao,
+   tional Conference on Neural Information Processing Sys-         H., Li, H., Qu, H., Cai, J. L., Liang, J., Guo, J., Ni, J., Li,
+   tems, NIPS ’22, Red Hook, NY, USA, 2022. Curran As-            J., Wang, J., Chen, J., Chen, J., Yuan, J., Qiu, J., Li, J.,
+   sociates Inc. ISBN 9781713871088.                               Song, J., Dong, K., Hu, K., Gao, K., Guan, K., Huang,
+                                                                   K., Yu, K., Wang, L., Zhang, L., Xu, L., Xia, L., Zhao,
+Ahmed, K., Chang, K.-W., and Van den Broeck, G. Con-               L., Wang, L., Zhang, L., Li, M., Wang, M., Zhang, M.,
+   trollable generation via locally constrained resampling.        Zhang, M., Tang, M., Li, M., Tian, N., Huang, P., Wang,
+   In Proceedings of the 13th International Conference             P., Zhang, P., Wang, Q., Zhu, Q., Chen, Q., Du, Q., Chen,
+   on Learning Representations (ICLR), 4 2025. URL                 R. J., Jin, R. L., Ge, R., Zhang, R., Pan, R., Wang, R.,
+   https://arxiv.org/pdf/2410.13111.                              Xu, R., Zhang, R., Chen, R., Li, S. S., Lu, S., Zhou, S.,
+                                                                   Chen, S., Wu, S., Ye, S., Ye, S., Ma, S., Wang, S., Zhou,
+Ankner, Z., Parthasarathy, R., Nrusimha, A., Rinard, C.,           S., Yu, S., Zhou, S., Pan, S., Wang, T., Yun, T., Pei, T.,
+   Ragan-Kelley, J., and Brandon, W. Hydra: Sequentially-          Sun, T., Xiao, W. L., Zeng, W., Zhao, W., An, W., Liu,
+   dependent draft heads for medusa decoding. In First            W., Liang, W., Gao, W., Yu, W., Zhang, W., Li, X. Q.,
+   Conference on Language Modeling, 2024. URL https:              Jin, X., Wang, X., Bi, X., Liu, X., Wang, X., Shen, X.,
+  //openreview.net/forum?id=FbhjirzvJG.                            Chen, X., Zhang, X., Chen, X., Nie, X., Sun, X., Wang,
+                                                                  X., Cheng, X., Liu, X., Xie, X., Liu, X., Yu, X., Song,
+Basharin, A., Chertkov, A., and Oseledets, I. Faster lan-         X., Shan, X., Zhou, X., Yang, X., Li, X., Su, X., Lin, X.,
+   guage models with better multi-token prediction using
+   tensor decomposition, 2025. URL https://arxiv.
+   org/abs/2410.17765.
+
+Cai, T., Li, Y., Geng, Z., Peng, H., Lee, J. D., Chen, D.,
+   and Dao, T. Medusa: Simple llm inference acceleration
+
+10
+Fast and Expressive Multi-Byte Prediction with Probabilistic Circuits
+
+   Li, Y. K., Wang, Y. Q., Wei, Y. X., Zhu, Y. X., Zhang,           Kloumann, I., Misra, I., Evtimov, I., Zhang, J., Copet, J.,
+  Y., Xu, Y., Xu, Y., Huang, Y., Li, Y., Zhao, Y., Sun, Y.,         Lee, J., Geffert, J., Vranes, J., Park, J., Mahadeokar, J.,
+   Li, Y., Wang, Y., Yu, Y., Zheng, Y., Zhang, Y., Shi, Y.,         Shah, J., van der Linde, J., Billock, J., Hong, J., Lee, J.,
+  Xiong, Y., He, Y., Tang, Y., Piao, Y., Wang, Y., Tan, Y.,         Fu, J., Chi, J., Huang, J., Liu, J., Wang, J., Yu, J., Bitton,
+   Ma, Y., Liu, Y., Guo, Y., Wu, Y., Ou, Y., Zhu, Y., Wang,         J., Spisak, J., Park, J., Rocca, J., Johnstun, J., Saxe, J., Jia,
+  Y., Gong, Y., Zou, Y., He, Y., Zha, Y., Xiong, Y., Ma, Y.,        J., Alwala, K. V., Prasad, K., Upasani, K., Plawiak, K., Li,
+  Yan, Y., Luo, Y., You, Y., Liu, Y., Zhou, Y., Wu, Z. F.,          K., Heafield, K., Stone, K., El-Arini, K., Iyer, K., Malik,
+   Ren, Z. Z., Ren, Z., Sha, Z., Fu, Z., Xu, Z., Huang, Z.,         K., Chiu, K., Bhalla, K., Lakhotia, K., Rantala-Yeary,
+   Zhang, Z., Xie, Z., Zhang, Z., Hao, Z., Gou, Z., Ma, Z.,         L., van der Maaten, L., Chen, L., Tan, L., Jenkins, L.,
+  Yan, Z., Shao, Z., Xu, Z., Wu, Z., Zhang, Z., Li, Z., Gu,         Martin, L., Madaan, L., Malo, L., Blecher, L., Landzaat,
+   Z., Zhu, Z., Liu, Z., Li, Z., Xie, Z., Song, Z., Gao, Z.,        L., de Oliveira, L., Muzzi, M., Pasupuleti, M., Singh,
+   and Pan, Z. Deepseek-v3 technical report, 2024. URL              M., Paluri, M., Kardas, M., Tsimpoukelli, M., Oldham,
+   https://arxiv.org/abs/2412.19437.                                M., Rita, M., Pavlova, M., Kambadur, M., Lewis, M.,
+Gala, G., de Campos, C., Peharz, R., Vergari, A., and               Si, M., Singh, M. K., Hassan, M., Goyal, N., Torabi, N.,
+   Quaeghebeur, E. Probabilistic integral circuits. In AIS-         Bashlykov, N., Bogoychev, N., Chatterji, N., Zhang, N.,
+  TATS 2024, 2024a.                                                 Duchenne, O., C¸ elebi, O., Alrassy, P., Zhang, P., Li, P.,
+Gala, G., de Campos, C., Vergari, A., and Quaeghebeur, E.           Vasic, P., Weng, P., Bhargava, P., Dubal, P., Krishnan,
+   Scaling continuous latent variable models as probabilistic       P., Koura, P. S., Xu, P., He, Q., Dong, Q., Srinivasan,
+   integral circuits. In The Thirty-eighth Annual Conference        R., Ganapathy, R., Calderer, R., Cabral, R. S., Stojnic,
+   on Neural Information Processing Systems, 2024b. URL             R., Raileanu, R., Maheswari, R., Girdhar, R., Patel, R.,
+   https://openreview.net/forum?id=Ke40                             Sauvestre, R., Polidoro, R., Sumbaly, R., Taylor, R., Silva,
+   kfOT2E.                                                          R., Hou, R., Wang, R., Hosseini, S., Chennabasappa, S.,
+Geiping, J., Stein, A., Shu, M., Saifullah, K., Wen, Y., and        Singh, S., Bell, S., Kim, S. S., Edunov, S., Nie, S., Narang,
+   Goldstein, T. Coercing LLMs to do and reveal (almost)            S., Raparthy, S., Shen, S., Wan, S., Bhosale, S., Zhang,
+   anything. In ICLR 2024 Workshop on Secure and Trust-             S., Vandenhende, S., Batra, S., Whitman, S., Sootla, S.,
+   worthy Large Language Models, 2024. URL https:                   Collot, S., Gururangan, S., Borodinsky, S., Herman, T.,
+  //openreview.net/forum?id=Y5inHAjMu0.                             Fowler, T., Sheasha, T., Georgiou, T., Scialom, T., Speck-
+Gloeckle, F., Idrissi, B. Y., Rozie`re, B., Lopez-Paz, D., and      bacher, T., Mihaylov, T., Xiao, T., Karn, U., Goswami, V.,
+   Synnaeve, G. Better & faster large language models via           Gupta, V., Ramanathan, V., Kerkez, V., Gonguet, V., Do,
+   multi-token prediction. In Proceedings of the 41st In-           V., Vogeti, V., Albiero, V., Petrovic, V., Chu, W., Xiong,
+   ternational Conference on Machine Learning, ICML’24.             W., Fu, W., Meers, W., Martinet, X., Wang, X., Wang,
+  JMLR.org, 2024.                                                   X., Tan, X. E., Xia, X., Xie, X., Jia, X., Wang, X., Gold-
+Grasedyck, L. Hierarchical singular value decomposition             schlag, Y., Gaur, Y., Babaei, Y., Wen, Y., Song, Y., Zhang,
+   of tensors. SIAM journal on matrix analysis and applica-         Y., Li, Y., Mao, Y., Coudert, Z. D., Yan, Z., Chen, Z.,
+   tions, 31(4):2029–2054, 2010.                                    Papakipos, Z., Singh, A., Srivastava, A., Jain, A., Kelsey,
+Grattafiori, A., Dubey, A., Jauhri, A., Pandey, A., Kadian,         A., Shajnfeld, A., Gangidi, A., Victoria, A., Goldstand,
+  A., Al-Dahle, A., Letman, A., Mathur, A., Schelten, A.,           A., Menon, A., Sharma, A., Boesenberg, A., Baevski, A.,
+  Vaughan, A., Yang, A., Fan, A., Goyal, A., Hartshorn,             Feinstein, A., Kallet, A., Sangani, A., Teo, A., Yunus, A.,
+  A., Yang, A., Mitra, A., Sravankumar, A., Korenev,                Lupu, A., Alvarado, A., Caples, A., Gu, A., Ho, A., Poul-
+  A., Hinsvark, A., Rao, A., Zhang, A., Rodriguez, A.,              ton, A., Ryan, A., Ramchandani, A., Dong, A., Franco,
+   Gregerson, A., Spataru, A., Roziere, B., Biron, B., Tang,        A., Goyal, A., Saraf, A., Chowdhury, A., Gabriel, A.,
+   B., Chern, B., Caucheteux, C., Nayak, C., Bi, C., Marra,         Bharambe, A., Eisenman, A., Yazdan, A., James, B.,
+   C., McConnell, C., Keller, C., Touret, C., Wu, C., Wong,         Maurer, B., Leonhardi, B., Huang, B., Loyd, B., Paola,
+   C., Ferrer, C. C., Nikolaidis, C., Allonsius, D., Song, D.,      B. D., Paranjape, B., Liu, B., Wu, B., Ni, B., Hancock,
+   Pintz, D., Livshits, D., Wyatt, D., Esiobu, D., Choudhary,       B., Wasti, B., Spence, B., Stojkovic, B., Gamido, B.,
+   D., Mahajan, D., Garcia-Olano, D., Perino, D., Hupkes,           Montalvo, B., Parker, C., Burton, C., Mejia, C., Liu, C.,
+   D., Lakomkin, E., AlBadawy, E., Lobanova, E., Dinan,             Wang, C., Kim, C., Zhou, C., Hu, C., Chu, C.-H., Cai, C.,
+   E., Smith, E. M., Radenovic, F., Guzma´n, F., Zhang, F.,         Tindal, C., Feichtenhofer, C., Gao, C., Civin, D., Beaty,
+   Synnaeve, G., Lee, G., Anderson, G. L., Thattai, G., Nail,       D., Kreymer, D., Li, D., Adkins, D., Xu, D., Testuggine,
+   G., Mialon, G., Pang, G., Cucurell, G., Nguyen, H., Ko-          D., David, D., Parikh, D., Liskovich, D., Foss, D., Wang,
+   revaar, H., Xu, H., Touvron, H., Zarov, I., Ibarra, I. A.,       D., Le, D., Holland, D., Dowling, E., Jamil, E., Mont-
+                                                                    gomery, E., Presani, E., Hahn, E., Wood, E., Le, E.-T.,
+                                                                    Brinkman, E., Arcaute, E., Dunbar, E., Smothers, E., Sun,
+                                                                    F., Kreuk, F., Tian, F., Kokkinos, F., Ozgenel, F., Cag-
+
+                                                                11
+Fast and Expressive Multi-Byte Prediction with Probabilistic Circuits
+
+   gioni, F., Kanayet, F., Seide, F., Florez, G. M., Schwarz,         Conference on Learning Representations, 2022. URL
+   G., Badeer, G., Swee, G., Halpern, G., Herman, G., Sizov,           https://openreview.net/forum?id=nZeV
+   G., Guangyi, Zhang, Lakshminarayanan, G., Inan, H.,                 KeeFYf9.
+   Shojanazeri, H., Zou, H., Wang, H., Zha, H., Habeeb, H.,
+   Rudolph, H., Suk, H., Aspegren, H., Goldman, H., Zhan,           Huang, S., Cheng, T., Liu, J. K., Xu, W., Hao, J., Song,
+   H., Damlaj, I., Molybog, I., Tufanov, I., Leontiadis, I.,           L., Xu, Y., Yang, J., Liu, J., Zhang, C., Chai, L., Yuan,
+  Veliche, I.-E., Gat, I., Weissman, J., Geboski, J., Kohli,           R., Luo, X., Wang, Q., Fan, Y., Zhu, Q., Zhang, Z., Gao,
+  J., Lam, J., Asher, J., Gaya, J.-B., Marcus, J., Tang, J.,          Y., Fu, J., Liu, Q., Li, H., Zhang, G., Qi, Y., Yinghui,
+   Chan, J., Zhen, J., Reizenstein, J., Teboul, J., Zhong, J.,        X., Chu, W., and Wang, Z. OpenCoder: The open cook-
+  Jin, J., Yang, J., Cummings, J., Carvill, J., Shepard, J.,           book for top-tier code large language models. In Che,
+   McPhie, J., Torres, J., Ginsburg, J., Wang, J., Wu, K., U,         W., Nabende, J., Shutova, E., and Pilehvar, M. T. (eds.),
+   K. H., Saxena, K., Khandelwal, K., Zand, K., Matosich,             Proceedings of the 63rd Annual Meeting of the Associ-
+   K., Veeraraghavan, K., Michelena, K., Li, K., Jagadeesh,            ation for Computational Linguistics (Volume 1: Long
+   K., Huang, K., Chawla, K., Huang, K., Chen, L., Garg,              Papers), pp. 33167–33193, Vienna, Austria, July 2025.
+   L., A, L., Silva, L., Bell, L., Zhang, L., Guo, L., Yu, L.,        Association for Computational Linguistics. ISBN 979-
+   Moshkovich, L., Wehrstedt, L., Khabsa, M., Avalani, M.,             8-89176-251-0. doi: 10.18653/v1/2025.acl-long.1591.
+   Bhatt, M., Mankus, M., Hasson, M., Lennie, M., Reso,                URL https://aclanthology.org/2025.ac
+   M., Groshev, M., Naumov, M., Lathi, M., Keneally, M.,               l-long.1591/.
+   Liu, M., Seltzer, M. L., Valko, M., Restrepo, M., Patel,
+   M., Vyatskov, M., Samvelyan, M., Clark, M., Macey,               Kim, Y. and Rush, A. M. Sequence-level knowledge dis-
+   M., Wang, M., Hermoso, M. J., Metanat, M., Rastegari,               tillation. In Su, J., Duh, K., and Carreras, X. (eds.),
+   M., Bansal, M., Santhanam, N., Parks, N., White, N.,               Proceedings of the 2016 Conference on Empirical Meth-
+   Bawa, N., Singhal, N., Egebo, N., Usunier, N., Mehta,               ods in Natural Language Processing, pp. 1317–1327,
+   N., Laptev, N. P., Dong, N., Cheng, N., Chernoguz, O.,             Austin, Texas, November 2016. Association for Compu-
+   Hart, O., Salpekar, O., Kalinli, O., Kent, P., Parekh, P.,          tational Linguistics. doi: 10.18653/v1/D16-1139. URL
+   Saab, P., Balaji, P., Rittner, P., Bontrager, P., Roux, P.,         https://aclanthology.org/D16-1139/.
+   Dollar, P., Zvyagina, P., Ratanchandani, P., Yuvraj, P.,
+   Liang, Q., Alao, R., Rodriguez, R., Ayub, R., Murthy, R.,        Kingma, D. P. and Ba, J. Adam: A method for stochastic op-
+   Nayani, R., Mitra, R., Parthasarathy, R., Li, R., Hogan,            timization. In 3rd International Conference on Learning
+   R., Battey, R., Wang, R., Howes, R., Rinott, R., Mehta,            Representations (ICLR), 2015.
+   S., Siby, S., Bondu, S. J., Datta, S., Chugh, S., Hunt, S.,
+   Dhillon, S., Sidorov, S., Pan, S., Mahajan, S., Verma,           Kolda, T. G. and Bader, B. W. Tensor decompositions and
+   S., Yamamoto, S., Ramaswamy, S., Lindsay, S., Lindsay,              applications. SIAM review, 51(3):455–500, 2009.
+   S., Feng, S., Lin, S., Zha, S. C., Patil, S., Shankar, S.,
+   Zhang, S., Zhang, S., Wang, S., Agarwal, S., Sajuyigbe,          Lambert, N., Morrison, J., Pyatkin, V., Huang, S., Ivison, H.,
+   S., Chintala, S., Max, S., Chen, S., Kehoe, S., Satter-             Brahman, F., Miranda, L. J. V., Liu, A., Dziri, N., Lyu, X.,
+   field, S., Govindaprasad, S., Gupta, S., Deng, S., Cho,             Gu, Y., Malik, S., Graf, V., Hwang, J. D., Yang, J., Bras,
+   S., Virk, S., Subramanian, S., Choudhury, S., Goldman,              R. L., Tafjord, O., Wilhelm, C., Soldaini, L., Smith, N. A.,
+   S., Remez, T., Glaser, T., Best, T., Koehler, T., Robinson,        Wang, Y., Dasigi, P., and Hajishirzi, H. Tulu 3: Pushing
+  T., Li, T., Zhang, T., Matthews, T., Chou, T., Shaked,               frontiers in open language model post-training. In Second
+  T., Vontimitta, V., Ajayi, V., Montanez, V., Mohan, V.,             Conference on Language Modeling, 2025. URL https:
+   Kumar, V. S., Mangla, V., Ionescu, V., Poenaru, V., Mi-            //openreview.net/forum?id=i1uGbfHHpH.
+   hailescu, V. T., Ivanov, V., Li, W., Wang, W., Jiang, W.,
+   Bouaziz, W., Constable, W., Tang, X., Wu, X., Wang, X.,          Łan´cucki, A., Staniszewski, K., Nawrot, P., and Ponti, E.
+  Wu, X., Gao, X., Kleinman, Y., Chen, Y., Hu, Y., Jia, Y.,            Inference-time hyper-scaling with KV cache compres-
+   Qi, Y., Li, Y., Zhang, Y., Zhang, Y., Adi, Y., Nam, Y., Yu,         sion. In The Thirty-ninth Annual Conference on Neural
+  Wang, Zhao, Y., Hao, Y., Qian, Y., Li, Y., He, Y., Rait,            Information Processing Systems, 2026. URL https:
+   Z., DeVito, Z., Rosnbrick, Z., Wen, Z., Yang, Z., Zhao,            //openreview.net/forum?id=8ZiElzQxf1.
+   Z., and Ma, Z. The llama 3 herd of models, 2024. URL
+   https://arxiv.org/abs/2407.21783.                                Land, S. and Bartolo, M. Fishing for magikarp: Auto-
+Hu, E. J., yelong shen, Wallis, P., Allen-Zhu, Z., Li, Y.,             matically detecting under-trained tokens in large lan-
+  Wang, S., Wang, L., and Chen, W. LoRA: Low-rank                      guage models. In Al-Onaizan, Y., Bansal, M., and
+   adaptation of large language models. In International               Chen, Y.-N. (eds.), Proceedings of the 2024 Conference
+                                                                       on Empirical Methods in Natural Language Process-
+                                                                       ing, pp. 11631–11646, Miami, Florida, USA, November
+                                                                       2024. Association for Computational Linguistics. doi:
+
+                                                                12
+Fast and Expressive Multi-Byte Prediction with Probabilistic Circuits
+
+  10.18653/v1/2024.emnlp-main.649. URL https://ac                     Information Processing Systems, 2026. URL https:
+   lanthology.org/2024.emnlp-main.649/.                               //openreview.net/forum?id=DxKP2E0xK2.
+
+Lee, J., Mansimov, E., and Cho, K. Deterministic non-               Mnih, A. and Hinton, G. E. A scalable hierarchical dis-
+   autoregressive neural sequence modeling by iterative re-            tributed language model. In Koller, D., Schuurmans, D.,
+   finement. In Riloff, E., Chiang, D., Hockenmaier, J.,               Bengio, Y., and Bottou, L. (eds.), Advances in Neural
+   and Tsujii, J. (eds.), Proceedings of the 2018 Confer-             Information Processing Systems, volume 21. Curran As-
+   ence on Empirical Methods in Natural Language Pro-                  sociates, Inc., 2008. URL https://proceedings.
+   cessing, pp. 1173–1182, Brussels, Belgium, October-                 neurips.cc/paper_files/paper/2008/fi
+   November 2018. Association for Computational Linguis-               le/1e056d2b0ebd5c878c550da6ac5d3724-P
+   tics. doi: 10.18653/v1/D18- 1149. URL https:                        aper.pdf.
+  //aclanthology.org/D18-1149/.
+                                                                    Nakshatri, N. S., Roy, S., Das, R., Chaidaroon, S., Boytsov,
+Leviathan, Y., Kalman, M., and Matias, Y. Fast inference               L., and Gangadharaiah, R. Constrained decoding with
+   from transformers via speculative decoding. In Interna-             speculative lookaheads. In Chiruzzo, L., Ritter, A., and
+   tional Conference on Machine Learning (ICML), 2022.                Wang, L. (eds.), Proceedings of the 2025 Conference of
+                                                                       the Nations of the Americas Chapter of the Association
+Li, Y., Wei, F., Zhang, C., and Zhang, H. Eagle: specu-                for Computational Linguistics: Human Language Tech-
+   lative sampling requires rethinking feature uncertainty.            nologies (Volume 1: Long Papers), pp. 4681–4700, Albu-
+   In Proceedings of the 41st International Conference on              querque, New Mexico, April 2025. Association for Com-
+  Machine Learning, ICML’24. JMLR.org, 2024.                           putational Linguistics. ISBN 979-8-89176-189-6. doi:
+                                                                      10.18653/v1/2025.naacl-long.239. URL https://ac
+Liu, A., Ahmed, K., and Van Den Broeck, G. Scaling                     lanthology.org/2025.naacl-long.239/.
+   tractable probabilistic circuits: a systems perspective. In
+  Proceedings of the 41st International Conference on Ma-           Nawrot, P., Chorowski, J., Lancucki, A., and Ponti, E. M.
+   chine Learning, ICML’24. JMLR.org, 2024.                            Efficient transformers with dynamic token pooling. In
+                                                                       Rogers, A., Boyd-Graber, J., and Okazaki, N. (eds.), Pro-
+Loconte, L., Aleksanteri, M. S., Mengel, S., Trapp, M.,                ceedings of the 61st Annual Meeting of the Association
+   Solin, A., Gillis, N., and Vergari, A. Subtractive mixture          for Computational Linguistics (Volume 1: Long Papers),
+   models via squaring: Representation and learning. In The            pp. 6403–6417, Toronto, Canada, July 2023. Association
+  Twelfth International Conference on Learning Represen-               for Computational Linguistics. doi: 10.18653/v1/2023
+   tations (ICLR), 2024.                                               .acl-long.353. URL https://aclanthology.org
+                                                                      /2023.acl-long.353.
+Loconte, L., Mari, A., Gala, G., Peharz, R., de Campos, C.,
+   Quaeghebeur, E., Vessio, G., and Vergari, A. What is the         Nawrot, P., Łan´cucki, A., Chochowski, M., Tarjan, D., and
+   Relationship between Tensor Factorizations and Circuits             Ponti, E. Dynamic memory compression: Retrofitting
+  (and How Can We Exploit it)? Transactions on Machine                 LLMs for accelerated inference. In Forty-first Interna-
+  Learning Research, 2025a. ISSN 2835-8856. Featured                   tional Conference on Machine Learning, 2024. URL
+   Certification.                                                      https://openreview.net/forum?id=tDRY
+                                                                       rAkOB7.
+Loconte, L., Mengel, S., and Vergari, A. Sum of Squares
+   Circuits. In The 39th Annual AAAI Conference on Artifi-          Pagnoni, A., Pasunuru, R., Rodriguez, P., Nguyen, J.,
+   cial Intelligence (AAAI), 2025b.                                    Muller, B., Li, M., Zhou, C., Yu, L., Weston, J. E., Zettle-
+                                                                       moyer, L., Ghosh, G., Lewis, M., Holtzman, A., and Iyer,
+Mari, A., Vessio, G., and Vergari, A. Unifying and under-              S. Byte latent transformer: Patches scale better than to-
+   standing overparameterized circuit representations via              kens. In Che, W., Nabende, J., Shutova, E., and Pilehvar,
+   low-rank tensor decompositions. In 6th Workshop on                  M. T. (eds.), Proceedings of the 63rd Annual Meeting of
+  Tractable Probabilistic Modeling, 2023.                              the Association for Computational Linguistics (Volume
+                                                                      1: Long Papers), pp. 9238–9258, Vienna, Austria, July
+Minixhofer, B., Murray, T., Limisiewicz, T., Korhonen, A.,             2025. Association for Computational Linguistics. ISBN
+   Zettlemoyer, L., Smith, N. A., Ponti, E. M., Soldaini, L.,          979-8-89176-251-0. doi: 10.18653/v1/2025.acl-long.453.
+   and Hofmann, V. Bolmo: Byteifying the next generation               URL https://aclanthology.org/2025.ac
+   of language models, 2025. URL https://arxiv.or                      l-long.453/.
+   g/abs/2512.15586.
+                                                                    Peharz, R., Tschiatschek, S., Pernkopf, F., and Domingos,
+Minixhofer, B., Vulic´, I., and Ponti, E. Universal cross-             P. M. On Theoretical Properties of Sum-Product Net-
+   tokenizer distillation via approximate likelihood match-
+   ing. In The Thirty-ninth Annual Conference on Neural
+
+                                                                13
+Fast and Expressive Multi-Byte Prediction with Probabilistic Circuits
+
+  works. In International Conference on Artificial Intelli-          Information Processing Systems, 2023. URL https:
+   gence and Statistics, 2015.                                       //openreview.net/forum?id=SdYHLTCC5J.
+Peharz, R., Lang, S., Vergari, A., Stelzner, K., Molina,           The april Lab. cirkit, October 2024. URL https://gi
+  A., Trapp, M., Van Den Broeck, G., Kersting, K., and                thub.com/april-tools/cirkit.
+   Ghahramani, Z. Einsum networks: fast and scalable learn-        Varin, C., Reid, N., and Firth, D. An overview of composite
+   ing of tractable probabilistic circuits. In Proceedings of         likelihood methods. Statistica Sinica, 21, 01 2011.
+   the 37th International Conference on Machine Learning,          Vergari, A., Di Mauro, N., and Esposito, F. Visualizing and
+   ICML’20. JMLR, 2020a.                                              understanding sum-product networks. Machine Learning,
+Peharz, R., Vergari, A., Stelzner, K., Molina, A., Shao, X.,         108(4):551–573, 2019a.
+  Trapp, M., Kersting, K., and Ghahramani, Z. Random               Vergari, A., Di Mauro, N., and Van den Broeck, G. Tractable
+   sum-product networks: A simple and effective approach              probabilistic models: Representations, algorithms, learn-
+   to probabilistic deep learning. In 35th Conference on              ing, and applications. Tutorial at the 35th Conference on
+  Uncertainty in Artificial Intelligence (UAI), volume 115           Uncertainty in Artificial Intelligence (UAI), 2019b.
+   of Proceedings of Machine Learning Research, pp. 334–           Vergari, A., Choi, Y., Liu, A., Teso, S., and Van den Broeck,
+   344. PMLR, 2020b.                                                  G. A compositional atlas of tractable circuit operations for
+Peharz, R., Vergari, A., Stelzner, K., Molina, A., Shao,              probabilistic inference. In Advances in Neural Informa-
+  X., Trapp, M., Kersting, K., and Ghahramani, Z. Ran-                tion Processing Systems 34 (NeurIPS), pp. 13189–13201.
+   dom sum-product networks: A simple and effective ap-               Curran Associates, Inc., 2021.
+   proach to probabilistic deep learning. In Adams, R. P. and      Wang, J., Gangavarapu, T., Yan, J. N., and Rush, A. M.
+   Gogate, V. (eds.), Proceedings of The 35th Uncertainty             Mambabyte: Token-free selective state space model. In
+   in Artificial Intelligence Conference, volume 115 of Pro-         First Conference on Language Modeling, 2024. URL
+   ceedings of Machine Learning Research, pp. 334–344.                https://openreview.net/forum?id=X1xN
+   PMLR, 22–25 Jul 2020c. URL https://proceedi                        suKssb.
+   ngs.mlr.press/v115/peharz20a.html.                              Wertheimer, D., Rosenkranz, J., Parnell, T., Suneja, S., Ran-
+Rumbelow, J. and Watkins, M. Solidgoldmagikarp (plus,                 ganathan, P., Ganti, R., and Srivatsa, M. Accelerating
+   prompt generation). https://www.lesswrong.co                       production llms with combined token/embedding specu-
+   m/posts/aPeJE8bSo6rAFoLqg/solidgoldm                               lators, 2024. URL https://arxiv.org/abs/24
+   agikarp-plus-prompt-generation (accessed                           04.19124.
+  11-May-2025), 2023.                                              Xia, H., Yang, Z., Dong, Q., Wang, P., Li, Y., Ge, T.,
+Shao, X., Molina, A., Vergari, A., Stelzner, K., Peharz, R.,          Liu, T., Li, W., and Sui, Z. Unlocking efficiency in
+   Liebig, T., and Kersting, K. Conditional sum-product               large language model inference: A comprehensive sur-
+   networks: Imposing structure on deep probabilistic archi-         vey of speculative decoding. In Ku, L.-W., Martins,
+   tectures. In International Conference on Probabilistic            A., and Srikumar, V. (eds.), Findings of the Associa-
+  Graphical Models, pp. 401–412. PMLR, 2020.                          tion for Computational Linguistics ACL 2024, pp. 7655–
+Shao, X., Molina, A., Vergari, A., Stelzner, K., Peharz, R.,         7671, Bangkok, Thailand and virtual meeting, August
+   Liebig, T., and Kersting, K. Conditional sum-product               2024. Association for Computational Linguistics. doi:
+   networks: Modular probabilistic circuits via gate func-           10.18653/v1/2024.findings-acl.456. URL https://ac
+   tions. International Journal of Approximate Reasoning,             lanthology.org/2024.findings-acl.456.
+  140:298–313, 2022.                                               Yang, Z., Dai, Z., Salakhutdinov, R., and Cohen, W. W.
+Shpilka, A. and Yehudayoff, A. Arithmetic circuits: A                 Breaking the softmax bottleneck: A high-rank RNN lan-
+   survey of recent results and open questions. Founddations          guage model. In International Conference on Learning
+   and Trends in Theoretical Computer Science, 5:207–388,            Representations, 2018. URL https://openreview
+   2010.                                                              .net/forum?id=HkwZSG-CZ.
+Stern, M., Shazeer, N. M., and Uszkoreit, J. Blockwise             Yidou-Weng, G., Li, I., Liu, A., Broadrick, O., Cui, Y., den
+   parallel decoding for deep autoregressive models. In               Broeck, G. V., and Wang, B. Learning tractable distri-
+  Neural Information Processing Systems (NeurIPS), 2018.              butions of language model continuations, 2026. URL
+Sun, Z., Suresh, A. T., Ro, J. H., Beirami, A., Jain, H.,             https://arxiv.org/abs/2511.16054.
+   and Yu, F. Spectr: Fast speculative decoding via opti-
+   mal transport. In Thirty-seventh Conference on Neural
+
+                                                               14
+                                     Fast and Expressive Multi-Byte Prediction with Probabilistic Circuits
+
+Yu, L., Simig, D., Flaherty, C., Aghajanyan, A., Zettle-
+   moyer, L., and Lewis, M. Megabyte: Predicting million-
+   byte sequences with multiscale transformers. In Oh, A.,
+   Naumann, T., Globerson, A., Saenko, K., Hardt, M., and
+   Levine, S. (eds.), Advances in Neural Information Pro-
+   cessing Systems, volume 36, pp. 78808–78823. Curran
+  Associates, Inc., 2023. URL https://proceeding
+   s.neurips.cc/paper_files/paper/2023/
+   file/f8f78f8043f35890181a824e53a5713
+  4-Paper-Conference.pdf.
+
+Zhang, H., Dang, M., Peng, N., and Van Den Broeck, G.
+  Tractable control for autoregressive language generation.
+   In Krause, A., Brunskill, E., Cho, K., Engelhardt, B.,
+   Sabato, S., and Scarlett, J. (eds.), Proceedings of the 40th
+  International Conference on Machine Learning, volume
+   202 of Proceedings of Machine Learning Research, pp.
+  40932–40945. PMLR, 23–29 Jul 2023. URL https:
+  //proceedings.mlr.press/v202/zhang23g.
+   html.
+
+Zhang, H., Kung, P.-N., Yoshida, M., Van den Broeck, G.,
+   and Peng, N. Adaptable logical control for large lan-
+   guage models. In Globerson, A., Mackey, L., Belgrave,
+   D., Fan, A., Paquet, U., Tomczak, J., and Zhang, C. (eds.),
+  Advances in Neural Information Processing Systems, vol-
+   ume 37, pp. 115563–115587. Curran Associates, Inc.,
+   2024a. URL https://proceedings.neurips.
+   cc/paper_files/paper/2024/file/d15c1
+   6cf5619a2b1606da5fc88e3f1a9-Paper-Con
+   ference.pdf.
+
+Zhang, H., Dang, M., Wang, B., Ermon, S., Peng, N.,
+   and den Broeck, G. V. Scaling probabilistic circuits
+  via monarch matrices. In Forty-second International
+  Conference on Machine Learning, 2025. URL https:
+  //openreview.net/forum?id=uzVShD7wHO.
+
+Zhang, J., Wang, J., Li, H., Shou, L., Chen, K., Chen,
+   G., and Mehrotra, S. Draft & verify: Lossless large
+   language model acceleration via self-speculative decod-
+   ing. In Ku, L.-W., Martins, A., and Srikumar, V. (eds.),
+  Proceedings of the 62nd Annual Meeting of the Associ-
+   ation for Computational Linguistics (Volume 1: Long
+  Papers), pp. 11263–11282, Bangkok, Thailand, August
+   2024b. Association for Computational Linguistics. doi:
+  10.18653/v1/2024.acl- long.607. URL https:
+  //aclanthology.org/2024.acl-long.607/.
+
+Zheng, L., Zhao, X., Wang, G., Wu, C., Dong, D., Wang,
+  A., Wang, M., Du, Y., Bo, H., Sharma, A., Li, B., Zhang,
+   K., Hu, C., Thakker, U., and Kong, L. Evabyte: Efficient
+   byte-level language models at scale, 2025. URL https:
+  //hkunlp.github.io/blog/2025/evabyte.
+
+                                                                        15
+                                     Fast and Expressive Multi-Byte Prediction with Probabilistic Circuits
+
+A. Notation
+
+We adapt notation and nomenclature from the tensor factorisation (Kolda & Bader, 2009) and circuit (Loconte et al., 2025a)
+literature.
+We denote ordered sets of random variables with X, Y and Z, and we use [n] to express the set {1, 2, . . . , n} with n > 0.
+The domain of a variable X is denoted as dom(X), and we denoted as dom(X) = dom(X1) × · · · × dom(Xn) the joint
+domain of variables X = {Xi}in=1. We denote scalars with lower-case letters (e.g., a ∈ R), vectors with boldface lower-case
+letters (e.g., a ∈ RN ), matrices with boldface upper-case letters (excluding those used for variables, e.g., A ∈ RM×N ), and
+tensors with boldface calligraphic letters (e.g., A ∈ RI1×I2×I3 ). Moreover, we use subscripts to denote entries of tensors
+(e.g., aijk is the (i, j, k)-th entry in A).
+
+B. Background on circuits
+
+Circuits have a long history in theoretical computer science (Shpilka & Yehudayoff, 2010) and probabilistic reasoning (Dar-
+wiche, 2003; 2009). In their more modern definition and application to machine learning (Vergari et al., 2019b; Choi et al.,
+2020), circuits are introduced as structured computational graphs, simplified neural networks where one is allowed to use
+units from a restricted set of neurons (sum, product and input units) and whose connections need to abide certain structural
+properties to guarantee tractability (Choi et al., 2020; Vergari et al., 2021), as discussed next.
+
+B.1. Structural properties
+Tractability is to be intended as the ability to exactly compute a given function (operation) over the circuit in time that is
+polynomial in its size, denoted as |c| for a circuit c, and representing the number of edges between the computational units.
+For example, a circuit c can exactly integrate any subset of variables in time O(|c|) if (i) its input functions can be integrated
+efficiently and (ii) it is smooth and decomposable (Darwiche & Marquis, 2002; Choi et al., 2020).
+Definition 1 (Smoothness and decomposability (Darwiche & Marquis, 2002; Choi et al., 2020)). A circuit is smooth if for
+every sum unit n, all its input units depend on the same variables, i.e., ∀i, j ∈ in(n) : sc(i) = sc(j). A circuit is decomposable
+if the distinct inputs of every product unit n depend on disjoint sets of variables, i.e., ∀i, j ∈ in(n) i ̸= j : sc(i) ∩ sc(j) = ∅.
+
+Note that all the PC architectures we have discussed in this paper, FF, CP, HMM and BTree, are smooth and decomposable
+circuits by construction (Peharz et al., 2020c; Loconte et al., 2025a). The reader is encouraged to check this by themselves
+for the architectures in Fig. 2. Exactly integrating variables out is relevant to compute marginals such as the normalisation
+constant of the distribution encoded by the circuit (Eq. (3)). Note that in our implementation, circuits are normalised by
+design (Peharz et al., 2015), as we assume that input distributions are normalised categoricals and all sum units form a
+convex combination as their weights are parameterised with a softmax function (see Sec. 3.3).
+More importantly for our MTPCs, we can draw samples efficiently from the distribution of a circuit that is both smooth and
+decomposable, as we discuss in the next sub-section.
+
+B.2. Sampling a circuit
+A smooth and decomposable PC can use ancestral sampling to generate a complete sample for all n tokens in a window. In a
+nutshell, we can iteratively sample each latent variable in the hierarchy encoded by the PC, and then sample the selected
+input distributions, in the same way one sample one (hierarchical) mixture model by first sampling one component and then
+drawing a sample from that component.
+Operationally, Alg. 1 details the procedure. We have to sample one input branch for each sum unit we encounter when
+performing a backward traversal of the circuit computational graph (from the circuit output back to the input distributions).
+Such a branch is sampled proportionally to the sum unit weights ωj, which encode the mixture components (or equivalently
+the transition probabilities in an HMM). Then, when we traverse a product unit, we follow all its input branches. When we
+reach an input unit, we sample a token proportionally to the parameters ϕij of the categorical distributions encoded in the
+unit. If the circuit is smooth and decomposable, by this process we are guaranteed to end up in a set of input units whose
+scope is the full set of tokens X and in which only one input unit is selected per token position i (line 13 of Alg. 1). This
+procedure can be tensorised to efficiently generate a batch of samples in a single pass over the computational graph of the
+circuit (Vergari et al., 2019a; Peharz et al., 2020b;a; Loconte et al., 2025a; Liu et al., 2024).
+
+                                                                        16
+                                    Fast and Expressive Multi-Byte Prediction with Probabilistic Circuits
+
+Algorithm 1 SAMPLE(c)
+
+Input: A smooth, decomposable and normalised PC c encoding a joint distribution q over the next n tokens X =
+{X1, . . . , Xn} Output: a sample x ∼ q(X).
+
+1: x ← zeroes(n) {init empty sample}
+
+2: cn ← output(c)
+3: N ← queue({cn}) {traverse the computational graph from outputs to inputs}
+4: while N not empty do
+5: cn ← pop(N ) {cn is a sum unit}
+     if           r            then
+6:       cn =     j=1  ωj  cj                               {sample  from  a  categorical  with     states}
+7:       k←
+               sampleCategorical(ω1,      .  .  .  ,  ωr )                                       r
+
+8:       N ← push(N , ck)
+
+ 9:  else if cn =     . jd.=d1dcoj  then
+10:     for k = 1
+                   .
+
+11:      N ← push(N , ck) {visit all inputs of product unit cn}
+         end for
+12:
+13: else if cn is an input unit over variable Xi and parameters ϕi then
+         xi ← sampleCategorical(ϕi) {sample from a categorical with v = |V| states}
+14:
+15: end if
+16: end while
+17: return x
+
+Lastly, we remark that this routine is potentially computationally more efficient than the one implemented in Basharin et al.
+(2025), as the latter is based on autoregressive inverse transform sampling (see Loconte et al. (2024) for a discussion) and
+requires sampling one token at a time.
+
+C. Complexity Analysis for Circuits in MTPC
+
+We computed the theoretical number of FLOPs of the multi-token prediction linear head and the circuit feed-forward
+evaluation, by using calculate-flops.pytorch. We show the FLOPs needed to evaluate the circuit since it is required to compute
+the likelihoods in the speculative decoding algorithm. In Table 2, we report the number of parameters for combinations of
+circuits and the maximum number of draft tokens. We set the number of components of each sum to r = 32 in CP, HMM,
+and BTree. We also show the FLOPs required to do prefilling of a very small sequence of bytes (of length 64) with EvaByte
+for reference.
+While using the MTPC-BTREE or MTPC-HMM increases the FLOPs to evaluate the circuit when compared to the fully
+factorised circuit, it is still orders of magnitudes smaller than the cost of evaluating the LLM trunk (i.e., a few thousands
+vs billions). Moreover, using the BTree or HMM substantially increases the parameters of the multi-token head linear
+projection, when compared to the fully factorised circuit. However, we note that it is still very close to the number of
+parameters required by MTPC-CP (i.e., 730 M vs 671 M in the case of 16 draft tokens). This is because the categorical
+input units account for the same vast majority of circuit parameters in all circuits except for the fully factorised one.
+
+                           Table 2. FLOPs and parameter counts for circuit and MTP head configurations.
+
+     LLM             FLOPs          # Tokens          Circuit  FLOPs          Parameters   MTP Head          FLOPs   Parameters
+     EvaByte       828.95 G             8             FF              7             2,560  Linear            0.02 G         10 M
+                                                      CP            65             81,952  Linear            0.67 G       336 M
+                                       16             HMM                          89,120  Linear            0.73 G       365 M
+                                                      BTree    14.4 K              88,096  Linear            0.72 G       361 M
+                                                      FF       12.4 K               5,120  Linear            0.04 G         21 M
+                                                      CP                                   Linear            1.34 G
+                                                      HMM           15           163,872   Linear            1.47 G       671 M
+                                                      BTree         65           179,232   Linear            1.46 G       734 M
+                                                               30.8 K            178,208                                  730 M
+                                                               28.7 K
+
+                                                                     17
+                                     Fast and Expressive Multi-Byte Prediction with Probabilistic Circuits
+
+D. Shallow Autoregressive Models for Byte-Level LLMs
+
+We omit shallow autoregressive models such as Hydra (Ankner et al., 2024) and EAGLE (Li et al., 2024) from our setup
+as they do not fit our desiderata we mentioned in the introduction. At the same time, one may ask how well shallow
+autoregressive models perform for byte-level LLMs. While shallow autoregressive models are state-of-the-art for subword-
+level models, their superiority does not obviously transfer to byte-level models, and fairly comparing models from MTPC
+with them is non-trivial, as we discuss below.
+
+D.1. Key Differences between Byte-Level LLMs and Subword-Level LLMs
+Byte-level models differ from subword-level models in two important ways: a) they need a larger MTP window size and
+b) they have a much smaller vocabulary size. These two differences alter the balance in parameter allocation and make it
+non-obvious that Hydra and EAGLE are state-of-the-art methods for byte-level LLMs (this remains to be seen).
+
+Window size differences. To match subword-level throughput, byte-level models require MTP window sizes n roughly
+4-5 times longer, since 1 BPE token ≈ 4-5 bytes for English. Importantly, the memory required for the d-dimensional
+feature vectors for Hydra/Eagle scales as O(n × s × d), as the feature vector is adapted per token in the MTP window, in
+contrast to our MTPC feature embeddings which scale as O(s × d). As such, when n is larger, shallow autoregressive
+models are less appealing for MTP.
+
+Vocabulary differences. Moreover, byte-level vocabularies are 100 - 400× smaller (e.g. Vb=320 vs Vs in 32k - 128k),
+while d is comparable (e.g. d = 4096 for EvaByte and d = 3072 for Llama). Using d = 3200 for simplicity, the logit-to-
+feature ratio for subword-level models is Vs/D > 10, while for byte models we have (Vb/D < 1/10). Thus, increasing
+expressivity in logit-space (as MTPC does) can be more efficient for byte-level models than increasing it in feature-space as
+done in Hydra/EAGLE.
+
+D.2. Comparing MTPC to Shallow Autoregressive Models is non-trivial
+While we cannot make strong claims without experiments, our paper shows the expressiveness/latency trade-off is sensitive
+even to small changes, let alone differences of the magnitude mentioned above for the vocabulary size. This suggests that
+significant optimisation of the EAGLE/Hydra architectures may be needed for a fair comparison to MTPC on byte-level
+LLMs. We believe that optimising shallow autoregressive models for byte-level models is interesting, but we leave this for
+future work.
+
+E. Target Model Details
+
+                         Table 3. Details of target models we retrofitted using MTPC.
+
+                         MTP Window            EvaByte   Llama3.2 3B Byte
+                         # Transformer Layers  8         —
+                         # Attention Heads     32        28
+                         Embedding Size        32        24
+                         dtype                 4096      3072
+                         Vocab Size            bfloat16  float32
+                         Number of Parameters  320       268
+                         Max Context Window    6.5B      3B
+                                               32768     131072
+
+E.1. EvaByte Details
+In Table 4 we provide a copy of the benchmark results of fine-tuned version of EvaByte, EvaByte-SFT, which we retrofit in
+the paper. The model card can be found at https://hf.co/EvaByte/EvaByte-SFT, see also Zheng et al. (2025)
+for more details. The numbers in the table above were produced by Medusa-style (Cai et al., 2024) tree-based typical
+decoding. For all benchmarks apart from HumanEval, the results were produced via greedy decoding, i.e., similar to (Stern
+
+                                                                        18
+Fast and Expressive Multi-Byte Prediction with Probabilistic Circuits
+
+Table 4. Downstream benchmark performance of EvaByte-SFT, table taken verbatim from Zheng et al. (2025). Entries with † were
+computed by the EvaByte authors. All numbers were computed with Medusa-style tree-based greedy decoding using the multi-token
+head, apart from HumanEval∗, which used typical sampling. The authors of EvaByte followed Tulu 3, and evaluated the Pass@10 rate for
+HumanEval with 20 samples at temperature 0.8.
+
+Model                      BBH   GSM8k   IFEval  MATH   MMLU    HumanEval∗  TruthQA
+
+Gemma-2-9B-it              20.0    79.7   69.9    29.8    69.1       71.7      61.4
+Ministral-8B-Instruct      56.2    80.0   56.4    40.0    68.5       91.0      55.5
+Qwen-2.5-7B-Instruct       25.3    83.8   74.7    69.9    76.6       93.1      63.1
+Llama-3.1-8B-Instruct      69.7    83.4   80.6    42.5    71.3       86.3      55.1
+Tu¨lu 3 8B                 66.0    87.6   82.4    43.7    68.2       83.9      55.0
+OLMo-7B-Instruct           35.3    14.3   32.2     2.1    46.3       28.7†     44.5
+OLMo-v1.7-7B-Instruct      34.4    23.2   39.2     5.2    48.9       49.7†     55.2
+OLMoE-1B-7B-0924-Instruct  37.2    47.2   46.2     8.4    51.6       54.8      49.1
+MAP-Neo-7B-Instruct        26.4    69.4   35.9    31.5    56.5       72.1†     51.6
+OLMo-2-7B-SFT              50.7    71.2   68.0    25.1    62.0       67.0†     47.8
+OLMo-2-7B-1124-Instruct    48.5    85.2   75.6    31.3    63.9       67.6†     56.3
+
+EvaByte-SFT                34.6    52.9   60.2    29.8    49.5       73.7      46.3
+
+et al., 2018) with the exception of producing the last “free” token. As such, the produced tokens are equivalent to what
+EvaByte-STP would produce, and the authors found that the metrics were the same with EvaByte-STP up to some small
+rounding errors. For HumanEval the authors used tree-based typical decoding, which in this case does not maintain the
+quality of the EvaByte-STP model. The details above were shared with us by Lin Zheng, the author of EvaByte.
+
+F. Speculative Decoding
+
+We give pseudocode for our self-speculative decoding algorithm below. The algorithm accepts between 0 and n tokens,
+but always generates between 1 and n tokens, where n is the MTP window size. The algorithm is very similar to vanilla
+speculative decoding (Leviathan et al., 2022), but our algorithm includes a modification that reduces latency for the self-
+speculative scenario, and for this it needs to sacrifice the last “free” token typically obtained from the verifier. The gain in
+latency is possible because we can evaluate the shared LLM once per draft/verification cycle, while a naive implementation
+of Leviathan et al. (2022) for self-speculative decoding would need two, approximately halving the possible throughput.
+In our self-speculative setup, the verifier and draft LLMs share some layers of the backbone. Importantly, the verifier is
+always computing LLM states ahead of the draft. As such, we can get away with a single forward pass through the shared
+LLM, similar to Medusa (Cai et al., 2024), by re-using the LLM backbone state computed by the verifier for the draft model.
+For this to work, we cannot accept a “last sample for free” from the verifier (lines 23-30) Alg. 3), as we would not have the
+backbone state for this new token and it is not worth paying an extra LLM evaluation for it. Therefore, in our algorithm we
+only sample the “free” token from the verifier in the rare case that no tokens are accepted. This is necessary because the
+model can get caught in successive no-accept states in the sampling case, or get stuck in an infinite loop if we use greedy
+decoding. If any tokens were accepted, we use the last state of the shared backbone computed during the verify phase to
+seed the draft phase. In what follows, if we have no LoRA layers, the algorithm is modified to have a single component: the
+shared encoder.
+
+                                         19
+                                     Fast and Expressive Multi-Byte Prediction with Probabilistic Circuits
+
+Algorithm 2 SHAREDSTATESELFSPECULATIVEDECODING
+   Architecture Components:
+      Three components: Shared Encoder (S), Verifier (V ), Draft (D)
+      Each with their own KV-cache
+   Given: A prompt of length L
+   Initialisation:
+   Prefill V to L − 1, and D and S to L
+   Set S and D state
+   Switch to draft/verify cycle:
+   while true do
+      Draft stage:
+      if S state is not set then
+         Compute S by conditioning on the additional token
+      end if
+      Use S state to compute D state
+      Parameterize MTPC with D state
+      Draft n tokens
+      Verify stage:
+      Compute S state on n + 1 tokens (draft + predecessor)
+      Compute V state using S state
+      Obtain up to n + 1 tokens from speculative decoding
+      if 0 tokens accepted then
+         Keep “free” token sampled from last valid logits
+         Unset S state (stale)
+      else
+         Accept n tokens (drop “free” token)
+         Set S state (hidden state for last accepted token)
+      end if
+   end while
+
+                                                                        20
+                    Fast and Expressive Multi-Byte Prediction with Probabilistic Circuits
+
+Algorithm 3 SELFSPECULATIVEDECODING(x≤t, f, h, c, g)
+
+Input: A prefix x≤t of length t, an LLM backbone f : V∗ → Rd, an LLM head h : Rd → Θ parameterising a PC c encoding
+a joint distribution q over the next n tokens, and an LLM head g : Rd → ∆v computing the next token probabilities.
+Output: A sentence (x≤t || xt+1:t+s) ∈ Vt+s where 1 ≤ s ≤ n + 1. Moreover, we have that xt+1:t+s ∼ p(xt+1, . . . , xt+s |
+x≤t) as equivalently encoded by the autoregressive single token prediction model consisting of f and g only (Leviathan
+et al., 2022).
+
+1: et ← f (x≤t) {Compute the last embedding}
+2: θ ← h(et) {Compute the circuit parameters}
+
+3:
+
+4:   Let q(Xt+1:t+n | x≤t) =  xZ1≤θ ct)(X{St+am1:tp+len  |  θ)      from  c  in  time  O(|c|)}
+5:   xt+1:t+n ∼ q(Xt+1:t+n |                             n  tokens
+
+6: x ← x≤t || xt+1:t+n {Concatenate the prefix with the n tokens}
+
+7:
+
+8: Compute in parallel for 1 ≤ i ≤ n: {Compute marginals in time O(|c|)}
+
+ 9:  q(xt+1:t+i | x≤t) = xt+i+1,...,xt+n∈V q(xt+1:t+n | x≤t)
+10:
+
+11: Compute in parallel for 1 ≤ i ≤ n + 1: {Compute target model conditionals}
+     p(Xt+i | x≤t+i−1) = g(et+i−1), where et+i−1 = f (x≤t+i−1)
+12:
+
+13:
+
+14: s ← 0 {Determine the number of accepted tokens s, 0 ≤ s ≤ n}
+15: while s < n do
+
+16: α ∼ U (0, 1)
+17: if s > 0 then
+
+18:  q(xt+s+1 | x≤t+s) ← q(xt+1:t+s+1 | x≤t)/q(xt+1:t+s | x≤t)
+19: end if
+20: if α > p(xt+s+1 | xt+s)/q(xt+s+1 | xt+s) then
+     exit loop
+21:
+22: end if
+
+23: s ← s + 1
+24: end while{Sample one last token from the autoregressive LLM model}
+25: if s < n then
+26: Let s(Xt+s+1) = q(Xt+s+1 | x≤t+s) {Adjust the distribution first, if we accept fewer tokens}
+27: Let m(Xt+s+1) = max (0, p(Xt+s+1 | x≤t+s) − s(Xt+s+1))
+28: r(Xt+s+1 | xt+s) = m(Xt+s+1)/Z, with Z =
+29: xt+s+1 ∼ r(Xt+s+1 | x≤t+s)                                      x′∈V m(x′)
+30: else
+
+31: xt+s+1 ∼ p(Xt+s+1 | x≤t+s)
+32: end if
+33: return x≤t+s || xt+s+1
+
+                                                                          21
+                                     Fast and Expressive Multi-Byte Prediction with Probabilistic Circuits
+F.1. GPU Memory Usage For Speculative Decoding
+
+                                 Speculative Sampling (n=8)                                                   Speculative Sampling (n=16)
+
+Model Mem Usage (Gb)  17.5                                                          Model Mem Usage (Gb)                        Max Mem Usage (Gb)
+
+                      15.0                    Max Mem Usage (Gb)                                          15
+
+                      12.5       EvaByte                          BTREE r=32                                       EvaByte                          BTREE r=32
+                                                                  FF r=1                                                                            FF r=1
+
+                      10.0       Llama                                                                    10       Llama
+
+                      7.5
+
+                            012            4                      012            4                            012            4                      012            4
+
+                            # LoRA Layers                         # LoRA Layers                               # LoRA Layers                         # LoRA Layers
+
+Model Mem Usage (Gb)        Greedy Speculative Decoding (n=8)Max Mem Usage (Gb)     Model Mem Usage (Gb)     Greedy Speculative Decoding (n=16)Max Mem Usage (Gb)
+
+                      17.5                                                                                15
+                      15.0                                                                                10
+                      12.5
+                      10.0
+
+                       7.5
+
+                            012            4                      012            4                            012            4                      012            4
+
+                            # LoRA Layers                         # LoRA Layers                               # LoRA Layers                         # LoRA Layers
+
+Figure 5. GPU memory usage as a function of the number of LoRA layers (x-axis) during model loading (left subplot) and maximum
+memory usage during inference (right subplot). As can be seen, MTPC-BTREE has similar memory requirements to MTPC-FF and scales
+graciously with the MTP window size, n. Moreover, retrofitting LoRA on the last 1-4 layers barely changes the footprint: we pay a
+memory overhead of approximately k transformer layers when using k LoRA layers. Measurements taken on the L40S GPUs during the
+speculative decoding experiments with KV cache enabled, BF16 computations, and 1,024 generated tokens.
+
+G. Memory Bottleneck Due to Logits
+
+In this section we elaborate on the memory bottleneck that arises in MTP, especially when we use a model that has mixture
+coefficients, e.g. MTPC-CP, and propose ways to alleviate this bottleneck. As we mentioned in Sec. 5, the GPU memory
+required during training to store the logits scales linearly in the vocabulary size as s × n × v × r , where s is the context
+length, n the MTP window length, v the vocabulary size and r the number of mixture components. As can be seen in Table 5,
+the size of the logits quickly becomes too large to fit in GPU memory if we scale the vocabulary size. Therefore, although
+we can scale MTPC to subword-level models with vocabulary sizes of 32k+, we are forced to use a much smaller number of
+mixture coefficients, making the approach less attractive. However, there are several strategies to keep the parameter count
+under control despite the increase in vocabulary size from 320 to 32k+ which can be explored in follow-up work.
+Subsampling MTP windows. One pragmatic way of reducing the memory requirements due to logits during training is to
+avoid realising all of them. For example, we could subsample the token windows used for training in the MTP window.
+Unembedding parameter sharing. We could share parameters across token positions and the mixture components and
+fine-tune low-rank adaptors (Hu et al., 2022) to allow some flexibility while keeping the parameter count under control.
+For example, we could parametrise the unembedding matrix for token i and mixture component j as Ui,j = Wi + Li,j,
+where Wi ∈ Rv×d is the pretrained unembedding matrix for token i and Li,j = Ai,jBi,j is a rank-k LoRA adaptor where
+Ai,j ∈ Rv×k, Bi,j ∈ Rk×d. For EvaByte, the pretrained unembedding matrices are available and we smoothly resume
+training from them by setting all entries of Bi,j to zero, while for other models we would need to randomly initialise the
+unembedding matrices.
+Low-rank unembedding matrices. Another option is to explore whether we can lower the rank of the unembedding
+matrices (i.e. make d smaller) without losing performance. While it is known that a low-rank softmax layer is less
+
+                                                                        22
+Fast and Expressive Multi-Byte Prediction with Probabilistic Circuits
+
+Table 5. Memory footprint of the logits for MTPC-CP as a function of the vocabulary size v, the MTP window size n, and the number
+of mixture coefficients r for a sequence length of 8192. While the logits are manageable for a byte-level model with a vocabulary of
+size v = 320 even for large r, memory scales linearly in v, so for subword-level models with large vocabularies the requirement quickly
+exceeds that available on our GPU (80 GB).
+
+            Size (float 32 precision)
+
+v       r   n=8      n = 16
+
+        1 80.0 MB 160.0 MB
+        4 320.0 MB 640.0 MB
+320     8 640.0 MB   1.2 GB
+        16 1.2 GB    2.5 GB
+        32 2.5 GB    5.0 GB
+
+        1   7.8 GB    15.6 GB
+        4 31.2 GB     62.5 GB
+32,000  8 62.5 GB    125.0 GB
+        16 125.0 GB  250.0 GB
+        32 250.0 GB  500.0 GB
+
+        1 31.2 GB 62.5 GB
+        4 125.0 GB 250.0 GB
+128,000 8 250.0 GB 500.0 GB
+        16 500.0 GB 1000.0 GB
+        32  1.0 TB   2.0 TB
+
+expressive (Yang et al., 2018), the solution proposed in Yang et al. (2018, Section 2.4) is to increase expressivity by using a
+mixture of softmaxes. Since we are already employing a mixture of softmaxes (albeit across multiple tokens), we believe it
+may be possible to shrink d without sacrificing too much performance.
+
+Hierarchical partitioning and tensor factorisations. Lastly, we can explore ways of partitioning large vocabularies, e.g.
+hierarchical softmax (Mnih & Hinton, 2008), which introduces a non-linearity or other multi-linear tensor factorisations.
+For example, we could partition the vocabulary for each token into m categories and introduce a latent variable to switch
+between the categories for each token position. This can be beneficial because within each category we can limit the active
+vocabulary size significantly, and can therefore use an unembedding matrix which is lower rank, as proposed previously.
+
+H. Hidden Markov Models Setup
+
+In our experiments we use contextual, inhomogeneous hidden Markov models (HMMs) with identity initialisation
+(see Table 6). We chose the above after preliminary experiments where we assessed the following configuration choices for
+training our HMMs.
+Parameterisation. We can parameterise HMMs to either be contextual, i.e. we can make the transition probabilities depend
+on the input, or we can make the transition probabilities be independent of the input (non-contextual).
+Transition type. The transition matrix can be the same at each time step (homogeneous) or it can be different (inhomoge-
+neous). The former would correspond to additional parameter sharing across sum layers in the circuit representation. We
+note that inhomogeneous HMMs subsume homogeneous HMMs. This is because inhomogeneous HMMs could in theory
+learn parameters that do not vary from timestep to timestep, thus becoming equivalent to a homogeneous HMM.
+Initialisation. A crucial setup is to initialise the HMM with transition matrices that are identity matrices, which make the
+HMM equivalent to CP at the beginning of training. We achieve this by adding a bias term to allow the HMM model to be
+initialised to identity matrices. This setting in combination with extending to larger token windows, i.e. n = 16 lead to
+a scenario where HMMs outperform CP. The other alternative is to initialise the transition matrices uniformly at random
+(before softmax), but this complicates learning and yields performance that is lower than CP models.
+
+                                                                        23
+   Fast and Expressive Multi-Byte Prediction with Probabilistic Circuits
+
+                     Table 6. Most Successful HMM Configuration
+
+   Parameterisation                    Transition Type              Initialisation
+
+Contextual Non-Contextual Homogeneous Inhomogeneous Identity Init. Uniform Init.
+
+✓       ✗                           ✗  ✓                         ✓                           ✗
+
+I. Further Experimental Details
+
+To make the comparison between methods fair, we: a) constrained the models to not produce end-of-sequence symbols
+during generation, as the latency of retrieving KV cache items from memory increases with sequence length (Nawrot et al.,
+2024) and b) we filtered the validation set of the models to only include examples with both prompts and responses in
+English, as acceptance rates may vary dramatically based on the language chosen for the response.
+We compute throughput by generating answers to 250 prompts and report the mean and std of 3 runs with different prompts.
+
+J. Alternative Losses
+
+In early versions of this work we also experimented using a Kullback-Leibler divergence (KL) loss as recommended
+by Basharin et al. (2025). However, we found that training with the KL loss doubled the training time while requiring
+a lot more memory, and the benefits in the number of accepted tokens did not outweigh the additional complexity. For
+completeness we include the loss below. KL Loss L
+
+             n                   N  L fKL pθ(x(t+i)j | x<(i)t+j ) qθ′ (xt(+i)j | x<(i)t+j )     (6)
+                                                           N valid(i, j)
+   L = Lj γj−1,      Lj =
+
+   j=1               i=1 t=1
+
+In the above we condition both the draft model, qθ′ , and the target model, pθ, on the gold data. The above is equivalent to
+the KL term from the word-level distillation loss in (Kim & Rush, 2016).11
+
+   11While performing sequence-level distillation, i.e., conditioning on data sampled from the teacher model may improve distillation (Kim
+& Rush, 2016), we did not explore this.
+
+                                                                        24
+                                     Fast and Expressive Multi-Byte Prediction with Probabilistic Circuits
+
+K. Results on L40S GPU
+
+K.1. EvaByte 6.5B
+K.1.1. SPECULATIVE SAMPLING
+
+                          Table 7
+
+                  µlat ↓  µacc ↑           µtok/s ↑   maxtok/s
+
+    FF 1       0.0299±0.0003 5.19±0.05 176.3±0.9       297.55
+        8      0.0314±0.0005 5.67±0.05 184.2±3.9       297.92
+        16 0.0323±0.0020 5.79±0.08 183.4±13.3          290.71
+    CP 32 0.0314±0.0003 5.88±0.02 191.0±1.6            287.88
+        64 0.0327±0.0015 5.96±0.04 185.9±7.7           281.10
+        128 0.0337±0.0001 6.02±0.03 182.3±1.1          264.80
+
+                          Table 8
+
+                  µlat ↓           µacc ↑   µtok/s ↑   ×STP
+                                                       1.00
+1 1 STP 0.0254                   —          39.5       4.47
+    1 FF          0.0299±0.0003 5.19±0.05 176.3±0.9    4.29
+          HMM 0.0362±0.0006 6.02±0.02 169.4±2.6        4.78
+8   32 BTree 0.0326±0.0008 6.02±0.05 188.7±6.1         4.84
+                                                       4.46
+           CP     0.0314±0.0003 5.88±0.02 191.0±1.6    4.26
+    1 FF          0.0308±0.0003 5.34±0.03 176.1±2.3    4.80
+           HMM    0.0421±0.0022  6.93±0.06  168.0±9.4  5.05
+16  32     CP     0.0333±0.0009  6.18±0.02  189.4±5.4
+
+           BTree 0.0347±0.0000 6.76±0.07 199.2±2.2
+
+                          Table 9
+
+                  µlat ↓           µacc ↑   µtok/s ↑   ×STP
+                                                       1.00
+1 STP — 0.0254                   —          39.5       4.28
+               0 0.0308±0.0004 5.11±0.03 168.9±2.9     4.06
+               1 0.0325±0.0011 5.11±0.07 160.0±7.8     3.98
+    FF         2 0.0332±0.0009 5.12±0.07 157.1±6.3     3.79
+                                                       4.72
+8              4 0.0348±0.0004 5.12±0.04 149.5±3.1     4.58
+               0 0.0332±0.0006 6.05±0.05 186.1±1.8     4.52
+               1  0.0348±0.0010 6.16±0.06 180.9±6.9    4.33
+    BTree      2  0.0354±0.0014 6.18±0.03 178.2±7.9    4.40
+                                                       4.37
+               4 0.0373±0.0017 6.22±0.01 170.9±7.5     4.32
+                                                       4.09
+               0 0.0313±0.0012 5.36±0.07 173.8±7.9     5.09
+               1 0.0331±0.0010 5.62±0.08 172.6±7.1     5.15
+    FF         2 0.0339±0.0010 5.66±0.15 170.5±8.9     5.13
+                                                       5.00
+16             4 0.0357±0.0012 5.64±0.11 161.2±8.7
+               0 0.0350±0.0002 6.88±0.10 200.7±2.6
+               1  0.0371±0.0008 7.36±0.03 203.1±5.0
+    BTree      2  0.0379±0.0013 7.50±0.03 202.5±7.0
+
+               4 0.0393±0.0006 7.57±0.13 197.1±6.3
+
+                          25
+   Fast and Expressive Multi-Byte Prediction with Probabilistic Circuits
+
+K.1.2. GREEDY SPECULATIVE DECODING
+
+                                            Table 10
+
+                µlat ↓                             µacc ↑      µtok/s ↑     maxtok/s
+
+    FF 1   0.0300±0.0006 6.89±0.01 235.4±5.4                                 299.64
+        8  0.0310±0.0002 6.68±0.00 221.5±1.3                                 295.79
+        16 0.0312±0.0000 6.70±0.02 221.3±0.5                                 294.16
+    CP 32 0.0317±0.0002 6.70±0.01 217.4±1.6                                  288.68
+        64 0.0319±0.0002 6.69±0.01 215.9±1.1                                 282.55
+        128 0.0340±0.0003 6.68±0.02 202.3±2.1                                264.70
+
+                                            Table 11
+
+                                    µlat ↓             µacc ↑     µtok/s ↑   ×STP
+                                                                             1.00
+1 1 STP 0.0251                                         —          39.9       5.90
+    1 FF                            0.0300±0.0006 6.89±0.01 235.4±5.4        5.33
+           HMM 0.0324±0.0001 6.70±0.03 212.8±1.5                             5.45
+8   32 CP                           0.0317±0.0002 6.70±0.01 217.4±1.6        5.50
+                                                                             6.65
+           BTree 0.0315±0.0004 6.71±0.03 219.5±3.6                           6.06
+    1 FF                            0.0299±0.0002 7.75±0.02 265.4±1.8        6.07
+           HMM                      0.0360±0.0009      8.43±0.02  241.8±6.0  6.08
+16  32     CP                       0.0333±0.0002      7.79±0.05  242.2±1.8
+
+           BTree 0.0353±0.0020 8.26±0.08 242.6±12.4
+
+                                            Table 12
+
+                                    µlat ↓             µacc ↑     µtok/s ↑   ×STP
+                                                                             1.00
+1 STP — 0.0251                                         —          39.9       5.95
+           0 0.0297±0.0003 6.89±0.01 237.3±2.2                               5.69
+           1 0.0311±0.0003 6.89±0.01 227.2±2.7                               5.54
+    FF     2 0.0319±0.0002 6.90±0.02 221.2±1.7                               5.25
+                                                                             5.48
+8          4 0.0336±0.0006 6.88±0.01 209.6±4.1                               5.22
+           0 0.0316±0.0004 6.72±0.02 218.6±2.6                               5.15
+           1                        0.0333±0.0006 6.73±0.01 208.3±3.6        4.87
+    BTree  2                        0.0337±0.0002 6.73±0.01 205.6±1.2        6.53
+                                                                             6.74
+           4 0.0356±0.0009 6.72±0.03 194.5±4.0                               6.74
+           0 0.0305±0.0005 7.74±0.03 260.6±4.5                               6.51
+           1 0.0319±0.0004 8.36±0.04 269.2±3.4                               6.35
+    FF     2 0.0329±0.0002 8.60±0.02 269.1±1.9                               6.65
+                                                                             6.54
+16         4 0.0346±0.0002 8.72±0.02 259.9±1.1                               6.30
+           0 0.0341±0.0003 8.33±0.10 253.2±5.0
+           1                        0.0354±0.0001 9.05±0.06 265.2±2.3
+    BTree  2                        0.0365±0.0002 9.20±0.09 261.2±3.6
+
+           4 0.0381±0.0001 9.23±0.07 251.3±2.5
+
+                                                   26
+Fast and Expressive Multi-Byte Prediction with Probabilistic Circuits
+
+K.2. Llama 3.2 3B
+K.2.1. SPECULATIVE SAMPLING
+
+                                            Table 13
+
+                                    µlat ↓  µacc ↑            µtok/s ↑ maxtok/s
+
+    FF 1 0.0291±0.0031 1.71±0.01 64.2±6.4                               342.39
+           8 0.0298±0.0031 1.92±0.04 70.2±5.9                           355.81
+                                                                        357.04
+    CP 16 0.0301±0.0036 1.98±0.02 71.7±8.0                              357.82
+           32 0.0311±0.0032 2.04±0.04 71.4±8.2
+
+                                            Table 14
+
+                                    µlat ↓            µacc ↑  µtok/s ↑  ×STP
+                                                                        1.00
+1 1 STP 0.0256                                     —          39.2      1.64
+    1 FF                            0.0291±0.0031 1.71±0.01 64.2±6.4    1.82
+                             CP     0.0311±0.0032 2.04±0.04 71.4±8.2    1.82
+8   32 HMM 0.0351±0.0030 2.31±0.05 71.5±6.7                             1.98
+                                                                        1.60
+                             BTree 0.0318±0.0040 2.27±0.04 77.4±8.7     1.61
+    1 FF                            0.0299±0.0023 1.72±0.03 62.6±4.3    1.89
+                             HMM    0.0400±0.0045  2.32±0.03  63.0±6.3  1.96
+16  32                       CP     0.0303±0.0028  2.07±0.01  73.9±6.8
+
+                             BTree 0.0333±0.0037 2.37±0.05 76.9±6.9
+
+                                            Table 15
+
+                                    µlat ↓            µacc ↑  µtok/s ↑  ×STP
+                                                                        1.00
+1 STP — 0.0256                                     —          39.2      1.77
+                                 0 0.0269±0.0001 1.73±0.02 69.4±0.9     1.71
+                                 1 0.0323±0.0041 1.95±0.06 67.0±9.4     1.84
+    FF                           2 0.0308±0.0003 2.02±0.08 72.1±3.1     1.92
+                                                                        2.12
+8                                4 0.0318±0.0001 2.18±0.04 75.2±1.0     2.09
+                                 0 0.0301±0.0004 2.31±0.02 82.9±0.6     2.24
+                                 1  0.0334±0.0021 2.54±0.02 82.0±5.8    2.15
+    BTree                        2  0.0332±0.0011 2.71±0.04 87.7±1.9    1.75
+                                                                        1.81
+                                 4 0.0362±0.0042 2.82±0.08 84.1±10.1    1.83
+                                 0 0.0273±0.0002 1.73±0.04 68.6±0.6     1.84
+                                 1 0.0300±0.0004 1.94±0.03 70.9±1.3     2.13
+    FF                           2 0.0308±0.0002 2.00±0.02 71.6±0.1     2.19
+                                                                        2.13
+16                               4 0.0323±0.0005 2.12±0.05 72.2±1.2     2.04
+                                 0 0.0312±0.0004 2.42±0.03 83.4±1.4
+                                 1  0.0329±0.0006 2.63±0.07 85.9±3.3
+    BTree                        2  0.0343±0.0002 2.65±0.03 83.4±1.2
+
+                                 4 0.0376±0.0041 2.76±0.02 80.0±8.3
+
+                                            27
+   Fast and Expressive Multi-Byte Prediction with Probabilistic Circuits
+
+K.2.2. GREEDY SPECULATIVE DECODING
+
+                                            Table 16
+
+               µlat ↓                       µacc ↑        µtok/s ↑          maxtok/s
+
+    FF 1 0.0248±0.0010 2.70±0.00 111.8±4.3                                   330.31
+           8 0.0264±0.0003 3.22±0.03 128.2±1.1                               310.61
+                                                                             315.91
+    CP 16 0.0286±0.0020 3.39±0.05 125.2±7.9                                  282.88
+           32 0.0285±0.0026 3.45±0.04 128.4±12.2
+
+                                            Table 17
+
+                                    µlat ↓             µacc ↑     µtok/s ↑   ×STP
+                                                                             1.00
+1 1 STP 0.0255                                         —          39.4       2.84
+    1 FF                            0.0248±0.0010 2.70±0.00 111.8±4.3        3.26
+        CP                          0.0285±0.0026 3.45±0.04 128.4±12.2       3.52
+8   32 BTree 0.0283±0.0022 3.72±0.10 138.6±7.7                               3.56
+                                                                             2.79
+        HMM 0.0295±0.0023 3.94±0.06 140.3±11.5                               2.86
+    1 FF                            0.0257±0.0027 2.73±0.01 109.8±11.2       3.55
+        CP                          0.0304±0.0025      3.23±0.06  112.7±9.9  3.81
+16  32  HMM                         0.0312±0.0023      4.15±0.07  139.6±8.0
+
+        BTree 0.0285±0.0001 4.05±0.06 149.8±1.9
+
+                                            Table 18
+
+                                    µlat ↓             µacc ↑     µtok/s ↑   ×STP
+                                                                             1.00
+1 STP — 0.0255                                         —          39.4       2.81
+            0 0.0252±0.0014 2.71±0.00 110.8±6.2                              3.22
+            1 0.0266±0.0003 3.27±0.03 126.8±0.6                              3.26
+    FF      2 0.0288±0.0018 3.57±0.04 128.4±8.0                              3.42
+                                                                             3.60
+8           4 0.0300±0.0003 3.89±0.06 134.8±3.2                              3.78
+            0 0.0287±0.0017 3.86±0.07 141.7±8.8                              3.85
+            1                       0.0291±0.0005 4.12±0.05 148.7±0.8        3.73
+    BTree   2                       0.0297±0.0002 4.29±0.03 151.7±1.8        2.82
+                                                                             3.08
+            4 0.0320±0.0019 4.48±0.05 147.0±9.1                              3.25
+            0 0.0253±0.0016 2.74±0.01 111.2±7.0                              3.41
+            1 0.0275±0.0013 3.23±0.05 121.3±5.3                              3.78
+    FF      2 0.0289±0.0018 3.56±0.04 127.8±8.6                              3.78
+                                                                             3.71
+16          4 0.0300±0.0006 3.88±0.05 134.2±3.2                              3.82
+            0 0.0294±0.0014 4.15±0.04 148.8±7.5
+            1                       0.0314±0.0019 4.43±0.10 148.7±9.6
+    BTree   2                       0.0329±0.0014 4.56±0.05 146.2±6.5
+
+            4 0.0335±0.0016 4.78±0.02 150.5±6.6
+
+                                                   28
+                                     Fast and Expressive Multi-Byte Prediction with Probabilistic Circuits
+
+L. Results on RTX 3090 GPU
+
+L.1. EvaByte
+L.1.1. SPECULATIVE SAMPLING
+
+                       Table 19
+
+               µlat ↓  µacc ↑ µtok/s ↑ maxtok/s
+
+    FF 1 0.0548 5.14             96.2        160.66
+           8 0.0591 5.64         98.0        157.02
+           16 0.0577 5.73        102.3       158.35
+                                 105.8       154.99
+    CP 32 0.0574 5.89            108.8       154.92
+           64 0.0567 5.98        104.4       151.02
+           128 0.0590 5.98
+
+                       Table 20
+
+               µlat ↓       µacc ↑ µtok/s ↑  ×STP
+
+1 1 STP 0.0472 —                 21.2        1.00
+    1 FF       0.0548 5.14 96.2              4.53
+          HMM 0.0657 6.03        94.3        4.44
+8   32 BTree 0.0597 6.05         104.4       4.91
+
+        CP     0.0574 5.89       105.8       4.98
+    1 FF       0.0556 5.37 99.2              4.67
+        HMM    0.0774      6.88  91.2        4.29
+16  32  CP     0.0594      6.18  107.1       5.04
+
+        BTree 0.0639 6.71 108.2              5.09
+
+                       Table 21
+
+               µlat ↓       µacc ↑ µtok/s ↑  ×STP
+
+1 STP — 0.0472 —                 21.2        1.00
+            0 0.0553 5.13 95.0               4.47
+            1 0.0569 5.05 90.9               4.28
+    FF      2 0.0586 5.11 89.3               4.20
+
+8           4 0.0624 5.12 84.1               3.96
+            0 0.0595 6.04 104.5              4.92
+            1  0.0614 6.19       104.0       4.90
+    BTree   2  0.0625 6.21       102.6       4.83
+
+            4 0.0667 6.22 96.3               4.53
+            0 0.0554 5.35 99.1               4.67
+            1 0.0597 5.46 94.0               4.42
+    FF      2 0.0605 5.61 95.3               4.49
+
+16          4 0.0635 5.64 91.4               4.30
+            0 0.0620 6.85 114.0              5.37
+            1  0.0648 7.24       115.6       5.44
+    BTree   2  0.0666 7.41       115.3       5.43
+
+            4 0.0697 7.50 111.7              5.26
+
+                       29
+Fast and Expressive Multi-Byte Prediction with Probabilistic Circuits
+
+L.1.2. GREEDY SPECULATIVE DECODING
+
+                                               Table 22
+
+                                       µlat ↓  µacc ↑ µtok/s ↑ maxtok/s
+
+    FF 1 0.0552 6.87                                     128.9      162.65
+           8 0.0579 6.66                                 119.7      160.28
+           16 0.0580 6.67                                119.7      158.39
+                                                         119.2      161.22
+    CP 32 0.0581 6.65                                    118.7      155.42
+           64 0.0584 6.65                                118.7      151.29
+           128 0.0584 6.64
+
+                                               Table 23
+
+                                       µlat ↓      µacc ↑ µtok/s ↑  ×STP
+
+1 1 STP 0.0466 —                                         21.5       1.00
+    1 FF                               0.0552 6.87 128.9            5.98
+          HMM 0.0603 6.69                                115.3      5.35
+8   32 BTree 0.0589 6.66                                 117.7      5.46
+
+        CP                             0.0581 6.65       119.2      5.53
+    1 FF                               0.0550 7.71 145.7            6.76
+        HMM                            0.0657      8.38  133.6      6.20
+16  32  CP                             0.0602      7.70  134.3      6.23
+
+        BTree 0.0621 8.13 137.5                                     6.38
+
+                                               Table 24
+
+                                       µlat ↓      µacc ↑ µtok/s ↑  ×STP
+
+1 STP — 0.0466 —                                         21.5       1.00
+                                    0 0.0563 6.87 126.6             5.88
+                                    1 0.0588 6.87        121.0      5.62
+    FF                              2 0.0598 6.88        119.5      5.55
+
+8                                   4 0.0633 6.86 112.5             5.22
+                                    0 0.0598 6.68 116.4             5.40
+                                    1  0.0624 6.70       112.0      5.20
+    BTree                           2  0.0652 6.69       107.0      4.97
+
+                                    4 0.0669 6.70 104.4             4.85
+                                    0 0.0569 7.70 140.8             6.54
+                                    1 0.0621 8.30        139.5      6.48
+    FF                              2 0.0624 8.51        142.6      6.62
+
+16                                  4 0.0655 8.66 138.4             6.43
+                                    0 0.0636 8.22 136.0             6.31
+                                    1  0.0657 8.94       143.4      6.66
+    BTree                           2  0.0680 9.03       140.2      6.51
+
+                                    4 0.0709 9.10 135.5             6.29
+
+                                               30
+Fast and Expressive Multi-Byte Prediction with Probabilistic Circuits
+
+L.2. Llama 3.2 3B
+L.2.1. SPECULATIVE SAMPLING
+
+                                               Table 25
+
+                                       µlat ↓  µacc ↑ µtok/s ↑ maxtok/s
+
+                             FF 1 0.0503 1.71 36.8             193.61
+                                    8 0.0519 1.92 40.0         190.51
+                                                               192.18
+                             CP 16 0.0524 1.96 40.6            193.86
+                                    32 0.0517 2.04 42.7
+
+                                               Table 26
+
+                                       µlat ↓      µacc ↑ µtok/s ↑  ×STP
+
+1 1 STP 0.0410 —                                         24.5       1.00
+                             1 FF      0.0503 1.71 36.8             1.51
+                                 HMM 0.0605 2.21         39.8       1.63
+8                            32 CP     0.0517 2.04       42.7       1.75
+
+                                 BTree 0.0554 2.19 42.9             1.76
+                             1 FF      0.0506 1.72 36.8             1.50
+                                 HMM   0.0703      2.25  34.8       1.42
+16                           32  CP    0.0525      2.08  42.6       1.74
+
+                                 BTree 0.0555 2.38 46.0             1.88
+
+                                               Table 27
+
+                                       µlat ↓      µacc ↑ µtok/s ↑  ×STP
+
+1 STP — 0.0410 —                                         24.5       1.00
+                                    0 0.0497 1.71 37.4              1.53
+                                    1 0.0533 1.94 40.0              1.64
+                             FF     2 0.0538 2.05 41.8              1.71
+
+8                                   4 0.0568 2.11 40.9              1.67
+                                    0 0.0540 2.36 47.1              1.93
+                                    1  0.0566 2.56       48.8       1.99
+                             BTree  2  0.0577 2.68       50.1       2.05
+
+                                    4 0.0604 2.71 48.6              1.99
+                                    0 0.0495 1.71 37.5              1.53
+                                    1 0.0534 1.91 39.5              1.61
+                             FF     2 0.0546 2.04 41.0              1.68
+
+16                                  4 0.0573 2.05 39.8              1.63
+                                    0 0.0562 2.40 46.2              1.89
+                                    1  0.0583 2.60       48.3       1.97
+                             BTree  2  0.0596 2.65       48.1       1.97
+
+                                    4 0.0620 2.74 47.7              1.95
+
+                                               31
+Fast and Expressive Multi-Byte Prediction with Probabilistic Circuits
+
+L.2.2. GREEDY SPECULATIVE DECODING
+
+                                               Table 28
+
+                                       µlat ↓  µacc ↑ µtok/s ↑ maxtok/s
+
+    FF 1 0.0448 2.69 61.7                                      195.66
+           8 0.0485 3.23 70.0                                  193.55
+                                                               194.39
+    CP 16 0.0496 3.41 72.5                                     193.76
+           32 0.0496 3.45 73.6
+
+                                               Table 29
+
+                                       µlat ↓      µacc ↑ µtok/s ↑  ×STP
+
+1 1 STP 0.0413 —                                         24.3       1.00
+    1 FF                               0.0448 2.69 61.7             2.54
+        CP                             0.0496 3.45       73.6       3.03
+8   32 BTree 0.0506 3.72                                 77.6       3.20
+
+        HMM 0.0519 3.90 78.9                                        3.25
+    1 FF                               0.0458 2.70 60.8             2.50
+        CP                             0.0500      3.20  68.0       2.80
+16  32  HMM                            0.0559      4.10  77.1       3.17
+
+        BTree 0.0518 4.00 81.7                                      3.36
+
+                                               Table 30
+
+                                       µlat ↓      µacc ↑ µtok/s ↑  ×STP
+
+1 STP — 0.0413 —                                         24.3       1.00
+                                    0 0.0441 2.68 62.4              2.57
+                                    1 0.0477 3.25 70.6              2.91
+    FF                              2 0.0492 3.54 74.9              3.08
+
+8                                   4 0.0524 3.89 77.3              3.18
+                                    0 0.0503 3.84 80.6              3.32
+                                    1  0.0524 4.11       82.6       3.40
+    BTree                           2  0.0532 4.30       85.2       3.51
+
+                                    4 0.0554 4.45 84.6              3.48
+                                    0 0.0444 2.73 63.2              2.60
+                                    1 0.0479 3.23 70.0              2.88
+    FF                              2 0.0495 3.55 74.4              3.06
+
+16                                  4 0.0531 3.89 76.2              3.14
+                                    0 0.0517 4.16 85.0              3.50
+                                    1  0.0538 4.38       86.1       3.54
+    BTree                           2  0.0549 4.61       88.6       3.65
+
+                                    4 0.0573 4.74 87.4              3.60
+
+                                               32
+                                     Fast and Expressive Multi-Byte Prediction with Probabilistic Circuits
+
+M. Further Plots on Extending the MTP Token Window to n = 16
+
+                          (a) EvaByte Speculative Sampling                                                               (b) EvaByte Greedy Speculative Decoding
+
+               0.044                                              Throughput (tok/s) ↓                                                                           Throughput (tok/s) ↓
+               0.040
+                             BTREE CP                                            175                              0.044       BTREE CP                                                       205
+                                                                                                                  0.040
+                             FF       HMM                             16         180                                          FF           HMM                              215
+
+                          LoRA layers: 0                                         185                                     LoRA layers: 0
+                                                                                 190
+                                                                                 195                                                                                        225
+                          MTP window size: 8 16                                  200                                     MTP window size: 8 16
+← Latency (s)                                                                                      ← Latency (s)                                                            235
+
+               0.036                       8                                                                                                                                245
+
+                                                                  16                                              0.036                                          16 16      255
+
+                                                     16                                                                                                   16                265
+                                               8
+               0.032160      16           8                                                                       0.032  888
+                     165
+                     170  8                                                                                                       8                       16
+
+               0.028                                                                                              0.028
+
+                      5          5.5       6                6.5           7      7.5                              6.5                7          7.5           8        8.5  9
+
+                                      Accepted tokens →                                                                                    Accepted tokens →
+
+                             (c) Llama Speculative Sampling                                                              (d) Llama Greedy Speculative Decoding
+                                                              Throughput (tok/s) ↓
+               0.044                                                                                              0.044                                          Throughput (tok/s) ↓
+               0.040                                                                                              0.040
+               0.036         BTREE CP                                                     60                      0.036       BTREE CP                                         105
+               0.032
+               0.028         FF       HMM                                 16                                                  FF           HMM                                 110
+
+                          LoRA layers: 0                                                  65                             LoRA layers: 0                                        115
+
+← Latency (s)             MTP window size: 8 16                                                    ← Latency (s)         MTP window size: 8 16                                 120
+
+                                                                                           70                                                                                  125
+                                                                                                                                                                               130
+                                                                          8
+
+                                                                             16  75                                                                                            135
+                                                                                                                                                                               140
+                                                                      8                                           0.032                                                 16     145
+                                                            8 16                                                  0.028
+                                 816                                                                                                       16                    8
+                                                                                                                                                       8            16
+                                                                                                                                                              8
+
+                                                                                                                              16
+                                                                                                                              8
+
+               1.5                                       2                       2.5                              2.5                   3            3.5            4       4.5
+
+                                      Accepted tokens →                                                                                    Accepted tokens →
+
+Figure 6. Extending the MTP window to n = 16 is beneficial for models with no LoRA layers. Marker positions show the mean number
+of accepted tokens and the mean latency; iso-lines indicate the corresponding ratio of means, which may differ slightly from the per-run
+mean throughput reported in the tables above. More specifically, extending the MTP window of expressive PCs such as MTPC-HMM and
+MTPC-BTREE to n = 16 boosts their µacc in all settings: HMM 16 is to the right of HMM 8 and BTREE 16 is to the right of BTREE 8
+in all four subplots. Importantly, MTPC-BTREE improves µtok/s for all cases apart from Evabyte with greedy speculative decoding (top
+right), highlighting its strong expressiveness–latency trade-off. We hypothesise that the reason MTPC-FF is so successful for EvaByte in
+the greedy setting is that this setup aligns with the objective optimised during pretraining because of the independence assumption. In
+contrast, although MTPC-HMM has a high µacc, it lags behind in throughput because of its high latency due to its AR nature (HMM 16
+is much higher in the plots than HMM 8).
+
+                                                                                               33
+                                     Fast and Expressive Multi-Byte Prediction with Probabilistic Circuits
+
+N. Further Plots on Adding more LoRA Layers to the Draft Model
+
+                         Speculative Sampling (n=8)                                                                      Speculative Sampling (n=16)
+
+Mean Accepted Tokens  6                    Throughput (Bytes/s)                                 Mean Accepted Tokens                       Throughput (Bytes/s)  200
+
+                                                                 150                                                  6
+                                                                                 BTREE r=32
+                      4       EvaByte                                            FF r=1                                       EvaByte                            150  BTREE r=32
+
+                              Llama                              100                                                  4       Llama                                              FF r=1
+                                                                                                                                                                 100
+
+                      2                                                                                               2
+
+                         012            4                             012                    4                           012            4                             012                4
+
+                         # LoRA Layers                                # LoRA Layers                                      # LoRA Layers                                # LoRA Layers
+
+                         Greedy Speculative Decoding (n=8)                                                               Greedy Speculative Decoding (n=16)
+
+Mean Accepted Tokens  6                    Throughput (Bytes/s)                                 Mean Accepted Tokens  8                    Throughput (Bytes/s)  250
+
+                                                                 200
+
+                                                                                                                      6                                          200
+
+                      4                                          150                                                                                             150
+                                                                                                             4
+
+                         012            4                             012                    4                           012            4                             012                4
+
+                         # LoRA Layers                                # LoRA Layers                                      # LoRA Layers                                # LoRA Layers
+
+Figure 7. Increasing the expressiveness of our draft model by adding LoRA layers. For the n = 8 case, we get very little improvement for
+sampling with EvaByte and no improvement for greedy speculative decoding. We believe this is because EvaByte has been pretrained as a
+MTP model with n = 8 and as such the draft backbone has already converged to MTP representations which cannot be improved further.
+When we move to n = 16, EvaByte acceptance rates are boosted significantly both for speculative sampling and greedy speculative
+decoding and the optimal throughput is obtained with 1 LoRA layer. On the other hand, the Llama acceptance rates and throughput are
+boosted in all cases.
+
+                                                                                             34
+

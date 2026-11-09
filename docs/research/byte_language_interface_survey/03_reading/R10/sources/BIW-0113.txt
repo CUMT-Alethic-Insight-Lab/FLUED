@@ -1,0 +1,702 @@
+                            The Strawberry Problem:
+Emergence of Character-level Understanding in Tokenized Language
+
+                                       Models
+
+           Adrian Cosma1,2, S, tefan Rus, et,i1, Emilian Ra˘doi1, Mihai Dasca˘lu1
+       1National University of Science and Technology POLITEHNICA Bucharest
+
+             2Dalle Molle Institute for Artiﬁcial Intelligence Research (IDSIA)
+
+      {ioan_adrian.cosma, stefan.ruseti, emilian.radoi, mihai.dascalu}@upb.ro
+
+                      Abstract                                      19 Token-Character                 Task Special Token
+                                                                    Manipulation Tasks                 Single-character Token
+     Despite their remarkable progress across                                                          Multi-character Token
+     diverse domains, Large Language Models
+     (LLMs) consistently fail at simple character-                  Input               Token ↔ Token  Output
+     level tasks, such as counting letters in words,
+     due to a fundamental limitation: tokenization.            (a)                      Token ↔ Char
+     In this work, we frame this limitation as a                                          Mix ↔ Mix
+     problem of low mutual information and an-
+     alyze it in terms of concept emergence. Us-                                        Char ↔ Token
+     ing a suite of 19 synthetic tasks that isolate
+     character-level reasoning in a controlled set-                  Vanilla                           Character-aware
+     ting, we show that such capabilities emerge                    Emergence point                         Emergence point
+     suddenly and only late in training. We ﬁnd                     dependent on |V|                       independent of |V|
+     that percolation-based models of concept emer-
+     gence explain these patterns, suggesting that             (b)                    Block-Causal
+     learning character composition is not funda-                                     Cross Attention
+     mentally different from learning commonsense
+     knowledge. To address this bottleneck, we pro-                 Train steps                        Train steps
+     pose a lightweight architectural modiﬁcation
+     that signiﬁcantly improves character-level rea-           Figure 1: Tokenization obscures character composition
+     soning while preserving the inductive advan-              of words. (a) We develop 19 token manipulation tasks
+     tages of subword models. Together, our results            spanning token↔token, token↔char, char↔token, and
+     bridge low-level perceptual gaps in tokenized             mixed settings, isolating character reasoning from se-
+     LMs and provide a principled framework for                mantics. (b) In a standard transformer decoder LM,
+     understanding and mitigating their structural             character-level understanding emerges abruptly and late
+     blind spots. We make our code publicly avail-             in training, having the emergence point pushed back as
+     able.                                                     the tokenizer vocabulary size |V | increases; adding our
+                                                               character-aware module brings early emergence that is
+1 Introduction                                                 effectively independent of |V |.
+
+LLMs have exhibited impressive capabilities in                 and Kaneko, 2024; Zhang and He, 2024), and fail
+solving olympiad math problems (Trinh et al.,                  even simple reasoning tasks that require access
+2024), playing open-world games (Wang et al.,                  to words’ constituent letters. One such infamous
+2023) and passing bar exams (Achiam et al., 2023).             problem, the so-called "Strawberry Problem", con-
+However, paradoxically, LLMs often struggle in                 sists of counting the number of "r"s in the word
+simple tasks that involve character-level reason-              "strawberry", a problem that many foundational
+ing and manipulation1. A growing body of work                  models struggle to consistently answer even today
+shows that language models are brittle to mis-                 (Chai et al., 2024).
+spellings, struggle with character-level tasks (Shin
+                                                                  The root of this problem lies in text tokeniza-
+    1This can be seen as a form of Moravec’s Paradox (Newell,  tion. Tokenization is heavily used in modern lan-
+1983) - reasoning is easy; perception is hard.                 guage models (Sennrich et al., 2015), in which the
+                                                               raw text is compressed into sequences of multi-
+                                                               character subword tokens. This comes at a cost:
+
+                                                     28252
+
+Proceedings of the 2025 Conference on Empirical Methods in Natural Language Processing, pages 28252–28263
+                         November 4-9, 2025 ©2025 Association for Computational Linguistics
+tokenization severs the connection between words                 like existing byte-level or hybrid models (Tay et al.,
+and their characters, limiting the model’s reason-               2022; Neitemeier et al., 2025), our approach pre-
+ing capabilities about characters and morphology.                serves the inductive beneﬁts of subword tokeniza-
+Paradoxically, while tokenization imposes a struc-               tion while mitigating its perceptual blindness. We
+tural bottleneck, it also provides critical inductive            show that this design improves character-level rea-
+biases (Rajaraman et al., 2024), and cannot be com-              soning with minimal additional cost, and that it
+pletely avoided. In the absence of tokenization,                 effectively raises the mutual information between
+models trained directly on characters or bytes (e.g.,            tokens and characters during training. Our exper-
+Xue et al. (2022); Wang et al. (2024)) learn more                iments are reproducible and we make our code
+slowly and require more data to generalize. Thus,                publicly available4.
+there is a fundamental tension: tokenization im-
+proves efﬁciency and generalization at the cost of                  Our work makes the following contributions:
+losing ﬁne-grained perceptual access to the under-
+lying text (Chai et al., 2024).                                    1. We develop a benchmark of 19 synthetic tasks
+                                                                       to train and evaluate character-level under-
+   In this work, we argue that the emergence2                          standing in tokenized LMs, revealing slow
+of character-level understanding is best modeled                       and sudden emergence patterns across train-
+through the lens of mutual information and theo-                       ing. We show that character learning is slow
+ries of concept emergence (Lubana et al., 2025).                       and dependent on vocabulary size and number
+Our thesis is that learning character composition of                   of characters per token, even in an idealized
+words is equivalent to learning underreported com-                     setting, with the effect being heightened using
+monsense facts (Do et al., 2024). Human-written                        real-world data.
+text almost never directly mentions the characters
+inside words, as this is self-evident for humans                   2. We ﬁnd that we can explain the emergence
+upon reading a text3.                                                  of character-level understanding through
+                                                                       concept percolation theories of emergence
+   To better understand this phenomenon, we con-                      (Lubana et al., 2025). Our results hint that
+struct a suite of 19 synthetic tasks that require mod-                 learning character-token correspondences is
+els to reason about the character composition of                       not fundamentally different from learning ab-
+tokens in a strictly controlled, synthetic, setting                    stract concept-property associations.
+(see Figure 1). We show that performance on these
+tasks emerges late in training, is modulated by vo-                3. We propose a lightweight character-aware ar-
+cabulary size and composition, and aligns with                         chitecture that increases the empirical mutual
+theoretical predictions from concept percolation                       information between tokens and their charac-
+models of emergence (Lubana et al., 2025). A                           ters. Our design adds a small cross-attention
+model trained on tokenized sequences gets little                       module that allows each token to attend to its
+signal about characters and must slowly reconstruct                    constituent characters, while still using tokens
+this mapping across many training steps, and we                        as inputs and outputs. We validate our archi-
+show and that real world tokenizers worsen this                        tecture on models using pretrained tokenizers
+effect.                                                                and on real-world data, indicating signiﬁcant
+                                                                       improvements in character-level tasks com-
+   We introduce a simple architectural intervention                    pared to a standard language model operating
+to address this bottleneck: a block cross-attention                    on tokenized sequences.
+mechanism that exposes character-level informa-
+tion to the model alongside token embeddings. Un-                2 Related Work
+
+    2We consider the deﬁnition by Anderson (1972): "Emer-        Internal Character Representation in Language
+gence is when quantitative changes in a system result in qual-   Models. Recent works (Shin and Kaneko, 2024;
+itative changes in behavior". This applies not only to model     Zhang and He, 2024; Chai et al., 2024) highlight
+size, but, for example, to increasing training duration.         the limitations of Language Models in understand-
+                                                                 ing the character-level structure of tokens. Shin
+    3A phenomenon that can be understood as a form of non-
+reporting bias (Gordon and Van Durme, 2013; Shwartz and              4https://github.com/cosmaadrian/strawberry-problem
+Choi, 2020), in which the rare and the interesting are overrep-
+resented at the expense of the trivial.
+
+  2
+28253
+and Kaneko (2024) argued that LLMs lack robust         Park et al., 2024). Hupkes et al. (2020) designed
+internal representations of the character composi-     controlled tasks to test models’ capability to com-
+tion of tokens. In discussing future directions, they  positionally generalize. While they operated at the
+propose embedding tokens with character informa-       level of tokens, we explore whether similar emer-
+tion and positional encodings - an approach closely    gent behaviours arise at the lower level of token
+aligned with our method. Zhang and He (2024)           decomposition into characters. McKenzie et al.
+evaluated LLMs on 15 simple text-editing tasks         (2023) identiﬁed tasks in which larger LLMs per-
+and found that models struggle without ﬁne-tuning;     form worse than their smaller counterparts. Among
+the authors found that supervised ﬁne-tuning for       these tasks is the "resisting correction" task, in
+text editing substantially improved performance        which the model automatically, but wrongly, cor-
+without harming general capabilities. Kaplan et al.    rects a misspelled token. However, the study’s
+(2025) argued that LLMs implicitly combine sub-        focus was on model scale and compute allocation,
+word units into full words and exploited this ﬁnd-     while we explore the relationship between vocab-
+ing to improve efﬁciency by adding dedicated           ulary size and performance. Lubana et al. (2025)
+word-level tokens. In contrast, our focus is the       proposed a framework for studying emergent ca-
+reverse: we investigate how LLMs can be encour-        pabilities using context-sensitive grammars and
+aged to decompose tokens into their constituent        compositional tasks, under the theory of bipartite
+characters. Different from these previous works        graph percolation. While our scope and domain
+(Shin and Kaneko, 2024; Zhang and He, 2024), we        are different, we show that the framework of graph
+isolate and analyze character-level capabilities in a  percolation still applies and can explain the learn-
+tightly controlled synthetic setting, revealing their  ing dynamics observed in our setup, hinting that
+emergence dynamics during training.                    learning token-character correspondence is a simi-
+                                                       lar problem to learning correspondences between
+Character-aware models. There have been mul-           concepts and their properties.
+tiple works attempting to design character-aware
+models, such as the works of Tay et al. (2022); Is-    3 Method
+lam et al. (2022); Wang et al. (2024) et alia, by op-
+erating directly on characters, bypassing the need     3.1 Tokenization-Induced Information
+for tokenization. One downside of such models                 Bottleneck
+is that they model directly the input and output
+characters, resulting in long generation sequences     Let Σ be a character alphabet and let C =
+and decreased efﬁciency (Rajaraman et al., 2024).      (c1, . . . , cn) ∈ Σn denote the character sequence
+In contrast, our model operates directly on multi-     (spelling) of a word. Let W denote the lexical
+character tokens, utilizing the inductive bias given   identity (word type) determined by C: there is a
+by tokenization, while incorporating character in-     deterministic map g : Σ∗ → W with W = g(C).
+formation for each token.                              Let X be the corpus context, all surrounding to-
+                                                       kens excluding the word at the current position.
+   The construction of neural architectures with a     The quantity of interest is the empirical mutual
+hierarchical structure of representations has been a   information (Shannon and Weaver, 1998):
+common design pattern, usually in domains that re-
+quire either long contexts (He et al., 2024; Nawrot    Iˆ(X; C) = E  log   p(x, c)   (1)
+et al., 2021; Wu et al., 2021) or high-detail granu-                      p(x) p(c)
+larity (Chen et al., 2021). In contrast to previous
+works, we design our model for causal next-token          Namely, how much the context X tells us about
+prediction in mind, and not for MLM or for com-        the characters C of the word that appears in that
+puting general representations.                        context. Because W is a deterministic function of
+                                                       C, we have I(W ; C) = H(C) = H(W ). More-
+Theories of capability emergence. Our work is          over, natural text exhibits a certain phenomenon:
+also related to recent theoretical perspectives on     humans do not need to explicitly mention the char-
+capability emergence in models (McKenzie et al.,       acters in a word, so the context X provides lit-
+2023; Hupkes et al., 2020; Lubana et al., 2025;        tle signal about C, which means the empirical
+
+  3
+28254
+mutual information Iˆ(X; C) is low, even though       inﬂection points between memorization and gener-
+the theoretical mutual information I(W ; C) is        alization phases match between the two (Lubana
+high, since W deterministically determines C (i.e.,   et al., 2025). Furthermore, an exact match enables
+Iˆ(X; C) I(W ; C)). Thus, for a language              us to compare performance unambiguously across
+model trained only on tokenized word sequences,       different tokenizers and vocabulary sizes.
+the empirical mutual information Iˆ(X; C) ≈ 0, un-
+less the model is explicitly character-aware. Sim-    Vocabulary construction. We opted for a
+ilar to the presence of commonsense facts, this       strictly controlled and synthetic experimental en-
+data sparsity reﬂects a form of reporting bias        vironment to test the capability of tokenized lan-
+(Shwartz and Choi, 2020): humans do not en-           guage models to learn character-level tasks and to
+code character-level details in natural text, lead-   eliminate as many confounding factors as possible.
+ing to under-representation of this information in    We generate a ﬁxed-length vocabulary of words
+the training signal. However, learning common-        V , which is comprised of all single-character let-
+sense knowledge requires explicit data collection     ters, including uppercase, numbers, and a space
+(Speer et al., 2017), whereas learning character-     character. Multi-character tokens are all comprised
+token correspondences is comparatively simpler:       of the same number of characters, K, uniformly
+we know at all times which characters comprise a      sampled (see Appendix A: Table 3). In our work,
+word, and we can leverage this in the design of a     K ∈ {4, 6, 8} and |V | ∈ {28, . . . , 215}. To en-
+character-aware architecture.                         code a task, we use a special task token for each
+                                                      task, which is optionally followed by parameters
+3.2 Experimental Setup                                (see Table 1). Consequently, our tokenizer is com-
+                                                      prised of single characters, numbers, and multi-
+Word-level and Character-level tasks. Previ-          character words, each with its unique ID. As such,
+ous works explored pretrained LLMs’ performance       if a multi-character word is corrupted, it will be rep-
+on several character-level tasks (Shin and Kaneko,    resented through individual characters as a fallback
+2024; Zhang and He, 2024) and show that their per-    tokenization, with no intermediate subwords.
+formance is sub-par. In this work, we create a set
+of 7 word-level tasks and 12 character-level tasks       For our analysis, we ignore language grammar,
+to systematically explore emergent capabilities for   since none of the tasks require grammar manipu-
+character manipulation across training. Compared      lation, only token and character manipulation. To
+to previous works, our tasks are easier and do        construct sentences, words are sampled uniformly
+not involve counting or multi-hop reasoning (e.g.,    from the tokenizer vocabulary (see Appendix A:
+count vowels of every even word). Table 1 shows       Table 4), ignoring the Zipﬁan distribution of real-
+our tasks alongside examples for parameters, in-      world languages (Piantadosi, 2014). However, we
+puts, and desired outputs. By design, the tasks       also test performance on randomly sampled sen-
+have input-output combinations tokenized either as    tences from Wikipedia, using two pretrained to-
+words ↔ words (all word-level tasks), characters      kenizers (i.e., GPT-2 (Radford et al., 2019) and
+↔ words (dirty-input character tasks), words ↔        LLaMA-2 (Touvron et al., 2023)). It is expected
+characters (clean-input character tasks), or a mix    that real-world texts would not qualitatively change
+of tokenizations (e.g., "Rewrite uppercase" / "Re-    learning dynamics; still, they would make learn-
+place letters"). As such, for character-level tasks,  ing harder due to the imbalanced distribution of
+multi-character tokens might be imperfectly split     characters per word and different word lengths.
+into characters (e.g., "Remove letter"), and mod-
+els are forced to indirectly learn token-character       In this most simpliﬁed version of the problem,
+correspondence across many training steps. Tasks      the only factor inﬂuencing model performance is
+are evaluated using an exact match between the        its ability to connect tokens with their characters,
+model output and the desired output. While us-        which appear fragmented and inconsistent across
+ing exact match metrics impacts evaluation curves     training. Such a strictly controlled environment
+(Schaeffer et al., 2023), they are correlated with    is similar to other concurrent works (Allen-Zhu
+other softer metrics such as log-probabilities, and   and Li, 2023) aiming to explain model capabilities
+                                                      without real-world confounders. In this setup, the
+                                                      model is forced to learn the algorithm behind each
+
+  4
+28255
+Word-Level       Task Name                          Example Param.  Example Input                    Example Output
+
+Character-Level  Remove word                                red     Strawberries are red and sweet.  Strawberries are and sweet.
+                 Remove word every K                          2     Strawberries are red and sweet.  Strawberries red sweet.
+                 Swap every K words (clean)                   5     Strawberries are red and sweet.  sweet. are red and Strawberries
+                 Swap every K words (dirty)                   5     sweet. are red and Strawberries  Strawberries are red and sweet.
+                 Replace words                            are, red  Strawberries are red and sweet.  Strawberries red red and sweet.
+                 Reverse the words (clean)                  N/A     Strawberries are red and sweet.  sweet. and red are Strawberries
+                 Reverse the words (dirty)                  N/A     sweet. and red are Strawberries  Strawberries are red and sweet.
+
+                 Remove letter                                r     Strawberries are red and sweet.  Stawbeies ae ed and sweet.
+                 Rewrite uppercase every K letters            3     Strawberries are red and sweet.  StrAwbErrIes arE rEd And swEet.
+                 Replace letters                            e, s    Strawberries are red and sweet.  Strawbsrriss ars rsd and swsst.
+                 Rewrite with every K letter                  3     Strawberries are red and sweet.  Saei eea e.
+                 Swap every K letters (clean)                 2     Strawberries are red and sweet.  tSarbwreirsea err dea dns ewte.
+                 Swap every K letters (dirty)                 2     tSarbwreirsea err dea dns ewte.  Strawberries are red and sweet.
+                 Remove letter every K                        4     Strawberries are red and sweet.  Strwberie ar re an swet.
+                 Rewrite uppercase every K words              2     Strawberries are red and sweet.  STRAWBERRIES are RED and SWEET.
+                 Reverse words (clean)                      N/A     Strawberries are red and sweet.  seirrebwartS era der dna .teews
+                 Reverse words (dirty)                      N/A     seirrebwartS era der dna .teews  Strawberries are red and sweet.
+                 Reverse (clean)                            N/A     Strawberries are red and sweet.  .teews dna der era seirrebwartS
+                 Reverse (dirty)                            N/A     .teews dna der era seirrebwartS  Strawberries are red and sweet.
+
+Table 1: Summary of proposed tasks used in our work. The tasks address either word-level or character-level
+manipulations and optionally require input parameters.
+
+task, through so-called "induction heads" (Olsson                   vious tokens, but does not "cheat" by attending
+et al., 2022) or "name mover heads" (Wang et al.,
+2022), since the tasks only require token-level ma-                 to the characters of future tokens. The order of
+nipulations and not semantic understanding (Shin
+and Kaneko, 2024).                                                  characters inside a token is encoded using learn-
+
+3.3 Generating tokens by attending to                               able Intra-Token Position embeddings, similar to
+       characters.
+                                                                    Abacus Embeddings (McLeish et al., 2024). The
+We design a lightweight character-aware module
+that complements the main Transformer decoder                       dimensionality of the character encoder can be
+to increase the mutual information between tokens
+and their constitutive characters. In our design, we                made smaller than the main module (in our case,
+were guided by several criteria: (i) the character-
+aware module must be lightweight (ii) the model                     dchars  =  1  dtokens            =  256).  We also experiment
+output type must remain unchanged (i.e., still out-                            2
+put multi-character tokens), (iii) there is an unam-                with smaller dimensionalities for the character
+biguous correspondence between tokens and their
+characters, and (iv) there is an unambiguous order                  module (i.e., dchars ∈ {64, 128, 256}, correspond-
+of characters inside a token.                                       ing    ctoharraatciotesrsdd,tcothkhaeernssre∈sul{ti14n,g18e, m116b}e)d. dAinfgtserinetnecroacdt-
+                                                                    ing
+   Figure 2 showcases our architecture. Given
+these criteria, we designed a small, 1-layer                        with the token embeddings through a Block-Causal
+Transformer block that uses a Block-Causal Self-
+Attention mask to process characters. Since the                     Cross-Attention operation at each layer of the main
+main model operates on multi-character tokens,
+whenever a new token is generated, the charac-                      model. We also experiment with adding the charac-
+ter model has access to all its characters, remov-
+ing the need for a casual diagonal attention ma-                    ter embeddings at a single layer of the main model,
+trix. The block-causal attention mask enables the
+module to attend to all characters in the current                   at different positions. The cross-attention opera-
+token, as well as previous characters from pre-
+                                                                    tion prevents tokens from attending to future char-
+
+                                                                    acters and ensures that each token attends to its cor-
+
+                                                                    responding characters alongside characters from
+
+                                                                    previous tokens. Character-token correspondence
+
+                                                                    is ensured through learnable Inter-Token Position
+
+                                                                    embeddings.
+
+                                                                    Overview. The model is efﬁcient by operating on
+                                                                    multi-character tokens and not directly predicting
+                                                                    characters, leveraging the tokenizer compression,
+                                                                    and has explicit knowledge of the character com-
+                                                                    position of each token. In principle, this design
+                                                                    can be extended hierarchically, for example, hav-
+
+                                                                      5
+                                                                    28256
+Figure 2: Diagram of our character-aware language model. During inference, each token attends to its corresponding
+characters using a block-causal cross-attention operation. Characters are encoded alongside their positions
+within their corresponding tokens using a small 1-block Transformer decoder, using a block-causal self-attention
+mechanism. MLPs are omitted in the ﬁgure for brevity.
+
+ing tokens attend to their constituent subwords and    our model has 11M parameters, with 1M being
+each subword attending to its constituent charac-      allocated to the character encoder. The character
+ters. While the character module is signiﬁcantly       encoder is a lightweight, single-block Transformer
+smaller than the main module, it still suffers from    with a dimensionality of 256. One important ad-
+the quadratic complexity of the attention operation.   vantage of our experimental setup is that it is read-
+Presumably, the character encoder can be made          ily reproducible on a single A100 GPU. Training
+more efﬁcient to avoid quadratic attention by utiliz-  took approximately one day per run for all ∼60
+ing, for example, local attention patterns (Beltagy    runs. Models were trained with "inﬁnite" data,
+et al., 2020) or by using more specialized mod-        since input sentences and tasks were generated on-
+ules such as linear recurrent units (Orvieto et al.,   the-ﬂy. In the case of training on sentences from
+2023). Our model is reminiscent of other works         Wikipedia, we pre-generated 5M sentences. In our
+in computer vision, such as CrossViT (Chen et al.,     experiments, every hyperparameter is kept ﬁxed,
+2021), and is part of a larger pattern of designing    except for the vocabulary and the tokenizer.
+architectures that use hierarchical representations
+(Nawrot et al., 2021; Chalkidis et al., 2022; He       4 Experiments & Results
+et al., 2024). Nevertheless, this pattern is more
+common in computer vision than in NLP. This hier-      In Figure 4, we show the evolution of average ac-
+archical character-to-token cross-attention design     curacy across character tasks for both the base lan-
+addresses the problem of "perception" of current       guage model and our model that incorporates char-
+LLMs, which capture high-level semantic mean-          acter information. The emergence point for char-
+ing, but struggle at "high-resolution", in terms of    acter understanding tasks is progressively offset as
+perceiving individual characters of each token.        a function of vocabulary size |V | and number of
+                                                       characters per token K. In contrast, for our model,
+3.4 Training conﬁguration                              the emergence points are stable across |V | and K,
+                                                       having reasonable performance gain even in sce-
+All models were trained on a uniform sample            narios where the base model has accuracy equal
+over all tasks for 750k iterations. We used Adam       to 0. This effect is also present, although not as
+(Kingma and Ba, 2014) optimizer, a batch size of       prominently, for token understanding tasks (Figure
+64, and a learning rate of 0.00001, annealed using     5), since token manipulation tasks can be easily
+a cosine decay scheduler (Loshchilov and Hutter,       learned by the base model.
+2016). The baseline model has 10M parameters,
+excluding embedding matrices, across 8 layers,            In Figure 3 we show the emergence step across
+with a model dimensionality of 512. Similarly,         vocabulary sizes. We plot the training step at which
+
+  6
+28257
+Figure 3: Emergence point for acquisition of character-level (top) and word-level (bottom) understanding across
+vocabulary sizes for the "vanilla" model and our character-infused model. For our model, capabilities emerge early
+on in training for character-level tasks, and do not depend on |V | or |K|.
+
+Figure 4: Evolution of average accuracy over character-  Figure 5: Evolution of average accuracy over word-level
+level tasks. Using standard transformer decoder (top),   tasks. Emergence points for word-level tasks are not
+the emergence point depends on the vocabulary size       affected by vocabulary size as prominently as character-
+and K, whereas our architecture (bottom) eliminates      level tasks. While our architecture (bottom) targets
+the differences in emergence points across vocabulary    character-token associations, it still provides improve-
+sizes.                                                   ment by increasing the amount of information per train-
+                                                         ing sample compared to the standard LM (top).
+
+the accuracy for a task is larger than 0.5%, across      4.1 Evaluation on real-world data
+training runs of different |V | and K. We ﬁnd that
+increasing vocabulary size is correlated with a later    We trained the baseline language model and our
+emergence point for the vanilla model for both           model on sentences sourced from Wikipedia, us-
+word-level and character-level tasks, having a pre-      ing two pretrained tokenizers (i.e., GPT-2 (Radford
+dictable relationship. The addition of the character-    et al., 2019) and LLaMa-2 (Touvron et al., 2023)),
+aware module eliminates the dependence on |V |           with vocabulary sizes of 50K and 32K tokens, re-
+for character-level tasks, but to a lesser extent for    spectively. In Figure 6 we show our results: in-
+the word-level tasks.                                    corporating characters has a signiﬁcant effect on
+                                                         learning dynamics for both tokenizers, with the
+
+  7
+28258
+Figure 6: The effect of using real sentences sourced  Figure 7: The effect of the position of the block-cross
+from Wikipedia in evaluating character understanding  attention in the main model (top) and that of downsizing
+tasks, across two pretrained tokenizers.              the char. encoder (bottom). |V | = 8192 and K = 4.
+
+base model being unable to learn character com-       4.3 The effect of increasing base model size
+position of words across training. As our results
+point to, this effect will be ampliﬁed with larger    We scaled the model in a principled way using
+vocabularies: current LLMs tend to beneﬁt from        maximal update parametrization (µP (Yang et al.,
+having progressively larger vocabularies (Huang       2022)) to increase the model width (size of the lin-
+et al., 2025), with models such as Gemma 3 (Team      ear layer) through a multiplicative factor. Using µP
+et al., 2025) operating on a vocabulary of 256K       ensures that the hyperparameters for the smaller
+tokens, which also implies more characters per        model (e.g. learning rate) can be directly trans-
+token. Our results indicate that character under-     ferred to larger versions of the same model, mak-
+standing tasks in tokenized language models are a     ing the comparison fair between scales in terms
+form of "inverse scaling" (McKenzie et al., 2023):    of optimal hyperparameters. We scaled the base
+the larger the tokenizer vocabulary, the slower the   encoder, but kept the character encoder ﬁxed. The
+model learns.                                         results presented in Table 2 show that scaling the
+                                                      width of the model reduces the emergence point,
+4.2 The effect of downsizing the character            but without addition of the character encoder, the
+      encoder                                         acquisition is slow and inefﬁcient. In other words,
+                                                      without the character encoder, model needs ×15
+In Figure 7, we show results for varying the po-      more parameters to reach the same performance.
+sition of the cross-attention operation in the main   Across scales, the size of the character encoder
+model by incorporating character information ei-      is negligible. These results are for our simpliﬁed
+ther at the beginning, the middle, or the end of the  case, assuming uniform distribution of characters
+language model. Similarly, we reduce the dimen-       and tokens. Our other results (Figure 6) shows that
+sionality of the character encoder to 12.5% of that   this effect is greatly ampliﬁed with real world data.
+of the main model, making the character model fast
+and lightweight in terms of memory consumption.       4.4 A percolation model of character
+Infusing character information in the middle of the         understanding.
+model yields the best results, and downsizing the
+character encoder does not signiﬁcantly alter the     In the interest of explaining the offset emergence
+training curves, suggesting that only the presence    points for the acquisition character understanding,
+of characters and their association with tokens is    we applied a percolation model of capability emer-
+sufﬁcient.                                            gence, as described by Lubana et al. (2025). Read-
+                                                      ers are referred to the original work for a detailed
+                                                      explanation of this framework, which the authors
+
+  8
+28259
+Vocab. Size  Model Width  Base Params  Character-Aware  Params Char. En- Char. Tasks Emergence Step↓
+    8192                                                coder (% of base)
+   16384           512         10M               
+                  1024         45M                     –          >750k
+                  2048        150M                     1M (9%)    77k
+                   512         10M              
+                  1024         45M                     –          180k
+                  2048        150M                     1M (2%)    53k
+
+                                                       –          81k
+                                                
+                                                       1M (0.6%)  20k
+                                                
+                                                       –          >750k
+                                                       1M (9%)    110k
+
+                                                        –          260k
+                                                        1M (2%)    53k
+
+                                                        –          110k
+                                                        1M (0.6%)  45k
+
+Table 2: The effect of increasing model scale in terms of width. The addition of a small character-aware module
+substantially reduces the emergence point for the acquisition of character-level understanding. We kept K = 4
+ﬁxed across all runs.
+
+applied in the context of learning concept-property  Figure 8: Graph percolation explains emergence points
+relationships. In that scenario, emergence points    for acquisition of character understanding, similar to
+coincided with a critical threshold pc in which the  concept percolation (Lubana et al., 2025). Scaling train-
+bipartite graph of concepts and their respective     ing curves by the percolation threshold |V | ∗ k col-
+properties (K) is fully connected: across train-     lapses emergence points across vocabulary sizes.
+ing, the model progressively learns edges between
+concepts and properties until reaching a certain     due to non-reporting bias and that this phenomenon
+threshold, proportional to |K|, after which the      is similar to learning commonsense facts from gen-
+model enters a sudden generalization phase. In       eral text. There is a design mismatch in the way in
+our scenario, we have a direct analogy to concept    which humans hierarchically perceive written text
+learning: our "concepts" are multi-character to-     (from lines, characters, words and phrases) and the
+kens, and their "properties" are the set of char-    way LLMs process text.
+acters they are composed of. As such, the emer-
+gence point should be proportional to the num-          To this end, we proposed a lightweight and
+ber of edges (Newman et al., 2001; Cohen et al.,     straightforward architectural modiﬁcation that
+2002; Lubana et al., 2025), in our case equaling     eliminates this dependence on vocabulary size and
+                                                     showed that capabilities emerge faster and con-
+   |V | ∗ k. In Figure 8 we show the emergence       sistently. Lastly, we applied a theory of capabil-
+points for the base language model. Scaling the      ity emergence in concept learning (Lubana et al.,
+training steps by |V | ∗ k results in the collapse   2025) and showed that it applied to our setting,
+of the emergence points. This result indicates no    equating the phenomena of learning concepts with
+conceptual difference between learning concept-      learning characters’ composition in tokens.
+property mappings and learning token-character
+mappings.
+
+5 Conclusions
+
+Tokenization is crucial in language modeling, en-
+abling long context and aiding generalization (Ra-
+jaraman et al., 2024). In this paper, we show that
+for a class of problems that require ﬁne-grained
+understanding of character composition of tokens,
+models acquire such information very slowly, pre-
+dictably dependent on the vocabulary size and num-
+ber of characters per token. We argued that this is
+
+                                         9
+                                       28260
+Limitations                                                Reuven Cohen, Daniel Ben-Avraham, and Shlomo
+                                                              Havlin. 2002. Percolation critical exponents in scale-
+The main limitation of our work is that we con-               free networks. Physical Review E, 66(3):036113.
+ducted most of our experiments in a synthetic and
+idealized setup to understand the phenomena of             Quyet V Do, Junze Li, Tung-Duong Vuong, Zhaowei
+character understanding of tokens, without con-               Wang, Yangqiu Song, and Xiaojuan Ma. 2024. What
+founding factors. Nonetheless, our proposed archi-            really is commonsense knowledge? arXiv preprint
+tecture showed good results when training on real             arXiv:2411.03964.
+data, but its impact to real-world scenarios needs
+to be validated at larger scales.                          Jonathan Gordon and Benjamin Van Durme. 2013. Re-
+                                                              porting bias and knowledge acquisition. In Proceed-
+Acknowledgments                                               ings of the 2013 Workshop on Automated Knowl-
+                                                              edge Base Construction, AKBC ’13, page 2530, New
+This research was supported by the project "Ro-               York, NY, USA. Association for Computing Machin-
+manian Hub for Artiﬁcial Intelligence - HRIA",                ery.
+Smart Growth, Digitization and Financial Instru-
+ments Program, MySMIS no. 334906. We also                  Haoyu He, Markus Flicke, Jan Buchmann, Iryna
+thank Oleg Szehr for his unforgiving feedback that            Gurevych, and Andreas Geiger. 2024. HDT: Hierar-
+led to a more rigorous presentation of our method.            chical document transformer. In First Conference on
+                                                              Language Modeling.
+References
+                                                           Hongzhi Huang, Defa Zhu, Banggu Wu, Yutao Zeng,
+Josh Achiam, Steven Adler, Sandhini Agarwal, Lama             Ya Wang, Qiyang Min, and Xun Zhou. 2025. Over-
+   Ahmad, Ilge Akkaya, Florencia Leoni Aleman,                tokenized transformer: Vocabulary is generally worth
+   Diogo Almeida, Janko Altenschmidt, and 1 oth-              scaling. Preprint, arXiv:2501.16975.
+   ers. 2023. Gpt-4 technical report. arXiv preprint
+   arXiv:2303.08774.                                       Dieuwke Hupkes, Verna Dankers, Mathijs Mul, and
+                                                              Elia Bruni. 2020. Compositionality decomposed:
+Zeyuan Allen-Zhu and Yuanzhi Li. 2023. Physics of             How do neural networks generalise? volume 67,
+   language models: Part 1, learning hierarchical lan-        pages 757–795.
+   guage structures. arXiv preprint arXiv:2305.13673.
+                                                           Md Moﬁjul Islam, Gustavo Aguilar, Pragaash Pon-
+P. W. Anderson. 1972. More is different. Science,             nusamy, Clint Solomon Mathialagan, Chengyuan
+   177(4047):393–396.                                         Ma, and Chenlei Guo. 2022. A vocabulary-free mul-
+                                                              tilingual neural tokenizer for end-to-end task learn-
+Iz Beltagy, Matthew E. Peters, and Arman Cohan.               ing. arXiv preprint arXiv:2204.10815.
+   2020. Longformer: The long-document transformer.
+   arXiv:2004.05150.                                       Guy Kaplan, Matanel Oren, Yuval Reif, and Roy
+                                                              Schwartz. 2025. From tokens to words: On the inner
+Yekun Chai, Yewei Fang, Qiwei Peng, and Xuhong                lexicon of LLMs. In The Thirteenth International
+   Li. 2024. Tokenization falling short: On subword           Conference on Learning Representations.
+   robustness in large language models. In Findings
+   of the Association for Computational Linguistics:       Diederik P Kingma and Jimmy Ba. 2014. Adam: A
+   EMNLP 2024, pages 1582–1599, Miami, Florida,               method for stochastic optimization. arXiv preprint
+   USA. Association for Computational Linguistics.            arXiv:1412.6980.
+
+Ilias Chalkidis, Xiang Dai, Manos Fergadiotis, Prodro-     Ilya Loshchilov and Frank Hutter. 2016. Sgdr: Stochas-
+   mos Malakasiotis, and Desmond Elliott. 2022. An            tic gradient descent with warm restarts. arXiv
+   exploration of hierarchical attention transformers for     preprint arXiv:1608.03983.
+   efﬁcient long document classiﬁcation. arXiv preprint
+   arXiv:2210.05529.                                       Ekdeep Singh Lubana, Kyogo Kawaguchi, Robert P.
+                                                              Dick, and Hidenori Tanaka. 2025. A percolation
+Chun-Fu Richard Chen, Quanfu Fan, and Rameswar                model of emergence: Analyzing transformers trained
+   Panda. 2021. Crossvit: Cross-attention multi-scale         on a formal language. In The Thirteenth Interna-
+   vision transformer for image classiﬁcation. In Pro-        tional Conference on Learning Representations.
+   ceedings of the IEEE/CVF international conference
+   on computer vision, pages 357–366.                      Ian R. McKenzie, Alexander Lyzhov, Michael Martin
+                                                              Pieler, Alicia Parrish, Aaron Mueller, Ameya Prabhu,
+                                                              Euan McLean, Xudong Shen, and 1 others. 2023. In-
+                                                              verse scaling: When bigger isn’t better. Transactions
+                                                              on Machine Learning Research. Featured Certiﬁca-
+                                                              tion.
+
+ 10
+28261
+Sean Michael McLeish, Arpit Bansal, Alex Stein,            Rico Sennrich, Barry Haddow, and Alexandra Birch.
+   Neel Jain, John Kirchenbauer, Brian R. Bartoldson,         2015. Neural machine translation of rare words with
+   Bhavya Kailkhura, Abhinav Bhatele, and 1 others.           subword units. arXiv preprint arXiv:1508.07909.
+   2024. Transformers can do arithmetic with the right
+   embeddings. In The Thirty-eighth Annual Confer-         Claude E Shannon and Warren Weaver. 1998. The
+   ence on Neural Information Processing Systems.             mathematical theory of communication. University
+                                                              of Illinois press.
+Piotr Nawrot, Szymon Tworkowski, Michał Tyrolski,
+   Łukasz Kaiser, Yuhuai Wu, Christian Szegedy, and        Andrew Shin and Kunitake Kaneko. 2024. Large lan-
+   Henryk Michalewski. 2021. Hierarchical trans-              guage models lack understanding of character com-
+   formers are more efﬁcient language models. arXiv           position of words. In ICML 2024 Workshop on LLMs
+   preprint arXiv:2110.13711.                                 and Cognition.
+
+Pit Neitemeier, Björn Deiseroth, Constantin Eichenberg,    Vered Shwartz and Yejin Choi. 2020. Do neural lan-
+   and Lukas Balles. 2025. Hierarchical autoregressive        guage models overcome reporting bias? In Pro-
+   transformers for tokenizer-free language modelling.        ceedings of the 28th International Conference on
+   In The Thirteenth International Conference on Learn-       Computational Linguistics, pages 6863–6870.
+   ing Representations.
+                                                           Robyn Speer, Joshua Chin, and Catherine Havasi. 2017.
+Allen Newell. 1983. Intellectual issues in the history of     Conceptnet 5.5: An open multilingual graph of gen-
+   artiﬁcial intelligence, page 187294. John Wiley &          eral knowledge. In Proceedings of the AAAI confer-
+   Sons, Inc., USA.                                           ence on artiﬁcial intelligence, volume 31.
+
+Mark EJ Newman, Steven H Strogatz, and Duncan J            Yi Tay, Vinh Q. Tran, Sebastian Ruder, Jai Gupta,
+   Watts. 2001. Random graphs with arbitrary degree           Hyung Won Chung, Dara Bahri, Zhen Qin, Simon
+   distributions and their applications. Physical review      Baumgartner, and 1 others. 2022. Charformer: Fast
+   E, 64(2):026118.                                           character transformers via gradient-based subword
+                                                              tokenization. In International Conference on Learn-
+Catherine Olsson, Nelson Elhage, Neel Nanda,                  ing Representations.
+   Nicholas Joseph, Nova DasSarma, Tom Henighan,
+   Ben Mann, Amanda Askell, and 1 others. 2022. In-        Gemma Team, Aishwarya Kamath, Johan Ferret,
+   context learning and induction heads. arXiv preprint       Shreya Pathak, Nino Vieillard, Ramona Merhej,
+   arXiv:2209.11895.                                          Sarah Perrin, Tatiana Matejovicova, Alexandre
+                                                              Ramé, Morgane Rivière, Louis Rouillard, Thomas
+Antonio Orvieto, Samuel L Smith, Albert Gu, Anushan           Mesnard, Geoffrey Cideron, Jean bastien Grill,
+   Fernando, Caglar Gulcehre, Razvan Pascanu, and             Sabela Ramos, Edouard Yvinec, Michelle Cas-
+   Soham De. 2023. Resurrecting recurrent neural net-         bon, Etienne Pot, Ivo Penchev, and 197 others.
+   works for long sequences. In International Con-            2025. Gemma 3 technical report. Preprint,
+   ference on Machine Learning, pages 26670–26698.            arXiv:2503.19786.
+   PMLR.
+                                                           Hugo Touvron, Louis Martin, Kevin Stone, Peter Albert,
+Core Francisco Park, Maya Okawa, Andrew Lee,                  Amjad Almahairi, Yasmine Babaei, Nikolay Bash-
+   Ekdeep Singh Lubana, and Hidenori Tanaka. 2024.            lykov, Soumya Batra, and 1 others. 2023. Llama
+   Emergence of hidden capabilities: Exploring learn-         2: Open foundation and ﬁne-tuned chat models.
+   ing dynamics in concept space. In The Thirty-eighth        Preprint, arXiv:2307.09288.
+   Annual Conference on Neural Information Process-
+   ing Systems.                                            Trieu H Trinh, Yuhuai Wu, Quoc V Le, He He,
+                                                              and Thang Luong. 2024. Solving olympiad ge-
+Steven T Piantadosi. 2014. Zipf’s word frequency law          ometry without human demonstrations. Nature,
+   in natural language: a critical review and future di-      625(7995):476–482.
+   rections. Psychon Bull Rev, 21(5):1112–1130.
+                                                           Junxiong Wang, Tushaar Gangavarapu, Jing Nathan
+Alec Radford, Jeff Wu, Rewon Child, David Luan,               Yan, and Alexander M Rush. 2024. Mambabyte:
+   Dario Amodei, and Ilya Sutskever. 2019. Language           Token-free selective state space model. In First Con-
+   models are unsupervised multitask learners.                ference on Language Modeling.
+
+Nived Rajaraman, Jiantao Jiao, and Kannan Ramchan-         Kevin Wang, Alexandre Variengien, Arthur Conmy,
+   dran. 2024. Toward a theory of tokenization in llms.       Buck Shlegeris, and Jacob Steinhardt. 2022. In-
+   arXiv preprint arXiv:2404.08335.                           terpretability in the wild: a circuit for indirect ob-
+                                                              ject identiﬁcation in gpt-2 small. arXiv preprint
+Rylan Schaeffer, Brando Miranda, and Sanmi Koyejo.            arXiv:2211.00593.
+   2023. Are emergent abilities of large language mod-
+   els a mirage? In Thirty-seventh Conference on Neu-
+   ral Information Processing Systems.
+
+ 11
+28262
+Zihao Wang, Shaofei Cai, Guanzhou Chen, Anji Liu, Xi-      1 def make_vocab(vocab_size, K):
+   aojian Ma, Yitao Liang, and Team CraftJarvis. 2023.
+   Describe, explain, plan and select: interactive plan-   2   vocab = dict()
+   ning with large language models enables open-world
+   multi-task agents. In Proceedings of the 37th Interna-  3   token_id = 0
+   tional Conference on Neural Information Processing
+   Systems, NIPS ’23, Red Hook, NY, USA. Curran            4
+   Associates Inc.
+                                                           5   numbers = '0123456789'
+Chuhan Wu, Fangzhao Wu, Tao Qi, and Yongfeng
+   Huang. 2021. Hi-transformer: Hierarchical inter-        6   letters_lower =
+   active transformer for efﬁcient and effective long
+   document modeling. In Proceedings of the 59th An-           → 'abcdefghijklmnopqrstuvwxyz'
+   nual Meeting of the Association for Computational
+   Linguistics and the 11th International Joint Confer-    7   letters_upper = letters_lower.upper()
+   ence on Natural Language Processing (Volume 2:
+   Short Papers), pages 848–853.                           8   letters = letters_lower + letters_upper
+
+Linting Xue, Aditya Barua, Noah Constant, Rami Al-         9
+   Rfou, Sharan Narang, Mihir Kale, Adam Roberts,
+   and Colin Raffel. 2022. ByT5: Towards a token-free      10  # adding the bytes and space
+   future with pre-trained byte-to-byte models. Trans-
+   actions of the Association for Computational Lin-       11  for token_name in letters + numbers + ' ':
+   guistics, 10:291–306.
+                                                           12      vocab[token_name] = token_id
+Greg Yang, Edward J. Hu, Igor Babuschkin, Szymon
+   Sidor, Xiaodong Liu, David Farhi, Nick Ryder, Jakub     13      token_id += 1
+   Pachocki, Weizhu Chen, and Jianfeng Gao. 2022.
+   Tensor programs v: Tuning large neural networks         14
+   via zero-shot hyperparameter transfer. Preprint,
+   arXiv:2203.03466.                                       15  # adding multi-character tokens
+
+Yidan Zhang and Zhenan He. 2024. Large language            16  for _ in range(vocab_size):
+   models can not perform well in understanding and
+   manipulating natural language at both character and     17      word = ''.join(random.choice(letters)
+   word levels? In Findings of the Association for
+   Computational Linguistics: EMNLP 2024, pages                    → for _ in range(K))
+   11826–11842.
+                                                           18      vocab[word] = token_id
+A Appendix
+                                                           19      token_id += 1
+
+                                                           20
+
+                                                           21  return vocab
+
+                                                           Table 3: Python snippet for tokenizer vocabulary cre-
+                                                           ation. In our work, words are made from randomly
+                                                           sampled characters of ﬁxed size K. The tokenizer vo-
+                                                           cabulary contains single-characters, numbers, multi-
+                                                           character words, and a space as individual unique to-
+                                                           kens. Additionally, each task is represented as a unique
+                                                           special token.
+
+                                                           1 def make_task(tokenizer):
+
+                                                           2   target_task = random.choice(TASKS)
+
+                                                           3   # choose multi-character words
+
+                                                           4   word_list = [
+
+                                                           5       w for w in tokenizer.vocab2id.keys()
+
+                                                           6       (if len(w) > 1 and w not in
+
+                                                                   → SpecialTokens)
+
+                                                           7   ]
+
+                                                           8   random_sentence = ' '.join([
+
+                                                           9       random.choice(word_list) for _ in
+
+                                                                   → range(16)
+
+                                                           10  ])
+
+                                                           11  task_output = target_task(random_sentence)
+
+                                                           12  # task_token, param, input, output
+
+                                                           13  return task_output
+
+                                                           Table 4: Python snippet for task creation. In our work,
+                                                           a sentence is comprised of 16 uniformly sampled multi-
+                                                           character words from the tokenizer, upon which the task
+                                                           algorithm is enacted.
+
+ 12
+28263
+

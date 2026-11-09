@@ -1,0 +1,516 @@
+                                        Character-Level Language Modeling with Deeper Self-Attention
+
+                                        Rami Al-Rfou*  Dokook Choe*  Noah Constant*                          Mandy Guo*  Llion Jones*
+
+                                                                                        Google AI Language
+                                                       {rmyeid, choed, nconstant, xyguo, llion}@google.com
+
+arXiv:1808.04444v2 [cs.CL] 10 Dec 2018                                Abstract                               only effectively uses around 200 tokens of context (even if
+                                                                                                             more is provided), and that word order only has an effect
+                                           LSTMs and other RNN variants have shown strong perfor-            within approximately the last 50 tokens.
+                                           mance on character-level language modeling. These models
+                                           are typically trained using truncated backpropagation through        In this paper, we show that a non-recurrent model can
+                                           time, and it is common to assume that their success stems         achieve strong results on character-level language model-
+                                           from their ability to remember long-term contexts. In this        ing. Speciﬁcally, we use a deep network of transformer
+                                           paper, we show that a deep (64-layer) transformer model           self-attention layers (Vaswani et al. 2017) with causal
+                                           (Vaswani et al. 2017) with ﬁxed context outperforms RNN           (backward-looking) attention to process ﬁxed-length inputs
+                                           variants by a large margin, achieving state of the art on two     and predict upcoming characters. The model is trained on
+                                           popular benchmarks: 1.13 bits per character on text8 and          mini-batches of sequences from random positions in the
+                                           1.06 on enwik8. To get good results at this depth, we show        training corpus, with no information passed from one batch
+                                           that it is important to add auxiliary losses, both at intermedi-  to the next.
+                                           ate network layers and intermediate sequence positions.
+                                                                                                                Our primary ﬁnding is that the transformer architecture is
+                                                              Introduction                                   well-suited to language modeling over long sequences and
+                                                                                                             could replace RNNs in this domain. We speculate that the
+                                        Character-level modeling of natural language text is chal-           transformer’s success here is due to its ability to “quickly”
+                                        lenging, for several reasons. First, the model must learn a          propagate information over arbitrary distances; by compar-
+                                        large vocabulary of words “from scratch”. Second, natural            ison, RNNs need to learn to pass relevant information for-
+                                        text exhibits dependencies over long distances of hundreds           ward step by step.
+                                        or thousands of time steps. Third, character sequences are
+                                        longer than word sequences and thus require signiﬁcantly                We also ﬁnd that some modiﬁcations to the basic trans-
+                                        more steps of computation.                                           former architecture are beneﬁcial in this domain. Most im-
+                                                                                                             portantly, we add three auxiliary losses, requiring the model
+                                           In recent years, strong character-level language models           to predict upcoming characters (i) at intermediate sequence
+                                        typically follow a common template (Mikolov et al. 2010;             positions, (ii) from intermediate hidden representations, and
+                                        2011; Sundermeyer, Schlu¨ter, and Ney 2012). A recurrent             (iii) at target positions multiple steps in the future. These
+                                        neural net (RNN) is trained over mini-batches of text se-            losses speed up convergence, and make it possible to train
+                                        quences, using a relatively short sequence length (e.g. 200          deeper networks.
+                                        tokens). To capture context longer than the batch sequence
+                                        length, training batches are provided in sequential order, and                 Character Transformer Model
+                                        the hidden states from the previous batch are passed for-
+                                        ward to the current batch. This procedure is known as “trun-         Language models assign a probability distribution over to-
+                                        cated backpropagation through time” (TBTT), because the              ken sequences t0:L by factoring out the joint probability as
+                                        gradient computation doesn’t proceed further than a single           follows, where L is the sequence length:
+                                        batch (Werbos 1990). A range of methods have arisen for
+                                        unbiasing and improving TBTT (Tallec and Ollivier 2017;              L
+                                        Ke et al. 2017).
+                                                                                                             Pr(t0:L) = P (t0) Pr(ti|t0:i−1),  (1)
+                                           While this technique gets good results, it adds complex-
+                                        ity to the training procedure, and recent work suggests              i=1
+                                        that models trained in this manner don’t actually make
+                                        “strong” use of long-term context. For example Khandelwal               To model the conditional probability Pr(ti|t0:i−1), we
+                                        et al. (2018) ﬁnd that a word-based LSTM language model              train a transformer network to process the character se-
+                                                                                                             quence t0:i−1. Transformer networks have recently showed
+                                            *Equal contribution.                                             signiﬁcant gains in tasks that require processing sequences
+                                        Copyright © 2019, Association for the Advancement of Artiﬁcial
+                                        Intelligence (www.aaai.org). All rights reserved.                    accurately and efﬁciently.
+                                                                                                                Our character-level transformer architecture has 64 trans-
+
+                                                                                                             former layers. Following Vaswani et al. (2017), by “trans-
+                                                                                                             former layer” we mean a block containing a multihead self-
+attention sub-layer followed by a feed-forward network of                                         listing the number of parameters in our models, we distin-
+two fully connected sub-layers. For more details on the                                           guish between “training parameters” and “inference param-
+transformer architecture, refer to Vaswani et al. (2017) and                                      eters”.
+the tensor2tensor library1. To ensure that the model’s
+predictions are only conditioned on past characters, we mask                                      Multiple Positions First, we add prediction tasks for each
+our attention layers with a causal attention, so each position                                    position in the ﬁnal layer, extending our predictions from
+can only attend leftward. This is the same as the “masked                                         one per example to |L| (sequence length). Note, predicting
+attention” in the decoder component of the original trans-                                        over all sequence positions is standard practice in RNN-
+former architecture used for sequence-to-sequence problems                                        based approaches. However in our case, since no informa-
+(Vaswani et al. 2017).                                                                            tion is passed forward across batches, this is forcing the
+                                                                                                  model to predict given smaller contexts—sometimes just
+   Figure 1 shows our initial model with the causal attention                                     one or two characters. It is not obvious whether these sec-
+mask limiting information ﬂow from left to right. Each char-                                      ondary training tasks should help on the primary task of pre-
+acter prediction is conditioned only on the characters that                                       dicting with full context. However, we ﬁnd that adding this
+appeared earlier.                                                                                 auxiliary loss speeds up training and gives better results (see
+                                                                                                  Ablation Experiments below). Figure 2 illustrates the task of
+                                                                      t4                          predicting across all sequence positions. We add these losses
+Transformer Layers                                                                                during training without decaying their weights.
+                                                                                Transformer Layers
+                                                                                                        t1      t2      t3      t4
+
+t0  t1  t2  t3
+
+Figure 1: Character transformer network of two layers pro-                                          t0      t1      t2      t3
+cessing a four character sequence to predict t4. The causal
+attention mask limits information to left-to-right ﬂow. Red                                       Figure 2: Adding the intermediate positions prediction tasks
+arrows highlight the prediction task the network has to learn.                                    to our network. Now, we predict the ﬁnal character t4 and
+                                                                                                  all intermediate characters t0:3. t3 has access only to t0:2
+Auxiliary Losses                                                                                  because of the causal attention masks. All of these losses
+
+Our network is, to our knowledge, deeper than any trans-                                          contribute equally during training.
+former network discussed in previous work. In initial exper-
+iments, we found training a network deeper than ten layers                                        Intermediate Layer Losses In addition to the ﬁnal pre-
+to be challenging, with slow convergence and poor accuracy.                                       diction layer, we add predictions made from the output of
+We were able to deepen the network to better effect through                                       each intermediate transformer layer. As with the ﬁnal layer,
+the addition auxiliary losses, which sped up convergence of                                       we add predictions for all intermediate positions in the se-
+the training signiﬁcantly.                                                                        quence (see Figure 3). Lower layers are weighted to con-
+                                                                                                  tribute less and less to the loss as training progresses. If there
+   We add several types of auxiliary losses, correspond-                                          are n layers total, then the lth intermediate layer stops con-
+ing to intermediate positions, intermediate layers, and non-                                      tributing any loss after ﬁnishing l/2n of the training. This
+adjacent targets. We hypothesize that these losses not only                                       schedule drops all intermediate losses after half of the train-
+speed up convergence but also serve as an additional regu-                                        ing is done.
+larizer. During training, the auxiliary losses get added to the
+total loss of the network with discounted weights. Each type                                      Multiple Targets At each position in the sequence, the
+of auxiliary loss has its own schedule of decay. During eval-                                     model makes two (or more) predictions of future characters.
+uation and inference time, only the prediction of the ﬁnal                                        For each new target we introduce a separate classiﬁer. The
+position at the ﬁnal layer is used.                                                               losses of the extra targets get weighted by a multiplier of 0.5
+                                                                                                  before being added to their corresponding layer loss.
+   One consequence of this approach is that a number
+of the network parameters are only used during train-                                             Positional Embeddings
+ing—speciﬁcally, the parameters in the output classiﬁcation
+layers associated with predictions made from intermediate                                         In the basic transformer network described in Vaswani et
+layers and predictions over non-adjacent targets. Thus, when                                      al. (2017), a sinusoidal timing signal is added to the input
+                                                                                                  sequence prior to the ﬁrst transformer layer. However, as our
+    1https://github.com/tensorflow/tensor2tensor
+Transformer Layers      t1      t2      t3      t4              characters. Following Mikolov et al. (2012) and Zhang et
+                                                                al. (2016), we split the data into 90M characters for train,
+                        t1      t2      t3      t4              5M characters for dev, and 5M characters for test.
+
+                                                                   To aid in comparison with other recent approaches, we
+                                                                also evaluate our model on enwik8 (Mahoney 2009) which
+                                                                is 100M bytes of unprocessed Wikipedia text, including
+                                                                markup and non-Latin characters. There are 205 unique
+                                                                bytes in the dataset. Following Chung et al. (2015), and as in
+                                                                text8, we split the data into 90M, 5M and 5M for training,
+                                                                dev and test respectively.
+
+                    t0      t1      t2      t3                  Training
+
+Figure 3: Our network after adding prediction tasks for the     Compared to most models based on transformers (Vaswani
+intermediate layers. For this example of two layers, the
+losses of the intermediate layer prediction tasks will be ab-   et al. 2017; Salimans et al. 2018), our model is very deep,
+sent after ﬁnishing 25% of the training.
+                                                                with 64 transformer layers and each layer using two atten-
+
+                                                                tion heads. Each transformer layer has a hidden size of 512
+
+                                                                and a ﬁlter size of 2048. We feed our model sequences of
+
+Transformer Layers      t1      t2      t3      t4              length 512. Each item in the sequence represents a single
+
+                        t2      t3      t4      t5              byte (or equivalently, one character in text8) which gets
+
+                                                                replaced by its embedding, a vector of size 512. We add to
+
+                                                                the byte embeddings a separate learned positional embed-
+
+                                                                ding for each of the 512 token positions, as described in the
+
+                        t1      t2      t3      t4              Positional Embeddings section above. We do the same ad-
+
+                        t2      t3      t4      t5              dition at each layer activation throughout the network. The
+
+                                                                positional embeddings are not shared across the layers. With
+
+                                                                two predictions per position, each layer learns to predict
+
+                                                                1024 characters. Because we are primarily interested in pre-
+
+                                                                dicting the immediately following character (one step away),
+
+                    t0      t1      t2      t3                  we halve the loss of predicting characters two steps away.
+
+Figure 4: Our example network after adding two predictions      The prediction layers are logistic regression layers over the
+per position.
+                                                                full 256 outputs (the number of unique bytes). To demon-
+
+                                                                strate the generality of the model, we always train and pre-
+
+                                                                dict over all 256 labels, even on datasets that cover a smaller
+
+network is deeper (64 layers), we hypothesize that the tim-     vocabulary. Despite this, we found that in practice the model
+ing information may get lost during the propagation through
+the layers. To address this, we replace the timing signal with  never predicted a byte value outside of the ones observed in
+a learned per-layer positional embedding added to the in-
+put sequence before each transformer layer. Speciﬁcally, the    the training dataset.
+model learns a unique 512-dimensional embedding vector
+for each of the L context positions within each of N layers,    The model has approximately 235 million parameters,
+giving a total of L × N × 512 additional parameters. We are
+able to safely use positional embeddings for our task, as we    which is larger than the number of characters in the text8
+don’t require the model to generalize to longer contexts than
+those seen during training.                                     training corpus. To regularize the model, we apply dropout
+
+                 Experimental Setup                             in the attention and ReLU layers with a probability of 0.55.
+
+Datasets                                                        We use the momentum optimizer with 0.99 momentum. The
+
+For evaluation we focus mainly on text8 (Mahoney 2009).         learning rate is ﬁxed during training to 0.003. We train our
+This dataset consists of English Wikipedia articles, with su-
+perﬂuous content removed (tables, links to foreign language     model for 4 million steps, with each step processing a batch
+versions, citations, footnotes, markup, punctuation). The re-
+maining text is processed to use a minimal character vocab-     of 16 randomly selected sequences. We drop the intermedi-
+ulary of 27 unique characters—lowercase letters a through
+z, and space. Digits are replaced by their spelled-out equiva-  ate layer losses consecutively, as described in the Intermedi-
+lents, so “20” becomes “two zero”. Character sequences
+not in the range [a-zA-Z] are converted to a single space. Fi-  ate Layer Losses section above. Starting from the ﬁrst layer,
+nally, the text is lowercased. The size of the corpus is 100M
+                                                                after  every  62.5K  (=  4M×    1   )  steps,  we  drop  the  losses
+                                                                                              2∗64
+                                                                introduced by the next layer. According to this schedule, af-
+
+                                                                ter training is halfway complete, only the ﬁnal layer losses
+
+                                                                are present.
+
+                                                                Evaluation
+
+                                                                At inference time, we use the model’s prediction at the ﬁ-
+                                                                nal position of the ﬁnal layer to compute the probability of
+                                                                a character given a context of 512 characters. There is no
+                                                                state passed between predictions as would be the case with
+                                                                RNN models, so for each character predicted we have to pro-
+                                                                cess the context from scratch. Because there is no reused
+                                           Parameters (×106)     data.
+
+Model                                      train inference bpc      Table 2 shows the performance of our model given differ-
+LSTM (Cooijmans et al. 2016)                                     ent context sizes. We are able to achieve state-of-the-art re-
+BN-LSTM (Cooijmans et al. 2016)            -    - 1.43           sults once the context increases beyond 128 characters, with
+HM-LSTM (Chung, Ahn, and Bengio 2016)                            the best performance of 1.06 bpc at 512 characters. As ex-
+Recurrent Highway (Zilly et al. 2016)      -    - 1.36           pected, the model performs better when it is given more con-
+mLSTM (Krause et al. 2016)                                       text. However this trend levels off after 512 characters; we
+T12 (ours)                                 35   35 1.29          do not see better results using a context of 1024.
+T64 (ours)
+                                           45   45 1.27             Using the same hyperparameters and training procedure
+                                                                 for text8, we also train and evaluate the T12 and T64 ar-
+                                           45   45 1.27          chitectures on enwik8 (see Table 3). Note, several previous
+                                                                 authors discuss “bits per character” on enwik8 but are in
+                                           44   41 1.18          fact reporting bits per byte. Without retuning for this dataset,
+                                                                 our models still achieve state-of-the-art performance.
+                                           235  219 1.13
+
+mLSTM + dynamic eval (Krause et al. 2017) 45    - 1.19
+
+Table 1: Comparison of various models on text8 test.
+
+       Context            bpc    Accuracy (%)                    Ablation Experiments
+             32        dev test   dev test
+             64       1.25 1.34  72.8 71.1                       To better understand the relative importance of the several
+                      1.17 1.26  74.8 73.0                       modiﬁcations we proposed, we run an ablation analysis. We
+            128       1.12 1.20  76.1 74.4                       start from our best model T64 and then remove one modiﬁ-
+            256       1.09 1.16  76.9 75.3                       cation at a time. For example, when we disable Multiple Po-
+            512       1.06 1.13  77.3 75.9                       sitions, the model gets trained with only the last position loss
+                                                                 for each layer. This corresponds to calculating {L(t4 | t0:3),
+Table 2: Bits per character (bpc) and accuracy of our best       L(t5 | t0:3)} in the example shown in Figure 4 for both the
+model on text8 dev and test, for different context lengths.      ﬁrst and the second layers. When disabling Positional Em-
+                                                                 beddings, we add the default transformer sinusoidal timing
+computation from previous steps, our model requires ex-          signal before the ﬁrst layer.
+pensive computational resources for evaluation and infer-
+ence. We measure the performance of training checkpoints         Description                           bpc   ∆bpc
+(roughly every 10,000 steps) by evaluating bits per character    T64 (Baseline)                       1.062    -
+(bpc) over the entire the validation set, and save the param-    T64 w/out Multiple Positions         2.482
+eters that perform the best. Our best model is achieved after    T64 w/out Intermediate Layer Losses  1.158  1.420
+around 2.5 million steps of training, which takes 175 hours      T64 w/out Positional Embeddings      1.069  0.096
+on a single Google Cloud TPU v2.                                 T64 w/out Multiple Targets           1.068  0.007
+                                                                 T64 w/ SGD Optimizer                 1.065  0.006
+                         Results                                                                             0.003
+
+We report the performance of our best model (T64) on the         Table 4: Evaluation of T64 on text8 dev with context set
+validation and test sets. Table 1 compares our models against    to 512. Disabling each feature or loss lowers the quality of
+several recent results. On the test set, we achieve a new state  the model. The biggest win comes from adding multiple po-
+of the art, 1.13 bpc. This model is 5x larger than previous      sitions and intermediate layers losses.
+models, which necessitated aggressive dropout rates of 0.55.
+For better comparison with smaller models, we also train a          For the ablation experiments, we reuse the hyperparame-
+smaller model (T12) with 41M parameters. This model con-         ters from our best model to avoid a prohibitively expensive
+sists of 12 layers, and trained for 8M steps, with a reduced     parameter search for each ablation. The only exception is
+dropout rate of 0.2. All other settings were left the same as    the SGD experiment, where we vary the learning rate. The
+T64. Our smaller model still outperforms previous models,        analysis shows that the biggest advantage comes from mul-
+achieving 1.18 bpc on the test dataset. Increasing the depth     tiple positions and intermediate layers losses. Predicting all
+of the network from 12 layers to 64 improved the results sig-    the intermediate positions leads to signiﬁcant speed up in
+niﬁcantly, with the auxiliary losses enabling the training to    convergence, since the model sees more effective training
+better utilize the depth of the network. Note, our models do     examples per batch. Adding losses at the intermediate lay-
+not use dynamic evaluation (Krause et al. 2017), a technique     ers acts in the same spirit by forcing more predictions per
+that adjusts model weights at test time by training on test      training step.
+
+                                           Parameters (×106)        Finally, we replace momentum with SGD as our opti-
+                                                                 mizer, using a range of learning rates (0.3, 0.1, 0.03, 0.01,
+Model                                      train inference bpb   0.003, 0.001). This ablation shows that SGD produces com-
+                                                                 petitive models, with learning rate 0.1 giving the best per-
+FS-LSTM-4 (Mujika, Meier, and Steger 2017) 47   - 1.25           formance. Despite the depth of our network, SGD is able to
+                                                                 train the network efﬁciently with the help of our auxiliary
+mLSTM (Krause et al. 2016)                 46   - 1.24           losses.
+
+cmix v13 (Knol 2017)                       -    - 1.23
+
+T12 (ours)                                 44   41 1.11
+
+T64 (ours)                                 235  219 1.06
+
+mLSTM + dynamic eval (Krause et al. 2017)  46   - 1.08
+
+Table 3: Comparison of various models on enwik8 test.
+Type Model                      bpb ppl                                                                  Seed
+
+Word Jo´zefowicz et al. (2016)  - 23.7                              mary was not permitted to see them or to speak in her own de-
+                                                                    fence at the tribunal she refused to offer a written defence unless
+Byte T64                        1.03 40.6                           elizabeth would guarantee a verdict of not guilty which elizabeth
+                                                                    would not do although the casket letters were accepted by the
+Table 5: Performance of T64 on the lm1b test set.                   inquiry as genuine after a study of the handwriting and of the
+                                                                    information contained therein and were generally held to be cer-
+Comparison with Word-Level Models                                   tain proof of guilt if authentic the inquiry reached the conclusion
+                                                                    that nothing was proven from the start this could have been pr
+To understand how byte-level language models perform in
+comparison to word-level language models, we train T64                                         Word Completions
+on the lm1b corpus (Chelba et al. 2013). For lm1b, we
+use the standard train/test split of the preprocessed corpus,       proven, proved, proof, prevented, presented, problematic,
+where out-of-vocab words have been replaced with UNK, to            probably, provided, practical, provoked, preceded, predicted,
+allow comparison to previous work on word and word-piece            previously, presumed, praised, proposed, practicable, pro-
+models. We report word perplexity (ppl) by converting bits-         duced, present, preserved, precisely, prior, protected, probable,
+per-byte (bpb) into ppl2. During training we use the sec-           prompted, proofed, properly, practiced, prohibited, profound,
+ond shard (01) of the heldout dataset as a dev set, as the          preferable, proceeded, precise, predictable, practically, prevalent
+ﬁrst shard (00) is the test. Given this is a signiﬁcantly larger
+dataset than text8, we set all dropouts to zero. Table 5            Figure 5: A seed sequence of 512 characters taken from the
+shows a gap in performance between the two classes of lan-          text8 test set, and all word completions assigned cumula-
+guage models. This comparison can serve as a starting point         tive probability above 0.001 to follow the seed, in order from
+for researching possible ways to bridge the gap.                    most likely (0.529) to least likely (0.001).
+
+Qualitative Analysis                                                second occurrence to she. Similarly, in the continuation, we
+                                                                    change elizabeth to zjakdmu bmijwxn. The result-
+To probe the strengths and weaknesses of our best model             ing distance between the two occurrences of the fake name
+(T64), we run the model forward, starting with the seed se-         is 434 characters.
+quence of 512 characters in Figure 5, taken from the text8
+test set. Figure 6 shows several per-character metrics for the         Figure 7a conﬁrms that the model can successfully copy
+model’s predictions over the true continuation of this seed         over this long distance. While the initial z in zjakdmu is
+text. At each position, we measure i) the model’s prediction        unexpected, the model immediately chooses to copy the re-
+entropy in bits across all 256 output classes, ii) its loss—        mainder of this word from the context, as opposed to pre-
+the negative log probability of the target label, i.e. the “bits    dicting any real z- words learned during training. Similarly,
+per character” for this position, and iii) the rank of the tar-     while the model is somewhat unsure whether the fake sur-
+get in the list of output classes sorted by likelihood. Unsur-      name bmijwxn will appear (assigning the initial b a rank
+prisingly, the model is least certain when predicting the ﬁrst      of two), it immediately picks up on the correspondence after
+character of a word, and becomes progressively more conﬁ-           the b is observed, correctly predicting the remainder of the
+dent and correct as subsequent characters are seen.                 fake surname.
+
+   To investigate the degree to which our model prefers ac-            For comparison, Figure 7b shows how the model would
+tual English words over non-existent words, we compute the          rank the targets in our fake continuation if the original seed
+likelihood the model assigns to all continuations after the         with elizabeth were used. This conﬁrms that the fake
+seed. We cut off continuations when they reach a space char-        name is not predictable based on knowledge gained through
+acter, or when the total probability of the continuation falls      training, and is indeed being copied from the preceding con-
+below 0.001. Figure 5 shows the entire set of word comple-          text.
+tions, in order of probability, where the initial pr- from the
+seed is repeated for readability. Note that these are all real      Generation
+or plausible (proofed) English words, and that even short           For generating samples using our language model, we train
+but bad continuations like prz are assigned a lower cumu-           on a larger and less processed dataset, enwik9 (Mahoney
+lative probability than long realistic word completions like        2009). We split enwik9 into 900M, 50M and 50M for
+predictable.                                                        training, dev and test. Using the dev dataset to tune our
+                                                                    dropout, we ﬁnd that dropout=0.1 performs the best. On the
+   We expect that the transformer self-attention should make        test dataset, T64 achieves 0.85 bpb. Table 6 shows different
+it easy for our model to copy sequences observed in the con-        generated samples following the seed text, using a sampling
+text over long distances (up to the context size of 512 char-       temperature of 1.0.
+acters). To test this expectation, we corrupt the seed and con-
+tinuation from above by introducing a fake name zjakdmu                                  Related Work
+bmijwxn. Speciﬁcally, we change the ﬁrst occurrence of
+elizabeth in the seed to zjakdmu bmijwxn, and the                   Character-level modeling has shown promise in many ar-
+                                                                    eas such as sentiment analysis (Radford, Jo´zefowicz, and
+    2For this test set, ppl = 2bpb∗826189/159658, where 826,189 is
+the number of bytes and 159,658 is the number of tokens.
+Figure 6: Per-character entropy, loss and rank assigned by T64 after seeding on the 512 character sequence from Figure 5.
+
+                               Seed                           ability to easily adapt to other languages. Neural network
+                                                              based language modeling has been heavily researched since
+'''Computational neuroscience''' is an interdisciplinary      its effectiveness was shown by Bengio et al. (2003). By far,
+ﬁeld which draws on [[neuroscience]], [[computer sci-         the most popular architecture in this area is the RNN and
+ence]], and [[applied mathematics]]. It most often uses       variants, ﬁrst studied in Mikolov et al. (2010).
+mathematical and computational techniques such as com-
+puter [[simulation]]s and [[mathematical model]]s to un-         Much of the progress in this area has been made by
+derstand the function of the [[nervous system]].              mitigating the vanishing gradients problem (Hochreiter et
+The ﬁeld of computational neuroscience began with             al. 2001) by architectures such as LSTMs (Hochreiter and
+the work of [[Andrew Huxley]], [[Alan Hodgkin]], and          Schmidhuber 1997), GRU (Cho et al. 2014), Recurrent
+[[David Marr]]. The results of Hodgkin and Huxley's pi-       Highway Networks (Zilly et al. 2016), Unitary RNNs (Ar-
+oneering work in developing                                   jovsky, Shah, and Bengio 2015) and others. This is an issue
+                                                              that transformers do not have, due to attention allowing short
+Sample 1  computational neuroscience were chronicled in       paths to all inputs. Methods of normalizing activation func-
+Sample 2  ''[[Is Mathematics Anything I Could Learn?]]''.     tions, such as Batch Normalization (Ioffe and Szegedy 2015;
+Sample 3  (ISBN 0826412246). Computational                    Merity, Keskar, and Socher 2017) and Layer Normaliza-
+          neuroscience concerned neurological auraria         tion (Lei Ba, Kiros, and Hinton 2016) have also demon-
+          and the inherited ability to communicate and re-    strated improvements on language modeling tasks. As with
+          spond to environmental destruction -                this work, progress has been made with discovering ways to
+          the model were published in 1982 and 1983 re-       regularize sequential architectures, with techniques such as
+          spectively, and the subsequent work on the ﬁeld     Recurrent Dropout (Zaremba, Sutskever, and Vinyals 2014;
+          began its graduate program with [[M                 Gal and Ghahramani 2015) and Zoneout (Krueger et al.
+                                                              2016; Rocki 2016).
+Truth     the voltage clamp allowed them to develop the
+          ﬁrst mathematical model of the [[action poten-         A closely related architecture is the Neural Cache
+          tial]]. David Marr's work focuses on                Model (Grave, Joulin, and Usunier 2016), where the RNN
+                                                              is allowed to attend to all of its previous hidden states at
+Table 6: Samples generated by T64, seeded with text from      each step. Another similar model is used in (Daniluk et
+the enwik9 dev set, using a sampling temperature of 1.0.      al. 2017) where a key-value attention mechanism similar to
+                                                              transformers is used. Both approaches show improvements
+Sutskever 2017), question answering (Kenter, Jones, and       on word level language modeling. Memory Networks (We-
+Hewlett 2018) and classiﬁcation (Zhang, Zhao, and LeCun       ston, Chopra, and Bordes 2014) have a similarity to the
+2015), and is an exciting area due to its simplicity and the  transformer model in design as it also has layers of atten-
+                                                              tion for processing a ﬁx memory representing the input doc-
+(a) Continuing after the modiﬁed seed (including the fake name 434 characters away).
+
+                                                     (b) Continuing after the original seed from Figure 5.
+
+Figure 7: Per-character rank assigned by T64 to a fake continuation, after being seeded on either (a) the fake context where
+elizabeth is replaced with zjakdmu bmijwxn, or (b) the original context.
+
+ument and has been shown to be effective for language mod-      in quality by deepening the network to 64 layers, utilizing
+eling in (Sukhbaatar et al. 2015). ByteNet (Kalchbrenner et     capacity and depth efﬁciently. The use of auxiliary losses at
+al. 2016), which is related but uses layers of dilated con-     intermediate layers and positions is critical for reaching this
+volutions rather than attention, showed promising results       performance, and these losses allow us to train much deeper
+on byte level language modeling. Gated Convolutional Net-       transformer networks. Finally, we analyze the behavior of
+works (Dauphin et al. 2016) was an early non-recurrent          our network and ﬁnd that it is able to exploit dependencies
+model to show superior performance on word level language       in structure and content over long distances, over 400 char-
+modeling.                                                       acters apart.
+
+   Language models are not usually very deep due to com-                               References
+putational constraints of training RNNs, and this also limits
+the number of parameters. The transformer architecture al-      Arjovsky, M.; Shah, A.; and Bengio, Y. 2015. Unitary evolution
+lowed us to build very deep (64 layer) models with a large      recurrent neural networks. CoRR abs/1511.06464.
+number of parameters. A recent CNN model for text clas-
+siﬁcation (Conneau et al. 2016) at 29 layers is considered      Bengio, Y.; Ducharme, R.; Vincent, P.; and Janvin, C. 2003.
+deep in the NLP community. A Sparsely-Gated Mixture-of-         A neural probabilistic language model. J. Mach. Learn. Res.
+Experts Layer (Shazeer et al. 2017) allowed language mod-       3:1137–1155.
+eling experiments with a greatly increased number of pa-
+rameters by only accessing a small portion of parameters        Chelba, C.; Mikolov, T.; Schuster, M.; Ge, Q.; Brants, T.;
+every time step, showing a reduction in bits per word. In Ex-   Koehn, P.; and Robinson, T. 2013. One billion word bench-
+ploring the Limits of Language Modeling (Jo´zefowicz et al.     mark for measuring progress in statistical language modeling.
+2016), an increase in the number of parameters was achieved     arXiv preprint arXiv:1312.3005.
+by mixing character-level and word level models, using spe-
+cialized softmaxes and using a large amount of computa-         Cho, K.; van Merrienboer, B.; Gu¨lc¸ehre, C¸ .; Bougares, F.;
+tional resources to train. IndRNN (Li et al. 2018) uses a sim-  Schwenk, H.; and Bengio, Y. 2014. Learning phrase repre-
+pliﬁed RNN architecture that allows deeper stacking with        sentations using RNN encoder-decoder for statistical machine
+21-layers, achieving near SOTA character-level language         translation. CoRR abs/1406.1078.
+modeling. Fast-Slow Recurrent Neural Networks (Mujika,
+Meier, and Steger 2017) also achieved near SOTA by in-          Chung, J.; Ahn, S.; and Bengio, Y. 2016. Hierarchi-
+creasing the number of recurrent steps for each character       cal multiscale recurrent neural networks. arXiv preprint
+processed.                                                      arXiv:1609.01704.
+
+                      Conclusion                                Chung, J.; Gulcehre, C.; Cho, K.; and Bengio, Y. 2015. Gated
+                                                                feedback recurrent neural networks. In International Confer-
+Character language modeling has been dominated by re-           ence on Machine Learning, 2067–2075.
+current network approaches. In this paper, we show that a
+network of 12 stacked transformer layers achieves state-of-     Conneau, A.; Schwenk, H.; Barrault, L.; and LeCun, Y. 2016.
+the-art results on this task. We gain further improvements      Very deep convolutional networks for natural language process-
+                                                                ing. CoRR abs/1606.01781.
+
+                                                                Cooijmans, T.; Ballas, N.; Laurent, C.; and Courville, A. C.
+                                                                2016. Recurrent batch normalization. CoRR abs/1603.09025.
+Daniluk, M.; Rockta¨schel, T.; Welbl, J.; and Riedel, S. 2017.     Mikolov, T.; Karaﬁt, M.; Burget, L.; Cernock, J.; and Khudan-
+Frustratingly short attention spans in neural language modeling.   pur, S. 2010. Recurrent neural network based language model.
+CoRR abs/1702.04521.                                               In Kobayashi, T.; Hirose, K.; and Nakamura, S., eds., INTER-
+                                                                   SPEECH, 1045–1048. ISCA.
+Dauphin, Y. N.; Fan, A.; Auli, M.; and Grangier, D. 2016.
+Language modeling with gated convolutional networks. CoRR          Mikolov, T.; Kombrink, S.; Burget, L.; ernock, J.; and Khudan-
+abs/1612.08083.                                                    pur, S. 2011. Extensions of recurrent neural network language
+                                                                   model. In 2011 IEEE International Conference on Acoustics,
+Gal, Y., and Ghahramani, Z. 2015. A Theoretically Grounded         Speech and Signal Processing (ICASSP), 5528–5531.
+Application of Dropout in Recurrent Neural Networks. ArXiv
+e-prints.                                                          Mikolov, T.; Sutskever, I.; Deoras, A.; Le, H.-S.; Kombrink,
+                                                                   S.; and Cernocky, J. 2012. Subword language model-
+Grave, E.; Joulin, A.; and Usunier, N. 2016. Improv-               ing with neural networks. preprint (http://www. ﬁt. vutbr.
+ing neural language models with a continuous cache. CoRR           cz/imikolov/rnnlm/char. pdf) 8.
+abs/1612.04426.
+                                                                   Mujika, A.; Meier, F.; and Steger, A. 2017. Fast-slow recurrent
+Hochreiter, S., and Schmidhuber, J. 1997. Long short-term          neural networks. In Advances in Neural Information Processing
+memory. 9:1735–80.                                                 Systems, 5915–5924.
+
+Hochreiter, S.; Bengio, Y.; Frasconi, P.; Schmidhuber, J.; et al.  Radford, A.; Jo´zefowicz, R.; and Sutskever, I. 2017. Learn-
+2001. Gradient ﬂow in recurrent nets: the difﬁculty of learning    ing to generate reviews and discovering sentiment. CoRR
+long-term dependencies.                                            abs/1704.01444.
+
+Ioffe, S., and Szegedy, C. 2015. Batch normalization: Acceler-     Rocki, K. M. 2016. Surprisal-driven feedback in recurrent net-
+ating deep network training by reducing internal covariate shift.  works. arXiv preprint arXiv:1608.06027.
+CoRR abs/1502.03167.
+                                                                   Salimans, T.; Zhang, H.; Radford, A.; and Metaxas, D. N.
+Jo´zefowicz, R.; Vinyals, O.; Schuster, M.; Shazeer, N.; and Wu,   2018. Improving gans using optimal transport. CoRR
+Y. 2016. Exploring the limits of language modeling. CoRR           abs/1803.05573.
+abs/1602.02410.
+                                                                   Shazeer, N.; Mirhoseini, A.; Maziarz, K.; Davis, A.; Le, Q. V.;
+Kalchbrenner, N.; Espeholt, L.; Simonyan, K.; Oord, A. v. d.;      Hinton, G. E.; and Dean, J. 2017. Outrageously large neural
+Graves, A.; and Kavukcuoglu, K. 2016. Neural machine trans-        networks: The sparsely-gated mixture-of-experts layer. CoRR
+lation in linear time. arXiv preprint arXiv:1610.10099.            abs/1701.06538.
+
+Ke, N. R.; Goyal, A.; Bilaniuk, O.; Binas, J.; Charlin, L.; Pal,   Sukhbaatar, S.; Weston, J.; Fergus, R.; et al. 2015. End-to-end
+C.; and Bengio, Y. 2017. Sparse attentive backtracking: Long-      memory networks. In Advances in neural information process-
+range credit assignment in recurrent networks. arXiv preprint      ing systems, 2440–2448.
+arXiv:1711.02326.
+                                                                   Sundermeyer, M.; Schlu¨ter, R.; and Ney, H. 2012. Lstm neural
+Kenter, T.; Jones, L.; and Hewlett, D. 2018. Byte-level machine    networks for language modeling. In Thirteenth annual confer-
+reading across morphologically varied languages.                   ence of the international speech communication association.
+
+Khandelwal, U.; He, H.; Qi, P.; and Jurafsky, D. 2018. Sharp       Tallec, C., and Ollivier, Y. 2017. Unbiasing truncated back-
+nearby, fuzzy far away: How neural language models use con-        propagation through time. arXiv preprint arXiv:1705.08209.
+text. In Association for Computational Linguistics (ACL).
+                                                                   Vaswani, A.; Shazeer, N.; Parmar, N.; Uszkoreit, J.; Jones, L.;
+Knol, B. 2017. cmix - http://www.byronknoll.com/cmix.html.         Gomez, A. N.; Kaiser, L.; and Polosukhin, I. 2017. Attention
+                                                                   is all you need. In Advances in Neural Information Processing
+Krause, B.; Lu, L.; Murray, I.; and Renals, S. 2016. Mul-          Systems 30. Curran Associates, Inc. 5998–6008.
+tiplicative lstm for sequence modelling. arXiv preprint
+arXiv:1609.07959.                                                  Werbos, P. J. 1990. Backpropagation through time: what it does
+                                                                   and how to do it. Proceedings of the IEEE 78(10):1550–1560.
+Krause, B.; Kahembwe, E.; Murray, I.; and Renals, S. 2017.
+Dynamic evaluation of neural sequence models. arXiv preprint       Weston, J.; Chopra, S.; and Bordes, A. 2014. Memory net-
+arXiv:1709.07432.                                                  works. CoRR abs/1410.3916.
+
+Krueger, D.; Maharaj, T.; Krama´r, J.; Pezeshki, M.; Ballas, N.;   Zaremba, W.; Sutskever, I.; and Vinyals, O. 2014. Recurrent
+Ke, N. R.; Goyal, A.; Bengio, Y.; Courville, A.; and Pal, C.       neural network regularization. CoRR abs/1409.2329.
+2016. Zoneout: Regularizing rnns by randomly preserving hid-
+den activations. arXiv preprint arXiv:1606.01305.                  Zhang, S.; Wu, Y.; Che, T.; Lin, Z.; Memisevic, R.; Salakhut-
+                                                                   dinov, R. R.; and Bengio, Y. 2016. Architectural complexity
+Lei Ba, J.; Kiros, J. R.; and Hinton, G. E. 2016. Layer Normal-    measures of recurrent neural networks. In Advances in Neural
+ization. ArXiv e-prints.                                           Information Processing Systems, 1822–1830.
+
+Li, S.; Li, W.; Cook, C.; Zhu, C.; and Gao, Y. 2018. Inde-         Zhang, X.; Zhao, J. J.; and LeCun, Y. 2015. Character-
+pendently recurrent neural network (indrnn): Building A longer     level convolutional networks for text classiﬁcation. CoRR
+and deeper RNN. CoRR abs/1803.04831.                               abs/1509.01626.
+
+Mahoney, M. 2009. Large text compression benchmark.                Zilly, J. G.; Srivastava, R. K.; Koutn´ık, J.; and Schmidhuber, J.
+http://www.mattmahoney.net/text/text.html.                         2016. Recurrent highway networks. CoRR abs/1607.03474.
+
+Merity, S.; Keskar, N. S.; and Socher, R. 2017. Reg-
+ularizing and optimizing LSTM language models. CoRR
+abs/1708.02182.
+

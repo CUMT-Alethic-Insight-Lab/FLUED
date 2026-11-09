@@ -1,0 +1,512 @@
+                              Models In a Spelling Bee:
+Language Models Implicitly Learn the Character Composition of Tokens
+
+                                      Itay Itzhak Omer Levy
+                              The Blavatnik School of Computer Science
+
+                                             Tel Aviv University
+                           {itay1itzhak,omerlevy}@gmail.com
+
+                      Abstract                         internal character composition, pretrained language
+                                                       models do learn some notion of spelling.
+     Standard pretrained language models operate
+     on sequences of subword tokens without di-           To examine what pretrained language models
+     rect access to the characters that compose each   learn about spelling, we present the SpellingBee
+     token’s string representation. We probe the       probe. SpellingBee is a generative language model
+     embedding layer of pretrained language mod-       that predicts the character composition of a token
+     els and show that models learn the internal       given only its (uncontextualized) vector representa-
+     character composition of whole word and sub-      tion from the pretrained model’s embeddings ma-
+     word tokens to a surprising extent, without       trix. SpellingBee is trained on part of the model’s
+     ever seeing the characters coupled with the to-   vocabulary, and then tested by spelling unseen to-
+     kens. Our results show that the embedding lay-    ken types. If the probe can successfully reconstruct
+     ers of RoBERTa and GPT2 each hold enough          the correct character sequence from an unseen to-
+     information to accurately spell up to a third     ken’s embedding, then there must be signiﬁcant
+     of the vocabulary and reach high character        orthographic information encoded in the vector.
+     ngram overlap across all token types. We fur-
+     ther test whether enriching subword models           We ﬁnd that the embedding layers of several
+     with character information can improve lan-       pretrained language models contain surprising
+     guage modeling, and observe that this method      amounts of character information. SpellingBee
+     has a near-identical learning curve as train-     accurately spells 31.8% of the held-out vocabu-
+     ing without spelling-based enrichment. Over-      lary for RoBERTa-Large (Liu et al., 2019), 32.9%
+     all, our results suggest that language model-     for GPT2-Medium (Radford et al., 2019), and
+     ing objectives incentivize the model to implic-   40.9% for the Arabic language model AraBERT-
+     itly learn some notion of spelling, and that ex-  Large (Antoun et al., 2020). A softer metric that
+     plicitly teaching the model how to spell does     is sensitive to partially-correct spellings (chrF)
+     not appear to enhance its performance on such     (Popovic´, 2015) shows a similar trend, with 48.7
+     tasks.1                                           for RoBERTa-Large and 62.3 for AraBERT-Large.
+                                                       These results are much higher than the baseline
+1 Introduction                                         of applying SpellingBee to randomly-initialized
+                                                       vectors, which fails to spell a single token.
+Contemporary subword tokenization algorithms
+such as BPE (Sennrich et al., 2016) partition a           Given that subword models learn some notion
+string into contiguous spans of characters. Each       of character composition to fulﬁll language mod-
+span represents a frequent character ngram, from       eling objectives, could they perhaps beneﬁt from
+individual characters (a), through preﬁxes (uni)       knowing the exact spelling of each token a priori?
+and sufﬁxes (tion), and even complete words (cats).    To that end, we reverse SpellingBee’s role and use
+The tokenizer then converts each such span into        it to pretrain the embedding layer of a randomly-
+a discrete symbol (a token) with no internal struc-    initialized model, thus imbuing each token repre-
+ture, effectively discarding the token’s orthographic  sentation with its orthographic information before
+information. Therefore, a model operating over se-     training the whole model on the masked language
+quences of subword tokens should be oblivious to       modeling objective. We compare the pretraining
+the spelling of each token. In this work, we show      process of the character-infused model to that of
+that despite having no direct access to the subwords’  an identical model whose embedding layer is ran-
+                                                       domly initialized (and not pretrained), and ﬁnd that
+    1Our code is available at: https://github.com/
+itay1itzhak/SpellingBee
+
+                                                        5061
+
+Proceedings of the 2022 Conference of the North American Chapter of the Association for Computational Linguistics:
+                                        Human Language Technologies, pages 5061 - 5068
+
+                              July 10-15, 2022 ©2022 Association for Computational Linguistics
+both learning curves converge to virtually identi-               SpellingBee is given only the corresponding em-
+cal values within the ﬁrst 1,000 gradient updates,               bedding vector ew, and is expected to generate the
+a fraction of the total optimization process. This               character sequence w1, . . . , wn that deﬁnes w. We
+experiment suggests that while language models                   measure success on the test set using two metrics:
+may need to learn some notion of spelling to op-                 exact match (EM), and character ngram overlap
+timize their objectives, they might also be able to              score using chrF (Popovic´, 2015). While EM is
+quickly acquire most of the character-level informa-             strict, chrF allows us to measure partial success.
+tion they need from plain token sequences without                We also report edit distance using Levenshtein dis-
+directly observing the composition of each token.                tance ratio in Appendix A.
+
+2 Spelling Bee                                                   SpellingBee for Pretraining Embeddings
+                                                                 While we mainly use SpellingBee as a probe, a
+To measure how much a model knows the character                  variation of our method could potentially imbue
+composition of its tokens, we introduce Spelling-                the embedding layer with character information
+Bee, a generative probe that tries to spell out a to-            before training a language model. We could train
+ken character-by-character. Speciﬁcally, Spelling-               a probe with randomly-initialized embeddings
+Bee probes the original model’s embedding matrix,                (instead of pretrained embeddings from another
+since spelling is a property of token types, invari-             model) to predict the spelling of all vocabulary
+ant to context. For example, given the embedding                 items, and use these trained probe embeddings
+of the token cats, SpellingBee will try to generate              to initialize any target model’s embedding layer
+the sequence [c, a, t, s]. We do so by modeling                  (instead of random initialization). We experiment
+SpellingBee as a character-based language model,2                with this method in Section 5, but ﬁnd that it does
+where the ﬁrst token is a vector representation of               not have any signiﬁcant impact on the convergence
+the vocabulary item.3                                            of language models.
+
+Training We split the vocabulary to train and test               3 Experiment Setup
+sets,4 and use teacher forcing to train SpellingBee.
+In the example of cats, SpellingBee will compute                 We begin with a series of probing experiments,
+the following probabilities:                                     where we apply SpellingBee to the embedding
+                                                                 layer of various pretrained models.5
+      P (x1 = c | x0 = cats)
+      P (x2 = a | x0 = cats, x1 = c)                             Pretrained Models We probe four pretrained
+       P (x3 = t | x0 = cats, x1 = c, x2 = a)                    models: RoBERTa-Base and Large (Liu et al.,
+                                                                 2019), GPT2-Medium (Radford et al., 2019), and
+                  ...                                            AraBERT-Large (Antoun et al., 2020). This set
+                                                                 introduces some diversity in vocabulary, objective,
+All of SpellingBee’s parameters are randomly ini-                and scale: the ﬁrst three models are trained on En-
+tialized. The only parameters that are pretrained                glish corpora, while AraBERT is trained on text
+are the token embeddings (e.g. the representation                in Arabic; GPT2 is an autoregressive language
+of cats or a), which are taken from the original                 model, while the rest are masked language mod-
+pretrained language model we intend to probe,                    els; RoBERTa-Base consists of 125M parameters
+and treated as constants; i.e. kept frozen during                (with 768 dimensions per embedding), while the
+SpellingBee’s training.                                          other models have approximately 350M parameters
+                                                                 (with 1024 dimensions per embedding).
+Inference & Evaluation Once SpellingBee is
+trained, we apply it to the test set using greedy de-            Control Since SpellingBee is a trained probe, we
+coding. For each vocabulary item w in the test set,              wish to establish the probe’s baseline performance
+                                                                 when provided with inputs with no orthographic
+    2Implemented using the transformer decoder architecture,     information. As an empirical control, we train and
+following standard practice in language modeling.                test SpellingBee on randomly-initialized vectors, in
+                                                                 addition to the main experiments where we utilize
+    3Some vocabularies have symbols for indicating preceding     the pretrained embedding layers.
+whitespaces (_) or that the next token is part of the same word
+(##). SpellingBee learns to predict these symbols too.               5Hyperparameters are detailed in Appendix E.
+
+    4We test various train/test splits to ensure the robustness
+of our ﬁndings. See Section 3 for more detail.
+
+5062
+EM    Filter        RoBERTa    GPT2    AraBERT             ally analyzing the predictions of the control base-
+                  Base Large  Medium     Large             lines (see Appendix D) indicate that it primarily
+chrF  None        27.3 31.8               40.9             generates combinations of frequent character se-
+      Similarity  15.7 18.2     32.9      21.9             quences, which mildly contributes to the chrF score,
+      Lemma       15.7 17.7     17.9      19.5             but does not affect EM. These results are persistent
+      Control                   16.5        0.0            across different models and ﬁlters, strongly indicat-
+      None         0.0 0.0        0.0     62.3             ing that the embedding layer of pretrained models
+      Similarity  44.7 48.7     51.6      46.0             contains signiﬁcant amounts of information about
+      Lemma       32.7 35.1     36.4      43.9             each token’s character composition.
+      Control     32.6 34.8     35.2        7.0
+                   7.0 7.0        7.0                         One may suggest that training SpellingBee over
+                                                           32,000 examples may leak information from the
+Table 1: The percent of token types that can be spelled    test set; for example, if dog was seen during train-
+out exactly (EM) from their embeddings by Spelling-        ing, then spelling out dogs might be easy. We thus
+Bee, and the ngram overlap between SpellingBee’s re-       consider the similarity and lemma ﬁlters, which
+productions and the token types’ true spellings (chrF).    remove such near-neighbors from the training set.
+The ﬁrst three rows reﬂect different methods for ﬁlter-    While results are indeed lower (and probably do
+ing the training data, and the fourth represents the con-  account for some level of information leakage),
+trol experiment, which uses randomly initialized em-       they are still considerably higher than the control,
+beddings. All SpellingBee instances in this table are      both in terms of EM and chrF. Results using the
+trained on 32,000 examples.                                similarity and lemma ﬁlters are rather similar, sug-
+                                                           gesting that embedding-space similarity captures
+Training & Testing Data We split the vocabu-               some information about each token’s lemma.
+lary into training and testing data using the fol-
+lowing protocol. First, we randomly sample 1000               Finally, we ﬁnd that the properties of pretrained
+token types as test. We then ﬁlter the remaining           models also seem to have a signiﬁcant effect on
+vocabulary to eliminate tokens that may be too             the amount of spelling information SpellingBee
+similar to the test tokens, and randomly sample            can extract. Larger models tend to score higher in
+32000 training examples.We experiment with three           the probe, and the model trained on text in Ara-
+ﬁlters: none, which do not remove tokens beyond            bic appears to have substantially higher EM and
+the test-set tokens; similarity, which removes the         chrF scores than those trained on English corpora.
+top 20 most similar tokens for every token in test,        One possibility is that Arabic’s rich morphology
+according to the cosine similarity induced by the          incentivizes the model to store more information
+embedding vectors; lemma, which removes any to-            about each token’s character composition; however,
+ken type that shares a lemma with a test-set token         it is also possible that AraBERT’s different vocab-
+(e.g. if diving is in the test set, then diver cannot      ulary, which allocates shorter character sequences
+be in the training set).6 The lemma ﬁlter always           to each token type, might explain this difference
+applies the similarity ﬁlter ﬁrst, providing an even       (we discuss the link between sequence length and
+more adversarial approach for splitting the data.          accuracy in Appendix C).
+To control for variance, we create 10 such splits
+for each model and ﬁlter, and report the averaged             Overall, our probing experiments show that even
+evaluation metrics over all 10 test sets.                  though subword-based language models do not
+                                                           have direct access to spelling, they can and do
+4 Results                                                  learn a surprising amount of information about the
+                                                           character composition of each vocabulary token.
+Main Result Table 1 shows how well Spelling-
+Bee can spell a vocabulary token using only its            Character-Aware Models Some models are pro-
+frozen pretrained embedding. We observe that               vided with the raw character sequence of each to-
+SpellingBee is able to accurately recover the              ken. To test whether the embedding layers of such
+spelling of up to 40.9% of the test set, while the         models are indeed more informed about each to-
+control is unable to spell even a single word cor-         ken’s spelling, we apply SpellingBee to Character-
+rectly. A similar trend can be seen when consider-         BERT (El Boukkouri et al., 2020), a BERT-style
+ing the ﬁner character ngram metric (chrF). Manu-          model whose layer-zero word embeddings are de-
+                                                           rived from a character CNN, following ELMo (Pe-
+    6We lemmatize using NLTK’s WordNet lemmatizer (Loper   ters et al., 2018).
+and Bird, 2002) for English and Farasa’s Stemmer (Darwish
+and Mubarak, 2016) for Arabic.
+
+                                                 5063
+      Filter      RoBERTa  CharacterBERT  GloVe                      None Similarity Lemma Control
+                     Base         Base    300D                 40
+      None           43.0          28.2     2.0
+EM    Similarity      9.6          12.9     1.6                30
+      Lemma           9.9          12.9     1.6
+      Control         0.0          0.0      0.0          EM    20
+      None           58.8          53.3    13.6
+      Similarity     27.0          37.5    13.2                10
+      Lemma          27.3          37.5    13.0
+chrF  Control         7.9          8.0      8.0                0            2000  4000  8000 16000 32000
+                                                                      1000
+
+                                                                                  Training Examples
+
+Table 2: The percent of whole words that can be spelled  chrF        None Similarity Lemma Control
+out exactly (EM) from their embeddings by Spelling-            50
+Bee, and the ngram overlap between SpellingBee’s re-           40
+productions and the token types’ true spellings (chrF).        30
+All SpellingBee instances in this table are trained on         20
+32,000 examples of whole words.
+
+                                                               10
+
+   Table 2 shows that the spelling-aware embed-                0            2000  4000  8000 16000 32000
+dings of CharacterBERT score higher on the                            1000
+SpellingBee probe when the similarity and lemma
+ﬁlters are applied. However, when no ﬁlter is ap-                                 Training Examples
+plied, RoBERTa’s character-oblivious but highly-
+tuned training process produces embeddings that          Figure 1: The amount of character information
+score higher on SpellingBee, presumably by lever-        SpellingBee is able to extract from RoBERTa-Large, as
+aging implicit similarity functions in the embed-        measured by EM (top) and chrF (bottom), given differ-
+ding space.                                              ent quantities of training examples.
+
+   Although CharacterBERT’s embedding layer              tion when trained on less examples. Figure 1 shows
+is better at reconstructing original words (when         how well SpellingBee can spell RoBERTa-Large’s
+similarity ﬁlters are applied), this does not mean       vocabulary when trained on varying amounts of
+that character-aware models are necessarily better       data, across all ﬁlters. We ﬁnd that more data
+downstream. El Boukkouri et al. (2020) report per-       makes for a better probe, but that even a few thou-
+formance increases only on the medical domain.           sand examples are enough to train SpellingBee to
+In Section 5, we demonstrate that initializing a         extract signiﬁcant character information from the
+masked language model’s embedding layer with             embeddings, which cannot be extracted from ran-
+character information has a negligible effect on its     domized vectors (the control).7
+perplexity.
+                                                         5 Pretraining Language Models to Spell
+Context-Oblivious Models The ﬁrst generation
+of neural word representations (Mikolov et al.,          Our probing experiments reveal that language mod-
+2013a,b) contained only embedding layers, with-          els learn some partial notion of spelling, despite
+out any contextualization mechanism. We thus             the lack of direct access to characters. Therefore,
+use GloVe (Pennington et al., 2014) to estimate a        we hypothesize that learning to spell is beneﬁcial
+lower bound on character information that can be         for language models, and propose pretraining the
+obtained by simple context-oblivious models. We          embedding layer using a variant of the SpellingBee
+probe the ﬁrst 50K words in GloVe’s vocabulary           probe described in Section 2. Here, the goal is to
+with SpellingBee. Table 2 shows that GloVe embed-        imbue each embedding with enough information
+dings do contain a weak orthographic signal, better      for SpellingBee to accurately generate its surface
+than random embeddings, but substantially weaker         form, and then initialize the language model with
+than the information stored in the embedding layer       the pretrained embeddings before it starts training
+of large transformer-based language models.              on the language modeling objective.
+
+Probing with Less Training Data We further                  We apply this process to RoBERTa-Large, train-
+examine whether SpellingBee can extract informa-
+                                                             7We provide additional analysis on spelling accuracy by
+                                                         subword frequency and length in Appendices B and C.
+
+                                                 5064
+12  Control                                  16                       Control                                                             7   Control
+10  Pretrained                               14                       Pretrained
+                                                                                                                                          6   Pretrained
+                                             12
+Training Loss                                                                                                                             5
+8                                                            Training Loss10
+                                                                                                                           Validation Loss
+6                                            8                                                                                            4
+
+4                                            6                                                                                            3
+
+                                             4
+
+20 1000 2000Train3in0g00Step4s000 5000 6000  1201  Traini1n0g2 Steps              103                                                     20  1000 2000Train3in0g00Step4s000 5000 6000
+
+Figure 2: The overall training loss (left), ﬁrst steps of training loss (center), and validation loss (right) of RoBERTa-
+Large, when training on the masked language modeling objective with embeddings pretrained by SpellingBee
+(pretrained) and randomly-initialized embeddings (control).
+
+ing the model’s embedding layer with Spelling-                  language modeling objective, suggesting that the
+Bee using the same hyperparameter settings from                 model can independently learn all the character-
+Appendix E, with the key difference being that                  level information it needs for the task.
+the embeddings are now tunable parameters (not
+frozen).8 We train RoBERTa-Large on English                     Acknowledgements
+Wikipedia using the hyperparameter conﬁguration
+of 24hBERT (Izsak et al., 2021), and cease training             This work was supported by the Tel Aviv University
+after 24 hours (approximately 16,000 steps). For                Data Science Center, Len Blavatnik and the Blavat-
+comparison, we train exactly the same model with                nik Family foundation, the Alon Scholarship, Intel
+a randomly-initialized embedding layer.                         Corporation, and the Yandex Initiative for Machine
+                                                                Learning. We thank Avia Efrat for his valuable
+   Figure 2 shows the masked language modeling                  feedback.
+loss with and without pretrained embeddings. We
+see that the curves quickly converge into one. After            References
+only 1000 training steps, the difference between the
+validation losses never exceeds 0.01. This result               Wissam Antoun, Fady Baly, and Hazem Hajj. 2020.
+indicates that in this scenario, the model does not                AraBERT: Transformer-based model for Arabic lan-
+utilize the character information injected into the                guage understanding. In Proceedings of the 4th
+tokens’ embeddings.                                                Workshop on Open-Source Arabic Corpora and Pro-
+                                                                   cessing Tools, with a Shared Task on Offensive Lan-
+   Although there are many possible ways to ex-                    guage Detection, pages 9–15, Marseille, France. Eu-
+plicitly add orthographic information to tokens em-                ropean Language Resource Association.
+beddings, our method is relatively straightforward
+as it gives the model a chance to utilize pre-stored            Kareem Darwish and Hamdy Mubarak. 2016. Farasa:
+character information. Along with the results from                 A new fast and accurate Arabic word segmenter. In
+Section 4, we hypothesize that the implicit notion                 Proceedings of the Tenth International Conference
+of spelling that the model learns during pretraining               on Language Resources and Evaluation (LREC’16),
+might be sufﬁcient for masked language modeling.                   pages 1070–1074, Portorož, Slovenia. European
+                                                                   Language Resources Association (ELRA).
+
+6 Conclusion                                                    Hicham El Boukkouri, Olivier Ferret, Thomas
+                                                                   Lavergne, Hiroshi Noji, Pierre Zweigenbaum, and
+This work reveals that pretrained language models                  Jun’ichi Tsujii. 2020. CharacterBERT: Reconciling
+learn, to some extent, the character composition                   ELMo and BERT for word-level open-vocabulary
+of subword tokens. We show that our Spelling-                      representations from characters. In Proceedings
+Bee probe can spell many vocabulary items using                    of the 28th International Conference on Compu-
+their uncontextualized embedding-layer represen-                   tational Linguistics, pages 6903–6915, Barcelona,
+tations alone. Trying to explicitly infuse character               Spain (Online). International Committee on Compu-
+information into the model appears to have a min-                  tational Linguistics.
+imal effect on the model’s ability to optimize its
+                                                                Peter Izsak, Moshe Berchansky, and Omer Levy. 2021.
+    8To verify that this process does indeed encode the to-        How to train bert with an academic budget. arXiv
+kens’ spellings into the embeddings, we apply a SpellingBee        preprint arXiv:2104.07705.
+probe (using a different random initialization) to the learned
+embeddings, which yields 93.5% EM on held-out token types.      Diederik P. Kingma and Jimmy Ba. 2015. Adam:
+                                                                   A method for stochastic optimization. CoRR,
+                                                                   abs/1412.6980.
+
+                                                   5065
+Vladimir I Levenshtein et al. 1966. Binary codes capa-      Rico Sennrich, Barry Haddow, and Alexandra Birch.
+   ble of correcting deletions, insertions, and reversals.     2016. Neural machine translation of rare words
+   In Soviet physics doklady, volume 10, pages 707–            with subword units. In Proceedings of the 54th An-
+   710. Soviet Union.                                          nual Meeting of the Association for Computational
+                                                               Linguistics (Volume 1: Long Papers), pages 1715–
+Yinhan Liu, Myle Ott, Naman Goyal, Jingfei Du, Man-            1725, Berlin, Germany. Association for Computa-
+   dar Joshi, Danqi Chen, Omer Levy, Mike Lewis,               tional Linguistics.
+   Luke Zettlemoyer, and Veselin Stoyanov. 2019.
+   Roberta: A robustly optimized bert pretraining ap-
+   proach. arXiv preprint arXiv:1907.11692.
+
+Edward Loper and Steven Bird. 2002. NLTK: The nat-
+   ural language toolkit. In Proceedings of the ACL-02
+   Workshop on Effective Tools and Methodologies for
+   Teaching Natural Language Processing and Com-
+   putational Linguistics, pages 63–70, Philadelphia,
+   Pennsylvania, USA. Association for Computational
+   Linguistics.
+
+Tomas Mikolov, Kai Chen, Greg Corrado, and Jef-
+   frey Dean. 2013a. Efﬁcient estimation of word
+   representations in vector space. arXiv preprint
+   arXiv:1301.3781.
+
+Tomas Mikolov, Ilya Sutskever, Kai Chen, Gregory S.
+   Corrado, and Jeffrey Dean. 2013b. Distributed rep-
+   resentations of words and phrases and their compo-
+   sitionality. In NIPS.
+
+Myle Ott, Sergey Edunov, Alexei Baevski, Angela
+   Fan, Sam Gross, Nathan Ng, David Grangier, and
+   Michael Auli. 2019. fairseq: A fast, extensible
+   toolkit for sequence modeling. In Proceedings of
+   the 2019 Conference of the North American Chap-
+   ter of the Association for Computational Linguistics
+   (Demonstrations), pages 48–53, Minneapolis, Min-
+   nesota. Association for Computational Linguistics.
+
+Jeffrey Pennington, Richard Socher, and Christopher
+   Manning. 2014. GloVe: Global vectors for word
+   representation. In Proceedings of the 2014 Confer-
+   ence on Empirical Methods in Natural Language
+   Processing (EMNLP), pages 1532–1543, Doha,
+   Qatar. Association for Computational Linguistics.
+
+Matthew E. Peters, Mark Neumann, Mohit Iyyer, Matt
+   Gardner, Christopher Clark, Kenton Lee, and Luke
+   Zettlemoyer. 2018. Deep contextualized word rep-
+   resentations. In Proceedings of the 2018 Confer-
+   ence of the North American Chapter of the Associ-
+   ation for Computational Linguistics: Human Lan-
+   guage Technologies, Volume 1 (Long Papers), pages
+   2227–2237, New Orleans, Louisiana. Association
+   for Computational Linguistics.
+
+Maja Popovic´. 2015. chrF: character n-gram F-score
+   for automatic MT evaluation. In Proceedings of the
+   Tenth Workshop on Statistical Machine Translation,
+   pages 392–395, Lisbon, Portugal. Association for
+   Computational Linguistics.
+
+Alec Radford, Jeffrey Wu, Rewon Child, David Luan,
+   Dario Amodei, Ilya Sutskever, et al. 2019. Lan-
+   guage models are unsupervised multitask learners.
+   OpenAI blog, 1(8):9.
+
+5066
+A Levenshtein Distance                                    60      none Filter
+
+Levenshtein distance (Levenshtein et al., 1966) is        EM  40
+an edit distance metric that, given two strings, cal-
+culates the minimal number of changes needed to           20
+be done in order to make the two strings identical.
+Levenshtein distance ratio is the length-normalized             0 0-10K 10K-20K Fr2e0qKu-3e0nKcy 30K-40K 40K-50K
+version, which is computed by adding the sum of
+lengths of both strings to the edit distance and divid-   60      similarity Filter
+ing by the same sum of lengths. We report the main
+experiment’s results using this ratio in Table 3.         EM40
+
+                                                            20
+
+                                                                0 0-10K 10K-20K Fr2e0qKu-3e0nKcy 30K-40K 40K-50K
+
+Filter        RoBERTa    GPT2    AraBERT                  Figure 3: The EM scores of SpellingBee on RoBERTa-
+            Base Large  Medium     Large                  Large for each frequency quintile with the none ﬁlter
+None        69.7 72.7               83.6                  (top) and the similarity ﬁlter (bottom).
+Similarity  61.5 63.7     74.4      75.8
+Lemma       61.4 63.3     64.5      74.8                      80  none Filter
+Control      25.6 26.4    63.7       25.7                     60
+                           27.0
+
+                                                          chrF40
+
+Table 3: Levenshtein distance ratio. The ﬁrst three rows      20
+reﬂect different methods for ﬁltering the training data,
+and the fourth represents the control experiment, which         0 0-10K 10K-20K Fr2e0qKu-3e0nKcy 30K-40K 40K-50K
+uses randomly initialized embeddings. All SpellingBee         80
+instances in this table are trained on 32000 examples.        60  similarity Filter
+
+                                                          chrF40
+
+                                                              20
+
+B Spelling Accuracy by Frequency                                0 0-10K 10K-20K Fr2e0qKu-3e0nKcy 30K-40K 40K-50K
+
+We test whether pretrained models tend to                 Figure 4: The chrF scores of SpellingBee on RoBERTa-
+store more spelling-related information in higher-        Large for each frequency quintile with the none ﬁlter
+frequency token types. We focus on RoBERTa-               (top) and the similarity ﬁlter (bottom).
+Large, and assign each token in the test set to
+its frequency quintile according to the number of         tokens with 2-4 characters can be accurately re-
+times it appeared in the pretraining corpus – from        produced from their vector representations, while
+the 10000 most frequent token types (top 20%) to          longer tokens are harder to replicate. This trend
+those ranked 40000-50000 in the vocabulary (bot-          is particularly sharp when the similarity ﬁlter is
+tom 20%) – and measure the average performance            applied, as the probe is hardly able to spell tokens
+of SpellingBee within each quintile. Figures 3 and        with 6 or more characters accurately; having said
+4 shows the results with and without the similarity       that, the probe is able to generate many partially
+ﬁlter. We observe that SpellingBee is indeed able         correct spellings, as measured by chrF (Figure 6).
+to extract more information from higher-frequency         Perhaps a less intuitive result is the probe’s fail-
+token types, suggesting that the pretrained model         ure to spell single-character tokens. A closer look
+has more information about their character compo-         reveals that many of these examples are rare or
+sition.                                                   non-alphanumeric characters (e.g. ç and $), which
+                                                          are probably very difﬁcult for the probe to gener-
+C Spelling Accuracy by Length                             ate if it had not seen them during training. While
+                                                          these results show strong trends with respect to
+We analyze the effect of token length on the probe’s      length, token length is also highly correlated with
+ability to spell. A priori, it is reasonable to assume    frequency, and it is not necessarily clear which of
+that it is easier for the probe to spell shorter to-      the two factors has a stronger impact on the amount
+kens, since less information needs to be extracted        and resolution of character-level information stored
+from the embedding and there are less discrete de-        in the embedding layer of pretrained models.
+cisions to be made while decoding. Indeed, Figure
+5 shows that with the none ﬁlter most vocabulary
+
+                                           5067
+    60  none Filter                                               Token     SpellingBee  Control
+                                                                  _Issa     _Asey        _kinston
+EM  40                                                            _Rhod     _Rob         _hoedn
+                                                                  Memory    Mathinge     _entically
+    20                                                            _metals   _metrys      _leaved
+                                                                  _Reed     _Redd        _fomparing
+      0 1 2 3 4 T5oken6Leng7th 8 9 10 11+                         _break    _breach      _promoters
+                                                                  _summit   _mosump      _seasons
+60      similarity Filter                                         Catholic  Cravital     _tonversal
+                                                                  _cleanup  _lamed       _paclus
+EM  40                                                            _Winner   _Womer       _purden
+                                                                  _LIM      _LUM         _Send
+    20                                                            Copy      Cople        _providers
+                                                                  _voicing  _relicing    _walking
+      0 1 2 3 4 T5oken6Leng7th 8 9 10 11+                         _Stab     _Stamb       _hoviders
+                                                                  _356      _353         _budiance
+Figure 5: The EM scores of SpellingBee on RoBERTa-                ﬁnd       wive         _malding
+Large for each token length with the none ﬁlter (top)             _Psychic  _Syptanc     _joacter
+and the similarity ﬁlter (bottom). The rightmost col-             _Looking  _Lowing      parging
+umn groups together tokens with length of 11 or above.            CLOSE     DEFIC        _tuldence
+                                                                  _proliﬁc  _promistic   _complexement
+    80  none Filter
+    60
+
+chrF40                                                  Table 4: Sampled SpellingBee errors with the lemma
+                                                        ﬁlter alongside the control baseline’s spelling for the
+    20                                                  same tokens. The underscore (_) represents a preceding
+                                                        whitespace.
+      0 1 2 3 4 T5oken6Leng7th 8 9 10 11+
+    80
+    60  similarity Filter
+
+chrF40                                                  rameters for training a transformer language model
+                                                        in Fairseq (Ott et al., 2019).
+    20
+
+      0 1 2 3 4 T5oken6Leng7th 8 9 10 11+
+
+Figure 6: The chrF scores of SpellingBee on RoBERTa-
+Large for each token length with the none ﬁlter (top)
+and the similarity ﬁlter (bottom). The rightmost col-
+umn groups together tokens with length of 11 or above.
+
+D Manual Error Analysis
+
+We manually analyze 100 random tokens that
+SpellingBee spelled incorrectly with the lemma ﬁl-
+ter to understand the nature of the spelling mistakes.
+Out of those 100 we display 20 mistakes in Table
+4 alongside the spelling prediction of the control
+baseline. SpellingBee’s mistakes vary from single-
+character typos to completely different words. Hav-
+ing said that, the vast majority of mistakes have
+signiﬁcant overlap with the correct spelling, such
+as shared preﬁxes and capitalization.
+
+E Hyperparameters
+
+We implement SpellingBee with a 6-layer encoder-
+decoder model, with 512 model dimensions.
+The model parameters are optimized with Adam
+(Kingma and Ba, 2015) for 1000 steps with up to
+1024 tokens per batch, a learning rate of 5e-4, and a
+dropout rate of 0.1. These are the default hyperpa-
+
+                                                            5068
+

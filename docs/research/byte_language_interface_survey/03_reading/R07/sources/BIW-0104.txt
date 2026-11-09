@@ -1,0 +1,1115 @@
+                                         MYTE: Morphology-Driven Byte Encoding for Better and Fairer
+                                                              Multilingual Language Modeling
+
+                                                         Tomasz Limisiewicz1†∗ Terra Blevins2 Hila Gonen2
+                                                                  Orevaoghene Ahia2 Luke Zettlemoyer2
+
+                                                    1Faculty of Mathematics and Physics, Charles University in Prague
+                                        2Paul G. Allen School of Computer Science and Engineering, University of Washington
+
+                                                              Abstract                              EN:    roughly at 12
+                                                                                                    utf-8
+                                             A major consideration in multilingual language         myte   72 6F 75 67 68 6C 79 61 74 31 32
+                                             modeling is how to best represent languages                   52 82 A3 93 6C 79 61 74 31 32
+                                             with diverse vocabularies and scripts. Although
+arXiv:2403.10691v2 [cs.CL] 11 Nov 2024       contemporary text encoding methods cover               CS:    přibližně ve 12
+                                             most of the world’s writing systems, they ex-          utf-8
+                                             hibit bias towards the high-resource languages         myte   70 C5 99 69 62 6C 69 C5 BE 6E C4 9B 76 65 31 32
+                                             of the Global West. As a result, texts of un-                 4B 84 81 53 80 96 BB 43 97 76 65 31 32
+                                             derrepresented languages tend to be segmented
+                                             into long sequences of linguistically meaning-         TE:    రసుమారు 12 వదద్
+                                             less units. To address the disparities, we intro-      utf-8
+                                             duce a new paradigm that encodes the same                     E0 B0 B0 E0 B0 B8 E0 B1 81 E0 B0 AE E0 B0 BE E0 B0 B0 E0 B1 81
+                                             information with segments of consistent size
+                                             across diverse languages. Our encoding con-            myte   31 32 E0 B0 B5 E0 B0 A6 E0 B1 8D E0 B0 A6
+                                             vention (MYTE) is based on morphemes, as                      57 83 B7 94 E0 B1 81 57 80 8F B4 31 32 57 82 9C 8B
+                                             their inventories are more balanced across lan-
+                                             guages than characters, which are used in pre-         Figure 1: The same phrase is spelled in three languages:
+                                             vious methods. We show that MYTE pro-                  English, Czech, and Telugu. UTF-8 byte encoding of
+                                             duces shorter encodings for all 99 analyzed            the phrase is shown in blue, while MYTE in green
+                                             languages, with the most notable improvements          underneath. MYTE achieves higher encoding compres-
+                                             for non-European languages and non-Latin               sion, especially for texts using diacritics or non-Latin
+                                             scripts. This, in turn, improves multilingual          script.
+                                             LM performance and diminishes the perplexity
+                                             gap throughout diverse languages.                         Byte-level models aim to solve these challenges.
+                                                                                                    Rather than words or subword tokens, they use
+                                        1 Introduction                                              byte-level text representations that achieve high
+                                                                                                    coverage (Xue et al., 2022), as common encodings
+                                        Multilingual language models have become the                such as UTF-8 support most of the world’s scripts.
+                                        state-of-the-art solution for performing tasks on           Nevertheless, the over-segmentation problem still
+                                        a wide range of languages (Devlin et al., 2019;             exists even at the byte level, as byte sequences for
+                                        Conneau et al., 2020; Xue et al., 2021). However,           single characters are overly long for many non-
+                                        it is challenging to ensure high performance for            Latin script languages (Arnett et al., 2024). This
+                                        all languages due to differences in data availabil-         problem has an immense effect on modeling these
+                                        ity, especially for the long tail of low-resource lan-      scripts in NLP systems, as operating on longer
+                                        guages (Malkin et al., 2022). This challenge is com-        sequences significantly increases the computation
+                                        pounded by choices of how words are represented             costs of training and inference in models, while
+                                        during tokenization; past studies have shown that           also making learning less sample efficient. Fur-
+                                        multilingual models either cannot accurately rep-           thermore, the billing for APIs such as ChatGPT
+                                        resent texts in rare languages (Pfeiffer et al., 2021)      (openai.com/chatgpt) is often associated with
+                                        or do so via over-segmentation, which is detrimen-          the segmented sequence length, disadvantaging
+                                        tal both to model performance and inference cost            speakers of specific languages (Ahia et al., 2023).
+                                        (Petrov et al., 2023; Ahia et al., 2023).
+                                                                                                       In this work, we propose a novel method to
+                                            †Correspondence to limisiewicz@ufal.mff.cuni.cz         derive byte representations of text, enabling eq-
+                                            *Work done while visiting the University of Washington  uitable segmentations across languages and scripts.
+                                                                                                    In our approach, we replace the current conven-
+                                                                                                    tion of assigning byte codes to characters with a
+morphology-driven approach, as morphemes1 are                    Figure 2: UTF-8 codepage (inspired by the visualiza-
+more informatively comparable constituents of text               tions from: en.wikipedia.org/wiki/UTF-8). Each
+across languages than characters (Cotterell et al.,              row contains 16 bytes with the same leading hexadeci-
+2018). Specifically, we introduce a novel algo-                  mal digit. Bytes in the range C2 - F4 are leading bytes.
+rithm for representing text as byte sequences that               They mark the beginning of a multibyte code of the
+is based on unsupervised morphological segmen-                   length shown in each cell. Bytes in the range 80 - BF
+tation (Smit et al., 2014). We demonstrate that                  are continuation bytes, which follow a leading byte in
+our new paradigm for byte representation improves                multibyte codes. Bytes FE and FF are unused. Range
+the segmentation of diverse languages of various                 41 - 5A encodes Latin capital letters. In MYTE, these
+scripts and morphological inventories. Further-                  characters are decomposed to free space used to encode
+more, the segmentation of parallel sentences across              morphemes.
+languages converges to comparable lengths.
+                                                                 is represented as a sequence of one to four bytes.
+   We test our method’s effectiveness in creating                Due to the gradual development of communication
+equitable text representation – representations that             standards, UTF-8 first allocated one-byte represen-
+given parallel texts have similar encoded sequence               tation ASCII symbols, which cover primary Latin-
+lengths. We then evaluate the applicability of the               script characters (see 00 to 7F in Figure 2). Other
+method to multilingual language modeling across                  characters are represented as multi-byte codes start-
+99 typologically diverse languages.                              ing with a byte from range C2 to F4 denoting the
+                                                                 number of bytes in the codepoint and followed by
+   Our contributions can be summarized as follows:               continuation bytes from range 80 to BF.
+(a) We propose a novel byte-encoding method that
+is morphologically driven; (b) We show empiri-                      In UTF-8 convention, characters in non-Latin
+cally that the resulting representations are more                alphabetic scripts (Cyrillic, Armenian, Georgian),
+equitable across languages than vanilla byte, char-              diacritics, and abjads3 usually have two-byte codes,
+acter, or subword segmentation; (c) We analyze the               while the byte length increases to three or four for
+typical lengths of these representations and show                Brahmic abugidas4 and CJK (Chinese, Japanese,
+decreased sequence length across all analyzed lan-               Korean) logographs. As a result, the granularity
+guages, significantly reducing computation cost                  of byte codes varies significantly across languages;
+and benefiting non-Latin script languages the most;              this means that texts conveying the same informa-
+(d) We train a language model with our new repre-                tion across languages tend to be represented by
+sentation scheme and demonstrate that it maintains               byte sequences of significantly different lengths
+balanced and better LM performance across diverse                (Arnett et al., 2024).
+languages and exhibits faster inference speed. This
+improvements holds across different model scales.                    3Abjads are writing scripts that do not denote vowels, e.g.,
+Our models match SOTA ByT5 performance across                    Hebrew, Arabic.
+multiple tasks for diverse low-resource languages
+while being more efficient in training and inference.                4Abugidas are scripts representing consonant-vowel as one
+                                                                 character, typical to the Indian Subcontinent and South-East
+   We will release our code and models to facilitate             Asia, e.g., Devanagari, Bengali.
+further research in this direction.
+
+2 Background: UTF-8 Bytes
+
+The vast majority of texts online2 are represented
+as bytes via UTF-8 convention, which is defined by
+the Unicode Standard (The Unicode Consortium,
+2011). In UTF-8, each character (or codepoint)
+
+    1In this work, the usage of term “morphemes” encom-
+passes both “morphemes” and “morphs”. Some linguistic
+theories use the term “morph” for specific textual realizations
+of abstract “morphemes”. For instance, in English, es as in
+foxes and s as in cats are two distinct “morphs” of a plurality
+“morpheme”. For an in-depth discussion about these two terms,
+see Section 4 of Žabokrtský et al. (2022)
+
+    2https://w3techs.com/technologies/overview/
+character_encoding
+3 Method: Morphology-Driven Bytes                            ID Group  Unicode Script(s)   Leading Byte
+                                                             0 Latin   Latin               2b 3b 4b
+As discussed in the prior section and shown in                                             42 4A 52
+Figure 1, UTF-8 convention produces longer byte
+sequences for some languages due to the develop-             1 Common Mixed, Common, 43 4B 53
+ment choices. To make byte representation more                                       Inherited, Unkown
+equitable, we introduce an encoding paradigm that
+aims to assign byte codes of similar lengths to mor-         2 Non-Latin Greek, Cyrillic, Ar- 44 4C 54
+phemes across languages. We base our encoding                       Alphabetic menian, Georgian
+scheme on morphological analysis because mor-
+phemes are the shortest meaningful constituents              3 Abjads  Hebrew,   Arabic, 45  4D 55
+and are independent of the writing convention                          Syriac,   Thaana,
+(Haspelmath and Sims, 2010). We assume that                            Tifinagh
+the number of morphemes in sentences with the
+same information load is more balanced across lan-           4 Abugidas Devanagari, Gur- 46 4E 56
+guages than the number of characters, bytes, or
+tokens. Thus, we enforce balanced segmentation               North     mukhi, Gujarati,
+granularity across languages.
+                                                                       Oriya, Bengali,
+   An alternative approach to encoding morpholog-
+ical representations would be treating the union                       Sinhala, Tibetan
+of multilingual morpheme inventories across lan-
+guages as one large subword vocabulary. To cover             5 Abugidas Telugu, Kannada, 47 4F 57
+the morphemes of many languages in this manner,
+the vocabulary would be much larger than the ones            South     Tamil, Malayalam,
+usually applied to models.5 This would incur ad-
+ditional computational costs and, similar to other                     Thai, Lao, Myan-
+subword representations, would likely not general-
+ize well to new, unseen languages.                                     mar, Tai, Tagalog,
+
+                                                                       Khmer
+
+                                                             6 CJK     Hangul, Han, Yi, 48 50 58
+                                                                       Katakana, Hiragana,
+                                                                       Bopomofo
+
+                                                             7 Other   Remaining scripts 49 51 59
+
+                                                             Table 1: Groups of scripts with the initial bytes for their
+                                                             morphological blocks. The groups were selected to
+                                                             balance the number of covered languages with similar
+                                                             writing systems.
+
+3.1 Morphological Analysis                                   3.2 Enriching Byte Representation with
+                                                                   Morphology
+We train an unsupervised morphological analyzer,
+Morfessor (Smit et al., 2014) on lexicons derived            To alleviate UTF-8 inefficiencies, we propose a
+from whole Wikipedia articles in 99 languages.               systematic rearrangement of byte codepage. We
+The morphological analysis is performed on each              free 26 bytes ( 41 to 5A ) by decomposing capital
+of the languages separately to balance the number            letter codes into lowercase letters and capitalization
+of morphemes per language, regardless of data re-            markers. The first byte from this range ( 41 ) is re-
+sourcefulness. For each language, we derived a               purposed as a capitalization marker. The remaining
+set of 4096 morphemes; the number was chosen to              25 bytes are freed space used to store morphemes.
+balance segmentation granularity across languages.
+For each morpheme, we save its score, defined as                Our method takes the sequences of UTF-8 bytes
+the hypothetical loss reduction of the Morfessor             and transcodes them into shorter sequences using
+model if the morpheme had not been included in               the vocabulary of the same size, i.e. 256, as de-
+the set. We take the union of sets across languages          picted in Figure 1. We apply the following steps to
+to obtain a multilingual morpheme inventory. The             transcode UTF-8 sequences to MYTE encodings:
+details of lexicon preparation and the usage of Mor-
+fessor are in Appendix A.                                      1. We use UTF-8 as base encoding of text. Then,
+                                                                   the byte sequences are transcoded from left
+    5The proposed MYTE encoding offers capacity for                to right, merging morpheme sequences and
+2,130,432 of variable length codepoints. It is considerably        replacing them as dedicated codepoints de-
+more than in any of the commonly used subword vocabularies.        scribed in the following points.
+For reference, large vocabulary XLM-V model allocates 1
+million subwords (Liang et al., 2023).                         2. The morphemes are grouped by scripts as
+                                                                   shown in Table 1. Codepoints of multiple
+scripts within a single morpheme are assigned
+to the second cluster (Mixed script).
+
+3. The morphemes are ranked based on their
+   Morfessor score defined in Section 3.1.
+
+  4. We assign multibyte codepoint for each of the        Figure 3: Boxplot aggregating parity against English
+      morphemes analogously to the UTF-8 conven-          for three segmentation methods: MYTE, UTF-8, char-
+      tion (see Section 2). Specifically, the first byte  acters, and subword tokens from mT5 tokenizer (Xue
+      denoting the beginning of the morphological         et al., 2021). Parities were computed on multi-parallel
+      codepoint is assigned from the freed range          Flores 200 corpus.
+      ( 42 - 5A ) based on the morph’s inclusion in
+      one of the script groups. It is followed by con-    4.1 Results
+      tinuation bytes from the 64 element range 80
+     - BF, as in UTF-8 convention. The 64 mor-            MYTE is Equitable across Languages The
+      phemes with the highest score are saved as          comparison of sequence length across parallel sen-
+      two-byte codepoints, following 642 = 4096           tences in Flores 200 is shown in Figure 4. Our rep-
+      as three-byte codepoints; the remaining mor-        resentation is more balanced across languages than
+      phemes are saved as up to 643 = 262, 144            the original UTF-8 bytes. There are still four lan-
+      four-byte codepoints. The capacity for new          guages with observably higher code lengths (e.g.,
+      codepoints was not exhausted for any script         Greek, Vietnamese, Punjabi, Khmer). However,
+      group.                                              MYTE encoding still improves their parity to En-
+                                                          glish such that it is much lower than outlier lan-
+4 Equitable Multilingual Segmentation                     guages in UTF-8 (1.7 vs. 3.5 in the worst-case
+    with MYTE                                             languages, respectively).
+
+We first analyze the properties of our proposed              Figure 3 shows that MYTE representations are
+morphology-driven encoding. Following the set-            more balanced in parity scores across languages
+ting of Petrov et al. (2023), we measure whether          than subword tokenization. In particular, we im-
+MYTE produces the segmented sequences of com-             prove on the long tail of languages over-segmented
+parable length across languages.                          either in byte or subword encoding. The parties
+                                                          closest to MYTE are obtained by character repre-
+   We compute parity across languages using the           sentation. However, the set of all Unicode char-
+multi-parallel corpus Flores 200 (Team et al., 2022).     acters is larger by orders of magnitude than the
+Parity is defined as |t(sl)|/|t(sen)|, where sl and       number of unique bytes used in MYTE (149,878
+sen stand for parallel sentences in language l and        vs. 254).
+in English, respectively. |t(s)| is the length of se-
+quence s with segmentation method t.                      MYTE Encoding Compresses Text Representa-
+                                                          tion The encoded sequence lengths are decreased
+   We compare the MYTE encoding from Sec-                 with MYTE encoding for all languages, as de-
+tion 3.2 to several baselines of common input rep-        picted in Figure 4c. The rate of compression
+resentation: (a) Vanilla byte-level encoding via          varies from 1% for Vietnamese and Chinese to
+UTF-8; (b) Character-level encoding; (c) Subwords         almost 70% for Burmese. As seen in Table 2, the
+produced by Sentencepiece algorithm (Kudo and             highest compression is obtained for low-resource
+Richardson, 2018). In comparison, we focus on the         languages with non-Latin scripts. Notably, this
+equitability of sequence lengths produced by the          group of languages is the most susceptible to over-
+methods for diverse languages.                            segmentation in UTF-8 encoding.
+
+   Furthermore, we compare our morphological
+byte encoding sequence compression rate against
+the UTF-8 convention. Compression is essential
+for an effective text representation as it affects NLP
+systems’ efficiency and usage cost (Ahia et al.,
+2023). Finally, we check whether our method more
+effectively compresses languages and scripts un-
+seen in MYTE algorithm described in Section 3.2.
+                                                           English         Byte         Myte    Comp.
+
+                                                           Latin HR   Parity Len.  Parity Len.   16%
+                                                           Latin LR                              14%
+                                                           ¬Latin HR  1.00 131     1.00 109      12%
+                                                           ¬Latin LR                             29%
+                                                                      1.14 149     1.18 129      50%
+                                                           Seen       1.12 147     1.18 128      26%
+                                                                      1.62 212     1.29 141
+                                                                      2.33 305     1.33 145
+
+                                                                      1.56 204     1.24 135
+
+                                                           Unseen Lang 1.50 196 1.27 138 23%
+                                                           Unseen Script 2.80 365 3.35 365 0%
+
+                                                           Unseen     1.72 224 1.61 176 19%
+
+(a) UTF-8                                                  Table 2: Averaged sequence length and corresponding
+                                                           parities to English of UTF-8 and MYTE. We aggregated
+                                                           results for languages used in morphological adaptation
+                                                           (i.e., Seen) by their script (Latin vs. Non-Latin) and
+                                                           resourcefulness (HR: high resource, LR: low resource)
+                                                           based on categorization from Joshi et al. (2020). The
+                                                           last three rows present results for languages unseen in
+                                                           morphological adaptation; all of them are low-resource.
+                                                           Shortened column headers: Len. – Length, Comp. –
+                                                           Compression.
+
+(b) MYTE                                                   to five low-resource languages not considered in
+                                                           constructing MYTE representation, referred to as
+                                                           unseen languages. One exemption from the rule
+                                                           is Santhali, written in unseen Ol Chiki script, for
+                                                           which we do not observe a change in the encoded
+                                                           sequence length. This observation highlights the
+                                                           importance of considering a wide range of lan-
+                                                           guages and scripts when constructing morpheme
+                                                           inventories. Importantly, MYTE did not reach a
+                                                           capacity of available byte codepoints, and thus, the
+                                                           method can be extended to additional languages.
+                                                           The complete results for unseen languages and
+                                                           scripts are shown in Appendix B.
+
+                                                           5 MyT5: Language Modeling with
+                                                               MYTE
+
+                    (c) Sequence compression               This section investigates the benefits of MYTE as
+                                                           an encoding scheme for byte-level language model-
+Figure 4: Average byte sequence lengths of parallel        ing. For that purpose, we have trained T5 language
+sentences from Flores 200 encoded by a) UTF-8 and b)       models on MYTE representation. We refer to these
+MYTE. Figure c) depicts the percentage by which the        models as Myte T5 models, or MyT5 for short.
+latter sequences are shorter than the former. Results for
+all the languages can be found in Appendix B.              5.1 Training Details
+
+Findings Generalize to Unseen Languages but                We base the architecture and implementation of our
+not Unseen Scripts In Table 2, we observe that             MyT5 model on the byte-level T5 model, i.e., ByT5
+a decrease in sequence length and parity applies           (Xue et al., 2022). ByT5, like other T5 models (Raf-
+                                                           fel et al., 2020), is an encoder-decoder Transformer
+                                                           model trained on predicting masked spans of texts.
+                                                           ByT5 operates on bytes instead of the subword to-
+(a) LM Performance (ρS = −0.81)                          (b) Inference Time (ρS = −0.77)
+
+Figure 5: The difference in Byte-per-English-Bit and inference time between MyT5 and ByT5 large models against
+compression factor of MYTE. For each sentence, the BPEB value is normalized by the number of UTF-8 bytes used
+to represent the corresponding English sentence. The inference was run on A40 GPU core, we report an average
+per-sentence deltas. ρS are Spearman’s correlation coefficients.
+
+kenization in the standard T5 model, making it a         ble across languages? Inspired by Cotterell et al.
+suitable base model for our setting.                     (2018), we use the Bit-per-English-Byte metric on
+                                                         the multi-parallel FLORES 200 corpus to control
+   We pre-train three new instances of MYTE-             for the informativeness of evaluation sequences:
+level models of different sizes: small (300M), base
+(582M), and large (1.23B parameters). For pre-           1                            |c|+1
+training, we used the standard task of restoring
+corrupted spans from mC4 corpus (Raffel et al.,          BP EB = |cEnglish,UT F | + 1 i=1 log p(ci|c<i)
+2020). All the byte sequences are transcoded into
+morphologically-driven bytes. We use Jax imple-                                              (1)
+mentation, i.e., t5x repository (Roberts et al., 2022),
+and the same hyperparameters as in ByT5 (Xue             c is a sequence of bytes (original UTF-8 or
+et al., 2022). The only difference from their train-
+ing approach is that we pre-train for 250,000 steps      MYTE) with ci being the i-th byte. For normaliza-
+rather than one million steps since we observe over-
+fitting when training for more steps, especially on      tion, we use the number of UTF-8 bytes in English
+low-resource languages. Chung et al. (2023) simi-
+larly observed overfitting in multilingual T5 mod-       sentence cEnglish,UT F for fair comparison across
+els caused by extensive duplications in the mC4
+corpus, leading them to also train models for only       languages and representation methods. It is the
+250,000 steps. In evaluations, we compare against
+a reimplemented ByT5 instance trained for the            main difference from perplexity, which is normal-
+same number of steps.
+                                                         ized by the sequence length and thus confounded
+5.2 Experiments
+                                                         by segmentation rates characteristic of individual
+We compare the performance of the MyT5 and
+ByT5 models, focusing on three aspects: language         languages and encodings.
+modeling performance, efficiency, and downstream
+evaluation.                                              Second, we compare inference times of text gen-
+
+   First, the multilingual language modeling per-        eration of MyT5 and ByT5. We expect a decrease
+formance of MyT5 – how is it, and is it compara-
+                                                         in sequence length, as shown in the last section,
+
+                                                         will render up to a quadratic reduction of forward-
+
+                                                         pass time due to the quadratic complexity of atten-
+
+                                                         tion computation. For both aspects, we report the
+
+                                                         results on three scales of the model (small, base,
+
+                                                         and large). Unless stated otherwise, we present the
+
+                                                         results of the large model.
+
+                                                         Lastly, we compare models’ performance on four
+
+                                                         tasks from the XTREME-UP benchmark (Ruder
+
+                                                         et al., 2023): question answering, named entity
+recognition, semantic parsing, and translation from                            Byt5                 Myt5
+English. In each task, we fine-tune the large models
+on the multilingual data of all languages for each                        BPEB T (ms)     BPEB T (ms)
+task. Fine-tuned models are evaluated on test data
+for low-resource languages, following Ruder et al.      small  All        10.1 7.0             4.6        6.7
+(2023). The only exception is machine translation,      base   Latin
+where we fine-tune and evaluate on a subset of          large  Non Latin  4.6        5.9       4.2        6.6
+languages to reduce the computation cost. The
+details of training and evaluation are provided in             All        18.1 8.5             5.1        6.8
+Appendix C.                                                    Latin
+                                                               Non Latin  8.2 11.5             5.8        8.9
+
+                                                               All        4.9        9.4       5.0        8.7
+                                                               Latin
+                                                               Non Latin  13.0 14.6            6.9        9.1
+
+                                                                          13.4 31.8            4.6 26.7
+                                                                          10.1 28.1            4.0 26.6
+                                                                          18.2 37.3            5.4 27.0
+
+5.3 Results                                             Table 3: Byte-per-English-Bits and Inference times (av-
+                                                        erage per Flores 200 sentence) averaged for three lan-
+MyT5 Outperforms ByT5 in Language Model-                guage groupings.
+ing In Figure 5a, our model outperforms ByT5,
+producing lower (better) average BP EB scores           Task              QA   NER   Semantic       MT
+for all analyzed languages. The improvement is                                        Parsing
+strongly negatively correlated with the compression
+rate discussed in the previous section. The gains are   Metric            F1 F1           EM chrF
+largest for languages using Abugidas (scripts repre-
+senting consonant-vowel as one character, typical       Flan-PaLM* 22.9 12.0              0.1       —
+to the Indian Subcontinent and SE Asia) that tend
+to be shortened the most by MYTE encoding. On           mT5*              59.7 74.0 21.8            —
+the other end of compression distribution, we still
+observe (smaller) improvement for Latin and CJK         ByT5              73.2 81.5 25.1 20.1
+scripts. This observation suggests that the MYTE        MyT5              75.3 80.8 19.6 20.4
+encoding’s leverage is not constrained to shorten-
+ing sequences, but it also uses codepoints that are             Inference Time (ms)
+easier to predict by a language model. MYTE
+uses codepoints based on morphemes that are in-         ByT5              36.2 13.8 13.2 15.9
+herently meaningful language units in contrast to       MyT5              35.6 12.6 12.4 12.6
+orthographic symbols, which are the backbone of
+the UTF-8 convention.                                   Table 4: The average result of XTREME-UP tasks across
+                                                        low-resource languages. The baseline results of mT5
+Encoding in MyT5 Diminishes LM Performance              and Flan-PaLM (in-context-learning evaluation) are
+Gap Across Languages Previous works have ar-            copied from: Ruder et al. (2023). We observed dispar-
+gued that some languages are more challenging to        ities between their reported and reimplemented ByT5
+model due to their morphological properties (Cot-       results, which are probably caused by the differences
+terell et al., 2018). In contrast, others suggest that  in fine-tuning setting. The time is an average across
+LM performance is linked with how texts in spe-         evaluation examples, the inference was run on an A40
+cific languages are represented (Park et al., 2021).    GPU core. The results for all languages and fine-tuning
+Our results in Figure 6 support the latter view,        details are in Appendix.
+as the predictability of the languages is balanced
+by using equitable underlying representation, i.e.,     ByT5 for languages unseen in morphological anal-
+MYTE encoding. Specifically, we show that MyT5          ysis, except for Sanatli, which also uses a distinct
+achieves more balanced BP EB across languages           script.
+than ByT5. As discussed in the previous section,
+the benefit is the starkest for languages prone to      MyT5 is More Efficient at Scale than ByT5 As
+over-segmentation under UTF-8. The smallest im-         shown in Figure 5b, MyT5’s inference time is
+provements of MyT5 are obtained for languages           shorter than that of ByT5 for almost all languages.
+benefited by MYTE to a lesser extent, as observed       This behavior is mostly observed for Non-Latin
+in Section 4.1: Greek and Vietnamese.                   script languages and can thus be attributed to the
+                                                        higher rates of compression observed when using
+   In Figure 7, we observe that MyT5 outperforms        the MYTE encoding scheme (Figure 4). Further-
+                                                        more, Table 3 demonstrates that MyT5’s inference
+                                                        speed gains over ByT5 improve with model size,
+                                                        hinting that MYTE will bring further efficiency
+                                                        gains when applied to models of larger scales.
+Figure 6: Sentence prediction suprisal expressed as Bit-per-English-Byte on multi-parallel Flores 200 corpus. Each
+point corresponds to the BPEP value of one sentence. The comparison shows that under MyT5 model, performance
+is more equitable across languages than in the standard ByT5 model.
+
+Figure 7: Bit-per-English-Byte for six languages unseen   Figure 8: Avarage score on end tasks from XTREME-
+in morphological analysis: Santali, Sanskrit, Tunisian,   UP end tasks on low-resource languages against the
+Waray, Asturian, Esperanto. Santali (sal) uses an unseen  inference time. The times were divided by the value for
+script (Ol Chicki).                                       ByT5 model, which is always higher than MyT5 model.
+                                                          The metrics and the absolute values of inference time
+MyT5 Performs End Tasks Faster than ByT5                  are shown in Table 4.
+As shown in Table 4, MyT5 and ByT5 perform
+comparably (and better than baselines) on MT and          do not observe a consistent relationship between
+NER. While MyT5 outperforms ByT5 by 2 points              the change in end task performance and efficiency,
+on QA, the opposite is true for semantic parsing.         contrasting with the earlier observed correlation
+We hypothesize that in this case, the morphological       between ∆ of inference time and BP EP in multi-
+prior encoded in MYTE may confound semantic               lingual language modeling.
+parsing fine-tuning, which requires a structured
+output starkly dissimilar to natural language.
+
+   For all the tasks, the inference of MyT5 is faster
+than ByT5 (Figure 8), mirroring our observations
+on language modeling efficiency. However, we
+6 Related Work                                         6.2 Tokenization-free Language Modeling
+
+6.1 Fair Representation across Languages               An alternative to subword tokenization is represent-
+                                                       ing texts directly as underlying encoding: charac-
+Perhaps the most significant challenge of multilin-    ters or bytes. Or even representing texts as pixels
+gual NLP is the large disparity of resourcefulness     of rendered text images (Rust et al., 2023).
+across the world’s languages (Joshi et al., 2020),
+as the size and quality of data used for the model        Xue et al. (2022) shows that for many non-Latin
+training directly affects its performance in individ-  scripts, byte-level encoding performs worse than
+ual languages. Hence, researchers have proposed        subword tokenization. The problem with small
+multiple ways to balance the training signal across    units is that they do not carry meaningful infor-
+languages (Malkin et al., 2022). Solutions include     mation independently and often underperform sub-
+sampling data to overrepresent low-resource lan-       word models (Sun et al., 2023; Clark et al., 2022).
+guages, e.g., with alpha (Conneau et al., 2020) or
+uniform sampling of data across languages (Chung          The researchers have proposed multiple algo-
+et al., 2023). This unequal treatment of languages     rithms to enrich the byte-level embeddings with
+is also present in how data is encoded as input to     information from a local context. For that pur-
+the model (Ahia et al., 2023). Petrov et al. (2023)    pose, recent approaches use shallow networks to
+show that practically all methods used to repre-       aggregate information in local contexts defined as
+sent texts as input of NLP systems treat languages     character n-grams (Clark et al., 2022), byte patches
+unequally, segmenting some (mainly the lowest-         (Yu et al., 2023), or character blocks (Tay et al.,
+resourced ones) into fine-grained non-informative      2022). However, the problem with choosing the
+units.                                                 appropriate context window is hard, because infor-
+                                                       mation density varies for different languages. A so-
+   Some approaches aimed at balancing the seg-         lution to that problem can be dynamically learning
+mentation or tokenization methods have been intro-     the segmentation in byte sequences (Nawrot et al.,
+duced. Limisiewicz et al. (2023) proposed merging      2023). Another approach is to redefine the encod-
+vocabulary based on the tokenizer scoring func-        ing convention to equate the information loads in
+tion. Zheng et al. (2021) introduced a method of       sequences, as the proposed MYTE approach.
+allocating vocabulary capacity uniformly across
+languages, while Chung et al. (2020) constructed       7 Conclusion
+multilingual vocabulary for clusters of languages
+and merged them. Liang et al. (2023) combined          In this paper, we introduce MYTE encoding, a
+the elements of both approaches and showed the         fairer byte-level representation for multilingual lan-
+advantage of extending vocabulary to benefit multi-    guage modeling that is based on morphological seg-
+lingual transfer. These solutions promise to obtain    mentation. We show that adapting a morphological
+a better allocation of vocabulary units. However,      analyzer to unsupervised segmentation allows us to
+they do not solve the inequality of the underlying     represent multi-parallel corpora with comparable
+encoding, which may affect the construction pro-       encoding lengths across a wide range of languages.
+cess of vocabulary units. For instance, byte merges    Additionally, our new representation significantly
+in the BPE algorithm begin at individual bytes Sen-    improves language modeling, especially of low-
+nrich et al. (2016); Zouhar et al. (2023). Therefore,  resource and non-Latin script languages, and pro-
+the unequal granularity of UTF-8 representation        vides efficiency benefits over traditional byte-level
+impacts the vocabulary construction step in BPE,       models. These trends hold across model sizes, with
+especially harming the low-resource non-Latin lan-     improvement increasing at scale. Overall, MYTE
+guages (Kargaran et al., 2024). A possible solution    bridges the gap in encoding efficiency between
+is training BPE on top of MYTE encoded and bal-        high and low-resource languages, benefiting (to
+anced multilingual corpus.                             varying extent) all 99 analyzed languages.
+
+   Morphological analyzers, such as Morfessor,
+showed promising results for segmenting input
+texts for language models and neural machine trans-
+lators (Machácek et al., 2018; Hou et al., 2023). We
+are the first to apply morphology-based encoding
+for a massively multilingual setting.
+Ethical Statement                                      program. Tomasz Limisiewicz acknowledges the
+                                                       support of grant 338521 of the Charles University
+Our work makes a significant contribution to a         Grant Agency, a Fellowship from Paul G. Allen
+fairer representation of text across diverse lan-      School, and the Mobility Fund of Charles Univer-
+guages. It will potentially benefit the speakers of    sity.
+underrepresented languages by enabling access to
+more reliable and cheaper NLP tools. For all the       References
+experiments, we relied on open-source tools and
+datasets. We strongly discourage unintended usage      David Adelani, Graham Neubig, Sebastian Ruder,
+of the released language models.                          Shruti Rijhwani, Michael Beukman, Chester Palen-
+                                                          Michel, Constantine Lignos, Jesujoba Alabi, Sham-
+Limitations                                               suddeen Muhammad, Peter Nabende, Cheikh
+                                                          M. Bamba Dione, Andiswa Bukula, Rooweither
+Our method inherits the limitations of Morfessor,         Mabuya, Bonaventure F. P. Dossou, Blessing Sibanda,
+which was used to obtain multilingual morpholog-          Happy Buzaaba, Jonathan Mukiibi, Godson Kalipe,
+ical segmentation for MYTE. First, Morfessor is           Derguene Mbaye, Amelia Taylor, Fatoumata Ka-
+data dependent and is affected by the quality of the      bore, Chris Chinenye Emezue, Anuoluwapo Aremu,
+corpus (Wikipedia) and the lexicon (MUSE Lample           Perez Ogayo, Catherine Gitau, Edwin Munkoh-
+et al. (2018) when available). The artifact of these      Buabeng, Victoire Memdjokam Koagne, Allah-
+resources is a significant presence of cross-lingual      sera Auguste Tapo, Tebogo Macucwa, Vukosi Mari-
+contamination, typically from high-resource lan-          vate, Mboning Tchiaze Elvis, Tajuddeen Gwad-
+guages (Blevins and Zettlemoyer, 2022). This leads        abe, Tosin Adewumi, Orevaoghene Ahia, Joyce
+to the appearance of Latin (typically English) mor-       Nakatumba-Nabende, Neo Lerato Mokono, Ig-
+phemes in analyses of many languages. Second,             natius Ezeani, Chiamaka Chukwuneke, Mofetoluwa
+we use the unsupervised mode of Morfessor that            Oluwaseun Adeyemi, Gilles Quentin Hacheme,
+can be applied to any language due to its indepen-        Idris Abdulmumin, Odunayo Ogundepo, Oreen
+dence of annotated data. However, it is also prone        Yousuf, Tatiana Moteu, and Dietrich Klakow. 2022.
+to errors in morphological segmentations, i.e., over-     MasakhaNER 2.0: Africa-centric transfer learning
+segmenting texts of specific languages. We miti-          for named entity recognition. In Proceedings of the
+gate this issue by picking a constant target number       2022 Conference on Empirical Methods in Natural
+of morphemes.                                             Language Processing, Abu Dhabi, United Arab Emi-
+                                                          rates. Association for Computational Linguistics.
+   Dependence on data might also affect the gen-
+eralizability of our findings’ to the languages that   Orevaoghene Ahia, Sachin Kumar, Hila Gonen, Jungo
+were not used in the construction of MYTE. Re-            Kasai, David R. Mortensen, Noah A. Smith, and
+sults in Section 4.1 show that the method is indeed       Yulia Tsvetkov. 2023. Do All Languages Cost the
+effective in compressing text representation of un-       Same? Tokenization in the Era of Commercial Lan-
+seen languages but not unseen scripts. Notably, we        guage Models. In Proceedings of the 2023 Confer-
+do not exhaust the capacity of the MYTE code-             ence on Empirical Methods in Natural Language Pro-
+page; thus, it can be extended to further languages.      cessing, EMNLP 2023, Singapore, December 6-10,
+                                                          2023, pages 9904–9923. Association for Computa-
+   Lastly, even perfect morphological analysis can-       tional Linguistics.
+not guarantee equal granularity of segmentation
+across languages. Some languages are character-        Catherine Arnett, Tyler A. Chang, and Benjamin K.
+ized by higher morphological richness, thus their         Bergen. 2024. A bit of a problem: Measurement
+texts consist of more morphemes. Accordingly,             disparities in dataset sizes across languages.
+we observe differences in MYTE segmentation
+lengths across languages, yet these disparities are    Terra Blevins and Luke Zettlemoyer. 2022. Language
+significantly smaller than in other conventions.          Contamination Helps Explains the Cross-lingual Ca-
+                                                          pabilities of English Pretrained Models. In Proceed-
+Acknowledgements                                          ings of the 2022 Conference on Empirical Methods
+                                                          in Natural Language Processing, pages 3563–3574,
+We would like to thank Jana Straková and Zdeneˇk          Abu Dhabi, United Arab Emirates. Association for
+Žabokrtský for helpful feedback on this project.          Computational Linguistics.
+We are thankful to Google for providing free com-
+putation quotas through the TPU Research Cloud         Hyung Won Chung, Xavier Garcia, Adam Roberts,
+                                                          Yi Tay, Orhan Firat, Sharan Narang, and Noah Con-
+                                                          stant. 2023. UniMax: Fairer and More Effective
+                                                          Language Sampling for Large-scale Multilingual Pre-
+                                                          training. In The Eleventh International Conference
+                                                          on Learning Representations, ICLR 2023, Kigali,
+                                                          Rwanda, May 1-5, 2023. OpenReview.net.
+Hyung Won Chung, Dan Garrette, Kiat Chuan Tan, and             low resource writing system identification. In Pro-
+   Jason Riesa. 2020. Improving Multilingual Models            ceedings of the 2024 Joint International Conference
+   with Language-clustered Vocabularies. In Proceed-           on Computational Linguistics, Language Resources
+   ings of the 2020 Conference on Empirical Methods in         and Evaluation (LREC-COLING 2024), pages 7774–
+   Natural Language Processing, EMNLP 2020, Online,            7784, Torino, Italia. ELRA and ICCL.
+   November 16-20, 2020, pages 4536–4546. Associa-
+   tion for Computational Linguistics.                      Taku Kudo and John Richardson. 2018. SentencePiece:
+                                                               A simple and language independent subword tok-
+Jonathan H. Clark, Dan Garrette, Iulia Turc, and John          enizer and detokenizer for neural text processing. In
+   Wieting. 2022. Canine: Pre-training an efficient            Proceedings of the 2018 Conference on Empirical
+   tokenization-free encoder for language representa-          Methods in Natural Language Processing: System
+   tion. Transactions of the Association for Computa-          Demonstrations, pages 66–71, Brussels, Belgium.
+   tional Linguistics, 10:73–91.                               Association for Computational Linguistics.
+
+Alexis Conneau, Kartikay Khandelwal, Naman Goyal,           Guillaume Lample, Alexis Conneau, Marc’Aurelio Ran-
+   Vishrav Chaudhary, Guillaume Wenzek, Francisco              zato, Ludovic Denoyer, and Hervé Jégou. 2018.
+   Guzmán, Edouard Grave, Myle Ott, Luke Zettle-               Word translation without parallel data. In 6th In-
+   moyer, and Veselin Stoyanov. 2020. Unsupervised             ternational Conference on Learning Representations,
+   cross-lingual representation learning at scale. In Pro-     ICLR 2018, Vancouver, BC, Canada, April 30 - May
+   ceedings of the 58th Annual Meeting of the Asso-            3, 2018, Conference Track Proceedings. OpenRe-
+   ciation for Computational Linguistics, pages 8440–          view.net.
+   8451, Online. Association for Computational Lin-
+   guistics.                                                Davis Liang, Hila Gonen, Yuning Mao, Rui Hou, Na-
+                                                               man Goyal, Marjan Ghazvininejad, Luke Zettle-
+Ryan Cotterell, S. J. Mielke, Jason Eisner, and Brian          moyer, and Madian Khabsa. 2023. XLM-V: Over-
+   Roark. 2018. Are All Languages Equally Hard to              coming the Vocabulary Bottleneck in Multilingual
+   Language-Model? In Proceedings of the 2018 Con-             Masked Language Models. In Proceedings of the
+   ference of the North American Chapter of the As-            2023 Conference on Empirical Methods in Natural
+   sociation for Computational Linguistics: Human              Language Processing, EMNLP 2023, Singapore, De-
+   Language Technologies, NAACL-HLT, New Orleans,              cember 6-10, 2023, pages 13142–13152. Association
+   Louisiana, USA, June 1-6, 2018, Volume 2 (Short Pa-         for Computational Linguistics.
+   pers), pages 536–541. Association for Computational
+   Linguistics.                                             Tomasz Limisiewicz, Jirí Balhar, and David Marecek.
+                                                               2023. Tokenization Impacts Multilingual Language
+Jacob Devlin, Ming-Wei Chang, Kenton Lee, and                  Modeling: Assessing Vocabulary Allocation and
+   Kristina Toutanova. 2019. BERT: Pre-training of             Overlap Across Languages. In Findings of the As-
+   deep bidirectional transformers for language under-         sociation for Computational Linguistics: ACL 2023,
+   standing. In Proceedings of the 2019 Conference of          Toronto, Canada, July 9-14, 2023, pages 5661–5681.
+   the North American Chapter of the Association for           Association for Computational Linguistics.
+   Computational Linguistics: Human Language Tech-
+   nologies, Volume 1 (Long and Short Papers), pages        Dominik Machácek, Jonás Vidra, and Ondrej Bojar.
+   4171–4186, Minneapolis, Minnesota. Association for          2018. Morphological and Language-agnostic Word
+   Computational Linguistics.                                  Segmentation for NMT. In Text, Speech, and Di-
+                                                               alogue - 21st International Conference, TSD 2018,
+M. Haspelmath and A.D. Sims. 2010. Understanding               Brno, Czech Republic, September 11-14, 2018, Pro-
+   Morphology. Understanding language series. Hodder           ceedings, volume 11107 of Lecture Notes in Com-
+   Education.                                                  puter Science, pages 277–284. Springer.
+
+Jue Hou, Anisia Katinskaia, Anh-Duc Vu, and Roman           Dan Malkin, Tomasz Limisiewicz, and Gabriel
+   Yangarber. 2023. Effects of sub-word segmentation           Stanovsky. 2022. A balanced data approach for eval-
+   on performance of transformer language models. In           uating cross-lingual transfer: Mapping the linguistic
+   Proceedings of the 2023 Conference on Empirical             blood bank. In Proceedings of the 2022 Conference
+   Methods in Natural Language Processing, EMNLP               of the North American Chapter of the Association for
+   2023, Singapore, December 6-10, 2023, pages 7413–           Computational Linguistics: Human Language Tech-
+   7425. Association for Computational Linguistics.            nologies, pages 4903–4915, Seattle, United States.
+                                                               Association for Computational Linguistics.
+Pratik Joshi, Sebastin Santy, Amar Budhiraja, Kalika
+   Bali, and Monojit Choudhury. 2020. The state and         Piotr Nawrot, Jan Chorowski, Adrian Lancucki, and
+   fate of linguistic diversity and inclusion in the NLP       Edoardo Maria Ponti. 2023. Efficient Transformers
+   world. In Proceedings of the 58th Annual Meeting of         with Dynamic Token Pooling. In Proceedings of the
+   the Association for Computational Linguistics, pages        61st Annual Meeting of the Association for Compu-
+   6282–6293, Online. Association for Computational            tational Linguistics (Volume 1: Long Papers), ACL
+   Linguistics.                                                2023, Toronto, Canada, July 9-14, 2023, pages 6403–
+                                                               6417. Association for Computational Linguistics.
+Amir Hossein Kargaran, François Yvon, and Hinrich
+   Schütze. 2024. GlotScript: A resource and tool for
+Hyunji Hayley Park, Katherine J. Zhang, Coleman Ha-       Rico Sennrich, Barry Haddow, and Alexandra Birch.
+   ley, Kenneth Steimel, Han Liu, and Lane Schwartz.         2016. Neural Machine Translation of Rare Words
+   2021. Morphology Matters: A Multilingual Lan-             with Subword Units. In Proceedings of the 54th
+   guage Modeling Analysis. Trans. Assoc. Comput.            Annual Meeting of the Association for Computational
+   Linguistics, 9:261–276.                                   Linguistics, ACL 2016, August 7-12, 2016, Berlin,
+                                                             Germany, Volume 1: Long Papers. The Association
+Aleksandar Petrov, Emanuele La Malfa, Philip H. S.           for Computer Linguistics.
+   Torr, and Adel Bibi. 2023. Language Model Tokeniz-
+   ers Introduce Unfairness Between Languages. CoRR,      Peter Smit, Sami Virpioja, Stig-Arne Grönroos, and
+   abs/2305.15425.                                           Mikko Kurimo. 2014. Morfessor 2.0: Toolkit for sta-
+                                                             tistical morphological segmentation. In Proceedings
+Jonas Pfeiffer, Ivan Vulic´, Iryna Gurevych, and Sebas-      of the Demonstrations at the 14th Conference of the
+   tian Ruder. 2021. UNKs everywhere: Adapting mul-          European Chapter of the Association for Computa-
+   tilingual language models to new scripts. In Proceed-     tional Linguistics, pages 21–24, Gothenburg, Sweden.
+   ings of the 2021 Conference on Empirical Methods in       Association for Computational Linguistics.
+   Natural Language Processing, pages 10186–10203,
+   Online and Punta Cana, Dominican Republic. Asso-       Jimin Sun, Patrick Fernandes, Xinyi Wang, and Graham
+   ciation for Computational Linguistics.                    Neubig. 2023. A Multi-dimensional Evaluation of
+                                                             Tokenizer-free Multilingual Pretrained Models. In
+Colin Raffel, Noam Shazeer, Adam Roberts, Katherine          Findings of the Association for Computational Lin-
+   Lee, Sharan Narang, Michael Matena, Yanqi Zhou,           guistics: EACL 2023, Dubrovnik, Croatia, May 2-6,
+   Wei Li, and Peter J. Liu. 2020. Exploring the Lim-        2023, pages 1680–1690. Association for Computa-
+   its of Transfer Learning with a Unified Text-to-text      tional Linguistics.
+   Transformer. J. Mach. Learn. Res., 21:140:1–140:67.
+                                                          Yi Tay, Vinh Q. Tran, Sebastian Ruder, Jai Prakash
+Adam Roberts, Hyung Won Chung, Anselm Levskaya,              Gupta, Hyung Won Chung, Dara Bahri, Zhen Qin,
+   Gaurav Mishra, James Bradbury, Daniel Andor, Sha-         Simon Baumgartner, Cong Yu, and Donald Metzler.
+   ran Narang, Brian Lester, Colin Gaffney, Afroz            2022. Charformer: Fast Character Transformers via
+   Mohiuddin, Curtis Hawthorne, Aitor Lewkowycz,             Gradient-based Subword Tokenization. In The Tenth
+   Alex Salcianu, Marc van Zee, Jacob Austin, Sebas-         International Conference on Learning Representa-
+   tian Goodman, Livio Baldini Soares, Haitang Hu,           tions, ICLR 2022, Virtual Event, April 25-29, 2022.
+   Sasha Tsvyashchenko, Aakanksha Chowdhery, Jas-            OpenReview.net.
+   mijn Bastings, Jannis Bulian, Xavier Garcia, Jianmo
+   Ni, Andrew Chen, Kathleen Kenealy, Jonathan H.         NLLB Team, Marta R. Costa-jussà, James Cross, Onur
+   Clark, Stephan Lee, Dan Garrette, James Lee-Thorp,        Çelebi, Maha Elbayad, Kenneth Heafield, Kevin Hef-
+   Colin Raffel, Noam Shazeer, Marvin Ritter, Maarten        fernan, Elahe Kalbassi, Janice Lam, Daniel Licht,
+   Bosma, Alexandre Passos, Jeremy Maitin-Shepard,           Jean Maillard, Anna Sun, Skyler Wang, Guillaume
+   Noah Fiedel, Mark Omernick, Brennan Saeta, Ryan           Wenzek, Al Youngblood, Bapi Akula, Loic Bar-
+   Sepassi, Alexander Spiridonov, Joshua Newlan, and         rault, Gabriel Mejia Gonzalez, Prangthip Hansanti,
+   Andrea Gesmundo. 2022. Scaling Up Models                  John Hoffman, Semarley Jarrett, Kaushik Ram
+   and Data with $\texttt{t5x}$ and $\texttt{seqio}$.        Sadagopan, Dirk Rowe, Shannon Spruit, Chau
+   ArXiv:2203.17189 [cs].                                    Tran, Pierre Andrews, Necip Fazil Ayan, Shruti
+                                                             Bhosale, Sergey Edunov, Angela Fan, Cynthia
+Sebastian Ruder, Jonathan H. Clark, Alexander Gutkin,        Gao, Vedanuj Goswami, Francisco Guzmán, Philipp
+   Mihir Kale, Min Ma, Massimo Nicosia, Shruti Ri-           Koehn, Alexandre Mourachko, Christophe Ropers,
+   jhwani, Parker Riley, Jean Michel A. Sarr, Xinyi          Safiyyah Saleem, Holger Schwenk, and Jeff Wang.
+   Wang, John Wieting, Nitish Gupta, Anna Katanova,          2022. No Language Left Behind: Scaling Human-
+   Christo Kirov, Dana L. Dickinson, Brian Roark,            centered Machine Translation.
+   Bidisha Samanta, Connie Tao, David Ifeoluwa Ade-
+   lani, Vera Axelrod, Isaac Caswell, Colin Cherry, Dan   The Unicode Consortium. 2011. The Unicode Standard.
+   Garrette, R. Reeve Ingle, Melvin Johnson, Dmitry          Technical Report Version 6.0.0, Unicode Consortium,
+   Panteleev, and Partha Talukdar. 2023. XTREME-UP:          Mountain View, CA. ISBN: 978-1-936213-01-6.
+   A User-centric Scarce-data Benchmark for Under-
+   represented Languages. In Findings of the Associa-     Linting Xue, Aditya Barua, Noah Constant, Rami Al-
+   tion for Computational Linguistics: EMNLP 2023,           Rfou, Sharan Narang, Mihir Kale, Adam Roberts,
+   Singapore, December 6-10, 2023, pages 1856–1884.          and Colin Raffel. 2022. ByT5: Towards a Token-
+   Association for Computational Linguistics.                free Future with Pre-trained Byte-to-byte Models.
+                                                             Trans. Assoc. Comput. Linguistics, 10:291–306.
+Phillip Rust, Jonas F. Lotz, Emanuele Bugliarello, Eliz-
+   abeth Salesky, Miryam de Lhoneux, and Desmond          Linting Xue, Noah Constant, Adam Roberts, Mihir Kale,
+   Elliott. 2023. Language Modelling with Pixels. In         Rami Al-Rfou, Aditya Siddhant, Aditya Barua, and
+   The Eleventh International Conference on Learning         Colin Raffel. 2021. mT5: A massively multilingual
+   Representations, ICLR 2023, Kigali, Rwanda, May           pre-trained text-to-text transformer. In Proceedings
+   1-5, 2023. OpenReview.net.                                of the 2021 Conference of the North American Chap-
+                                                             ter of the Association for Computational Linguistics:
+   Human Language Technologies, pages 483–498, On-
+   line. Association for Computational Linguistics.
+
+Lili Yu, Daniel Simig, Colin Flaherty, Armen
+   Aghajanyan, Luke Zettlemoyer, and Mike Lewis.
+   2023. MEGABYTE: Predicting Million-byte Se-
+   quences with Multiscale Transformers. CoRR,
+   abs/2305.07185.
+
+Zdeneˇk Žabokrtský, Niyati Bafna, Jan Bodnár, Lukáš
+   Kyjánek, Emil Svoboda, Magda Ševcˇíková, and
+   Jonáš Vidra. 2022. Towards universal segmenta-
+   tions: UniSegments 1.0. In Proceedings of the Thir-
+   teenth Language Resources and Evaluation Confer-
+   ence, pages 1137–1149, Marseille, France. European
+   Language Resources Association.
+
+Bo Zheng, Li Dong, Shaohan Huang, Saksham Sing-
+   hal, Wanxiang Che, Ting Liu, Xia Song, and Furu
+   Wei. 2021. Allocating Large Vocabulary Capacity for
+   Cross-lingual Language Model Pre-training. In Pro-
+   ceedings of the 2021 Conference on Empirical Meth-
+   ods in Natural Language Processing, EMNLP 2021,
+   Virtual Event / Punta Cana, Dominican Republic, 7-
+   11 November, 2021, pages 3203–3215. Association
+   for Computational Linguistics.
+
+Vilém Zouhar, Clara Meister, Juan Luis Gastaldi, Li Du,
+   Tim Vieira, Mrinmaya Sachan, and Ryan Cotterell.
+   2023. A Formal Perspective on Byte-pair Encoding.
+   In Findings of the Association for Computational
+   Linguistics: ACL 2023, Toronto, Canada, July 9-14,
+   2023, pages 598–614. Association for Computational
+   Linguistics.
+A Details of Unsupervised Morphological                 errors, such as over-segmentation of roots or mis-
+     Analysis                                           placed morpheme boundaries. We use adaptive loss
+                                                        weighting to limit the number of attested morphs
+In this appendix, we provide details on the prerequi-   to around 4096 to avoid over-segmentation. Unlike
+sites of MYTE transcoding algorithm: a) preparing       the typical usage of Morfessor, we applied it to the
+multilingual lexicons and corpora for morpholog-        corpus on byte instead of character level.
+ical analysis and b) usage of Morfessor unsuper-
+vised algorithm to obtain morpheme inventory for        A.3 Morfessor: Technical Details
+each language.
+                                                        Morfessor uses recursive optimization to produce
+A.1 Preparing Lexicons for Morphological                subword segmentation akin to morphological anal-
+       Analysis                                         ysis. The input data required for unsupervised anal-
+                                                        ysis are language corpus and lexicon consisting of
+To obtain morphological segmentation across a           unique words c ∈ C. We also define the set of
+wide variety of languages and scripts, we perform       atoms a ∈ A, which are indivisible segments of
+the following steps:                                    texts that can be assembled into words. We choose
+                                                        atoms to be UTF-8 bytes.
+  1. We use 45 languages with bilingual lexicons
+      available through MUSE (Lample et al., 2018)         The aim of the algorithm is to find a set of mor-
+      as a base. Lexicons are obtained indepen-         phemes m ∈ M appearing in the segmentation
+      dently for each language; hence, we ignore the    of words from the given lexicon. The set of mor-
+      bilingual aspect of the data. We filter out the   phemes M is extended by a recursive algorithm
+      lexemes that are the same in English and the      optimizing two losses: corpus loss and lexicon loss
+      target language to avoid contamination that       computed with respective data resources. Before
+      would unfairly boost the frequency of English     providing equations for the mentioned losses, let’s
+      words across lexicons.                            define the auxiliary variables:
+
+  2. We use Wikipedia corpus dump from Septem-             M=        #COR(m)
+      ber 2023 dumps.wikimedia.org to count the
+      occurances of lexemes. For 54 languages in-               m∈M
+      cluded in mC4 (Raffel et al., 2020), but with-
+      out the MUSE lexicon, we compile the list of         C = #COR(m) − 1             (2)
+      unique words in Wikipedia as a lexicon.
+                                                                c∈C
+  3. The lexicons are clipped to the size of 30,000
+      lexemes.                                                  A = #M(a)
+
+  4. All lexemes are transcribed to bytes via UTF-8                     a∈A
+      standard. All byte sequences are decomposed
+      following NKFD convention, i.e., modifying           The # notation is used to denote the number
+      symbols (diacritics, accents), which are rep-     of elements in the corpus (COR) or morpheme
+      resented as separate codepoints. On top of        set M. In other words, M is the total number of
+      UTF-8 decomposition, we rewrite capital let-      morphemes in the corpus, C is the total number of
+      ter codes into lowercase letters and capitaliza-  words in the corpus, and A is the total number of
+      tion markers.                                     atoms in the set of (unique) morphemes. Morfessor
+                                                        uses the following losses in recursive optimization:
+A.2 Unsupervised Segmentation with
+       Morfessor                                        Corpus loss favors morphemes frequently ap-
+                                                        pearing in the corpus:
+We use Morfessor (Smit et al., 2014), an unsuper-
+vised algorithm producing segmentation on a sub-        LCOR = (M + C) log(M + C)+
+word level that resembles morphological analysis.
+The unsupervised nature of the method allows us         −       #COR(m) log #COR(m)+
+to apply it to a wide range of languages. However,
+it is essential to note that the method is prone to        m∈M                         (3)
+
+                                                                               M −1
+                                                                     + log
+
+                                                                              |M| − 1
+
+                                                        Lexocon loss favors segments consisting of di-
+                                                        verse sets of atoms so that overlapping segments
+                                                        are not identified as morphemes:
+LLEX = (A + |M|) log(A + |M|) − |M| log |M|+                  (a) UTF-8
+
+             − #M(a) log #M(a) − log(|M|!)+
+
+                      a∈A
+
+                                                     A−1
+                                          + log
+
+                                                    |A| − 1
+                                                         (4)
+
+   The losses are weighted by a parameter α, which
+indirectly controls the size of the morpheme set
+|M|. For instance, we adapt α to keep the number
+of morphemes close to 4096 for each language. We
+observed that this size leads to comparable segmen-
+tation across languages,
+
+L = αLCOR + LLEX         (5)
+
+B Supplementary Results
+
+This appendix summarizes complementary results
+referred to throughout the papers.
+
+B.1 Results for Each Language                                 (b) MYTE
+
+All the experimental results for each of the ana-
+lyzed mC4 languages are presented in Table 9. Se-
+quence lengths under UTF-8 and MYTE are visu-
+alized in Figure 10. Corresponding compression
+rates in Figure 11.
+
+   Figure 9 illustrates the sequence lengths and
+compressions obtained for languages unseen in the
+morphological analysis. While Figure 7 shows
+the comparison of ByT5 and MyT5 for these lan-
+guages.
+
+B.2 LM Performance Across Scales                                                  (c) Sequence compression
+
+Figure 12 shows the difference of BP EB between               Figure 9: Average byte sequence lengths of parallel
+MyT5 and ByT5 the models in small and base                    sentences for languages unseen in the morphological
+scales. Furthermore, Table 9 contains average lan-            analysis used in the construction of MYTE. Santali (sal)
+guage modeling scores and inference times across              uses a script (Ol Chicki), a distinct script not seen in
+all available scales for each language. Both Fig-             morphological analysis.
+ures show that MYTE offers improvement for lan-
+guages not seen in morphological analysis but not
+for Sanatli, which uses a distinct script.
+
+B.3 XTREME-UP Benchmark Results
+
+Tables 5, 6, 7, and 8 present detailed results of
+edtasks collected in XTREME-UP benchmark.
+
+C Technical Details
+
+C.1 Compuatational Infrastracture                             Platform. We used v3-8 for training small and base
+                                                              models and v3-32 for the large model. The train-
+The MyT5 and reimplemented ByT5 models were                   ing took approximately 90h for small, 230h for
+trained on TPUs available through Google Cloud
+                                                                (a) Original UTF-8
+
+                                                         (b) MYTE (Same order as in a)
+                    Figure 10: Average byte sequence lengths of parallel sentences from Flores 200.
+
+Figure 11: Sequence compression rates on Flores 200 of MYTE in comparison with the original UTF-8 encoding.
+                               ar bn en fi id ko ru sw te AVG LR AVG
+
+                  ByT5 81.6 59.3 76.3 80.7 77.8 75.7 75.9 77.1 78.1 73.2 75.9
+                  MyT5 82.3 67.2 74.9 80.5 76.1 74.8 76.6 74.2 83.6 75.3 76.7
+
+                          Table 5: F1 scores for question answering (XTREME-UP benchmark).
+                (a) small                                                               (b) base
+
+Figure 12: The difference in Byte-per-English-Bit between MyT5 and ByT5 for models in small and base scales.
+
+am  bbj bm  ee  ha         ig      lg      luo mos ny pcm rw  sn    sw      tn      tw  wo  xh    yo  zu AVG LR AVG
+
+ByT5 60.8 72.5 80.0 88.1 88.1 84.3 84.6 77.1 73.5 89.1 85.2 76.7 90.0 88.5 85.6 77.6 80.2 83.4 78.7 85.2  81.5  81.5
+
+MyT5 62.1 68.9 79.2 87.1 87.5 83.3 83.6 75.4 75.4 88.0 85.2 77.9 90.2 88.9 84.7 77.7 75.0 82.0 79.4 83.8  80.8  80.8
+
+Table 6: F1 scores for named entity recognition (MasakhaNER test set Adelani et al. (2022) via XTREME-UP
+benchmark)
+
+am  be  bn  de  en             es      fi  fr  ha  hi  ja pt_br ru      sw      ta      th  tr    yo  zu AVG LR AVG
+
+ByT5 18.6 31.7 30.7 34.5 35.1 33.1 30.0 34.8 25.7 25.7 31.4 34.7 35.7 26.4 26.4 24.6 32.1 18.6 22.8       25.1  29.1
+
+MyT5 16.5 26.2 20.6 31.6 31.6 28.1 25.7 28.1 21.7 18.7 18.1 30.4 32.8 21.4 21.2 19.2 25.7 13.0 16.7       19.7  23.5
+
+            Table 7: Exact match score for semantic parsing (XTREME-UP benchmark)
+
+              am de el fr hy ja kk ko mt pl ru sn ta te vi AVG LR AVG
+  MyT5 9.4 31.9 21.9 36.5 22.6 9.2 20.1 7.7 26.2 25.3 24.3 27.8 22.5 18.4 24.1 21.1 21.8
+  ByT5 8.8 35.4 22.1 41.8 22.8 9.3 20.9 7.1 34.1 27.8 26.9 27.4 21.3 17.4 23.9 21.9 23.1
+
+Table 8: ChrF scores for machine translation (Florers 200 test set Team et al. (2022) via XTREME-UP benchmark).
+
+base, and 190h for large models. We are thankful       MT 10000. For machine translation, we selected
+to Google for providing free quotas for those ma-      the following sample of language both for training
+chines through the TPU Research Cloud program.         and evaluation: Telugu, Tamil, Greek, Armenian,
+                                                       Russian, Kazakh, Amharic, Vietnamese, Japanese,
+   The inference in language modeling experiments      French, Korean, German, Marathi, and Polish.
+was run on an A40 GPU core.
+
+C.2 Fine-Tuning
+
+For few-shot fine-tuning, we choose the same
+hyperparameters and optimization strategy as in
+Ruder et al. (2023): 0.1 dropout, 1e−3 learning
+rate with inverse square root decay. The batch
+size was chosen to facilitate training on v3-8 TPU,
+specifically 128 for NER; 64 for MT, QA, and se-
+mantic parsing. The number of fine-tuning steps
+corresponded to the sizes of the training datasets:
+QA 6500, NER 6000, semantic parsing 1000, and
+           UTF-8        MYTE    Comp. .                     ByT5                                     MyT5
+
+Lang  Parity Len.  Parity Len.    in %          BPEB                   Time (ms)         BPEB                   Time (ms)
+
+ af    1.1 139.6    1.1 123.3     11.7   small   base  large small base large     small   base  large small base large
+ am    1.7 222.8    1.3 137.6     38.2
+ ar    1.6 208.8    1.3 144.2     30.9    3.9     4.6  9.5        5.8  8.9 27.6    3.7     4.3  3.4        6.6  8.4 26.1
+ az    1.3 164.6    1.2 129.1     21.6   11.7     8.3                              5.1     6.9
+ be    2.1 267.7    1.4 155.5     41.9    7.0     6.7  15.3 6.9 12.5 32.0          4.6     6.4  5.2        6.7  9.0 27.0
+ bg    1.9 247.6    1.3 137.1     44.6    6.4     5.7                              4.6     5.4
+ bn    2.6 340.6    1.3 145.0     57.4   14.6    11.6  13.7 7.0 11.6 31.4          5.7     7.5  4.4        6.4  9.1 26.7
+ ca    1.1 147.1    1.2 127.7     13.2   11.9     9.6                              4.3     4.9
+ ceb   1.2 156.9    1.3 143.8     8.3    28.4    17.2  11.4       6.3  9.9 28.9    5.3     7.2  4.7        6.7  8.7 27.5
+ cs    1.1 140.7    1.1 124.1     11.8    4.1     4.6                              3.9     4.6
+ cy    1.1 140.1    1.2 129.1     7.9     5.0     5.0  17.1 8.1 13.5 35.5          4.4     6.0  5.9        6.9  9.5 27.4
+ da    1.0 136.7    1.1 116.9     14.5    4.4     4.8                              4.5     4.8
+ de    1.2 154.5    1.2 132.8     14.1    4.5     5.1  14.6 7.7 12.6 33.9          4.2     5.1  3.8        7.1  8.8 24.1
+  el   2.2 284.1    1.7 185.0     34.9    3.9     4.5                              3.6     4.0
+ en    1.0 130.5    1.0 109.1     16.4    4.6     5.1  21.3 9.3 16.6 41.3          4.2     5.1  5.4        6.9  9.2 27.5
+ eo    1.0 132.2    1.1 115.1     12.9   12.8    13.6                              8.2    13.3
+ es    1.2 158.0    1.2 133.5     15.5    2.6     3.3  9.6        5.8  9.4 27.9    2.6     3.2  3.4        6.7  8.5 25.9
+  et   1.0 131.9    1.1 115.0     12.8    3.8     4.4                              3.6     4.1
+ eu    1.1 138.6    1.0 114.0     17.8    4.7     4.8  11.1       6.0  9.6 28.7    4.0     4.8  4.5        6.3  9.2 27.6
+ fa    1.7 220.9    1.3 143.4     35.1    4.1     4.4                              3.9     4.3
+  fi   1.1 144.1    1.1 122.3     15.1    4.3     4.6  9.5        5.5  9.0 28.1    3.7     4.1  4.1        6.7  8.4 26.0
+  fr   1.2 162.1    1.3 138.6     14.5    8.6     7.6                              4.4     6.1
+ fy    1.1 143.0    1.2 131.3     8.2     4.7     4.8  10.7       5.9  8.7 27.6    4.2     4.9  4.2        7.1  8.5 23.4
+ ga    1.2 160.3    1.3 142.5     11.1    4.7     5.1                              4.2     5.3
+ gd    1.3 167.2    1.4 148.8     11.0    4.8     5.1  9.3        5.9  8.7 27.8    4.5     5.5  3.3        6.8  8.2 33.7
+ gl    1.1 148.0    1.1 124.8     15.7    5.4     5.7                              5.0     6.2
+ gu    2.5 327.1    1.4 150.0     54.1    5.8     6.0  10.2       6.2  9.7 27.9    5.1     6.9  3.6        6.5  8.8 26.7
+ ha    1.1 140.0    1.2 126.5     9.6     4.2     4.5                              3.8     4.4
+ he    1.4 180.9    1.2 127.3     29.6   26.5    16.6  19.5 8.3 14.0 36.6          5.8     7.8  9.3        7.1 10.4 29.7
+ hi    2.6 333.1    1.5 161.6     51.5    4.1     4.6                              3.7     4.5
+ ht    0.9 123.2    1.1 115.8     6.0     5.6     7.4  6.8        6.2 11.0 28.4    4.3     5.0  1.9        6.6 10.5 30.3
+ hu    1.2 150.8    1.2 128.9     14.5   23.8    15.8                              5.9     9.0
+ hy    2.0 266.5    1.3 141.2     47.0    3.5     4.2  9.1        5.8  8.5 27.2    3.5     4.0  3.3        6.6  8.1 25.7
+ id    1.1 140.8    1.1 120.7     14.3    5.2     5.3                              4.7     5.3
+ ig    1.2 159.1    1.3 137.4     13.7   13.0    13.6  9.9        6.2  9.2 28.2    5.3     6.2  3.4        6.4  8.7 34.2
+  is   1.1 141.8    1.1 124.1     12.4    4.0     4.3                              3.5     4.1
+  it   1.2 155.4    1.2 130.9     15.8    5.8     5.7  9.1        5.8  8.6 27.3    4.8     5.8  3.7        6.4  8.2 24.7
+  ja   1.3 165.1    1.4 151.6     8.2     4.9     5.1                              4.2     4.9
+ jv    1.0 135.6    1.1 117.2     13.5    4.5     4.9  9.4        5.9  8.8 27.9    3.9     4.7  3.5        6.5  8.1 25.6
+ ka    2.9 385.0    1.4 154.4     59.9    5.4     5.0                              4.9     7.5
+ kk    1.9 247.0    1.2 132.1     46.5    3.9     4.3  14.5 8.7 12.0 32.0          3.5     4.0  4.5        7.0  9.0 26.7
+ km    3.3 430.0    1.5 167.3     61.1   23.5    16.0                              6.0     7.9
+ kn    2.8 371.0    1.3 139.7     62.4   12.2     9.7  9.7        5.8  9.4 26.6    4.4     4.8  4.1        6.7  8.4 25.9
+ ko    1.2 155.9    1.2 133.0     14.7   27.6    22.7                              7.0    12.3
+ ku    1.1 143.0    1.2 131.6     8.0    34.1    20.5  10.2       6.3  9.6 28.2    4.8     6.7  3.5        6.5  9.0 26.9
+ ky    1.9 247.3    1.2 129.5     47.6    4.5     5.0                              4.7     5.8
+ lb    1.1 150.1    1.2 130.2     13.2    4.7     5.0  9.8        5.7  9.1 27.6    4.5     5.2  4.4        6.5  8.8 26.1
+ lo    2.7 356.5    1.2 125.9     64.7   12.2     9.8                              4.3     4.7
+  lt   1.1 137.6    1.2 125.8     8.5     4.7     5.2  11.2       6.0  9.7 28.1    4.3     5.1  5.1        6.7  9.1 26.5
+ lv    1.1 144.9    1.2 126.1     13.0   30.8    19.6                              4.6     6.1
+ mg    1.3 163.7    1.3 142.4     13.0    4.4     4.7  12.0 6.1 10.5 28.9          4.5     5.1  5.5        6.8  9.1 27.3
+ mi    1.2 152.0    1.3 140.0     7.9     4.8     5.0                              4.6     5.0
+ mk    1.9 248.2    1.3 137.7     44.5    5.5     5.7  9.4        6.1  9.4 28.0    4.6     6.0  3.3        6.7  8.5 27.6
+ ml    3.1 406.9    1.4 148.4     63.5    4.8     5.3                              4.7     5.7
+ mn    1.9 249.0    1.3 139.7     43.9   12.2     9.8  23.5 8.9 16.7 39.8          4.3     4.9  6.2        6.8  9.4 26.8
+ mr    2.7 351.5    1.3 140.2     60.1   37.6    21.0                              5.4     7.8
+ ms    1.1 144.9    1.1 124.5     14.0   12.2    10.3  9.9        5.7  9.3 27.5    4.9     5.3  3.7        6.5  8.6 25.9
+ mt    1.2 152.0    1.2 127.2     16.3   26.8    17.1                              5.1     6.5
+ my    3.5 460.0    1.2 136.1     70.4    4.2     4.4  11.3 6.5 10.2 29.6          3.6     4.3  3.9        6.7  8.5 26.0
+ ne    2.6 335.4    1.2 130.3     61.2    5.2     5.5                              4.4     5.1
+ nl    1.1 146.0    1.1 125.5     14.1   31.9    21.3  22.2 9.2 16.2 40.4          5.1     6.9  6.1        7.2  9.7 28.5
+ no    1.0 133.4    1.1 115.7     13.3   24.2    16.1                              4.6     5.5
+ ny    1.1 145.8    1.1 121.6     16.6    4.1     4.8  8.7        5.4  8.4 27.1    3.8     4.5  3.3        6.3  8.0 25.6
+ pa    2.6 340.1    1.6 179.3     47.3    3.8     4.4                              3.5     4.0
+ pl    1.1 146.5    1.2 129.0     11.9    4.7     4.8  10.5       5.8  9.5 28.4    3.9     4.5  4.4        6.7  8.6 25.9
+ ps    1.6 212.3    1.3 145.4     31.5   26.9    17.9                              7.4    12.6
+ pt    1.1 145.8    1.1 124.0     14.9    4.7     5.1  18.1 8.1 13.4 35.6          4.5     5.3  5.5        7.0  9.0 26.3
+ ro    1.2 155.1    1.2 135.3     12.8    8.4     7.7                              4.6     6.3
+ ru    2.0 257.3    1.3 142.5     44.6    4.1     4.4  9.4        5.9  9.2 27.6    3.8     4.3  3.4        6.6  8.3 25.3
+ sd    1.6 209.4    1.3 145.2     30.7    4.8     5.1                              4.5     5.4
+  si   2.6 342.0    1.4 149.2     56.4   12.5     9.9  11.1 6.0 10.5 28.1          4.6     5.6  4.8        6.7  9.0 25.9
+ sk    1.1 142.0    1.1 124.7     12.2    8.1     7.5                              4.8     6.5
+  sl   1.0 132.4    1.1 117.5     11.2   28.0    18.2  9.7        5.7  9.1 27.6    5.7     7.5  4.1        6.4  8.6 26.0
+ sm    1.2 158.2    1.3 146.3     7.5     4.5     4.9                              4.5     4.9
+ sn    1.1 145.9    1.1 124.1     14.9    3.9     4.5  10.0       6.1  9.3 28.1    3.9     4.3  3.4        6.4  8.5 25.9
+ so    1.2 150.1    1.2 133.5     11.1    4.9     5.6                              4.5     6.2
+ sq    1.2 156.6    1.2 134.6     14.1    4.7     4.7  7.0        6.3 10.0 28.4    4.1     4.9  5.1        6.7  9.2 26.5
+  sr   1.8 235.2    1.2 136.0     42.2    4.8     5.1                              4.4     5.4
+  st   1.2 157.2    1.3 142.9     9.1     5.4     5.5  9.2        5.6  8.9 27.6    4.7     5.5  3.4        6.4  7.9 25.3
+ su    1.0 136.6    1.1 118.0     13.6   11.1     9.2                              4.3     4.9
+ sv    1.0 135.8    1.1 114.9     15.4    5.2     5.4  24.5 10.3 18.9 44.9         4.5     6.0  6.6        7.1  9.5 28.3
+ sw    1.0 136.7    1.1 121.8     10.8    3.9     4.3                              3.6     4.2
+  ta   3.2 416.6    1.4 153.2     63.2    3.9     4.4  15.0 7.7 12.6 33.8          3.7     4.1  4.3        6.3  8.7 27.6
+  te   2.7 349.5    1.3 140.3     59.9    4.1     4.5                              3.8     4.4
+ tg    2.0 262.4    1.4 150.4     42.7   39.4    22.0  29.0 10.8 20.6 48.3         5.5     8.2  9.3        7.2 10.1 28.3
+ th    2.8 360.8    1.2 134.4     62.7   30.0    17.9                              4.8     6.5
+  tr   1.1 146.2    1.1 124.2     15.0   14.2    11.0  23.5 9.8 18.4 43.7          5.3     6.5  5.7        6.7  9.1 26.4
+ uk    1.9 243.0    1.3 140.9     42.0   30.5    19.2                              4.6     6.8
+ ur    1.8 229.0    1.4 150.8     34.1    4.8     4.8  9.1        6.0  9.7 30.6    4.2     4.8  4.0        6.8  8.7 26.2
+ uz    1.1 147.7    1.1 122.7     16.9   11.7     9.6                              4.7     5.4
+ vi    1.4 181.4    1.6 179.6     1.0    10.1     8.7  10.1       5.7  9.1 27.6    4.9     7.1  4.4        6.5  8.8 26.2
+ xh    1.1 137.6    1.1 115.0     16.4    4.8     5.1                              4.1     4.8
+ yi    1.9 253.8    1.3 145.6     42.6    7.1     6.1  14.6 7.6 12.9 34.1          7.3    12.2  4.1        6.5  8.6 26.2
+ yo    1.3 166.9    1.3 144.8     13.2    4.4     4.5                              3.9     4.4
+ zh    0.9 119.4    1.1 117.5     1.6    12.5    13.2  10.8       5.8  9.3 28.0    5.0     6.6  4.1        6.5  8.7 26.0
+ zu    1.1 146.8    1.1 121.3     17.4    6.3     6.3                              5.3     6.8
+                                          3.4     4.0  22.7 9.3 17.5 44.9          3.4     4.9  5.2        6.5  8.6 26.4
+                                          4.8     4.8                              4.1     4.7
+                                                       9.2        5.9  8.7 27.3                 4.2        6.4  8.6 27.6
+
+                                                       9.6        5.8  9.2 27.9                 4.3        6.7  8.5 26.9
+
+                                                       11.1       6.2  9.8 28.8                 4.8        6.9  9.0 26.6
+
+                                                       10.7       5.8  9.9 28.2                 4.6        6.6  9.0 26.8
+
+                                                       14.7 7.6 12.9 37.7                       3.9        6.8  8.8 27.3
+
+                                                       25.9 17.9 19.4 46.7                      6.5        7.0  9.2 26.6
+
+                                                       15.0 7.5 13.5 33.5                       4.7        6.6  8.9 26.4
+
+                                                       22.9 9.5 17.0 42.1                       5.0        6.9  9.0 26.6
+
+                                                       9.7        5.9  8.9 27.9                 3.6        6.6  8.3 26.0
+
+                                                       11.0       5.7  9.9 31.6                 4.3        6.5  8.6 33.1
+
+                                                       29.7 11.6 21.7 51.4                      6.3        7.0  8.9 26.4
+
+                                                       22.0 9.1 16.0 40.7                       4.3        7.5  8.7 26.2
+
+                                                       9.9        6.0  9.2 27.8                 3.5        6.4  8.5 25.9
+
+                                                       9.1        5.7  9.0 27.4                 3.3        6.6  8.2 25.9
+
+                                                       10.3       5.4  9.6 27.1                 3.9        6.4  8.4 25.7
+
+                                                       23.8 9.2 16.7 40.8                       8.6        7.3 10.5 28.5
+
+                                                       10.1       6.0  9.4 32.3                 4.3        6.5  8.4 25.8
+
+                                                       14.7 6.9 11.9 31.1                       5.0        6.8  9.1 27.1
+
+                                                       9.3        5.9  9.4 28.1                 3.3        6.4  8.4 25.7
+
+                                                       10.4       6.0  9.5 28.5                 4.3        6.9  8.8 26.3
+
+                                                       14.5 7.9 13.0 34.5                       3.8        6.6  9.0 26.6
+
+                                                       14.8 6.7 12.0 30.9                       5.3        6.8  9.2 27.1
+
+                                                       24.0 9.2 18.1 40.9                       6.4        6.8  9.3 27.0
+
+                                                       9.6        5.9  8.8 27.6                 4.1        6.3  8.4 23.2
+
+                                                       9.0        5.8  8.8 27.7                 3.5        6.6  8.3 27.3
+
+                                                       11.4 5.8 10.1 28.2                       4.8        6.7  9.2 26.2
+
+                                                       10.2       5.7  9.9 27.8                 4.1        6.5  8.5 26.5
+
+                                                       11.0       5.7  9.8 27.8                 4.5        6.5 13.2 26.7
+
+                                                       10.8       6.0  9.6 28.5                 4.6        6.8  8.8 26.3
+
+                                                       13.8 7.3 12.5 32.9                       4.0        6.8  8.8 26.3
+
+                                                       11.5 5.6 10.0 27.8                       4.8        6.7  9.1 26.4
+
+                                                       9.2        5.6  8.9 27.4                 3.5        6.3  8.3 25.3
+
+                                                       9.2        6.1  8.7 27.2                 3.3        6.3  8.3 26.6
+
+                                                       9.6        5.7  8.9 27.5                 3.6        6.7  8.1 25.9
+
+                                                       24.9 10.7 19.8 47.6                      6.7        7.1  9.4 28.2
+
+                                                       22.2 9.4 16.9 41.9                       5.6        6.9  9.0 26.5
+
+                                                       16.4 7.8 13.4 34.7                       5.3        7.0  9.2 26.6
+
+                                                       20.5 9.8 17.5 42.6                       5.1        6.8  8.8 27.7
+
+                                                       9.5        5.7  9.4 28.1                 4.1        6.7  8.4 26.0
+
+                                                       14.2 7.6 12.8 33.5                       4.3        6.5  8.9 26.5
+
+                                                       15.7 7.4 12.3 32.7                       5.4        7.0  9.4 28.2
+
+                                                       10.7       6.1  9.0 27.9                 4.0        6.8  8.4 23.2
+
+                                                       11.7 6.5 10.6 29.5                       8.3        6.9 10.2 28.3
+
+                                                       9.9        5.5  9.4 30.2                 3.8        6.3  8.2 25.6
+
+                                                       18.1 7.4 13.5 34.1                       5.7        6.7  9.2 27.2
+
+                                                       11.9 6.2 10.0 29.0                       5.4        6.9  9.3 26.9
+
+                                                       6.0        5.6  8.6 27.2                 3.3        6.3  8.2 25.4
+
+                                                       10.6       5.7  9.9 27.7                 4.1        6.4  8.4 26.5
+
+Table 9: Results for each of the analyzed languages. The left-hand columns contain the comparison of enoding
+lengths UTF-8 and MYTE. The right-hand columns present performance (BPEB) and inference time of correspond-
+ing language models ByT5 and MyT5. All numbers are averages across the FLORES-200 test split.
+

@@ -1,0 +1,556 @@
+                                        Generating Long Sequences with Sparse Transformers
+
+                                        Rewon Child 1 Scott Gray 1 Alec Radford 1 Ilya Sutskever 1
+
+arXiv:1904.10509v1 [cs.LG] 23 Apr 2019                     Abstract
+
+                                        Transformers are powerful sequence models, but
+                                        require time and memory that grows quadrati-
+                                        cally with the sequence length. In this paper we
+                                        introduce sparse factorizations o√f the attention
+                                        matrix which reduce this to O(n n). We also
+                                        introduce a) a variation on architecture and initial-
+                                        ization to train deeper networks, b) the recompu-
+                                        tation of attention matrices to save memory, and
+                                        c) fast attention kernels for training. We call net-
+                                        works with these changes Sparse Transformers,
+                                        and show they can model sequences tens of thou-
+                                        sands of timesteps long using hundreds of layers.
+                                        We use the same architecture to model images,
+                                        audio, and text from raw bytes, setting a new state
+                                        of the art for density modeling of Enwik8, CIFAR-
+                                        10, and ImageNet-64. We generate unconditional
+                                        samples that demonstrate global coherence and
+                                        great diversity, and show it is possible in principle
+                                        to use self-attention to model sequences of length
+                                        one million or more.
+
+                                        1. Introduction                                                 Figure 1. Unconditional samples from our neural autoregressive
+                                                                                                        model on ImageNet 64 and a classical music dataset. We used the
+                                        Estimating complex, high-dimensional data distributions is      same self-attention based architecture for audio, images, and text.
+                                        a central problem in unsupervised learning, as many down-       The samples above were generated with softmax temperature 1.0,
+                                        stream applications of interest involve generation of text,     and had lengths 12,288 and 65,536. Audio samples be listened to at
+                                        images, audio, and other data. Additionally, it is believed to  https://openai.com/blog/sparse-transformer
+                                        be a key component of unsupervised representation learning.
+                                                                                                        great progress in this direction, but require signiﬁcant depth
+                                        Recently, neural autoregressive models have achieved im-        to expand their receptive ﬁeld. To address this, WaveNet
+                                        pressive results in this domain, achieving state-of-the-art in  (Van Den Oord et al., 2016) introduced dilated convolutions,
+                                        modeling natural language (Jozefowicz et al., 2016) (Rad-       which allowed the network to model long-range dependen-
+                                        ford et al., 2018) (Dai et al., 2018), raw audio (Van Den Oord  cies in a logarithmic number of layers.
+                                        et al., 2016) (Mehri et al., 2016), and images (Oord et al.,
+                                        2016) (Menick & Kalchbrenner, 2018) (Salimans et al.,           Separately, the Transformer (Vaswani et al., 2017) has been
+                                        2017) (Reed et al., 2017) (Chen et al., 2017).                  shown to excel on many natural language tasks, which may
+                                                                                                        be in part due to its ability to model arbitrary dependencies
+                                        These methods decompose a joint probability distribution        in a constant number of layers. As each self-attention layer
+                                        into a product of conditional ones. Modeling these condi-       has a global receptive ﬁeld, the network can allocate rep-
+                                        tional distributions is extremely challenging, however, as      resentational capacity to the input regions for which it is
+                                        they contain many complex, long-range dependencies and
+                                        require a suitably expressive model architecture to learn
+                                        them.
+
+                                        Architectures based off CNNs (Oord et al., 2016) have made
+Generating Long Sequences with Sparse Transformers
+
+most useful. Thus the architecture may be more ﬂexible          Outside of generative modeling, there are several works
+at generating diverse data types than networks with ﬁxed        relevant to improving the efﬁciency of attention based off
+connectivity patterns.                                          chunking (Chiu & Raffel, 2017) or using ﬁxed length repre-
+                                                                sentations (Britz et al., 2017). Other works have investigated
+However, the memory and computational requirements of           attention with multiple ”hops”, such as (Sukhbaatar et al.,
+such networks grows quadratically with sequence length,         2015) and (Gehring et al., 2017).
+which excludes their use on long sequences.
+                                                                It is worth noting that the Gated Pixel CNN (Oord et al.,
+The main contribution of this work is to introduce several      2016) and WaveNet (Van Den Oord et al., 2016) use multi-
+sparse f√actorizations of the attention matrix, which scale     plicative interactions in their networks, which are related to
+as O(n p n) with the sequence length without sacriﬁcing         self-attention.
+performance. These work by separating the full attention
+computation into several faster attention operations which,     3. Background
+when combined, can approximate the dense attention oper-
+ation. We use this to apply self-attention to sequences of      We consider the task of autoregressive sequence gener-
+unprecedented length.                                           ation, where the joint probability of a sequence x =
+                                                                {x1, x2, ..., xn} is modeled as the product of conditional
+Additionally, we introduce several other changes to the         probability distributions and parameterized by a network θ.
+Transformer, including:
+
+   • A restructured residual block and weight initialization    n
+      to improve training of very deep networks
+                                                                p(x) = p(xi|x1, ..., xi−1; θ)  (1)
+   • A set of sparse attention kernels which efﬁciently com-
+      pute subsets of the attention matrix                      i=1
+
+   • Recomputation of attention weights during the back-        We treat images, text, and audio as a sequence of discrete
+      wards pass to reduce memory usage                         tokens, typically raw bytes. The network θ takes in the se-
+                                                                quence of tokens and outputs a categorical distribution over
+We empirically validate that models augmented in this man-      the v possible values of the next token using the softmax
+ner can achieve state-of-the-art compression and generation     function, where v is the size of the vocabulary. The training
+of natural language, raw audio, and natural images. The         objective is to maximize the log-probability of the data with
+simplicity of the architecture leads us to believe it may be    respect to θ.
+useful for many problems of interest.
+                                                                A simple and powerful choice for model θ is a Transformer
+2. Related Work                                                 (Vaswani et al., 2017) in decoder-only mode, as demon-
+                                                                strated by (Radford et al., 2018) and (Liu et al., 2018). These
+The most related work involves other techniques for scaling     models transform the input sequence with blocks of mul-
+up autoregressive generative models. For images, (Reed          tihead self-attention over the entire sequence, followed by
+et al., 2017) models conditional independence between the       dense transformations over each sequence element. The self-
+pixels in order to generate many locations in parallel, and     attention portion of the network must compute n weightings
+(Menick & Kalchbrenner, 2018) imposes an ordering and           for each of n elements, however, which can quickly become
+multi-scale upsampling procedure to generate high ﬁdelity       intractable as the sequence length grows.
+samples. (Parmar et al., 2018) uses blocks of local attention
+to apply Transformers to images. For text, (Dai et al., 2018)   In the following sections, we describe our modiﬁcations to
+introduces a state reuse ”memory” for modeling long-term        the Transformer architecture which make it more suitable
+dependencies. And for audio, in addition to (Van Den Oord       for modeling long sequences.
+et al., 2016), (Mehri et al., 2016) used a hierarchical struc-
+ture and RNNs of varying clock-rates to use long contexts       4. Factorized Self-Attention
+during inference, similar to (Koutnik et al., 2014). (Huang
+et al., 2018) apply Transformers to MIDI generation with        Sparse Transformers separate the full self-attention opera-
+an efﬁcient relative attention.                                 tion across several steps of attention, as visualized in Figure
+                                                                3(b) and 3(c). To motivate our approach, we ﬁrst perform
+Our work is simpler than many of the techniques above and       a qualitative assessment of attention patterns learned by a
+can be applied equally across images, text, and audio. Many     standard Transformer on an image dataset.
+of the above techniques are orthogonal to ours, moreover,
+and could be used in conjunction with ours.
+                                              Generating Long Sequences with Sparse Transformers
+
+Figure 2. Learned attention patterns from a 128-layer network on CIFAR-10 trained with full attention. White highlights denote attention
+weights for a head while generating a given pixel, and black denotes the autoregressive mask. Layers are able to learn a variety of
+specialized sparse structures, which may explain their ability to adapt to different domains. a) Many early layers in the network learn
+locally connected patterns, which resemble convolution. b) In layers 19 and 20, the network learned to split the attention across a
+row attention and column attention, effectively factorizing the global attention calculation. c) Several attention layers showed global,
+data-dependent access patterns. d) Typical layers in layers 64-128 exhibited high sparsity, with positions activating rarely and only for
+speciﬁc input patterns.
+
+(a) Transformer  (b) Sparse Transformer (strided)  (c) Sparse Transformer (ﬁxed)
+
+Figure 3. Two 2d factorized attention schemes we evaluated in comparison to the full attention of a standard Transformer (a). The top
+row indicates, for an example 6x6 image, which positions two attention heads receive as input when computing a given output. The
+bottom row shows the connectivity matrix (not to scale) between all such outputs (rows) and inputs (columns). Sparsity in the connectivity
+matrix can lead to signiﬁcantly faster computation. In (b) and (c), full connectivity between elements is preserved when the two heads are
+computed sequentially. We tested whether such factorizations could match in performance the rich connectivity patterns of Figure 2.
+                                    Generating Long Sequences with Sparse Transformers
+
+4.1. Qualitative assessment of learned attention                            Additionally, for the time being we consider valid choices
+     patterns                                                               of A, where all input positions are connected to all future
+                                                                            output positions across the p steps of attention.
+We visualized the attention patterns learned by a 128-layer
+self-attention network on CIFAR-10, and present several                     For every j ≤ i pair, we set every A such that i can attend
+examples in Figure 2. Visual inspection showed that most                    to j through a path of locations with maximum length p + 1.
+layers had sparse attention patterns across most data points,               Speciﬁcally, if (j, a, b, c, ..., i) is the path of indices, then
+suggesting that some form of sparsity could be introduced                   j ∈ A(a1), a ∈ Ab(2), b ∈ A(c3), and so forth.
+without signiﬁcantly affecting performance. Several layers
+(Figure 2c) clearly exhibited global patterns, however, and                 These two criteria allow us keep the ability of Transformers
+others exhibited data-dependent sparsity (Figure 2d), both                  to propagate signals from arbitrary input positions to arbi-
+of which would be impacted by introducing a predetermined                   trary output positions in a constant number of ste√ps, while
+sparsity pattern into all of the attention matrices.                        reducing the total effective computation to O(n p n). We
+                                                                            also note that softening the validity criterion (for instance,
+In this paper, we restricted our investigation to a class of                having a series of only locally connected layers) may be a
+sparse attention patterns that have connectivity between all                useful inductive bias for certain domains.
+positions over several steps of attention. These methods can
+be more efﬁcient than full attention while still providing                  In this work, we explore two factorizations for p = 2, which
+global context to any given position. We aimed to empiri-                   we describe in the following section, though we note that
+cally validate the performance of these factorized patterns                 the same techniques can be easily extended to higher dimen-
+on a range of tasks, given that they are unable to learn the                sions.
+exact same mappings as those in Figure 2. We present the
+formulation of factorized attention below.                                  4.3. Two-dimensional factorized attention
+
+4.2. Factorized self-attention                                              A natural approach to deﬁning a factorized attention pattern
+                                                                            in two dimensions is to have one head attend to the previous
+A self-attention layer maps a matrix of input embeddings                    l locations, and the other head attend to ever√y lth location,
+X to an output matrix and is parameterized by a connectiv-                  where l is the stride and chosen to be close to n, a method
+ity pattern S = {S1, ..., Sn}, where Si denotes the set of                  we call strided attention.
+indices of the input vectors to which the ith output vector
+attends. The output vector is a weighted sum of transforma-                 Formally, Ai(1) = {t, t + 1, ..., i} for t = max(0, i − l)
+tions of the input vectors:                                                 and Ai(2) = {j : (i − j) mod l = 0}. This pattern can be
+                                                                            visualized in Figure 3(b).
+         Attend(X, S) = a(xi, Si)                                    (2)
+                                                                            This formulation is convenient if the data naturally has a
+                                                  i∈{1,...,n}               structure that aligns with the stride, like images or some
+                                                                            types of music. For data without a periodic structure, like
+         a(xi, Si) = softmax        (Wq√xi)KSTi        VSi           (3)    text, however, we ﬁnd that the network can fail to properly
+                                           d                                route information with the strided pattern, as spatial coor-
+                                                                            dinates for an element do not necessarily correlate with the
+KSi =    Wk xj                      VSi =         Wv xj              (4)    positions where the element may be most relevant in the
+                                                                            future.
+                      j∈Si                                     j∈Si
+                                                                            In those cases, we instead use a ﬁxed attention pattern (Fig-
+Here Wq, Wk, and Wv represent the weight matrices which                     ure 3(c)), where speciﬁc cells summarize previous locations
+transform a given xi into a query, key, or value, and d is                  and propagate that information to all future cells.
+the inner dimension of the queries and keys. The output at
+each position is a sum of the values weighted by the scaled                 Formally, Ai(1) = {j : ( j/l = i/l )}, where the brackets
+dot-product similarity of the keys and queries.                             denote the ﬂoor operation, and A(i2) = {j : j mod l ∈
+                                                                            {t, t + 1, ..., l}, where t = l − c and c is a hyperparameter.
+Full self-attention for autoregressive models deﬁnes Si =
+{j : j ≤ i}, allowing every element to attend to all previous               Concretely, if the stride is 128 and c = 8, then all future
+positions and its own position.                                             positions greater than 128 can attend to positions 120-128,
+                                                                            all positions greater than 256 can attend to 248-256, and so
+Factorized self-attention instead has p separate attention                  forth.
+
+heads, where the mth head deﬁnes a subset of the indices                    A ﬁxed-attention pattern with c = 1 limits the expressivity
+Ai(m) ⊂ {j : j ≤ i} and lets Si = A(im). We are                             of the network signiﬁcantly, as many representations in
+
+chieﬂy   inte√rested  in  efﬁcient  choices  for  the  subset  A,    where
+|A(im)|  ∝ p n.
+Generating Long Sequences with Sparse Transformers
+
+the network are only used for one block whereas a small                     embed
+number of locations are used by all blocks. We instead
+found choosing c ∈ {8, 16, 32} for typical values of l ∈                               norm
+{128, 256} to perform well, although it should be noted that                       attention
+this increases the computational cost of this method by c in
+comparison to the strided attention.                                                dropout
+
+Additionally, we found that when using multiple heads,                                   norm
+having them attend to distinct subblocks of length c within                        feed-forward
+the block of size l was preferable to having them attend to
+the same subblock.                                                                     dropout
+
+In the subsequent section, we describe how to incorporate
+factorized attention into the Sparse Transformer architec-
+ture.
+
+5. Sparse Transformer
+
+Here we fully describe the Sparse Transformer architecture,
+which is a modiﬁed version of the Transformer (Vaswani
+et al., 2017).
+
+5.1. Factorized attention heads                                                                     ...
+
+Standard dense attention simply performs a linear transfor-                                            norm
+mation of the attend function deﬁned in Equation 2:
+                                                                                                     linear
+attention(X) = Wp · attend(X, S)                  (5)
+                                                                                                    softmax
+where Wp denotes the post-attention weight matrix. The
+simplest technique for integrating factorized self-attention                Figure 4. Diagram depicting one residual block of the Sparse Trans-
+is to use one attention type per residual block, and interleave             former. The shaded background indicates tensors which are check-
+them sequentially or at a ratio determined as a hyperparam-                 pointed (Chen et al., 2016) and stored in GPU memory. The other
+eter:                                                                       tensors, including the attention weights and feedforward network
+                                                                            activations, are recomputed during the calculation of gradients,
+        attention(X) = Wp · attend(X, A(r mod p)) (6)                       reducing memory usage substantially.
+
+Here r is the index of the current residual block and p is the              Here, the A can be the separate attention patterns, the
+number of factorized attention heads.                                       merged patterns, or interleaved as in Eq. 2. Also, the di-
+                                                                            mensions of the weight matrices inside the attend function
+A second approach is to have a single head attend to the                    are reduced by a factor of 1/nh, such that the number of
+locations of the pixels that both factorized heads would                    parameters are invariant across values of nh.
+attend to, which we call a merged head:                                     We typically ﬁnd multiple heads to work well, though for
+                                                                            extremely long sequences where the attention dominates the
+                                                                         p  computation time, it is more worthwhile to perform them
+                                                                            one at a time and sequentially.
+        attention(X) = Wp · attend(X, A(m)) (7)
+                                                                            5.2. Scaling to hundreds of layers
+                                                                      m=1   We found that Transformers were difﬁcult to train with
+                                                                            many layers, as noted by (Al-Rfou et al., 2018). Instead
+This is slightly more computationally intensive, but only                   of incorporating auxillary losses, we adopted the following
+by a constant factor. A third approach is to use multi-head
+attention (Vaswani et al., 2017), where nh attention products
+are computed in parallel, then concatenated along the feature
+dimension:
+
+attention(X) = Wp attend(X, A)(i)                 (8)
+
+                                   i∈{1,...,nh }
+                                      Generating Long Sequences with Sparse Transformers
+
+architectural changes.                                                For images, we used data embeddings, where ddata = 3
+                                                                      for the row, column, and channel location of each input
+First, we use the pre-activation residual block of (He et al.,        byte. For text and audio, we used two-dimensional attention
+2016), deﬁning a network of N layers in the following way:            embeddings, where dattn = 2 and the index corresponds to
+                                                                      each position’s row and column index in a matrix of width
+                    H0 = embed(X, We)                          (9)    equal to the stride.
+
+               Hk = Hk−1 + resblock(Hk−1)                      (10)   5.4. Saving memory by recomputing attention weights
+
+               y = softmax(norm(HN )Wout)                      (11)   Gradient checkpointing has been shown to be effective in
+                                                                      reducing the memory requirements of training deep neural
+where embed is a function we describe in the next section,            networks (Chen et al., 2016), (Gruslys et al., 2016). It is
+Wout is a weight matrix, and resblock(h) normalizes the               worth noting, however, that this technique is particularly
+input to the attention block and a positionwise feedforward           effective for self-attention layers when long sequences are
+network in the following way:                                         processed, as memory usage is high for these layers relative
+                                                                      to the cost of computing them.
+       a(H) = dropout(attention(norm(H))) (12)
+                                                                      Using recomputation alone, we are able to train dense atten-
+       b(H) = dropout(ﬀ(norm(H + a(H)))) (13)                         tion networks with hundreds of layers on sequence lengths
+                                                                      of 16,384, which would be infeasible on modern hardware
+               resblock(H) = a(H) + b(H)                       (14)   otherwise.
+
+The norm function denotes Layer Normalization (Ba et al.,             In our experiments, we recompute the attention and feed-
+2016), and ﬀ(x) = W2 f (W1x + b1) + b2. Our choice of                 forward blocks during the backwards pass. To simplify
+f is the Gaussian Error Linear Unit (Hendrycks & Gimpel,              our implementation, we do not apply dropout within the
+2016), f (X) = X sigmoid(1.702 · X), as used in (Rad-                 attention blocks, as in (Vaswani et al., 2017), and instead
+ford et al., 2018). The output dimension of W1 is 4.0 times           only apply it at the end of each residual addition, as seen in
+the input dimension, unless otherwise noted.                          Figure 4.
+
+Observe that HN is the sum of N applications of functions             5.5. Efﬁcient block-sparse attention kernels
+a and b, and thus each function block receives a gradient
+                                                                      The sparse attention masks in 3(b) and 3(c) can be efﬁciently
+directly from the output layer . We scale the initialization          computed by slicing out sub-blocks from the query, key, and
+                                                                      value matrices and computing the product in blocks. Atten-
+of W2  and  Wp  in  Eq.  5  by  √1    to  keep the  ratio  of  input  tion over a local window can be computed as-is, whereas
+                                  2N                                  attention with a stride of k can be computed by transposing
+                                                                      the matrix and computing a local window. Fixed attention
+embedding scale to residual block scale invariant across              positions can be aggregated and computed in blocks.
+
+values of N .                                                         In order to ease experimentation, we implemented a set of
+                                                                      GPU kernels which efﬁciently perform these operations.
+5.3. Modeling diverse data types                                      The softmax operation is fused into a single kernel and
+                                                                      also uses registers to eliminate loading the input data more
+In addition to the embedding of input symbols, positional             than once, allowing it to run at the same speed as a simple
+embeddings are typically used in Transformers and other               nonlinearity. The upper triangle of the attention matrix
+location-agnostic architectures to encode the spatial relation-       is never computed, moreover, removing the need for the
+ships of data (Gehring et al., 2017), (Parmar et al., 2018).          negative bias term of (Vaswani et al., 2017) and halving the
+                                                                      number of operations to be performed.
+We found using learned embeddings which either encoded
+the structure of the data or the factorized attention patterns        5.6. Mixed-precision training
+were important for performance of our models.
+                                                                      We store network weights in single-precision ﬂoating-point,
+We added either nemb = ddata or nemb = dattn embed-                   but otherwise compute network activations and gradients in
+dings to each input location, where ddata refers to the num-          half-precision, as in (Micikevicius et al., 2017). This acceler-
+ber of dimensions of the data, and dattn is the number of             ates our training due to the usage of Tensor Core operations
+dimensions of the factorized attention. If xi is the one-hot          on the V100 GPU. During the gradient calculation, we use
+encoded ith element in the sequence, and o(ij) represents
+the one-hot encoded position of xi in the jth dimension
+(1 ≤ j ≤ nemb), then:
+
+                                                   
+
+                                      nemb
+
+embed(X, We) = xiWe +                      oi(j)Wj           (15)
+
+                                      j=1              xi ∈X
+                                        Generating Long Sequences with Sparse Transformers
+
+Figure 5. Unconditional samples from ImageNet 64x64, generated with an unmodiﬁed softmax temperature of 1.0. We are able to learn
+long-range dependencies directly from pixels without using a multi-scale architecture.
+
+dynamic loss scaling to reduce numerical underﬂow, and                    ized  to  0  and  all  weights  are  initialized  from  N  (0,  0√.125 )
+we communicate half-precision gradients when averaging
+across multiple GPUs. When sampling, we cast the queries                                                                                    din
+and keys to single-precision, as the query-key product can
+sometimes overﬂow the max value of half-precision.                        where din is the fan-in dimension. The weight matrix for
+
+                                                                          the output logits was initialized to 0.
+
+6. Training                                                               7. Experiments
+
+We use the Adam optimizer with a linear warmup of 5000                    We empirically test our architecture on density modeling
+iterations and a gradient clipping of 1.0, both of which we               tasks including natural images, text, and raw audio. A
+found important for model stability. We use a weight decay                summary of the results is available in Table 1. We found
+penalty of 0.01. We annealed the learning rate according to               that, in addition to running signiﬁcantly faster than full
+a cosine decay as in (Radford et al., 2018). We train on 8                attention, sparse patterns also converged to lower error, as
+V100 GPUs unless otherwise noted.                                         shown in Table 2. This may point to a useful inductive bias
+                                                                          from the sparsity patterns we introduced, or an underlying
+All embeddings are of a constant dimension d, usually one                 optimization issue with full attention.
+of {256, 512, 1024}. By default, all linear transforms are to
+the same dimension, with the exception of the feed-forward                7.1. CIFAR-10
+network, which projects the input to 4d, unless we use
+“half-size” transformations, where it is 2d. Additionally,                We train strided Sparse Transformers on CIFAR-10 images
+sometimes we halve the size of the query and key transfor-                represented as sequences of 3072 bytes. Models have 2
+mations.                                                                  heads, 128 layers, d = 256, half-size feedforward network
+                                                                          and query-key projections, and are trained for 120 epochs
+We   initialize  the  token  embedding  We  from  N  (0,  0√.125  )  and  with a learning rate of 0.00035 and a dropout rate of 0.25
+                                                              d           until validation error stops decreasing.
+
+the  position    embeddings  from  N (0,    √0.125   ).  Within      the  We use 48000 examples for training and 2000 examples for
+                                              dnemb                       validation, evaluating the performance of our best models on
+
+attention and feedforward components, all biases are initial-
+                                   Generating Long Sequences with Sparse Transformers
+
+Table 1. Summary of our ﬁndings for density modeling tasks. Re-       Table 2. Sparse patterns showed increased speed and also better
+sults are reported in bits per byte, which is equivalent to bits per  loss on the datasets where we could compare both, which may
+dim for image tasks. M refers to millions of parameters.              point to a useful inductive bias in the patterns we learned or an
+                                                                      underlying optimization issue with full attention.
+
+Model                                         Bits per byte
+
+                                                                      Model                         Bits per byte Time/Iter
+
+CIFAR-10
+
+PixelCNN (Oord et al., 2016)                  3.03                    Enwik8 (12,288 context)
+
+PixelCNN++ (Salimans et al., 2017)            2.92                    Dense Attention               1.00        1.31
+
+Image Transformer (Parmar et al., 2018)       2.90                    Sparse Transformer (Fixed)    0.99        0.55
+
+PixelSNAIL (Chen et al., 2017)                2.85                    Sparse Transformer (Strided)  1.13        0.35
+
+Sparse Transformer 59M (strided)              2.80
+
+                                                                      CIFAR-10 (3,072 context)
+
+Enwik8                                                                Dense Attention               2.82        0.54
+
+Deeper Self-Attention (Al-Rfou et al., 2018)  1.06                    Sparse Transformer (Fixed)    2.85        0.47
+
+Transformer-XL 88M (Dai et al., 2018)         1.03                    Sparse Transformer (Strided)  2.80        0.38
+
+Transformer-XL 277M (Dai et al., 2018)        0.99
+
+Sparse Transformer 95M (ﬁxed)                 0.99
+
+ImageNet 64x64                                                        Table 3. We observe increased compression of Enwik8 with longer
+                                                                      contexts, suggesting the Sparse Transformer can effectively incor-
+PixelCNN (Oord et al., 2016)                  3.57                    porate long-term dependencies.
+
+Parallel Multiscale (Reed et al., 2017)       3.7                     Minimum context length during evaluation  Bits per byte
+
+Glow (Kingma & Dhariwal, 2018)                3.81                    6,144 tokens                                 0.9952
+                                                                      9,216 tokens                                 0.9936
+SPN 150M (Menick & Kalchbrenner, 2018)        3.52                    10,752 tokens                                0.9932
+                                                                      11,904 tokens                                0.9930
+Sparse Transformer 152M (strided)             3.44                    12,096 tokens                                0.9922
+                                                                      12,160 tokens                                0.9908
+Classical music, 5 seconds at 12 kHz
+
+Sparse Transformer 152M (strided)             1.97
+
+the test set. The model achieves 2.80 bits per dim (2.798 ±           the number of parameters. Strided attention failed to do well
+0.004 over seeds 1, 2, 3) versus the previous 2.85 state of           on this dataset, whereas ﬁxed patterns were able to recover
+the art (Chen et al., 2017). We also compare performance of           and surpass the performance of dense attention, as listed in
+different attention patterns in Table 2. The strided attention        Table 2.
+reaches the lowest error in the shortest amount of time,
+surpassing the error of dense attention at 2.82 bits per dim.         Additionally, during evaluation of the test set, we modiﬁed
+                                                                      the minimum context length the network could use by evalu-
+7.2. Text                                                             ating fewer tokens in parallel. We saw monotonic increases
+                                                                      in performance with more tokens used, up to 12,160 out
+In order to assess Sparse Transformers on datasets without            of the 12,288 tokens used for training (see Table 3), which
+a strong two-dimensional structure, we trained models on              suggests the network is effectively incorporating long-term
+the EnWik8 dataset, which represents the ﬁrst 108 bytes               dependencies.
+of Wikipedia and contains a great degree of variability in
+periodic structure. We trained with a context length of               7.3. ImageNet 64x64
+12,288, which is longer than previous approaches.
+                                                                      In order to test the ability of the model to learn long range
+We trained on the ﬁrst 90 million tokens and reserved the last        dependencies and scale to a large dataset, we train on the
+10 million for validation and test. We used 30-layer ﬁxed             version of downsampled ImageNet released by (Oord et al.,
+Sparse Transformers with 8 heads, d = 512, and a dropout              2016) and evaluate on the validation set. We used a 48 layer
+rate of 0.40. We trained for 80 epochs until validation loss          strided Sparse Transformer with 16 attention heads and d
+stopped decreasing. We used a stride of 128, c = 32, and              = 512, totaling 152 million parameters. We used a stride
+merged the factorized attention heads.                                of 128, a dropout of 0.01, and trained for 70 epochs, which
+                                                                      took 7 days on 64 V100 GPUs.
+Our best model reached 0.99 bits per dim (0.992 ± 0.001
+over seeds 1, 2, 3), surpassing the 1.03 state-of-the-art for         Our model achieves a loss of 3.44 bits per dim (3.437 across
+a similarly-sized Transformer-XL (Dai et al., 2018) and               1 run), in comparison to the previous 3.52 (Menick & Kalch-
+matching the 0.99 of a model trained with more than double            brenner, 2018).
+                 Generating Long Sequences with Sparse Transformers
+
+Additionally, we generate unconditional samples (Figure              9. Acknowledgements
+5) at an unmodiﬁed softmax temperature of 1.0, from the
+model and from one trained with twice the layers (300M               We would like to thank Ashish Vaswani for insightful dis-
+parameters total). We include here samples from the 300M             cussions during the genesis of the project. We also thank
+parameter model. On visual assessment we ﬁnd no artifacts            Joshua Meier and Mark Chen for helpful discussions, and
+from the sparsity patterns and see evidence of long-term             Johannes Otterbach, Prafulla Dhariwal, and David Luan for
+structure in most images.                                            feedback on drafts of this paper.
+
+7.4. Classical music from raw audio                                  References
+
+To test the extent to which Sparse Transformers are able             Al-Rfou, R., Choe, D., Constant, N., Guo, M., and Jones,
+to scale to very long contexts, we trained models on the                L. Character-level language modeling with deeper self-
+classical music dataset released by (Dieleman et al., 2018).            attention. arXiv preprint arXiv:1808.04444, 2018.
+As details of the dataset processing are unavailable, we omit
+any direct comparison to other work and instead study what           Ba, J. L., Kiros, J. R., and Hinton, G. E. Layer normalization.
+size of Sparse Transformer we can train with increasing                 arXiv preprint arXiv:1607.06450, 2016.
+context size. For each sequence length, we attempted to
+train the largest model which could entirely ﬁt into 16GB            Britz, D., Guan, M. Y., and Luong, M.-T. Efﬁcient attention
+V100 accelerators without model parallelism.                            using a ﬁxed-size memory representation. arXiv preprint
+                                                                        arXiv:1707.00110, 2017.
+Overall, we found that increasing the sequence length by a
+factor of 4√requires a reduction in model capacity of approx-        Chen, T., Xu, B., Zhang, C., and Guestrin, C. Training
+imately 4 4 = 8. Thus we found we could use factorized                  deep nets with sublinear memory cost. arXiv preprint
+self-attention on sequences over 1 million timesteps long,              arXiv:1604.06174, 2016.
+albeit with extremely few parameters (3 million).
+                                                                     Chen, X., Mishra, N., Rohaninejad, M., and Abbeel, P.
+Samples are available for sequences of length 65,536, which             Pixelsnail: An improved autoregressive generative model.
+correspond to around 5 seconds of generated audio at 12kHz.             arXiv preprint arXiv:1712.09763, 2017.
+The samples clearly demonstrate global coherence over the
+sampled period, and exhibit a variety of play styles and             Chiu, C.-C. and Raffel, C. Monotonic chunkwise attention.
+tones, swapping from rhythmic playing to forceful. To                   arXiv preprint arXiv:1712.05382, 2017.
+listen to samples, visit https://openai.com/blog/
+sparse-transformer. Sample quality quickly de-                       Dai, Z., Yang, Z., Yang, Y., Cohen, W. W., Carbonell, J., Le,
+grades for greater sequence lengths due to reduced model                Q. V., and Salakhutdinov, R. Transformer-xl: Language
+capacity.                                                               modeling with longer-term dependency. 2018.
+
+Table 4. Performance of a strided Sparse Transformer on a classical  Dieleman, S., van den Oord, A., and Simonyan, K. The chal-
+audio dataset (µ-law encoded at 12 kHz) as a function of sequence       lenge of realistic music generation: modelling raw audio
+length and model size.                                                  at scale. In Advances in Neural Information Processing
+                                                                       Systems, pp. 8000–8010, 2018.
+Sequence length  Parameters  Bits per byte
+                                                                     Gehring, J., Auli, M., Grangier, D., Yarats, D., and Dauphin,
+65,536              152M          1.97                                 Y. N. Convolutional sequence to sequence learning. arXiv
+262,144             25M           2.17                                  preprint arXiv:1705.03122, 2017.
+1,048,576            3M           2.99
+                                                                     Gruslys, A., Munos, R., Danihelka, I., Lanctot, M., and
+8. Conclusion                                                           Graves, A. Memory-efﬁcient backpropagation through
+                                                                        time. In Advances in Neural Information Processing
+We introduced Sparse Transformers and showed they attain               Systems, pp. 4125–4133, 2016.
+equivalent or better performance on density modeling of
+long sequences than standard Transformers while requiring            He, K., Zhang, X., Ren, S., and Sun, J. Identity mappings in
+signiﬁcantly fewer operations. This performance is state-               deep residual networks. arXiv preprint arXiv:1603.05027,
+of-the-art in images and text and is easily adaptable to raw            2016.
+audio. The model demonstrates usage of long-term context
+and generates globally coherent samples.                             Hendrycks, D. and Gimpel, K. Bridging nonlinearities and
+                                                                        stochastic regularizers with gaussian error linear units.
+                                                                        arXiv preprint arXiv:1606.08415, 2016.
+Generating Long Sequences with Sparse Transformers
+
+Huang, C.-Z. A., Vaswani, A., Uszkoreit, J., Shazeer, N.,     Sukhbaatar, S., Weston, J., Fergus, R., et al. End-to-end
+   Hawthorne, C., Dai, A. M., Hoffman, M. D., and Eck,           memory networks. In Advances in neural information
+   D. An improved relative self-attention mechanism for          processing systems, pp. 2440–2448, 2015.
+   transformer with application to music generation. arXiv
+   preprint arXiv:1809.04281, 2018.                           Van Den Oord, A., Dieleman, S., Zen, H., Simonyan, K.,
+                                                                Vinyals, O., Graves, A., Kalchbrenner, N., Senior, A., and
+Jozefowicz, R., Vinyals, O., Schuster, M., Shazeer, N., and      Kavukcuoglu, K. Wavenet: A generative model for raw
+  Wu, Y. Exploring the limits of language modeling. arXiv        audio. CoRR abs/1609.03499, 2016.
+   preprint arXiv:1602.02410, 2016.
+                                                              Vaswani, A., Shazeer, N., Parmar, N., Uszkoreit, J., Jones,
+Kingma, D. P. and Dhariwal, P. Glow: Generative ﬂow              L., Gomez, A. N., Kaiser, Ł., and Polosukhin, I. Atten-
+  with invertible 1x1 convolutions. In Advances in Neural        tion is all you need. In Advances in Neural Information
+  Information Processing Systems, pp. 10236–10245, 2018.        Processing Systems, pp. 5998–6008, 2017.
+
+Koutnik, J., Greff, K., Gomez, F., and Schmidhuber, J. A
+   clockwork rnn. arXiv preprint arXiv:1402.3511, 2014.
+
+Liu, P. J., Saleh, M., Pot, E., Goodrich, B., Sepa-
+   ssi, R., Kaiser, L., and Shazeer, N. Generating
+  wikipedia by summarizing long sequences. arXiv preprint
+   arXiv:1801.10198, 2018.
+
+Mehri, S., Kumar, K., Gulrajani, I., Kumar, R., Jain, S.,
+   Sotelo, J., Courville, A., and Bengio, Y. Samplernn: An
+   unconditional end-to-end neural audio generation model.
+   arXiv preprint arXiv:1612.07837, 2016.
+
+Menick, J. and Kalchbrenner, N. Generating high ﬁdelity im-
+   ages with subscale pixel networks and multidimensional
+   upscaling. arXiv preprint arXiv:1812.01608, 2018.
+
+Micikevicius, P., Narang, S., Alben, J., Diamos, G., Elsen,
+   E., Garcia, D., Ginsburg, B., Houston, M., Kuchaev, O.,
+  Venkatesh, G., et al. Mixed precision training. arXiv
+   preprint arXiv:1710.03740, 2017.
+
+Oord, A. v. d., Kalchbrenner, N., and Kavukcuoglu,
+   K. Pixel recurrent neural networks. arXiv preprint
+   arXiv:1601.06759, 2016.
+
+Parmar, N., Vaswani, A., Uszkoreit, J., Kaiser, Ł., Shazeer,
+   N., and Ku, A. Image transformer. arXiv preprint
+   arXiv:1802.05751, 2018.
+
+Radford, A., Narasimhan, K., Salimans, T., and Sutskever,
+   I. Improving language understanding by genera-
+   tive pre-training. URL https://s3-us-west-2. ama-
+   zonaws. com/openai-assets/research-covers/language-
+   unsupervised/language understanding paper. pdf, 2018.
+
+Reed, S., Oord, A. v. d., Kalchbrenner, N., Colmenarejo,
+   S. G., Wang, Z., Belov, D., and de Freitas, N. Paral-
+   lel multiscale autoregressive density estimation. arXiv
+   preprint arXiv:1703.03664, 2017.
+
+Salimans, T., Karpathy, A., Chen, X., and Kingma, D. P.
+   Pixelcnn++: Improving the pixelcnn with discretized lo-
+   gistic mixture likelihood and other modiﬁcations. arXiv
+   preprint arXiv:1701.05517, 2017.
+

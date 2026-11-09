@@ -1,0 +1,694 @@
+                                        MANTa: Efﬁcient Gradient-Based Tokenization
+                                          for Robust End-to-End Language Modeling
+
+                                        Nathan Godey∗1,2  Roman Castagné∗1,2 Éric de la Clergerie1        Benoît Sagot1
+                                                                       1Inria, Paris, France
+
+                                                             2Sorbonne Université, Paris, France
+
+                                        {nathan.godey,roman.castagne,eric.de_la_clergerie,benoit.sagot}@inria.fr
+
+                                        Abstract                                                          <id0> a r e
+
+                                             Static subword tokenization algorithms have                  Encoder-Decoder
+                                             been an essential component of recent works
+                                             on language modeling. However, their static                   (Transformer stack)
+                                             nature results in important ﬂaws that degrade
+arXiv:2212.07284v1 [cs.CL] 14 Dec 2022       the models’ downstream performance and ro-                             Pooling
+                                             bustness. In this work, we propose MANTa,
+                                             a Module for Adaptive Neural TokenizAtion.                   (1-D CNN + Max-Pooling)
+                                             MANTa is a differentiable tokenizer trained
+                                             end-to-end with the language model. The re-      Embeddings
+                                             sulting system offers a trade-off between the
+                                             expressiveness of byte-level models and the      O b v i o u s l y , a p p l e s <id0> r e d
+                                             speed of models trained using subword tok-
+                                             enization. In addition, our tokenizer is highly                 Frontier Predictor
+                                             explainable since it produces an explicit seg-
+                                             mentation of sequences into blocks. We eval-                 (Sliding Window Attention)
+                                             uate our pre-trained model on several English
+                                             datasets from different domains as well as on               O b v i o u s l y , a p p l e s <id0> r e d
+                                             synthetic noise. We ﬁnd that MANTa im-
+                                             proves robustness to character perturbations     Figure 1: The differentiable tokenization scheme of
+                                             and out-of-domain data. We then show that        MANTa-LM. Input bytes are ﬁrst assigned a separation
+                                             MANTa performs comparably to other mod-          probability using a Sliding Window Attention Trans-
+                                             els on the general-domain GLUE benchmark.        former. These probabilities are used to compute the
+                                             Finally, we show that it is considerably faster  contribution of each byte embedding in the pooled rep-
+                                             than strictly byte-level models.                 resentations of the blocks. The block embeddings are
+                                                                                              fed to the Encoder-Decoder layers which predict the
+                                        1 Introduction                                        masked bytes. All the components are optimized with
+                                                                                              the LM objective.
+
+                                        In order to improve Language Models (LMs), the        2016; Kudo, 2018) are a speciﬁc class of tokeniz-
+                                        Natural Language Processing ﬁeld has removed          ers designed in such a way that almost every string
+                                        most of the system-induced biases in the last few     can be encoded and decoded with very few out-
+                                        years. For instance, practices that were once stan-   of-vocabulary tokens. They are used in the vast
+                                        dard such as lemmatization, stemming and fea-         majority of recent LMs, but have been an essential
+                                        ture engineering have progressively disappeared       part of NLP systems since much longer (Mielke
+                                        in favor of general architectures trained on huge     et al., 2021).
+                                        amounts of data, learning end-to-end which fea-
+                                        tures may be leveraged to attain better perfor-          The success of these algorithms can be attributed
+                                        mances. However, one essential part of LMs has        to several reasons. Firstly, they produce token se-
+                                        seen little evolution: tokenization. Tokenizers con-  quences whose length is greatly reduced compared
+                                        vert sequences of characters into sequences of to-    to the original character sequence. This characteris-
+                                        kens (substrings of smaller length) which can then    tic is helpful because limitations in compute power
+                                        be embedded by the model. Subword tokeniza-           and architectural constraints, such as the quadratic
+                                        tion algorithms (Sennrich et al., 2016; Wu et al.,    complexity with respect to sequence length of
+                                                                                              Transformers (Vaswani et al., 2017), prevent mod-
+                                             ∗Equal contribution.                             els from processing arbitrary long sequences. Sec-
+ondly, they compress the corpus using occurrence        LM produces byte-based representations with se-
+statistics that may help LMs. For instance, if a        quence lengths similar to those produced by static
+word appears frequently in the training corpus, it      subword tokenizers. Additionally, by propagating
+will be encoded as a single token in the vocabulary     gradients through our soft segmentation module
+and the model will be able to build a representation    during ﬁne-tuning as well, we are able to adapt the
+for that particular token more easily.                  segmentation to new domains, removing the limita-
+                                                        tions imposed by static subword tokenization.
+   However, the induced biases of tokenizers are
+also harmful for modelization. One such limita-            We show that MANTa-LM is robust to noisy text
+tion lies in their brittleness to character deforma-    data and able to adapt to new domains while being
+tions which are commonly found in real world,           signiﬁcantly faster than byte-level models. Inter-
+noisy data. For instance, BERT’s tokenizer (De-         estingly, MANTa learns a simple but explainable
+vlin et al., 2019) encodes “performance” as             segmentation using only the LM objective while
+[“performance”] but “perfonmance” as [‘per’,            effectively reducing the length of byte sequences.
+‘##fo’, ‘##n’, ‘##man’, ‘##ce’], which
+makes it hard for the model to behave simi-                In summary, the contributions of this paper are
+larly in both cases. Moreover, the tokenizer is         the following:
+ﬁxed after its training and is therefore impos-
+sible to update, for instance to reﬂect new do-            • We introduce MANTa, a gradient-based tok-
+mains (El Boukkouri et al., 2020) where tokeniza-             enization and pooling module that can learn
+tion might over-segment speciﬁc or technical terms.           jointly with an encoder-decoder LM;
+Clark et al. (2022) list other issues emerging when
+using static subword tokenizers, especially when           • We train MANTa-LM on English data and
+modeling languages with a more complex morphol-               we evaluate its robustness to synthetic and
+ogy than English.                                             natural variation and its ability to adapt to new
+                                                              domains compared to byte-level models.
+   To overcome these issues, tokenization-free mod-
+els (Clark et al., 2022; Xue et al., 2022; Tay et al.,  2 Related Work
+2021) produce character-based or byte-based em-
+beddings for LMs instead of subword embeddings.         Non-neural subword-level tokenization methods
+These methods improve the robustness of LMs             have dominated in the last few years as the de-
+to naturally occurring noise as well as their ex-       fault way to encode textual data, the most used
+pressiveness when dealing with out-of-domain or         being BPE (Sennrich et al., 2016), WordPiece (Wu
+multilingual data. In order to cope with increased      et al., 2016) and Unigram (Kudo, 2018). However,
+input lengths, some of these methods compress           they have inherent ﬂaws that limit their multilin-
+sequences with constant reduction rates obtained        gual performance (Rust et al., 2021), their adapt-
+using specialized modules (Clark et al., 2022; Tay      ability to new languages and new domains after
+et al., 2021), subsequently removing any notion of      pre-training (El Boukkouri et al., 2020; Garcia
+subwords.                                               et al., 2021) and the downstream performance of
+                                                        language models in general (Bostrom and Durrett,
+   We argue that learning a subword tokenization        2020).
+together with input representations in an end-to-
+end fashion is beneﬁcial for language modeling. In         To alleviate these issues, tokenization-free (or
+this work, we introduce MANTa, a gradient-based         character-level) models leverage characters instead
+tokenizer and embedding module. It can easily be        of subwords to build text representations. Some
+plugged-in to replace the classical combination of      of the ﬁrst neural networks for sequence genera-
+ﬁxed tokenizers and trainable subword embedding         tion used characters directly as inputs (Sutskever
+matrices existing in most encoder-decoder models,       et al., 2011; Graves, 2013), and following works
+without any increase in the total number of train-      modiﬁed the approach to create input word repre-
+able parameters. We also introduce MANTa-LM,            sentations based on characters (Kim et al., 2016;
+a Transformer encoder-decoder that incorporates         Józefowicz et al., 2016; Peters et al., 2018). Sim-
+MANTa and that is trained end-to-end. By learning       ilar architectures were recently adapted to work
+a soft, adaptive segmentation of input sequences        with Transformers (El Boukkouri et al., 2020; Ma
+jointly with the LM pre-training objective, MANTa-      et al., 2020). Nevertheless, they still rely on ﬁxed
+                                                        tokenization heuristics (for instance segmenting us-
+                                                        ing whitespaces) which may not be suited to some
+languages or certain types of language variations.     model. We provide an overview of the entire model
+Recent works have tried to remove these induced        in Figure 1. We also summarize the process of
+biases by working purely with characters or bytes      mapping byte embeddings to block embeddings in
+as input (Clark et al., 2022; Tay et al., 2021; Xue    appendix D.
+et al., 2022). However, they either have to use var-
+ious tricks to reduce the sequence lengths based       3.1.1 Predicting Subword Frontiers
+on other induced biases like downsampling rates
+(Clark et al., 2022; Tay et al., 2021) or have ex-     Our frontier predictor consists in a parameterized
+tremely low training and inference speeds (Xue         module mapping each byte bi to the probability of
+et al., 2022). Chung et al. (2016) create tokens       being a block frontier pFi. In a ﬁrst part, we embed
+in a differentiable manner by predicting frontiers     each byte bi to an embedding ebi. Working with
+and using the representations of each character in-    bytes instead of characters allows modeling a larger
+side a “token”, but it remains unclear how their       array of symbols while having very small embed-
+model could be adapted to be used with newer ar-       ding matrices with 256 × hidden size parameters.
+chitectures such as Transformers. Moﬁjul Islam         Since the input sequences fed to the frontier predic-
+et al. (2022) propose to segment tokens using a        tor may be particularly long, we use a Transformer
+trained “frontier predictor.” Nevertheless, this dif-  with sliding window attention (Beltagy et al., 2020).
+ferentiable tokenizer is not trained with the main     This layer achieves a linear complexity with respect
+language model objective but instead mimics a BPE      to sequence length by computing attention using
+subword tokenizer, carrying some of its ﬂaws.          only a local context. This reduced context forces
+                                                       the model to focus on local surface features rather
+3 MANTa                                                than long-range dependencies which may be hard
+                                                       to model at the byte level.
+3.1 Differentiable Tokenization
+                                                          We make the assumption that long-range depen-
+Our main contribution is the introduction of an end-   dencies are not relevant for segmentation and that
+to-end differentiable tokenization architecture that   this reduced context window should not harm the
+consists in softly aggregating input bytes into what   quality of the tokenization.
+we refer to as blocks. As an analogy with hard
+tokenization schemes, blocks can be compared to        3.1.2 Modeling the Byte-Block Assignment
+tokens with smooth borders.
+                                                       Once the frontier probabilities (pFi)i∈[1,L] are pre-
+   We decompose the tokenization process into sev-     dicted for the whole sequence, we use them to
+eral differentiable operations, ensuring that our      model an assignment between bytes and block slots.
+model can be trained end-to-end. Our approach          Each byte is given a probability distribution over
+consists in predicting a segmentation, and then        the available block slots, and the expected block
+combining byte embeddings according to this seg-       position of a byte in the block sequence increases
+mentation. MANTa can be divided in three differ-       along the byte sequence (i.e. the next byte is always
+ent parts:                                             more likely to be assigned to the next block).
+
+   • Predicting block frontiers using a parameter-        Let us introduce (B, bi), the slot random vari-
+      ized layer to assign a probability pFi to each   ables for each byte bi, describing the position of
+      input byte bi of being a frontier;1              the block containing bi in the block sequence. In
+                                                       other words, the event (B = k, bi) describes the
+   • Building a byte-block unnormalized joint          fact that the i-th byte belongs in the k-th block.
+      distribution using the frontier probabilities    These variables can only take values in [1, L], as
+     (pFi)i∈[1,L] corresponding to a soft assign-      there cannot be more blocks than there are bytes.
+      ment from bytes to blocks;                       We can model the (B, bi) as a cumulative sum of
+                                                       the random variables Fi: the position of the block
+   • Pooling byte representations for each block       in which a byte belongs is exactly the number of
+      Bj weighted by the probability of each byte      frontier bytes before this one.
+      to belong in the current block P (bi ∈ Bj).
+                                                          Since Fi ∼ B(pFi), we can model the block
+   This process results in a sequence of embeddings    index variables B depending on the index of the
+that can be given directly to the encoder-decoder      bytes b using the Poisson Binomial distribution
+                                                       PB which models the cumulative sum of Bernoulli
+    1F in pFi stands for Frontier.                     variables: (B, bi) ∼ PB (pFk )k≤i . There exists
+no closed form for this distribution’s mass func-       Step 0
+tion, but some fast methods have been developed to
+avoid exploring the whole event tree (Biscarri et al.,
+2018; Zhang et al., 2017). However, to reduce com-
+putational cost, we use a truncated Gaussian kernel
+G with the same mean and variance to approximate
+the (B, bi) probability mass function:
+
+                                               1
+∀k ∈ [1, LB], P (B = k, bi) Pk,i Z Gµi,σi (k)
+
+where Z =           Gµi,σi(k) is a normalization        Step 3,000
+
+            1≤k≤LB
+
+term, and:
+
+
+LB = min (L, (µL + 3σL))
+
+
+
+
+
+
+
+
+           i       pFi                     (1)
+  µi =      k=1
+
+                                                       Step 7,000
+
+                   i    pFi  (1  −  pFi )
+                   k=1
+σi =
+
+   We denote by Pk,i the approximation of the prob-                                  Step 13,000
+ability of membership of the byte i to block k. We
+display an example of this map at different steps       Figure 2: The block-byte assignment P during the ﬁrst
+during training in Figure 2. We truncate the block      pre-training steps. MANTa learns to downsample input
+sequences after (µL + 3σL) since all the probabili-     sequences so that no information is lost through trunca-
+ties beyond this position are negligible.               tion, but also converges towards a sharp segmentation.
+
+3.1.3 Pooling Block Embeddings                             We ﬁnally apply a max-pooling operation on the
+                                                        contextualized weighted byte embeddings for each
+At this point in the forward pass, we have esti-        block. This yields one embedding per block, with
+mated the position of the block in which each input     the same dimension as the byte embeddings. We
+byte belongs, along with the block sequence max-        use a linear layer to map the block embeddings to
+imum plausible length LB. In order to provide           the right input dimension for the encoder-decoder
+block embeddings to the LM, we now focus on             model, i.e. its hidden size.
+the contribution of each byte to the block given by
+the block-byte assignment map. For each block              The ﬁnal step consists in truncating the block
+position k ∈ [1, LB], this map actually provides        embedding sequence to a ﬁxed length Lˆ =
+an unnormalized contribution (Pk,i)i∈[1,L] of each      min(LB, L/K) with K ∈ N∗ a ﬁxed truncation
+byte in this block. We can then use the byte embed-     factor. This simple heuristic ensures that all se-
+dings eb from the frontier predictor described in       quences fed to the encoder-decoder have a length
+Section 3.1.1 and, for the k-th block, build a block    at least K times shorter than the input byte se-
+embedding where each byte bi contributes based          quence length. We choose K = 4 throughout the
+on its probability of being in this block Pk,i.         paper which is in average the number of bytes in
+                                                        an English BPE token. Most importantly, this trun-
+   To build ekB, the embedding of block Bk in k-th      cation incentivizes the frontier predictor to produce
+position, we ﬁrst compute the weighted byte em-         sufﬁciently long blocks. We discuss the inﬂuence
+beddings Pk,i × eib i∈[1,L] ∈ RH , with H the hid-      of this mechanism in more depth in Section 6.1.
+den size of the byte embeddings. To make the block
+embeddings aware of the ordering of the bytes (so       3.2 Model Training
+that ape and pea can have different representations),
+we proceed to a depthwise 1-D convolution along         We obtain from the differentiable tokenizer and
+the dimension of the bytes after weighting. This        pooling module a sequence of block embeddings
+convolution also improves the expressiveness of
+the block embeddings. We discuss our efﬁcient
+implementation of these operations in Appendix A.
+that can be used exactly like subword embeddings.      size of 1024. Sequence lengths are respectively
+Thus, we use an encoder decoder architecture iden-     1024 for Small models and 2048 for the Base
+tical to T5 (Raffel et al., 2020). Nevertheless,       model. Thus, the models are trained on roughly the
+since we do not have a ﬁxed subword vocabulary,        same amount of bytes as in Tay et al. (2021), where
+our decoder operates at the byte level similarly to    a batch size of 64 is used for 1M steps.
+ByT5 (Xue et al., 2022).
+                                                          We also train a ByT5Small model on the same
+3.2.1 Pre-Training Details                             data, using a batch size of 64 and a sequence length
+                                                       of 1024. We consider the “Scaled” architecture
+Objective Our objective is identical to the one        which provides the encoder with more layers than
+used in ByT5. We mask 15% of bytes randomly            the decoder (Xue et al., 2022). To avoid prohibitive
+and choose a number of spans such that each has        computation costs and ensure fairness in terms
+an average length of 20 bytes. Each span is then       of available resources between models, we limit
+replaced by an <extra_id_i> token with i iden-         its training time to the one of MANTa-LMSmall.
+tifying the order of the span in the sequence. On      Hence, our ByT5Small is only trained for 200k
+the decoder side, the model has to predict in an au-   steps.
+toregressive way the span identiﬁer and the masked
+bytes.                                                 4 Experiments and Results
+
+Data We pre-train our model on English text            4.1 Evaluation on GLUE
+data using C4 (Raffel et al., 2020), a large corpus
+scraped from the Internet. This corpus is particu-     To ensure that our model is competitive with exist-
+larly suited to our pre-training due to its diversity  ing language models exploiting subword tokeniza-
+in terms of content and linguistic variations. In      tion algorithms, we evaluate it on several English
+addition, it enables a better comparison with other    datasets and compare it with other baseline models.
+tokenizer-free models trained using it such as Char-
+former. Since this dataset is not available publicly,  Setup We use GLUE (Wang et al., 2018), a Natu-
+we use the English split of the mC4 distributed by     ral Language Understanding benchmark consisting
+AllenAI. We ﬁlter long documents containing more       of 7 tasks, to evaluate our model. Similarly to T5,
+than 215 bytes, which is a simple proxy to remove      we cast the classiﬁcation tasks as generation tasks
+important quantities of unwanted code data.            where the model has to predict autoregressively the
+                                                       bytes forming the answer.
+Hyperparameters We pre-train two ver-
+sions of our model: MANTa-LMSmall and                     We compare our model to an encoder-decoder
+MANTa-LMBase. Each of them stacks a                    model with subword tokenization (pre-trained with
+MANTaSmall (resp. MANTaBase) tokenizer                 the same denoising objective as T5) and a fully
+and embedding module and a T5Small (resp.              byte-level encoder-decoder, similar to ByT5. We
+T5Base) encoder-decoder model stripped of its          compare Small models with our pre-trained ver-
+tokenizer and subword embedding matrix. Details        sions, and Base models with results mentioned
+about MANTa hyperparameters can be found in            in Tay et al. (2021). We report the number
+Appendix B.                                            of parameters given in Tay et al. (2021) for
+                                                       Byte-level T5Base, and gather from its low value
+   Following T5 and ByT5, we use the Adafac-           that their implementation corresponds to a T5Base
+tor optimizer with a learning rate of 10−2 for the     architecture trained on byte-level inputs.
+encoder-decoder model, parameter scaling for the
+whole system and no weight decay. However, to          Results Results can be found on Tables 1 and 2.
+maintain stability of our differentiable tokenizer,    Overall, MANTa-LM exhibits a performance
+we use a learning rate of 10−3 for the parameters      slightly below Charformer but stays within a small
+of the byte embeddings, the frontier predictor, and    margin on average (1.1 points below). Nonetheless,
+the pooling module. We also use a triangular learn-    the main objective of our method is to balance de-
+ing rate schedule with 1000 (resp. 5000) warm-up       cent performance with robustness and speed which
+steps for batch size 1024 (resp. 64).                  we show in the following sections.
+
+Training We train T5Small, MANTa-LMSmall,              4.2 Robustness to Domain Change
+and MANTa-LMBase for 65k steps with a batch
+                                                       Static subword tokenizers tend to show important
+                                                       limitations when used with texts originating from
+Model                   |θ| MNLI QNLI MRPC SST-2 QQP STSB COLA AVG
+
+T5Small                 60M 79.7/79.7 85.7 80.2/86.2 89.0 90.2/86.6 80.0                     30.3 76.6
+                                                                                             32.0 77.1
+MANTa-LMSmall (ours) 57M 79.2/78.6 84.5 82.3/87.2 89.6 89.9/86.5 81.4
+
+Table 1: Results on dev sets for the GLUE benchmark for small models following our pre-training procedure.
+
+          Model          |θ|   MNLI      QNLI              MRPC      SST-2    QQP      STSB  COLA   AVG
+                                                                      92.7
+        BERT†Base       110M   84.4 / -  88.4               86.7/-    92.7       -        -     -     -
+          T5†Base       220M  84.2/84.6  90.5             88.9/92.1         91.6/88.7  88.0   53.8  84.3
+                                         91.7                           -                     59.1
+     CharBERTB§ ase     125M       -     88.7               87.8/-    91.6     91/-       -   45.1    -
+   Byte-level T5B† ase  200M  82.5/82.7  89.0             87.3/91.0   91.6  90.9/87.7  84.3   42.6  81.5
+    CharformerB† ase    203M  82.6/82.7  88.2             87.3/91.1   91.3  91.2/88.1  85.3   51.0  81.4
+MANTa-LMBase (ours)     200M  77.5/78.8                   82.4/88.2         90.8/87.7  79.2         80.3
+
+Table 2: Results on dev sets for the GLUE benchmark. † indicates results obtained by Tay et al. (2021), which are
+very similar to our models in terms of compute, but use a smaller batch size which may enhance their performance.
+§ indicates results obtained by Ma et al. (2020). The top section concerns model trained using a subword tokenizer.
+
+Model                         Accuracy                    mance compared to the encoder models trained
+                                                          by (El Boukkouri et al., 2020), we believe this drop
+BERT‡Base                        77.7                     may be due to the different pretraining data used—
+CharacterBERT‡Base               77.9                     CharacterBERT uses splits of Wikipedia, which
+T5Small                          75.3                     may be helpful to learn some technical terms re-
+MANTa-LMSmall (ours)             75.6                     lated to the clinical domain—, and the different
+                                                          model sizes—CharacterBERT uses all of its param-
+Table 3: Results on MedNLI. ‡ indicates results from      eters to encode example, while we keep half of the
+El Boukkouri et al. (2020), who use a different pre-      parameters in the decoder. Nonetheless, we note
+training corpus than C4. All other results are from mod-  that MANTa-LM reaches a better performance than
+els trained with our codebase.                            its subword tokenization counterpart T5.
+
+a domain unseen during training. For instance,            4.3 Robustness to Noisy Data
+El Boukkouri et al. (2020) show that tokenizing
+medical texts with a tokenizer trained on Wikipedia       Although LMs may learn complex patterns even
+data often results in an over-segmentation of tech-       from noisy input texts, this ability is conditioned by
+nical terms which in turn affects the downstream          how the tokenizer segments character sequences.
+performance. By removing this static bottleneck           Since MANTa is not static and can be ﬁnetuned on
+in MANTa-LM, we hope that it should be able to            non-standard data, we expect it should be able to
+adapt more easily to new domains. To test this            learn to be more robust to variation/noise compared
+hypothesis, we ﬁnetune it on a medical Natural            to a subword tokenizer paired with a LM. To eval-
+Language Inference dataset.                               uate this hypothesis, we study how MANTa-LM
+                                                          behaves on both naturally occurring text variation
+Setup We ﬁnetune MANTa-LM on                              and multiple levels of synthetic noise.
+MEDNLI (Romanov and Shivade, 2018), a
+dataset consisting of 14,049 sentence pairs               4.3.1 Naturally Occurring Noise
+extracted from clinical notes. We follow the same
+ﬁnetuning setup than for the GLUE Benchmark               Setup Similarly to Tay et al. (2021), we test
+i.e. use the same batch size and learning rate.           our model on a toxicity detection task constructed
+We compare our results to the ones obtained               with user generated data. We use the TOXICCOM-
+by El Boukkouri et al. (2020) with models                 MENTS dataset (Wulczyn et al., 2017) which con-
+pretrained on the general domain.                         tains 223,549 sentences annotated with a binary
+                                                          label indicating whether each sentence can be clas-
+Results We present our results on Table 3. Al-            siﬁed as toxic or not. We also use the same ﬁnetun-
+though we notice a signiﬁcant drop in perfor-             ing setup here as the one used for evaluating on the
+Model                 Accuracy                                              90
+
+T5†Base               91.5                              SST-2 dev accuracy  85
+
+Charformer†Base       92.7
+
+MANTa-LMBase (ours) 93.2
+
+Table 4: Results on the TOXICCOMMENTS dataset. Re-                          80     TBM5yASTNm5TaSlaml -aLllMSmall
+sults indicated by † are from Tay et al. (2021).                            75
+
+Model            |θ| Seconds/step                                               0  N5oise level (1%0)              15
+
+Byte-level T5Small 57M 9.06 (× 8.0)
+
+MANTa-LMSmall    57M  2.61 (× 2.3)                                                 (a) DEV-ONLY
+T5Small          60M    1.13 (× 1)
+
+Table 5: Comparison of training speeds. All the exper-  SST-2 dev accuracy  88
+iments were run on 16 NVIDIA V100 GPUs using a
+batch size of 1024 and a sequence length of 1024 bytes                      86
+or 256 tokens
+                                                                            84
+GLUE benchmark.
+                                                                            82 0   N5oise level (1%0)              15
+Results We present our results in Table 4 and
+compare them to the ones reported in Tay et al.                                    (b) TRAIN-DEV
+(2021). As expected, noisy user generated data is
+particularly harmful for models using subword tok-      Figure 3: Best accuracy on the SST-2 development set
+enization. On the other hand, constructing sentence     as the noise level increases. The TRAIN-DEV setting
+representations with byte-level information helps       corresponds to models ﬁnetuned on noisy data while
+and our model is more accurate than Charformer.         models in the DEV-ONLY setting have been ﬁnetuned
+This gain may be due to a better segmentation of        on clean data.
+speciﬁc terms encountered in the data.
+
+4.3.2 Synthetic Noise                                   one trained at byte-level, hence using sequences
+                                                        that are roughly 4 times longer. We also report
+Setup We also compare T5 and ByT5 with our              the speed of the larger ByT5Small architecture as
+approach when facing different levels of noise.         described in Xue et al. (2022).
+This study pictures how these models react to un-
+seen noise at evaluation time (DEV-ONLY setup)             MANTa-LM is approximately 4 times faster
+and how they adapt to a given noise via ﬁne-tuning      than Byte-level T5Small, and 5 times faster than
+(TRAIN-DEV setup). We apply synthetic noise at          ByT5Small, which can be explained by the reduced
+different levels τ ∈ {0.05, 0.10, 0.15} by picking      sequence length we use in the encoder-decoder
+randomly τ × L positions in the byte sequences          model. MANTa-LM is only 2.3 times slower than
+and equiprobably deleting, replacing or inserting       T5Small which furthermore beneﬁts from already
+bytes at these positions.                               tokenized sequences at training time.
+
+Results We found that models performed simi-            6 Discussion
+larly for the different noise levels in the DEV-ONLY
+setting. On the contrary, in the TRAIN-DEV setting,     6.1 Truncating Embedding Sequences
+MANTa-LM can be ﬁnetuned as well as ByT5 for
+all levels of noise, while the performance of T5        Once we obtain block embeddings, the ﬁnal step
+quickly degrades.                                       in MANTa consists in truncating sequences to a
+                                                        length 4 times smaller than the original byte se-
+5 Training Speedups                                     quence, as described in Section 3.1.3. This is es-
+                                                        sential to make MANTa-LM work.
+In terms of speed, we compare our model to
+MANTa-LMSmall to T5Small counterparts: one                 First, it increases the control over the encoder-
+that is trained at the classical subword-level, and     decoder’s computation cost. Without this bottle-
+                                                        neck, the Transformer can receive sequences vary-
+Original                              Oh, it’s me vandalising?xD See here. Greetings,
+MANTa               O|h|,| |i|t|’|s| |m|e| |v|a|n|d|a|l|i|s|i|n|g|?|x|D| |S|e|e| |h|e|r|e|.| |G|r|e|e|t|i|n|g|s|,
+T5 tokenizer        O|h|,| |i|t|’|s| |m|e| |v|a|n|d|a|l|i|s|i|n|g|?|x|D| |S|e|e| |h|e|r|e|.| |G|r|e|e|t|i|n|g|s|,
+
+Original                         The patient was started on Levophed at 0.01mcg/kg/min.
+MANTa         T|h|e| |p|a|t|i|e|n|t| |w|a|s| |s|t|a|r|t|e|d| |o|n| |L|e|v|o|p|h|e|d| |a|t| |0|.|0|1|m|c|g|/|k|g|/|m|i|n|.
+T5 tokenizer  T|h|e| |p|a|t|i|e|n|t| |w|a|s| |s|t|a|r|t|e|d| |o|n| |L|e|v|o|p|h|e|d| |a|t| |0|.|0|1|m|c|g|/|k|g|/|m|i|n|.
+
+Table 6: Examples of segmentations produced by our module (pre-trained only) and by T5’s BPE tokenizer. The
+sentences are samples from TOXICCOMMENTS and MEDNLI.
+
+ing from a single block containing the whole se-       6.3 Gradient-Based Segmentation
+quence (LB = 1) to one block per byte in the
+sequence (LB = L). In the latter case, which mim-      We employ a radically different downsampling ap-
+ics ByT5’s input segmentation, the computation         proach compared to other gradient-based tokeniza-
+becomes extremely slow due to the quadratic cost       tion methods such as CANINE (Clark et al., 2022)
+of the attention with respect to the sequence length.  or Charformer (Tay et al., 2021). While CANINE
+Using the bottleneck ensures that we can control       downsamples sequences using a ﬁxed rate after
+the worst case complexity of the encoder Trans-        byte contextualization and Charformer’s GBST
+former and keep it similar to that of a subword-       (Gradient Based Subword Tokenizer) pools rep-
+based encoder model.                                   resentations created using various downsampling
+                                                       rates, MANTa only applies downsampling right be-
+   Second, it serves as a kind of regularization for   fore the LM to limit the length of block sequences.
+the block segmentations. We noted that training our    Hence, our model is able to build word-level repre-
+module without the bottleneck often led to block se-   sentations of arbitrary length as long as it divides
+quences as long as byte sequences (LB = L). This       the whole byte sequence length by a ﬁxed factor.
+may be due to the beginning of training where hav-
+ing very local information helps - for instance bytes     We also argue that our method yields more ex-
+to the left and right of masked spans. However,        plainable pooled representations as the segmenta-
+such a segmentation degrades the model speed and       tion can be explicitly derived from the outputs of
+performance later in training. Truncating the se-      MANTa. Indeed, contrary to CANINE and Char-
+quence forces the model to construct larger blocks     former, MANTa disentangles the segmentation of
+in order to “ﬁt” all the information from the input    blocks from their representations, allowing to study
+sequence.                                              each part separately.
+
+6.2 Learnt Block Segmentation                          6.4 Main hyperparameters
+
+Segmentation examples can be found in Table 6.         We discuss here some of the major hyperparameters
+For each byte, we retrieve the expected block posi-    of our method. Constrained by limited computa-
+tion produced by MANTa and approximate it with         tional resources, we were unable to assess their
+the closest integer to mimic hard tokenization. We     exact importance on MANTa’s performance. We
+found that MANTa is not keen to produce sub-           try to give some intuitions on their inﬂuence.
+word level segmentations. Most of the key sym-
+bols for word separation have been identiﬁed as        Frontier Predictor We used a small Trans-
+block delimiters during pre-training. As expected,     former network with sliding window attention for
+MANTa is less prone to over-segmentation of un-        this module. A much larger network would be
+known words like named entities. We also found         slower and may not bring signiﬁcant improvements
+that a trained MANTa produced spiked separation        to the overall performance of the model, since it is
+probabilities, meaning that it converged towards a     only used for predicting the block byte assignment
+“hard” segmentation. This can also be observed by      but does not “expand” the overall expressivity of
+monitoring the value min(pFi, 1 − pFi) which al-       the model.
+ways converges towards values of magnitude 10−5.
+                                                       Convolution kernel applied on byte embed-
+                                                       dings This kernel adds positional information to
+                                                       the byte embeddings and expressivity when con-
+                                                       structing the block embeddings. Using a larger
+                                                       kernel or a concatenation of kernels might help for
+better block representations. However, our exper-     at generation time. Previous works have attempted
+iments did not show any signiﬁcant difference in      to reduce this computational cost by decreasing
+the pretraining performance.                          the size of the decoder layers compared to the en-
+                                                      coder (Xue et al., 2022) or by projecting embed-
+Block embedding sequence truncation factor            dings to a smaller latent space (Jaegle et al., 2021)
+Trimming block sequences was instrumental to pro-     for the decoding.
+duce meaningful input segmentations and blocks
+containing more than a single byte. We settled           Finally, we presented in this work a proof of con-
+for a factor of 4 since other values led to minor     cept of adaptive segmentation algorithms on rela-
+degradations early in training. This factor roughly   tively small models, ranging from 50M to 200M pa-
+corresponds to the average number of bytes in a       rameters. Although we hypothesize that our model
+subword created by an English tokenizer.              would scale relatively well since it keeps most of
+                                                      the encoder-decoder architecture untouched, this
+   We believe that a more thorough hyperparame-       hypothesis should be tested in a future work.
+ter search could improve the performance of our
+model. We leave this for future work due to com-      Acknowledgements
+putational limitations.
+                                                      This work was funded by the last authors’ chair
+7 Conclusion                                          in the PRAIRIE institute funded by the French na-
+                                                      tional agency ANR as part of the “Investissements
+In this work, we present MANTa, a fully differ-       d’avenir” programme under the reference ANR-
+entiable module that learns to segment input byte     19-P3IA-0001. This work was granted access by
+sequences into blocks of arbitrary lengths, and con-  GENCI to the HPC resources of IDRIS under the
+structs a robust representation for these blocks.     allocation 2022-AD011012676R1.
+We train this module jointly with an encoder-
+decoder LM on a span denoising objective to ob-       References
+tain MANTa-LM. We then show that MANTa-LM
+is more robust when applied to noisy or out-of-       Iz Beltagy, Matthew E Peters, and Arman Cohan.
+domain data than models using static subword to-         2020. Longformer: The long-document transformer.
+kenizers. At the same time, it performs on par           arXiv preprint arXiv:2004.05150.
+with fully byte-level models on these setups while
+operating with a much reduced computational cost.     William Biscarri, Sihai Dave Zhao, and Robert J. Brun-
+                                                         ner. 2018. A simple and fast method for computing
+   Beyond the noisy and out-of-domain settings,          the poisson binomial distribution function. Compu-
+we believe that our approach could lead to interest-     tational Statistics & Data Analysis, 122:92–100.
+ing results for a number of languages, especially
+those whose writing system do not use whitespace      Kaj Bostrom and Greg Durrett. 2020. Byte pair encod-
+separators, such as Chinese.                             ing is suboptimal for language model pretraining. In
+                                                         Findings of the Association for Computational Lin-
+   Finally, tokenizers are hypothesized to be an         guistics: EMNLP 2020, pages 4617–4624, Online.
+important limiting factor when segmenting multi-         Association for Computational Linguistics.
+lingual data (Rust et al., 2021). We believe MANTa
+could be used in the multilingual setting to ensure   Junyoung Chung, Sungjin Ahn, and Yoshua Bengio.
+a more balanced segmentation between languages.          2016. Hierarchical multiscale recurrent neural net-
+                                                         works. arXiv preprint arXiv:1609.01704.
+Limitations
+                                                      Jonathan H Clark, Dan Garrette, Iulia Turc, and John
+Although MANTa can help alleviate some of the            Wieting. 2022. Canine: Pre-training an efﬁcient
+inherent issues accompanying subword tokenizers,         tokenization-free encoder for language representa-
+it also suffers some ﬂaws that we believe could be       tion. Transactions of the Association for Computa-
+addressed in future work.                                tional Linguistics, 10:73–91.
+
+   Contrary to encoder-decoder models that can de-    Jacob Devlin, Ming-Wei Chang, Kenton Lee, and
+code long sequences efﬁciently, our model has to         Kristina Toutanova. 2019. BERT: Pre-training of
+decode sequences byte-per-byte (similarly to Clark       deep bidirectional transformers for language under-
+et al. (2022); Xue et al. (2022); Tay et al. (2021))     standing. In Proceedings of the 2019 Conference
+which adds an important computational overhead           of the North American Chapter of the Association
+                                                         for Computational Linguistics: Human Language
+                                                         Technologies, Volume 1 (Long and Short Papers),
+                                                         pages 4171–4186, Minneapolis, Minnesota. Associ-
+                                                         ation for Computational Linguistics.
+Hicham El Boukkouri, Olivier Ferret, Thomas               Md Moﬁjul Islam, Gustavo Aguilar, Pragaash Pon-
+   Lavergne, Hiroshi Noji, Pierre Zweigenbaum, and           nusamy, Clint Solomon Mathialagan, Chengyuan
+   Jun’ichi Tsujii. 2020. CharacterBERT: Reconciling         Ma, and Chenlei Guo. 2022. A vocabulary-free mul-
+   ELMo and BERT for word-level open-vocabulary              tilingual neural tokenizer for end-to-end task learn-
+   representations from characters. In Proceedings           ing. arXiv e-prints, pages arXiv–2204.
+   of the 28th International Conference on Compu-
+   tational Linguistics, pages 6903–6915, Barcelona,      Matthew E. Peters, Mark Neumann, Mohit Iyyer, Matt
+   Spain (Online). International Committee on Compu-         Gardner, Christopher Clark, Kenton Lee, and Luke
+   tational Linguistics.                                     Zettlemoyer. 2018. Deep contextualized word rep-
+                                                             resentations. In Proceedings of the 2018 Confer-
+Xavier Garcia, Noah Constant, Ankur Parikh, and              ence of the North American Chapter of the Associ-
+   Orhan Firat. 2021. Towards continual learning for         ation for Computational Linguistics: Human Lan-
+   multilingual machine translation via vocabulary sub-      guage Technologies, Volume 1 (Long Papers), pages
+   stitution. In Proceedings of the 2021 Conference of       2227–2237, New Orleans, Louisiana. Association
+   the North American Chapter of the Association for         for Computational Linguistics.
+   Computational Linguistics: Human Language Tech-
+   nologies, pages 1184–1192, Online. Association for     Colin Raffel, Noam Shazeer, Adam Roberts, Kather-
+   Computational Linguistics.                                ine Lee, Sharan Narang, Michael Matena, Yanqi
+                                                             Zhou, Wei Li, and Peter J. Liu. 2020. Exploring
+Alex Graves. 2013. Generating sequences with                 the limits of transfer learning with a uniﬁed text-to-
+   recurrent neural networks. arXiv preprint                 text transformer. Journal of Machine Learning Re-
+   arXiv:1308.0850.                                          search, 21(140):1–67.
+
+Andrew Jaegle, Sebastian Borgeaud, Jean-Baptiste          Alexey Romanov and Chaitanya Shivade. 2018.
+   Alayrac, Carl Doersch, Catalin Ionescu, David Ding,       Lessons from natural language inference in the clin-
+   Skanda Koppula, Daniel Zoran, Andrew Brock,               ical domain. In Proceedings of the 2018 Conference
+   Evan Shelhamer, Olivier J. Hénaff, Matthew M.             on Empirical Methods in Natural Language Process-
+   Botvinick, Andrew Zisserman, Oriol Vinyals, and           ing, pages 1586–1596, Brussels, Belgium. Associa-
+   João Carreira. 2021. Perceiver IO: A general ar-          tion for Computational Linguistics.
+   chitecture for structured inputs & outputs. CoRR,
+   abs/2107.14795.                                        Phillip Rust, Jonas Pfeiffer, Ivan Vulic´, Sebastian
+                                                             Ruder, and Iryna Gurevych. 2021. How good is
+Rafal Józefowicz, Oriol Vinyals, Mike Schuster,              your tokenizer? on the monolingual performance of
+   Noam M. Shazeer, and Yonghui Wu. 2016. Ex-                multilingual language models. In Proceedings of the
+   ploring the limits of language modeling. ArXiv,           59th Annual Meeting of the Association for Compu-
+   abs/1602.02410.                                           tational Linguistics and the 11th International Joint
+                                                             Conference on Natural Language Processing (Vol-
+Yoon Kim, Yacine Jernite, David Sontag, and Alexan-          ume 1: Long Papers), pages 3118–3135, Online. As-
+   der M Rush. 2016. Character-aware neural language         sociation for Computational Linguistics.
+   models. In Thirtieth AAAI conference on artiﬁcial
+   intelligence.                                          Rico Sennrich, Barry Haddow, and Alexandra Birch.
+                                                             2016. Neural machine translation of rare words
+Taku Kudo. 2018. Subword regularization: Improving           with subword units. In Proceedings of the 54th An-
+   neural network translation models with multiple sub-      nual Meeting of the Association for Computational
+   word candidates. In Proceedings of the 56th Annual        Linguistics (Volume 1: Long Papers), pages 1715–
+   Meeting of the Association for Computational Lin-         1725, Berlin, Germany. Association for Computa-
+   guistics (Volume 1: Long Papers), pages 66–75, Mel-       tional Linguistics.
+   bourne, Australia. Association for Computational
+   Linguistics.                                           Ilya Sutskever, James Martens, and Geoffrey E Hin-
+                                                             ton. 2011. Generating text with recurrent neural net-
+Wentao Ma, Yiming Cui, Chenglei Si, Ting Liu, Shi-           works. In ICML.
+   jin Wang, and Guoping Hu. 2020. CharBERT:
+   Character-aware pre-trained language model. In         Yi Tay, Vinh Q Tran, Sebastian Ruder, Jai Gupta,
+   Proceedings of the 28th International Conference on       Hyung Won Chung, Dara Bahri, Zhen Qin, Si-
+   Computational Linguistics, pages 39–50, Barcelona,        mon Baumgartner, Cong Yu, and Donald Metzler.
+   Spain (Online). International Committee on Compu-         2021. Charformer: Fast character transformers via
+   tational Linguistics.                                     gradient-based subword tokenization. In Interna-
+                                                             tional Conference on Learning Representations.
+Sabrina J Mielke, Zaid Alyafeai, Elizabeth Salesky,
+   Colin Raffel, Manan Dey, Matthias Gallé, Arun          Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob
+   Raja, Chenglei Si, Wilson Y Lee, Benoît Sagot, et al.     Uszkoreit, Llion Jones, Aidan N Gomez, Ł ukasz
+   2021. Between words and characters: A brief his-          Kaiser, and Illia Polosukhin. 2017. Attention is all
+   tory of open-vocabulary modeling and tokenization         you need. In Advances in Neural Information Pro-
+   in nlp. arXiv preprint arXiv:2112.10508.                  cessing Systems, volume 30. Curran Associates, Inc.
+Alex Wang, Amanpreet Singh, Julian Michael, Fe-          this computation, storing O(K × L × H) parame-
+   lix Hill, Omer Levy, and Samuel Bowman. 2018.         ters and only later apply the convolution per block
+   GLUE: A multi-task benchmark and analysis plat-       by summing these products with the block-byte
+   form for natural language understanding. In Pro-      membership map P . Caching greatly lowers the
+   ceedings of the 2018 EMNLP Workshop Black-            speed and memory requirements of MANTa, allow-
+   boxNLP: Analyzing and Interpreting Neural Net-        ing to save LB − 1 element-wise products.2 K is
+   works for NLP, pages 353–355, Brussels, Belgium.      usually small, so the products can be stored easily.
+   Association for Computational Linguistics.
+                                                         B Hyperparameters
+Yonghui Wu, Mike Schuster, Zhifeng Chen, Quoc V
+   Le, Mohammad Norouzi, Wolfgang Macherey,              Hyperparameter           MANTaSmall  MANTaBase
+   Maxim Krikun, Yuan Cao, Qin Gao, Klaus
+   Macherey, et al. 2016. Google’s neural machine        Input Embeddings size          64         128
+   translation system: Bridging the gap between hu-      Num. layers                     1           2
+   man and machine translation. arXiv preprint           Num. heads                      8           8
+   arXiv:1609.08144.                                     Attention window               16          16
+                                                         Convolution kernel size         3           3
+Ellery Wulczyn, Nithum Thain, and Lucas Dixon. 2017.
+   Ex machina: Personal attacks seen at scale. In        Table 7: Hyperparameters for MANTa
+   Proceedings of the 26th international conference on
+   world wide web, pages 1391–1399.                      Hyperparameter           ByT5Small  T5Small  T5Base
+
+Linting Xue, Aditya Barua, Noah Constant, Rami Al-       Hidden size                 1472      512      768
+   Rfou, Sharan Narang, Mihir Kale, Adam Roberts,        Num. layers (encoder)         12        6       12
+   and Colin Raffel. 2022. Byt5: Towards a token-free    Num. layers (decoder)          4        6       12
+   future with pre-trained byte-to-byte models. Trans-   Num. heads                     6        8       12
+   actions of the Association for Computational Lin-     Feed-forward dim.                             3072
+   guistics, 10:291–306.                                 Dropout rate                3584      2048     0.1
+                                                                                       0.1      0.1
+Man Zhang, Yili Hong, and Narayanaswamy Balakr-
+   ishnan. 2017. An algorithm for computing the distri-  Table 8: Hyperparameters for encoder-decoders
+   bution function of the generalized poisson-binomial
+   distribution.
+
+A Improving Pooling Speed
+
+Applying the 1-D convolution requires comput-
+ing and storing O(LB × L × H) parameters since
+we apply the 1D-convolution on every row of the
+weighted embedding map P (eb)T . Therefore, this
+operation may be particularly costly, especially if
+the frontier predictor outputs a high number of
+blocks. However, we can use the fact that the
+weighted embedding map has a special form to
+reduce the memory load when computing the con-
+volution. Let K be the convolution kernel size,
+(Cj)j∈[1,K] ∈ RK×H the convolution ﬁlters and “·”
+denote the element-wise product. Then, omitting
+padding and biases :
+
+                  K
+
+ekB  =  max            Cj · Pk,i+j · ebi+j
+
+        i∈[1,L]   j=1
+
+                  K
+
+     = max             Pk,i+j · Cj · ebi+j
+
+         i∈[1,L]  j=1
+
+   Notice how the product between the convolution            2This caching would be exactly similar if the convolution
+ﬁlters and the byte embeddings Cj · ebi+j ∈ RH           was not depthwise.
+does not depend on the block anymore. We cache
+C Additional results
+
+We include here the scores obtained by MANTa-LM on the GLUE test sets for reproducibility and future
+comparisons. The development sets are used in the main body to allow a fair comparison, as the test
+scores are not reported in Charformer (Tay et al., 2021) and CharBERT (Ma et al., 2020).
+
+Model                                 |θ| MNLI QNLI MRPC SST-2 QQP STSB COLA AVG
+
+MANTa-LMBase (ours) 200M 78.1/78.2 88.6 83.6/88.6 91.0 70.7/88.6 74.1 45.0 78.7
+
+                                      Table 9: Results on test sets for the GLUE benchmark.
+
+D MANTa Module
+
+                                      Frontier scores
+
+                      Frontier                         Gaussian Kernel
+                     Predictor                                     Block byte assignment
+                 (Local Transformer)
+
+                                                        Broadcast        Convolution          Fully connected
+                                                       and multiply      kernel size: (K,1)          layer
+
+Byte embeddings                                                      Merged (see appendix A)
+
+                                                                                                               Block embeddings
+
+Figure 4: A detailed view of the MANTa module described in section 3.1. We denote by hb the dimension of the
+byte embeddings, by hLM the dimension of the block embeddings that will be fed to the encoder-decoder model,
+L the length of the input sequence and LB the length of the block sequence. We omit batch sizes for simplicity.
+

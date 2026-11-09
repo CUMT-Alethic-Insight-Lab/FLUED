@@ -1,0 +1,788 @@
+                                                 Cross-Tokenizer LLM Distillation through a Byte-Level Interface
+
+                                       Avyav Kumar Singh1*†, Yen-Chen Wu2*, Alexandru Cioba3‡, Alberto Bernacchia2, Davide Buffelli2,
+
+                                                                      1King’s College London, London (United Kingdom)
+                                                                       2MediaTek Research, Cambridge (United Kingdom)
+
+                                                                          3Orbital Materials, London (United Kingdom)
+
+                                                                        Correspondence: avyav_kumar.singh@kcl.ac.uk, davide.buffelli@mtkresearch.com
+
+arXiv:2604.07466v1 [cs.CL] 8 Apr 2026                        Abstract                                is intrinsically linked to their scale with state-of-
+                                                                                                     the-art LLMs often comprising billions of parame-
+                                            Cross-tokenizer distillation (CTD), the trans-           ters. This size renders their training prohibitively
+                                            fer of knowledge from a teacher to a student             expensive for most research institutes, and often
+                                            language model when the two use different tok-           inference becomes prohibitively slow for real-time
+                                            enizers, remains a largely unsolved problem.             or on-device applications.
+                                            Existing approaches rely on heuristic strate-
+                                            gies to align mismatched vocabularies, intro-               To bridge the gap between the capabilities of
+                                            ducing considerable complexity. In this pa-              large frontier models and the practical constraints
+                                            per, we propose a simple but effective baseline          of real-world systems, knowledge distillation has
+                                            called Byte-Level Distillation (BLD) which               emerged as a seminal technique (Hinton et al.,
+                                            enables CTD by operating at a common in-                 2015). Distillation is a process in which a com-
+                                            terface across tokenizers: the byte level. In            pact student model is trained to mimic the behavior
+                                            more detail, we convert the teacher’s output             of a larger, more powerful teacher model. Instead
+                                            distribution to byte-level probabilities, attach         of learning solely from hard labels in a dataset, the
+                                            a lightweight byte-level decoder head to the             student learns from the rich, dense output distri-
+                                            student, and distill through this shared byte-           bution produced by the teacher. This allows the
+                                            level interface. Despite its simplicity, BLD             student to inherit the teacher’s sophisticated reason-
+                                            performs competitively with—and on several               ing patterns while operating with a fraction of the
+                                            benchmarks surpasses—significantly more so-              computational footprint. The impact of distillation
+                                            phisticated CTD methods, across a range of               is already evident across the research environment
+                                            distillation tasks with models from 1B to 8B pa-         and the industry, e.g., it enables to speedup the
+                                            rameters. Our results suggest that the byte level        training of small specialized models, and to “com-
+                                            is a natural common ground for cross-tokenizer           press” models and lower costs when serving them
+                                            knowledge transfer, while also highlighting that         at scale (Xu et al., 2024).
+                                            consistent improvements across all tasks and
+                                            benchmarks remain elusive, underscoring that                Despite its success, the standard framework for
+                                            CTD is still an open problem.                            knowledge distillation is built on a fundamental,
+                                                                                                     yet restrictive, assumption: the teacher and student
+                                       1 Introduction                                                models must share an identical tokenizer and vo-
+                                                                                                     cabulary. This is because the most common form
+                                       Large Language Models (LLMs) demonstrated un-                 of distillation operates at the logit level, where the
+                                       precedented capabilities in natural language under-           student is trained to match the teacher’s probabil-
+                                       standing, generation, and reasoning. Their appli-             ity distribution over a fixed set of vocabulary to-
+                                       cations are becoming ubiquitous, from conversa-               kens. If the tokenizers differ, their corresponding
+                                       tional agents (e.g., (Guo et al., 2025; Yang et al.,          vocabularies lead to distinct output spaces. A logit
+                                       2025; OpenAI, 2025)) and next-generation search               vector of size 50,000 from the teacher cannot be
+                                       engines (Xi et al., 2025) to tools that assist in sci-        directly compared to a logit vector of size 32,000
+                                       entific discovery (Zhang et al., 2024b) and soft-             from the student. Consequently, performing cross-
+                                       ware development (Dong et al., 2025). The re-                 tokenizer distillation (CTD) has been considered
+                                       markable performance of these models, however,                infeasible without resorting to approximations or
+                                                                                                     heuristics. These workarounds, such as distilling
+                                           *Equal contribution.                                      from generated text samples (Kim and Rush, 2016)
+                                           †Work done during an internship at MediaTek Research.
+                                           ‡Work done while at MediaTek Research.
+
+                                                                                                  1
+or attempting to create ad-hoc mappings between                  free baseline for CTD that operates through a
+vocabularies or hidden states (Boizard et al., 2025;             shared byte-level interface.
+Wan et al., 2024; Zhang et al., 2024a; Minixhofer
+et al., 2025), are either computationally inefficient,        • We empirically show that this simple ap-
+suffer from significant information loss, or lack a              proach performs competitively with signif-
+principled theoretical foundation.                               icantly more complex state-of-the-art CTD
+                                                                 methods across a range of tasks.
+   The ability to perform principled CTD would
+unlock powerful new paradigms. First, it would                • Through our analysis of the results, we
+allow us to combine the distinct strengths of di-                highlight that no existing method—including
+verse models. For instance, one could distill the                ours—consistently dominates across bench-
+broad world knowledge of a general-purpose model                 marks, and argue that CTD remains a largely
+(e.g., trained with a large, multilingual tokenizer)             open problem deserving further investigation.
+into a specialized student model equipped with a
+domain-specific tokenizer optimized for medicine,          2 Related Work
+law, or finance. This would create highly efficient
+and accurate expert models. Second, it would en-           Our work is positioned at the intersection of three
+able distillation from ensembles of heterogeneous          active areas of research: cross-tokenizer knowl-
+models. For example, training a single student             edge distillation, byte-level language modeling,
+by distilling the collective intelligence of several       and methods for converting token-level probability
+top-tier open-source models (e.g., DeepSeek (Guo           distributions to the byte level.
+et al., 2025), Qwen (Yang et al., 2025), GPT-OSS
+(OpenAI, 2025), etc.), each with its own tokenizer.        Cross-Tokenizer Distillation The challenge of
+This would allow the student to learn a consensus          transferring knowledge between models with dif-
+of knowledge that potentially surpasses any indi-          ferent tokenizers is a significant hurdle for stan-
+vidual teacher.                                            dard distillation techniques. Several recent works
+                                                           have proposed approximate or heuristic methods to
+   In this paper we introduce Byte-Level Distilla-         bridge this gap. For instance, some approaches fo-
+tion (BLD), which sidesteps the vocabulary mis-            cus on aligning the vocabularies of the teacher and
+match in cross-tokenizer distillation by operating         student models through various mapping strategies.
+at the byte level—a representation shared by all           Boizard et al. (2025) introduce a Universal Logit
+tokenizers. Our method (i) converts the teacher’s          Distillation (ULD) loss based on optimal transport
+token-level output distribution to byte-level prob-        theory, which allows for distillation across differ-
+abilities using a fast approximation (Vieira et al.,       ent architectures and tokenizers without requiring
+2025), (ii) attaches a lightweight, learnable byte-        them to share the same vocabulary. Other works,
+level decoder head to the student in parallel with         like Wan et al. (2024) and Zhang et al. (2024a),
+its original token-level head, and (iii) performs dis-     explore knowledge fusion and dual-space distil-
+tillation through this shared byte-level interface.        lation, respectively, to enable knowledge transfer
+After distillation, the byte-level head is simply re-      between heterogeneous models. Similarly, Minix-
+moved, leaving a standard token-level model. This          hofer et al. (2025) propose a method for universal
+approach enables direct and effective knowledge            cross-tokenizer distillation through approximate
+transfer between models with different tokenizers.         likelihood matching. These methods often intro-
+                                                           duce additional complexity and rely on approxima-
+   Despite its simplicity, BLD performs com-               tions to align the output spaces of the models. In
+petitively with—and on several benchmarks                  contrast, our proposed BLD method circumvents
+surpasses—substantially more complex CTD meth-             this issue by operating at the byte level, a universal
+ods across tokenizer transfer and cross-model dis-         interface shared by all tokenizers.
+tillation tasks with models ranging from 1B to 8B
+parameters. At the same time, no method, includ-           Byte-Level Probability Estimation A core com-
+ing ours, achieves consistent gains across all bench-      ponent of our BLD method is the ability to obtain a
+marks, suggesting that CTD remains an open and             byte-level probability distribution from a standard
+challenging problem. In summary, our contribu-             token-based language model. This has been the fo-
+tions are:                                                 cus of a number of recent studies. Vieira et al.
+
+   • We propose BLD, a simple and alignment-
+
+                                                        2
+(2025) present algorithms for converting token-           not involve using byte-level models, it can be used
+level language models into character-level ones.          to distill information from token based model into
+Phan et al. (2025) introduce the Byte-Token Rep-          byte-level ones.
+resentation Lemma, a framework that provides a
+formal mapping between a model’s learned token            3 Our Method
+distribution and its equivalent byte-level distribu-
+tion. Our work leverages the insights from these          3.1 Preliminaries
+works to create a shared byte-level space for distil-
+lation.                                                   Let Σ be the alphabet containing all bytes, i.e.,
+                                                          {1, 2, . . . , 256}, and let Σ∗ be the set of all se-
+Byte-Level Language Models Our work is also               quences over the alphabet. Given a vocabulary
+related to the growing body of research on byte-          V ⊆ Σ∗, which determines all the possible tokens,
+level language models, which can be broadly cate-         a tokenizer is a deterministic function that maps se-
+gorized by how they process raw byte sequences.           quences of bytes to sequences of tokens: T : Σ∗ →
+First are the pure byte-level models, which op-           V ∗, where V ∗ indicates the set of all sequences
+erate directly on sequences of bytes without any          composed of tokens from the vocabulary V . We
+explicit grouping. Xue et al. (2022), with their          also define a decoder function D : V ∗ → Σ∗ as
+ByT5 model, demonstrated that a standard Trans-           the function that “maps back” from a sequence of
+former architecture can be adapted to process byte        tokens to a sequence of bytes. We can assume that
+sequences effectively, achieving competitive perfor-      the decoder function is the inverse of the tokenizer,
+mance with token-level models while being more            i.e., D(T ({b1, b2, . . . , bNb})) = {b1, b2, . . . , bNb},
+robust to noise. More recently, Wang et al. (2024)        with Nb indicating the length of the byte sequence,
+proposed MambaByte, a token-free model based              though this is not always the case in practice1.
+on the selective state space architecture. Second are
+models that use fixed chunking to group bytes into           When performing distillation, the goal is to trans-
+patches. YU et al. (2023) introduced MEGABYTE,            fer knowledge from a teacher model to a student
+a multi-scale architecture that segments long byte        model. The teacher model has an associated vo-
+sequences into fixed-size patches, using a local          cabulary VT , tokenizer TT , and decoder DT . The
+model within patches and a global model across            teacher model can be seen as a function mapping a
+them. Slagle (2024) proposed SpaceByte, which             given tokenized input sequence into a probability
+uses larger Transformer blocks after specific bytes       distribution over its vocabulary indicating the prob-
+(like spaces) to more efficiently model byte se-          ability of the next token, fT : TT (ΣT∗ ) → ∆(VT ),
+quences. The autoregressive U-Net (AU-Net) of             where ∆(VT ) is the probability simplex over the
+Videau et al. (2025) also falls into this category,       vocabulary. Similarly, the student model also has
+as it pools bytes into a multi-scale representation       a vocabulary VS, tokenizer TS, and decoder DS,
+based on fixed rules. Third are models that employ        which may differ from those of the teacher.
+learned chunking to dynamically group bytes. Hi-
+erarchical Transformers like the Hourglass model             In standard distillation approaches, given a
+from Nawrot et al. (2021) and the dynamic pool-           dataset of tokenized sequences Z = {s1, s2, . . . },
+ing mechanism from Nawrot et al. (2023) laid              each one composed of multiple tokens si =
+the groundwork for more flexible byte-level pro-          {t1, t2, . . . , t|si|}, the student model parameters are
+cessing. More recent works have built on this,            updated by minimizing the following loss function
+such as the Byte Latent Transformer (BLT) from
+Pagnoni et al. (2025), which encodes bytes into           1                     CE(δ(tj), fS(t<j))+
+dynamically sized patches based on next-byte en-          L=
+tropy, and MrT5 from Kallini et al. (2025), which               si∈Z |si|  tj ∈si
+uses dynamic token merging. The H-Net model
+from (Hwang et al., 2025) takes this a step further                        KL(fT (t<j), fS(t<j))     (1)
+with a dynamic chunking mechanism that learns
+content- and context-dependent segmentation di-           where δ(tj) is the delta function which is zero
+rectly from the data, effectively creating an end-to-     everywhere except at the index of token tj for
+end, tokenizer-free model. While our method does          which it is equal to 1, t<j indicates the sequence
+
+                                                              1This is because in practice tokenizers involve some pre-
+                                                          tokenization steps which are not reversible, like for example
+                                                          normalizing Unicode characters.
+
+                                                       3
+of tokens up to the j-th token excluded, CE in-             The above procedure can be quite expensive com-
+dicates cross-entropy, and KL indicates the Kull-           putationally, but Vieira et al. (2025) provide a fast
+back–Leibler divergence. The first term in equa-            approximation, which we use for our method. More
+tion 1, the cross entropy, is the standard next token       details are provided in Appendix C.
+prediction loss, while the second term, the KL di-
+vergence, is responsible for transferring knowledge         A naive approach to byte level CTD. Given
+from the teacher to the student. Notice however             that we can extract the probabilities at the byte
+that for the latter to be well defined, it requires         level from any token based model, one might think
+teacher and student to have the same vocabulary,            of “going back” from byte level to a different to-
+which in practice usually leads to sharing also the         ken level to perform CTD. In fact, a naive ap-
+same tokenizer, although in theory the it could be          proach for byte-level CTD, once the probabilities
+different between the two. Recently, several works          PT (bi|b<i) at the byte level are extracted from the
+have introduced heuristic or approximate strategies         teacher for a given sequence, could be to use them
+to overcome this issue (Boizard et al., 2025; Wan           to construct the probabilities of a tokenized ver-
+et al., 2024; Zhang et al., 2024a; Minixhofer et al.,       sion of the sequence in which the student’s tok-
+2025). These approaches require identifying some            enizer is used instead. In more detail, given a se-
+form of alignment between tokenizations and intro-          quence b = {b1, b2, . . . }, we can tokenize it using
+ducing additional heuristic losses. Our approach            the student’s tokenizer into a sequence of tokens
+instead overcomes these challenges by performing            {y1, y2, . . . } = TS(b), and then compute the prob-
+distillation at the byte level.                             ability of each possible token (as this is needed for
+                                                            the KL term in the distillation loss) in VS as follows
+From BPE-level to Byte-Level Probabilities.
+Given a sequence of bytes {b1, b2, . . . , bNb} and         ∀t = {b(1t), . . . , bk(t)} ∈ VS,
+a teacher model fT with vocabulary VT and tok-
+enizer TT , Phan et al. (2025) and Vieira et al. (2025)     P (yi = t|y<i) =            PT bj(t)|b<(t)j , y<i (4)
+show that it is possible compute the probability of
+generating a sequence of bytes using the model                                b(jt) ∈t
+fT by summing the probabilities that the model
+assigns to all the coverings of the byte sequence.          where, with a slight abuse of notation, we use
+Let us define a covering, associated to the teacher         PT b(jt)|b(<t)j, y<i to indicate the probability as-
+model, for a byte sequence {b1, b2, . . . , bNb} as         signed by the teacher to the j-th byte of token t
+the set containing all the sequences of tokens that         given all previous bytes in the whole sequence.
+“cover” the sequence of bytes when decoded, i.e.,           This quantity is computed using the equations pre-
+                                                            sented above. The advantage of this approach is
+coverT (b = {b1, b2, . . . , bNb}) =                        that there is no need to add any module to the orig-
+      {{t1, t2, . . . , tm} ∈ VT∗ | ∃i ∈ Z>0 s.t.           inal architecture of the student (which instead is
+                                                            required in our method). On the other side, this
+DT ({t1, t2, . . . , tm−1}) = b<i and                       approach has several issues that make it impracti-
+                                                            cal. First, equation (4) requires the computation of
+b≥i is a prefix of D(tm)}}                          (2)     |VS| probabilities – which in practice is between
+                                                            30000 and 250000 – for each token in the sequence
+We can now compute the probability assigned                 (where the sequence is tokenized according to the
+by the teacher to a byte sequence b =                       student’s tokenizer TS), which would be compu-
+{b1, b2, . . . , bNb} as                                    tationally prohibitive. Second, if the byte level
+                                                            probabilities are computed with an approximate
+PT (b) =                          fT  t(ji)|t<(i)j          method, the errors will compound when computing
+                                                            equation (4).
+          yi∈coverT (b) tj(i)∈si
+
+   From this we can straightforwardly obtain the            3.2 Byte-Level Interface for Distillation
+conditional probabilities for each single byte in the
+sequence as                                                 Our method, called Byte Level Distillation (BLD),
+                                                            can be divided into two steps which we present
+PT (bi|b<i)  =   PT ({b1, b2, . . . , bi})          (3)     below. A schematization of BLD can be found in
+                PT ({b1, b2, . . . , bi−1})                 Figure 1.
+
+                                                         4
+1. Adding a byte-level interface to the student                                                          2. Distillation Process
+
+                                                                           CE next-token    +   CE next-byte          +   KL byte-level
+                                                                           prediction loss     prediction loss           distillation loss
+                                                                                                                                                         Teacher
+
+ Original Student              Student with added byte-level interface                                                             Byte-level probabilities
+                                                                                                                             (using algorithm from Vieira et al.)
+Output layer (token level)
+                               Output layer   Output Layer                 Output layer             Output Layer
+                               (token level)   (byte level)                (token level)             (byte level)                           Output layer (token level)
+
+Transformer                    Transformer                                                  Transformer                                     Transformer
+
+Embedding Layer (token level)  Embedding Layer (token level)                   Embedding Layer (token level)                     Embedding Layer (token level)
+
+Figure 1: Representation of our Byte-Level Distillation (BLD) method composed of two steps. Step 1 adds a
+byte-level interface to the student model. Step 2 performs distillation by transferring knowledge from the teacher to
+the student using the shared byte-level interface. Additional next-token prediction and next-byte prediction losses
+are also used following standard distillation approaches. The byte-level interface can be removed at the end of the
+process.
+
+Step 1: byte-level interface. The first step is to                         PT (bi|b<i) for each sequence xi = {b1, b2, . . . }
+enable teacher and student models to share knowl-                          in a given dataset D. We can now perform distil-
+edge through the byte level. For the teacher we
+can use the approach presented in Section 3.1 to                           lation without requiring any specific alignment or
+compute byte-level probabilities, but for enabling
+training of the student we need to introduce a                             heuristic as we have the probabilities at the byte-
+new module to it. We start from a pretrained
+student model. The model is composed of a to-                              level obtained from the teacher model, and our
+kenizer TS : Σ∗ → VS∗ with a respective decoder
+DS : VS∗ → Σ∗, an encoder E : VS∗ → RN×d                                   student model has an output interface at the byte
+(typically a learnable embedding matrix with one
+row for each element of the vocabulary VS), a                              level. During distillation the loss is a combination
+transformer H : RN×d → RN×d, and an output
+layer O : RN×d → RN×|VS|. Here N is the in-                                of next-byte cross entropy loss, KL divergence at
+put sequence length (in terms of numbers of to-                            the byte level, and next-token cross entropy loss3.
+kens from the vocabulary VS), and d is the dimen-                          Formally, let fS : TS(VS∗) → ∆(VS) be the func-
+sion of token embeddings and hidden representa-                            tion at the token level for the student model ob-
+tions (we assume they are the same for simplicity
+of presentation but in practice hidden dimensions                          tained by composing fS(t) = O(H(E(t))) and
+at every layer of the transformer can be different                         let fS(b) : TS(VS∗) × Z>0 → ∆(Σ) be the function
+from the dimensions of token embeddings). We                               with the byte-level interface for the student model,
+now add a new learnable module to the student                              i.e., fS(b)(t, j) = Ob(H(E(t)))[j] (where “[j]” in-
+model. In more detail, in parallel to the existing                         dicates selecting the j-th byte of the output), then
+token-level decoder O, we a add byte-level decoder:
+Ob : RN×d → RNb×|Σ|, where Nb is the length of                             the full loss for distillation is:
+the input sequence in terms of bytes. With this we
+have effectively added a byte-level interface to the                       L=                                            1k                 CE (δ(tℓ), fs(t<ℓ))
+output of the student model2.
+                                                                                               xi ∈Z ,                   k  ℓ=1
+Step 2: distillation. Given a teacher model, we
+use the method of Vieira et al. (2025) to obtain                               {t1,t2,...,tk}=TS (xi),
+
+    2The byte-level decoder can be pre-trained while keeping                                ti ={b(1i) ,...,bn(ii) }
+the rest of the weights fixed for additional stability, but in our
+experiments we found that it is not necessary.                                 +            1 nℓ    CE          δ(bj(ℓ)), fS(b)(t<ℓ, j)                  +
+
+                                                                                            nℓ j=1
+
+                                                                           KL PT (bj(ℓ)|b<(ℓj), t<ℓ), fS(b)(t<ℓ, j)                                                     (5)
+
+                                                                           where PT (bj(ℓ)|b<(ℓj), t<ℓ) indicates the probability
+                                                                           assigned by the teacher to the j-th byte in the ℓ-
+                                                                           th token given all bytes in the sequence (including
+                                                                           those from tokens prior to the ℓ-th) up to the (j −1)-
+
+                                                                               3The next token cross entropy loss is added to ensure the
+                                                                           weights of the token-level decoder O get updated.
+
+                                                                        5
+th byte of the ℓ-th token. All or a subset of the          up. Full hyperparameter details are provided in
+parameters of the model can be updated during              Appendix B. Importantly, we use the same SFT
+distillation, except from the byte-level output layer      backbone for all considered distillation methods.
+which must be updated if not pre-trained first.
+                                                           Training datasets For the BPE tokenizer transfer
+   After distillation, we remove the byte-level in-        and byte tokenizer transfer experiments, we train
+terface Ob, and thus keeping only the token-level          on the Tulu-3 SFT mixture (Lambert et al., 2024).
+output layer O. It is also possible to instead keep        Byte-level teacher probabilities are pre-computed
+the byte level output layer if one is interested in        offline for this dataset using the fast approxima-
+generating outputs in terms of bytes or combina-           tion of Vieira et al. (2025), as described in Ap-
+tions of tokens and bytes. In our experiments, as          pendix C. For the cross-tokenizer distillation ex-
+byte-level decoder Ob, we use a simple linear pro-         periment (OpenMath2-Llama3.1-8B → Gemma2
+jection for Ob with Nb fixed to 10, which means            2B), we train on the OpenMathInstruct-2 dataset
+that for tokens that span more than 10 bytes, super-       (Toshniwal et al., 2024).
+vision signal will be provided only for the first ten.
+We validate our choice experimentally as shown             Validation datasets For the tokenizer transfer
+in Appendix A. A different approach could be to            experiments, we use the no-robots split of Tulu-3
+have a small autoregressive layer to accomodate            (Rajani et al., 2023) as a held-out validation set; this
+different values of Nb. We leave these directions          subset spans a diverse range of tasks—including
+for future work.                                           coding, mathematics, and general reasoning—
+                                                           making it a representative signal for general-
+4 Experiments                                              purpose capability. For the cross-tokenizer distil-
+                                                           lation experiment, we randomly sample approxi-
+To evaluate our approach, we follow the experimen-         mately 1,000 examples from OpenMathInstruct-2
+tal procedure of Minixhofer et al. (2025) which            as a held-out validation set.
+considers three tasks: tokenizer transfer across dif-
+ferent BPE tokenizers, tokenizer transfer from BPE         4.1 BPE Tokenizer Transfer
+to byte, and cross-tokenizer distillation.
+                                                           We first evaluate our method on the task of tok-
+Training setup. We fine-tune the student back-             enizer transfer between two different BPE tokeniz-
+bone with LoRA (Hu et al., 2022), applying rank            ers. This involves selecting a pre-trained model, in
+r = 64 updates to the query and value projection           our case LLama 3.2 3B (Meta, 2024) and replacing
+matrices while keeping all other backbone weights          its tokenizer with the BPE tokenizer from Qwen
+frozen. For tokenizer transfer experiments, the em-        2 (Yang et al., 2024). The procedure involves re-
+bedding matrix and LM head are re-initialised us-          placing embedding and output projection layers
+ing Fast Vocabulary Transfer (FVT) (Gee et al.,            with uninitialized layers in accordance (in terms
+2022): tokens present in both vocabularies are             of dimensionalities) with the new tokenizer, and
+initialised by directly copying the corresponding          distilling from the original model to the modified
+source embedding; tokens absent from the source            one. We present results in Table 1.
+vocabulary are initialised as the mean of their con-
+stituent sub-token embeddings, falling back to a              Table 1 shows that BLD performs competitively
+random Gaussian sample drawn from the source               but does not uniformly dominate. It achieves
+embedding distribution when no decomposition               the highest scores on PiQA (75.68) and AGI-ZH
+is available. The byte-level decoder head Ob is a          (35.97), and recovers performance close to the orig-
+lightweight module consisting of 10 parallel linear        inal model on PiQA, MMLU, and BoolQ, demon-
+projections from the model’s hidden dimension to           strating that distillation through the byte-level inter-
+the byte vocabulary (260 tokens representing the           face successfully transfers general knowledge after
+256 bytes and 4 special tokens for: beginning of           tokenizer replacement. ALM + SFT is the strongest
+sequence, end of sequence, padding, and out-of-            overall competitor, leading on four of seven bench-
+vocabulary), enabling each token position to pre-          marks (ARC-C, BoolQ, MMLU, AGI-EN). The
+dict up to 10 bytes simultaneously (see Appendix           most notable weakness of BLD is instruction fol-
+A for a validation of this approach). We optimize          lowing: its IFEval score (30.58) lags far behind
+with AdamW (Loshchilov and Hutter, 2019) using             MinED (62.83) and ALM + SFT (58.51), both
+a cosine learning rate schedule with linear warm-          of which retain near-original IFEval performance.
+
+                                                        6
+Model Method                                                     Benchmark
+
+original (Llama3.2 3B IT)   PiQA  ARC-C                   BoolQ  MMLU       AGI-EN  AGI-ZH  IFEval
+
+             SFT           75.46  45.73                   78.41  60.50       35.27   42.93  66.31
+             DSKD
+→ Qwen2 MinED              74.54  41.89                   76.48  57.11       30.47   34.30  26.74
+             ALM + SFT     62.95  28.84                   71.80  50.48       26.12   34.18  28.13
+             BLCTD (Ours)  75.35  42.58                   78.65  58.20       34.68   34.76  62.83
+                           75.46  45.82                   79.36  58.86       36.64   35.27  58.51
+                           75.68  43.26                                      31.98   35.97  30.58
+                                                          77.34  58.29
+
+Table 1: Results of transferring Llama3.2 3B (Meta, 2024) to the Qwen2 tokenizer (Yang et al., 2024). original
+denotes the original model without transfer. ARC-C refers to Arc-Challenge. AGI-EN and AGI-ZH refer to the
+English and Chinese splits of AGIEval.
+
+Model Method                                                     Benchmark
+
+original (Llama3.2 3B IT)   PiQA  ARC-C                   BoolQ  MMLU       AGI-EN  AGI-ZH  IFEval
+
+          SFT              75.46  45.73                78.41     60.50       35.27   42.93  66.31
+          DSKD
+→ Byte MinED               67.30  31.57                73.00     38.95       26.05   35.18  24.70
+          ALM + SFT        64.47  31.31                60.34     37.62       23.74   33.36  23.98
+          BLCTD (Ours)     67.41  32.94                65.32     39.84       27.52   33.90  31.89
+                           66.32  31.57                71.41     39.15       27.66   35.39  29.74
+                           67.52  30.89                                      26.44   34.57  25.43
+                                                       69.85     39.06
+
+Table 2: Results of transferring Llama3.2 3B (Meta, 2024) to byte-level tokenization. original denotes the original
+model without transfer. ARC-C refers to Arc-Challenge. AGI-EN and AGI-ZH refer to the English and Chinese
+splits of AGIEval.
+
+This suggests that the byte-level distillation objec-     (39.84), and ALM + SFT on AGI-EN (27.66) and
+tive does not sufficiently preserve the structured        AGI-ZH (35.39). The spread between methods is
+output behaviour required for instruction following.      noticeably narrower than in Table 1, suggesting that
+DSKD performs worst across all benchmarks, con-           in this harder regime all approaches converge to a
+firming that direct distribution alignment without        similar performance ceiling. DSKD again performs
+vocabulary alignment is ineffective in this setting.      worst across most benchmarks. Overall, no method
+                                                          establishes a clear advantage, and the collective
+4.2 BPE-to-byte Tokenizer Transfer                        degradation relative to the original underscores that
+                                                          byte-level tokenizer transfer remains an unsolved
+We now repeat the same tokenizer transfer task as         challenge.
+the previous section, but this time we transfer from
+a BPE tokenizer to byte-level. This can be seen           4.3 Cross-Tokenizer Distillation
+as adapting LLama 3.2 3B (Meta, 2024) to be a
+byte-level model. The procedure involves replac-          Finally, we perform CTD across different models
+ing embedding and output projection layers with           with different tokenizers. In more detail, we distill
+uninitialized layers compatible with a byte-level         the maths-specialised OpenMath2-Llama3.1-8B
+tokenizer, and distilling from the original model to      (Toshniwal et al., 2024) into Gemma2 2B (Deep-
+the modified one. We present results in Table 2.          mind, 2024). Results are shown in Table 3.
+
+   Results in Table 2 show that transferring to              Table 3 shows that BLD achieves the highest
+byte-level tokenization is substantially harder than      GSM8K score (62.55), modestly outperforming
+BPE-to-BPE transfer: all methods suffer large             ALM + SFT (61.56) and SFT (59.29), and rep-
+degradations across every benchmark (e.g., MMLU           resents a meaningful gain over the uninitialised
+drops approximately 21 points and ARC-C approx-           Gemma2 2B IT baseline (51.48). However, SFT
+imately 13 points relative to the original model),        leads on MATH (22.40 vs. 20.08 for BLD), sug-
+reflecting the challenge of adapting a model trained      gesting that BLD’s advantage over SFT is task-
+on subword tokens to a much finer-grained rep-            dependent and does not generalise uniformly across
+resentation. In this setting, BLD ranks first on          mathematical reasoning benchmarks. Despite
+PiQA (67.52), though the margin over MinED                BLD’s result, the gap to the teacher (87.26 GSM8K,
+(67.41) is negligible. Performance leadership is          37.60 MATH) remains very large, highlighting that
+fragmented across methods: SFT leads on BoolQ             effective cross-tokenizer knowledge transfer across
+(73.00), MinED on ARC-C (32.94) and MMLU                  heterogeneous models is still an open problem.
+
+                                                       7
+Model                  Method                             GSM8K        MATH
+
+OpenMath2-Llama3.1-8B                                     87.26 ±0.92  37.60 ±2.16
+Gemma2 2B IT                                              51.48 ±1.38  10.60 ±1.38
+
+Gemma2 2B              SFT                                59.29 ±1.35  22.40 ±1.87
+                       ALM + SFT                          61.56 ±1.34  19.00 ±1.76
+
+                       Ours                               62.55 ±1.33  20.08 ±1.82
+
+Table 3: Results of cross-tokenizer distilling the large math-specialized OpenMath2-Llama3.1-8B (Toshniwal et al.,
+2024) into the small Gemma2 2B (Deepmind, 2024) language model. All results are zero-shot CoT.
+
+5 Limitations                                             References
+
+Due to computational constraints, our work ex-            Nicolas Boizard, Kevin El Haddad, CELINE HUDE-
+plores the task of tokenizer transfer with 3 billion         LOT, and Pierre Colombo. 2025. Towards cross-
+parameter models, and the task of CTD between                tokenizer distillation: the universal logit distillation
+an 8 billion parameter teacher and a 2 billion pa-           loss for LLMs. Transactions on Machine Learning
+rameter student. While these are practical sizes             Research.
+for models that are destined to run on-device, the
+behavior of CTD methods at larger scales remains          Google Deepmind. 2024. Gemma 2: Improving
+underexplored.                                               open language models at a practical size. Preprint,
+                                                             arXiv:2408.00118.
+   Similarly, our distillation makes use of LORA
+to reduce the computational requirements, and per-        Yihong Dong, Xue Jiang, Jiaru Qian, Tian Wang, Kechi
+forming full-parameter optimization may lead to              Zhang, Zhi Jin, and Ge Li. 2025. A survey on
+higher performance.                                          code generation with llm-based agents. Preprint,
+                                                             arXiv:2508.00083.
+6 Conclusions
+                                                          Leonidas Gee, Andrea Zugarini, Leonardo Rigutini, and
+In this paper we introduced BLD, a simple base-              Paolo Torroni. 2022. Fast vocabulary transfer for
+line for cross-tokenizer knowledge distillation that         language model compression. In Proceedings of the
+operates through a shared byte-level interface. By           2022 Conference on Empirical Methods in Natural
+converting the teacher’s output distribution to byte-        Language Processing: Industry Track, pages 409–
+level probabilities and attaching a lightweight byte-        416, Abu Dhabi, UAE. Association for Computa-
+level decoder head to the student, our method                tional Linguistics.
+avoids the complex vocabulary alignment proce-
+dures required by existing approaches. Despite this       Daya Guo, Dejian Yang, Haowei Zhang, Junxiao Song,
+simplicity, BLD performs competitively with—and              Peiyi Wang, Qihao Zhu, Runxin Xu, Ruoyu Zhang,
+on several benchmarks outperforms—substantially              Shirong Ma, Xiao Bi, and 1 others. 2025. Deepseek-
+more sophisticated methods across both tokenizer             r1 incentivizes reasoning in llms through reinforce-
+transfer and cross-model distillation settings. The          ment learning. Nature, 645(8081):633–638.
+effectiveness of this approach can be enhanced
+much further, for example, one can use a byte-level       Geoffrey Hinton, Oriol Vinyals, and Jeff Dean. 2015.
+transformer architecture as opposed to MLP byte-             Distilling the knowledge in a neural network.
+level heads to capture sequential dependencies at            Preprint, arXiv:1503.02531.
+the byte level.
+                                                          Edward J Hu, Yelong Shen, Phillip Wallis, Zeyuan
+   Nevertheless, our experiments reveal a sobering           Allen-Zhu, Yuanzhi Li, Shean Wang, Lu Wang, and
+finding: no method, including ours, achieves con-            Weizhu Chen. 2022. LoRA: Low-rank adaptation of
+sistent improvements across all benchmarks and               large language models. International Conference on
+tasks. Performance leadership shifts depending on            Learning Representations.
+the benchmark, the transfer target, and the specific
+model pair. This inconsistency suggests that cross-       Sukjun Hwang, Brandon Wang, and Albert Gu. 2025.
+tokenizer distillation remains a fundamentally open          Dynamic chunking for end-to-end hierarchical se-
+problem. We thus encourage the community to                  quence modeling. arXiv preprint arXiv:2507.07955.
+continue pursuing this line of research which has
+strong practical implications.                            Julie Kallini, Shikhar Murty, Christopher D Manning,
+                                                             Christopher Potts, and Róbert Csordás. 2025. Mrt5:
+                                                             Dynamic token merging for efficient byte-level lan-
+                                                             guage models. In The Thirteenth International Con-
+                                                             ference on Learning Representations.
+
+                                                          Yoon Kim and Alexander M Rush. 2016. Sequence-
+                                                             level knowledge distillation. In Proceedings of the
+                                                             2016 conference on empirical methods in natural
+                                                             language processing, pages 1317–1327.
+
+                                                       8
+Nathan Lambert, Jacob Morrison, Valentina Pyatkin,           Shubham Toshniwal, Wei Du, Ivan Moshkov, Branislav
+   Shengding Hu, Hamish Ivison, Faeze Brahman,                  Kisacanin, Alexan Ayrapetyan, and Igor Gitman.
+   Lester James V. Miranda, Alisa Liu, Nouha Dziri,             2024. Openmathinstruct-2: Accelerating AI for math
+   Shane Lyu, Yuling Gu, Saumya Malik, Victoria                 with massive open-source instruction data. In The
+   Graf, Jena D. Hwang, Jiangjiang Yang, Ronan Le               4th Workshop on Mathematical Reasoning and AI at
+   Bras, Oyvind Tafjord, Chris Wilhelm, Luca Sol-               NeurIPS’24.
+   daini, and 4 others. 2024. Tülu 3: Pushing fron-
+   tiers in open language model post-training. Preprint,     Mathurin Videau, Badr Youbi Idrissi, Alessandro
+   arXiv:2411.15124.                                            Leite, Marc Schoenauer, Olivier Teytaud, and David
+                                                                Lopez-Paz. 2025. From bytes to ideas: Language
+Ilya Loshchilov and Frank Hutter. 2019. Decoupled               modeling with autoregressive u-nets. Preprint,
+   weight decay regularization. In International Confer-        arXiv:2506.14761.
+   ence on Learning Representations.
+                                                             Tim Vieira, Benjamin LeBrun, Mario Giulianelli,
+Meta. 2024. The llama 3 herd of models. Preprint,               Juan Luis Gastaldi, Brian DuSell, John Terilla, Tim-
+   arXiv:2407.21783.                                            othy J. O’Donnell, and Ryan Cotterell. 2025. From
+                                                                language models over tokens to language models over
+Benjamin Minixhofer, Ivan Vulic´, and Edoardo Maria             characters. In Forty-second International Conference
+   Ponti. 2025. Universal cross-tokenizer distillation          on Machine Learning.
+   via approximate likelihood matching. In The Thirty-
+   Ninth Conference on Neural Information Processing         Fanqi Wan, Xinting Huang, Deng Cai, Xiaojun Quan,
+   Systems.                                                     Wei Bi, and Shuming Shi. 2024. Knowledge fusion
+                                                                of large language models. In The Twelfth Interna-
+Piotr Nawrot, Jan Chorowski, Adrian Lancucki, and               tional Conference on Learning Representations.
+   Edoardo Maria Ponti. 2023. Efficient transformers
+   with dynamic token pooling. In Proceedings of the         Junxiong Wang, Tushaar Gangavarapu, Jing Nathan
+   61st Annual Meeting of the Association for Compu-            Yan, and Alexander M Rush. 2024. Mambabyte:
+   tational Linguistics (Volume 1: Long Papers), pages          Token-free selective state space model. In First Con-
+   6403–6417, Toronto, Canada. Association for Com-             ference on Language Modeling.
+   putational Linguistics.
+                                                             Yunjia Xi, Jianghao Lin, Yongzhao Xiao, Zheli Zhou,
+Piotr Nawrot, Szymon Tworkowski, Michal Tyrolski,               Rong Shan, Te Gao, Jiachen Zhu, Weiwen Liu, Yong
+   Lukasz Kaiser, Yuhuai Wu, Christian Szegedy, and             Yu, and Weinan Zhang. 2025. A survey of llm-based
+   Henryk Michalewski. 2021. Hierarchical transform-            deep search agents: Paradigm, optimization, evalua-
+   ers are more efficient language models. CoRR,                tion, and challenges. Preprint, arXiv:2508.05668.
+   abs/2110.13711.
+                                                             Xiaohan Xu, Ming Li, Chongyang Tao, Tao Shen,
+OpenAI. 2025. gpt-oss-120b & gpt-oss-20b model card.            Reynold Cheng, Jinyang Li, Can Xu, Dacheng Tao,
+   Preprint, arXiv:2508.10925.                                  and Tianyi Zhou. 2024. A survey on knowledge
+                                                                distillation of large language models. Preprint,
+Artidoro Pagnoni, Ramakanth Pasunuru, Pedro Ro-                 arXiv:2402.13116.
+   driguez, John Nguyen, Benjamin Muller, Margaret
+   Li, Chunting Zhou, Lili Yu, Jason E Weston, Luke          Linting Xue, Aditya Barua, Noah Constant, Rami Al-
+   Zettlemoyer, Gargi Ghosh, Mike Lewis, Ari Holtz-             Rfou, Sharan Narang, Mihir Kale, Adam Roberts,
+   man, and Srini Iyer. 2025. Byte latent transformer:          and Colin Raffel. 2022. ByT5: Towards a token-free
+   Patches scale better than tokens. In Proceedings             future with pre-trained byte-to-byte models. Transac-
+   of the 63rd Annual Meeting of the Association for            tions of the Association for Computational Linguis-
+   Computational Linguistics (Volume 1: Long Papers),           tics, 10:291–306.
+   pages 9238–9258, Vienna, Austria. Association for
+   Computational Linguistics.                                An Yang, Anfeng Li, Baosong Yang, Beichen Zhang,
+                                                                Binyuan Hui, Bo Zheng, Bowen Yu, Chang Gao,
+Buu Phan, Brandon Amos, Itai Gat, Marton Havasi,                Chengen Huang, Chenxu Lv, Chujie Zheng, Day-
+   Matthew J. Muckley, and Karen Ullrich. 2025. Ex-             iheng Liu, Fan Zhou, Fei Huang, Feng Hu, Hao
+   act byte-level probabilities from tokenized language         Ge, Haoran Wei, Huan Lin, Jialong Tang, and 41
+   models for FIM-tasks and model ensembles. In                 others. 2025. Qwen3 technical report. Preprint,
+   The Thirteenth International Conference on Learning          arXiv:2505.09388.
+   Representations.
+                                                             An Yang, Baosong Yang, Binyuan Hui, Bo Zheng,
+Nazneen Rajani, Lewis Tunstall, Edward Beeching,                Bowen Yu, Chang Zhou, Chengpeng Li, Chengyuan
+   Nathan Lambert, Alexander M. Rush, and Thomas                Li, Dayiheng Liu, Fei Huang, Guanting Dong, Hao-
+   Wolf. 2023. No robots.                                       ran Wei, Huan Lin, Jialong Tang, Jialin Wang, Jian
+                                                                Yang, Jianhong Tu, Jianwei Zhang, Jianxin Ma, and
+Kevin Slagle. 2024. Spacebyte: Towards deleting to-             43 others. 2024. Qwen2 technical report. Preprint,
+   kenization from large language modeling. In The              arXiv:2407.10671.
+   Thirty-eighth Annual Conference on Neural Informa-
+   tion Processing Systems.
+
+                                                          9
+LILI YU, Daniel Simig, Colin Flaherty, Armen Agha-             model. In this section we describe the approxima-
+   janyan, Luke Zettlemoyer, and Mike Lewis. 2023.             tion parameters used in our implementation and the
+   MEGABYTE: Predicting million-byte sequences                 empirical procedure used to select them.
+   with multiscale transformers. In Thirty-seventh Con-
+   ference on Neural Information Processing Systems.           C.1 Approximation Parameters
+
+Songming Zhang, Xue Zhang, Zengkui Sun, Yufeng                 The algorithm introduces two parameters, K and
+   Chen, and Jinan Xu. 2024a. Dual-space knowledge             ϵ, that control the trade-off between computational
+   distillation for large language models. In Proceed-         efficiency and approximation accuracy when esti-
+   ings of the 2024 Conference on Empirical Methods in         mating the byte-level probability
+   Natural Language Processing, pages 18164–18181.
+
+Yu Zhang, Xiusi Chen, Bowen Jin, Sheng Wang, Shui-                               PT (b1, b2, . . . , bNb )
+   wang Ji, Wei Wang, and Jiawei Han. 2024b. A
+   comprehensive survey of scientific large language              from a teacher model ft operating over a token
+   models and their applications in scientific discovery.      vocabulary (see Section 3.1).
+   Preprint, arXiv:2406.10833.
+
+A Evaluating the use of Linear Layers as                       Beam width (K). The algorithm performs a
+     Byte Level Heads                                          beam search over token sequences that are com-
+                                                               patible with a given byte prefix. The beam width
+To test the effectiveness of a simple linear layer             K specifies the maximum number of hypotheses re-
+for each byte level head, we performed SFT only                tained during the search. Larger values of K allow
+at the byte level on the Llama3.2 1B model (Meta,              more tokenization paths to be explored, which im-
+2024) on a subset the TULU-3 dataset (Lambert                  proves approximation accuracy but increases com-
+et al., 2024). We then looked at training and val-             putational cost.
+idation losses over both bytes and tokens. We re-
+port the plots in Figure 2. We observe that, not               Pruning threshold (ϵ). During beam search, hy-
+only do the training and validation losses decrease            potheses with very small probability mass are re-
+smoothly for the byte level, but, surprisingly, they           moved. Specifically, beams whose probability
+decrease also for the token level, demonstrating               falls below a threshold ϵ relative to the highest-
+the effectiveness of adding even simple linear lay-            probability beam are pruned. This pruning step
+ers as heads for the byte level interface. This also           eliminates tokenization paths that contribute negli-
+indicates that a byte-level probability distribution           gibly to the final byte probability distribution.
+can be effectively used for knowledge distillation
+– thus bridging a gap between different tokenizers                Together, K and ϵ determine the number of tok-
+with a common byte-level interface.                            enization paths considered during the computation.
+
+B Training Hyperparameters                                     C.2 Algorithm for Byte Probability
+                                                                      Computation
+
+We provide the values for the main hyperparam-                 The byte-level probability distribution at each posi-
+eters used in our experiments, together with the               tion is computed using the following procedure:
+respective search space for the tuning procedure
+in Table 4. The values for the baselines follow the            1. Initialization: Create a beam state with pa-
+optimized setup of Minixhofer et al. (2025), and                  rameters K (beam width) and ϵ (pruning
+only the learning rate has been further tuned due                 threshold). The beam maintains a set of can-
+to computational constraints. For our method we                   didate tokenization paths, each with an associ-
+tested different values of the weights for the loss               ated probability weight.
+functions.
+                                                               2. For each byte position i:
+C Approximation Settings for
+     Byte-Probability Computations                             • Compute distribution:       Call
+
+The algorithm proposed by Vieira et al. (2025)                 logp_next() to obtain the log prob-
+provides an efficient approximation for computing
+byte-level probabilities from a token-level language           ability distribution over the next 256
+
+                                                               possible byte values. This operation
+
+                                                               marginalizes over all tokenization paths
+
+                                                           10
+      0.8    Train Byte Loss                                                      Val Byte Loss
+
+      0.7                                                         0.44
+
+      0.6                                                         0.42
+
+Loss  0.5                                                   Loss  0.40
+
+      0.4                                                         0.38
+
+      0.3
+
+      0.2                                                         0.36
+
+      0.1 0  2k 4kTraini6nkg Step8k 10k 12k                       0.34 0       2k 4kTraini6nkg Step8k 10k 12k
+
+             Train Token Loss                                                  Val Token Loss
+
+      3.5                                                         2.8
+
+      3.0
+                                                                          2.6
+
+      2.5
+Loss                                                        Loss
+                                                                  2.4
+      2.0
+
+      1.5                                                         2.2
+
+      1.0 0  2k 4kTraini6nkg Step8k 10k 12k                       2.0 0        2k 4kTraini6nkg Step8k 10k 12k
+
+Figure 2: Training and validation losses for a Llama3.2-1B model with added byte-level head trained on a subset of
+the TULU-3 dataset with supervised fine-tuning only at the byte level. The top row plots are for training curves,
+while bottom row ones are for validation.
+
+             in the current beam:                               parameters K and ϵ control how many tokenization
+                                                                alternatives are maintained, which determines both
+             log P (bi | b<i) =                                 accuracy and computational cost.
+
+             log                    P (t) · P (bi | t) (6)      C.3 Evaluating Approximation Quality
+
+                            t∈Beam                              We measure the Jensen–Shannon divergence (JSD)
+                                                                between the approximated byte probability distri-
+             where t represents a tokenization path             bution and a high-precision reference distribution
+                                                                computed using K = 100, ϵ = 10−6. Figure 3
+             and P (t) is its weight.                           shows the resulting approximation error for dif-
+                                                                ferent combinations of K and ϵ. We observe that
+           • Advance beam: Incorporate the ob-                  the setting K = 10, ϵ = 0.01 achieves a Jensen–
+                                                                Shannon divergence of 0.0045. Figure 4 shows
+             served byte bi into the beam using the             that runtime is primarily affected by the pruning
+             operation beam.prune() « byte. This                threshold ϵ (lower values retain more beams), while
+                                                                beam width K has minimal impact due to efficient
+             extends each candidate path by consum-             GPU batching of token queries. We also evalu-
+                                                                ate the effect of the approximation on downstream
+             ing the byte.                                      distillation performance by measuring the distilled
+                                                                model’s perplexity and task accuracy, confirming
+           • Prune paths: Remove tokenization                   that configurations with JSD < 0.005 produce neg-
+                                                                ligible performance degradation.
+             paths with probability below the thresh-
+
+             old ϵ relative to the highest-probability
+
+             path. Retain at most K paths.
+
+           • Handle token boundaries: When a path
+
+             completes a token, extend the beam by
+
+             starting a new token using the teacher
+
+             model’s next-token probabilities.
+
+   The key computational bottleneck is the teacher
+model inference at token boundaries. The beam
+
+                                                            11
+Hyperparameter               Value                              Search Space
+
+LoRA                         64                                 —
+   Rank (r)
+   Alpha (α)                 64                                 —
+   Dropout
+   Target modules            0.05                               —
+
+                             q_proj, v_proj, k_proj,
+
+                             o_proj,                gate_proj,
+
+                             up_proj, down_proj
+
+Optimiser                    AdamW                              —
+   Algorithm                 2 × 10−5                           {5e-6, 1e-5, 2e-5, 3e-5, 5e-5, 1e-4}
+   Learning rate             0.01                               —
+   Weight decay              (0.9, 0.95)                        —
+   (β1, β2)                  1.0                                —
+   Gradient clipping (norm)
+
+Learning rate schedule       Cosine + linear warm-up            —
+   Scheduler
+   Warm-up steps             1,000                              —
+
+Training
+
+Epochs                       5                                  —
+
+Batch size (per device)      2                                  —
+
+Gradient accumulation steps 4                                   —
+
+Max sequence length          512                                —
+
+Precision                    bf16-mixed                         —
+
+Loss coefficients
+
+KL divergence (λKL)          0.1                                {0.1, 0.2, 0.5, 0.8, 1.0}
+                                                                {0.5, 1.0}
+Byte SFT (λb)                1.0
+
+Byte-level decoder head
+
+Parallel heads               10                                 —
+
+Byte vocabulary size         261                                —
+
+Table 4: Training hyperparameters used in all experiments. The Search Space column lists the values explored
+during hyperparameter tuning; a dash indicates the value was fixed without search.
+
+C.4 Experimental Setup                                  n_sample_worker=15 to parallelize across sam-
+                                                        ples, and the underlying trie operations batch up
+We conduct experiments using Llama-3.2-                 to 1000 token probability queries per forward pass.
+1B-Instruct and Llama-3.2-3B-Instruct as                We use Python’s asyncio framework to overlap
+teacher models, with the Tulu-3 dataset                 CPU preprocessing with GPU computation.
+for distillation. We test beam widths
+K ∈ {2, 5, 10, 20, 50, 100} and pruning thresholds         In our experiments using four NVIDIA RTX
+ϵ ∈ {10−1, 10−2, 10−3, 10−4, 10−6}, measur-             3090 GPUs, the configuration K = 10, ϵ = 0.01
+ing runtime and JSD relative to the reference           achieves approximately 10.4 seconds per sample
+configuration for each setting.                         for 100–150 byte sequences. We choose this
+                                                        configuration because it provides excellent ap-
+C.5 Parallel Implementation                             proximation accuracy (JSD < 0.005) while us-
+                                                        ing 10× less memory than the reference config-
+Our implementation achieves efficient throughput        uration (K = 100), enabling higher sample-level
+through multi-level parallelization. The dataset        parallelism. The lower memory footprint allows
+is partitioned into shards, with each shard pro-        us to process more samples concurrently, and the
+cessed by an independent worker (one per GPU).          balanced pruning threshold ϵ = 0.01 avoids both
+Within each worker, we use a process pool with
+
+                                                    12
+Figure 3: Jensen–Shannon divergence between approxi-         Figure 4: Runtime of byte-probability computation un-
+mated byte distributions and the reference distribution      der different beam search configurations.
+under different approximation settings.
+
+overly aggressive pruning (which degrades accu-
+racy) and overly conservative retention (which in-
+creases memory usage). With this configuration
+and parallelism, computing byte probabilities for
+the entire Tulu-3 dataset requires approximately 2
+days.
+
+                                                         13
+

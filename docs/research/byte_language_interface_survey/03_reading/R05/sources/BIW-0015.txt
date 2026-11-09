@@ -1,0 +1,829 @@
+                                             Dynamic Multi-Byte Prediction With Hierarchical Language Models
+
+                                        Abraham Toluwase Owodunni1 Chibuzor Okocha2 Christan Grant2 Tomasz Limisiewicz3
+                                                                                         Sachin Kumar1
+
+                                                   1The Ohio State University 2University of Florida 3 University of Washington
+                                                                                      owodunni.1@osu.edu
+
+                                                              Abstract                             _ lov e _i c e _ cr e a m . lov e _i c e _ cr e a m . 4
+
+arXiv:2608.15454v2 [cs.AI] 21 Aug 2026       Byte-level hierarchical language models (LMs)         NBP Decoder : Causal Mask  MBP Decoder : LCA Mask  3
+                                             have recently emerged as a robust alternative
+                                             to their popular counterparts that use subword           2
+                                             tokenization. However, generating one byte at
+                                             a time remains a bottleneck for inference speed.            +N                            Upsampled
+                                             To address this, we introduce multi-byte pre-
+                                             diction (MBP) for hierarchical models, which                    LM Module: Causal Mask
+                                             generates multiple bytes in parallel, speeding
+                                             up inference with minimal performance im-                   N+
+                                             pact and no additional parameters. MBP builds
+                                             on the popular multi-token prediction (MTP)           1     I _ l o v e _ i c e _ c r e a m . BP
+                                             paradigm with two crucial innovations. First,
+                                             we introduce a variable-length prediction win-        I _ l o v e _ i c e _ c r e am .
+                                             dow that aligns with the latent tokens, or seg-
+                                             ments, of a hierarchical LM. Second, we im-                 Encoder Module : Causal Mask
+                                             plement a novel attention-masking scheme that
+                                             enables parallel byte prediction without vio-         I _ l o v e _ i c e _ c r e am .
+                                             lating causality. We show that multi-byte pre-
+                                             diction strikes a Pareto-optimal trade-off across     Figure 1: Overview of the MBP architecture. An
+                                             multiple generative tasks, instruction following,     input byte sequence is first processed by the model, and
+                                             question answering, summarization, and ma-            the MBP head uses the LCA mask (Figure 2) to predict
+                                             chine translation, achieving the best trade-off       multiple future bytes in parallel from a single head.
+                                             between performance and inference throughput.         Colored bands denote learned segment boundaries. See
+                                             Code for our experiments will be released at          Appendix A for a detailed description of several parts
+                                             github.com/skai-research/lca-multibyte.               in this figure.
+
+                                        1 Introduction                                                Despite these advantages, byte-level modeling
+                                                                                                   remains computationally expensive (Tay et al.,
+                                        Subword tokenization has been a central design             2022; Yu et al., 2023). Byte sequences are sub-
+                                        choice in modern language models, enabling effi-           stantially longer than subword sequences, which in-
+                                        cient text compression and open-vocabulary gener-          creases the cost of Transformer attention and makes
+                                        ation (Sennrich et al., 2016; Kudo, 2018). However,        autoregressive decoding slower (Xue et al., 2022;
+                                        subword tokenizers, due to their predetermined             Wang et al., 2024; Slagle, 2024). Recent hierar-
+                                        fixed vocabulary, may overfragment rare words,             chical byte-level models attempt to address this
+                                        encode language- and script-specific biases, and           issue by compressing byte streams into shorter la-
+                                        generalize poorly across domains, non-English set-         tent sequences (Slagle, 2024; Pagnoni et al., 2025;
+                                        tings, and evolving scenarios (Mielke et al., 2021;        Hwang et al., 2025; Owodunni et al., 2025) by in-
+                                        Menschikov et al., 2025). Byte-level language mod-         corporating heuristic or learned tokenization mech-
+                                        eling (Xue et al., 2022; Wang et al., 2024; Yu et al.,     anisms that reduce the effective sequence length
+                                        2023) offers an appealing alternative: by operat-          before applying deeper Transformer computation.
+                                        ing directly on raw bytes, models can eliminate            These approaches show that byte-level models ben-
+                                        tokenizer-specific assumptions and represent any           efit from operating over higher-level units rather
+                                        text sequence.                                             than individual bytes alone. However, most hierar-
+                                                                                                   chical designs use latent tokenization primarily for
+                                                                                                   representation efficiency: the model compresses
+
+                                                                                                1
+the input, processes the shorter sequence, and then         2 Background
+decodes back to bytes (Hwang et al., 2025; Neite-
+meier et al., 2025). Inference still happens one byte       2.1 Multi-token Prediction
+at a time.
+                                                            Multi-token prediction (MTP) has emerged as a
+   In parallel, multi-token prediction (MTP) has            way to improve both sample efficiency and in-
+emerged as a promising approach for accelerating            ference speed of autoregressive language mod-
+language model decoding. Early work introduced              els by predicting multiple future subword tokens
+the idea of predicting multiple future tokens in a sin-     in parallel, as opposed to one token at a time
+gle forward pass to reduce decoding latency (Stern          (Gloeckle et al., 2024; Cai et al., 2024). Given a
+et al., 2018; Qi et al., 2020), and more recent meth-       sequence x1, . . . , xT , MTP is trained by minimiz-
+ods have shown that this objective also improves            ing LMTP = − t log Pθ(xt+1:t+n | x1:t) where θ
+sample efficiency at scale (Gloeckle et al., 2024).         parameterizes the LM and n is the number of fu-
+Existing MTP approaches typically rely on multi-            ture tokens to be predicted. To make this objective
+ple prediction heads attached to the model trunk            tractable, n dedicated prediction heads (typically
+(Cai et al., 2024; Ankner et al., 2024) or on smaller       multiple MLP layers or independent transformer
+draft models that propose candidates for the main           blocks followed by a shared unembedding matrix)
+model to verify (Leviathan et al., 2023; Chen et al.,       are used to predict each of the n future tokens in-
+2023; Li et al., 2024). While these designs can             dependently and in parallel. Each head operates
+improve inference speed, they have two important            on a shared hidden representation zt encoding x1:t.
+limitations. First, predicting more future tokens           Under this conditional independence assumption,
+typically requires additional heads or auxiliary pa-        the joint probability factorizes and loss becomes:
+rameters for every token, increasing memory cost.
+Second, fixed-offset prediction treats the next n                         n
+tokens as a static horizon, ignoring the fact that
+language has variable local structure: some regions         LMTP = −             log Pθ(xt+i | zt) (1)
+are easily predictable as coherent chunks, while
+others require finer-grained sequential modeling.                         t i=1
+
+   This paper proposes Latent Causal Attention                 Since different parts of a sequence exhibit vary-
+(LCA), a dynamic multi-byte prediction method               ing levels of surprisal, always predicting a fixed n
+for hierarchical language models. Our key idea              tokens per forward pass makes this approach rigid
+involves the use of learned byte segments not only          and unable to adapt to the local difficulty of the text.
+for compression, but also as the unit of multi-             Moreover, this design also introduces a parameter
+byte generation. Instead of assigning one predic-           bottleneck: each additional future token requires
+tion head to each future byte, LCA uses a sin-              its own prediction head, linearly increasing the pre-
+gle multi-byte decoder equipped with a boundary-            diction head’s parameter count with n.
+aware causal mask that allows each byte in a seg-
+ment to attend to previous segments while prevent-          2.2 Hierarchical Language Models
+ing dependence on other bytes within the same seg-
+ment. This preserves global autoregressive causal-          Hierarchical byte-level language models have re-
+ity while enabling all bytes in a predicted segment         cently emerged as a viable alternative to subword-
+to be generated in parallel. This design replaces the       based language models. In this work, we build on
+fixed-offset prediction of prior MTP methods with           the architectural design of FlexiTokens (Owodunni
+variable-length, segment-aligned generation. LCA            et al., 2025), introducing multiple modifications to
+removes the need for additional prediction heads as         support dynamic multi-byte prediction. Our hier-
+the number of generated tokens increases and pro-           archical model comprises four components (Fig-
+vides a natural extension of hierarchical byte-level        ure 1): an encoder module, a language modeling
+modeling to inference acceleration. We describe             (LM) module, a boundary predictor, and a decoder
+our methodology in detail in Section 3. We then             module. We note that our proposed method is gen-
+present our findings and extensive analyses in Sec-         eralizable to other hierarchical LM (Pagnoni et al.,
+tions 5 and 6, respectively.                                2025; Hwang et al., 2025) architectures since they
+                                                            follow a similar design.
+
+                                                            Encoder Module. This module maps an input
+
+                                                            byte sequence x1, . . . , xT to hidden states he ∈
+                                                            RT ×d via transformer layers with a causal attention
+
+                                                         2
+mask. he serves both as a rich contextual represen-                                               Latent KeysLatent Queries
+tation and as a residual connection for downstream
+modules. We then feed he into a boundary pre-                                  _ i c e _ c r e am .
+dictor B, which produces boundary probabilities                                          can attend masked (cannot attend)
+Bˆ ∈ [0, 1]T , indicating positions where a segment
+should end. A discrete label is sampled from these        Figure 2: The Latent Causal Attention (LCA) mask.
+probabilities using Gumbel Sigmoid trick to main-         Each row corresponds to a query byte and each column
+tain differentiability (?). At positions where the        to a key byte. A query at position i in segment si may at-
+label is 1, he is downsampled via mean pooling            tend to itself, to earlier positions within its own segment,
+with all preceding positions where the label is 0 to      and to all bytes in the immediately preceding segment
+form a shortened hidden representation h↓ or latent       si−1. Attention to later positions in the same segment
+tokens, with sequence length strictly less than that      and to segments further in the past is masked out. Col-
+of he. The boundary predictor in this module is           ored bands denote segment boundaries and match those
+jointly optimized during training; we use a bound-        in Figure 1. This mask preserves autoregressive causal-
+ary predictor loss LBP that controls the compres-         ity at the segment level while enabling all bytes in a
+sion of the input sequence. Following Owodunni            group to be predicted in parallel from a single decoder
+et al. (2025), we define:                                 head.
+
+LBP = max  k                               k              (MBP; Figure 1 3 ). The MBP head is trained to
+              − α, 0  + max β − , 0                       predict all bytes in a latent token in parallel, ex-
+           T                          T                   cept the first which is predicted by the next-byte
+                                                          head. Since the number of bytes in each latent
+where k is the number of boundaries predicted as 1.       token is variable, a fixed number of independent
+                                                          prediction heads, typically used in the MTP litera-
+Hyperparameters α and β define upper and lower            ture, is impractical. Instead, the MBP head consists
+                                                          of transformer layers.
+bounds on k/T , respectively, such that the compres-
+                                                             The input to the MBP head is the duplicated
+sion rate is considered optimal when β  ≤  k  ≤ α.        upsampled output of the LM module. We add a
+                                           T              residual connection r2 = h↓ from the downsam-
+                                                          pled representation to each of these vectors.
+Language Modeling Module. A learned [BOS]
+                                                             Since the LM module shifts the latent tokens
+token embedding is appended to h↓ before being            by one position, this input only carries informa-
+passed through the LM module’s transformer stack          tion about the bytes from the previous latent token.
+to output hidden vectors h↓′ . The [BOS] token shifts     For each transformer layer in the MBP head, we
+the shortened sequence forward by one, ensuring           construct an attention mask (Figure 2) such that
+                                                          each position may attend to itself, to earlier posi-
+that the representation at each latent token position     tions within the latent token, and to all bytes in the
+                                                          immediately preceding latent token. Intra-token at-
+conditions only on preceding tokens, thereby pre-         tention does not violate causality at inference time,
+serving causality. h′↓ is subsequently upsampled          as the input to each position within the same token
+via duplication to match the original byte sequence       are duplicates plus residuals of the previous latent
+
+length and passed to the decoder.
+
+Decoder Module. This module produces byte-
+level predictions. We add a residual connection
+r1 = he from the encoder to the upsampled output
+of the LM module. The result is passed through a
+small stack of transformer layers, followed by an
+unembedding layer forming the primary next-byte
+prediction head, optimized with cross-entropy loss.
+
+3 Multi-Byte Prediction with Latent
+    Causal Attention
+
+Here we describe our modifications to the hierarchi-
+cal LM architecture to enable multi-byte prediction.
+We decouple the decoder module into only two
+heads: a standard next-byte prediction head (same
+as before) and a single multi-byte prediction head
+
+                                                       3
+Algorithm 1 Multi-byte Prediction with LCA
+
+Require: Prompt x1:t, boundary predictor B, threshold τ , #MBP candidates n
+
+1: while not done do
+
+2: he ← EncoderModule(x1:t); cache residual r1 ← he
+
+3: b ← B(he)                                                                 ▷ Predict boundary
+
+4: if b = 1 or no cached h↓ then
+
+5:  h↓ ← Downsample(he); cache residual r2 ← h↓
+
+6:  h′↓ ← LMModule(h↓)
+
+7: end if
+
+8: h1 ← NTLayers(Upsample(h′↓) + r1)                     ▷ Residual added before upsample
+9: h2 ← Upsample(h′↓ + r2)
+
+10: h2 ← h2 ; h2[−1], . . . , h2[−1]                     ▷ Duplicate last token n−2 times
+
+                                           n−2 copies    ▷ Only prev. + current segment
+                                                                   ▷ NT: always accepted
+11: s ← start index of previous segment boundary                    ▷ MBP: n speculative
+
+12: h2 ← MBPLayers h2[s :], segment mask
+13: t1 ∼ Head(h1[−1])
+14: t2:n+1 ∼ Head(h2[−(n − 1) :])
+15: Accept t2:k while P (tk) ≥ τ ; discard rest
+16: Append accepted bytes to x1:t
+17: end while
+
+token. We call this mask Latent Causal Attention         passed through the encoder module to produce a
+(LCA) and our overall method as LCA-MBP. The             hidden representation he, from which we store a
+output of the transformer layers is multiplied by        residual connection r1 = he. The boundary predic-
+an unembedding matrix to predict byte logits over        tor is then applied to he to identify boundaries.
+which the cross-entropy loss is computed to predict
+target bytes shifted by two positions (Figure 1 4 ).        To generate the first token, if the boundary pre-
+Both decoder heads share a single unembedding            dicted at position xt is 1, or no cached LM mod-
+matrix.                                                  ule state exists, we downsample he to obtain h↓
+                                                         (Line 5), store a residual r2 = h↓, and pass h↓
+   The overall training objective combines the next-     through the LM module to produce h′↓ (Line 6).
+byte prediction loss with the multi-byte prediction      Otherwise, the cached h′↓ from the previous step is
+loss:                                                    reused, avoiding a full LM forward pass.
+
+  LLM = −λ0 log Pθ(xt+1 | x1:t)                             To predict the next byte, we add the residual
+                                                         r1 to h↓′ , and process the result through the next-
+                            t                            byte head (Line 8). To predict the next n bytes
+                                                         with the MBP head, we add the residual r2 to h′↓
+                    − λ1 log Pθ(xt+2 | xi:t) (2)         before upsampling to obtain h2. We then slice h2
+                                                         to retain only the bytes belonging to the current
+                                       t                 and previous latent tokens, and pass this window
+                                                         through the MBP transformer layers with the LCA
+   where i is the starting index of the xt’s immedi-     mask (Lines 9–12).
+ately previous latent token. λ0 and λ1 are hyper-
+parameters. Unlike standard MTP, which requires          Byte Acceptance. The output of the next-byte
+separate prediction heads, LCA achieves this in-         head is always accepted (Line 14). For the MBP
+dependence through the latent attention mask and         head, a predicted token xˆt+i is accepted only if the
+byte segments pooling, while using a single set          model’s confidence exceeds a predefined threshold:
+of shared transformer layers. The final loss we
+train this model with is LLM + λ2LBP, where λ2                 xˆt+i is accepted ⇐⇒ Pθ(xˆt+i | ·) ≥ τ
+is another hyperparameter.
+                                                         Tokens are accepted from left to right; the first
+3.1 Inference Algorithm                                  token falling below τ and all subsequent candidates
+                                                         are discarded. This acceptance strategy is applied
+We present our inference methodology in Algo-
+rithm 1. At inference time, the prompt x1:t is first
+
+                                                      4
+uniformly across all MBP methods evaluated in              4.2 Model Architecture
+this work, following Kirchenbauer et al. (2026).
+                                                           For all models, we use a hidden dimension of
+4 Experimental Setup                                       dmodel = 1024, an LM inner dimension of dinner =
+                                                           4096, and a context window of 4096. We also use
+4.1 Baselines                                              RMSNorm with ϵ = 10−6, a rotary embedding
+                                                           base of 100000, 8 attention heads, 8 KV heads,
+We compare LCA against five baselines spanning             dropout of 0.1, and attention scaling of 1.0. Unless
+flat and hierarchical byte-level architectures.            otherwise stated, we keep these architectural and
+                                                           optimization settings fixed across runs. The main
+   • LlamaByte (Grattafiori et al., 2024): a vanilla       architectural differences across models, therefore,
+      byte-level model implemented with the Llama          lie in how layers are allocated across the encoder,
+      3 architecture.                                      LM module, next-token (NT) decoder, and multi-
+                                                           byte (MB) decoder. For the plain LlamaByte base-
+   • SpaceByte (Slagle, 2024): a hierarchical byte-        line, all layers are placed in a single stack, while
+      level model that uses an external fixed heuris-      the hierarchical baselines distribute layers across
+      tic for segmentation during training. An ex-         the encoder, LM module, and decoder components.
+      ternal fixed heuristic was also used in BLT          Among these hierarchical variants, the principal dif-
+      (Pagnoni et al., 2025).                              ference is the choice of MB prediction head: either
+                                                           no MB head, multiple MLP heads, or a two-layer
+   • FlexiTokens (FxT) (Owodunni et al., 2025;             LCA head.
+      Hwang et al., 2025): a hierarchical model with
+      a learned boundary predictor that dynamically        4.3 Model Training
+      segments byte sequences into variable-length
+      segments. This boundary predictor is jointly         We follow Llama 3 (Grattafiori et al., 2024) for the
+      optimized with the language modeling objec-          general implementation of all parts of our model,
+      tive during training.                                and we detail our configurations in Appendix A.
+                                                           We pretrain a 373M-parameter hierarchical trans-
+   • MLP-MBP (Gloeckle et al., 2024): a multi-             former model on 50B bytes from FineWeb-edu
+      byte prediction baseline built on the FxT archi-     English dataset (Lozhkov et al., 2024). We train
+      tecture, which employs n independent MLP             with a total batch size of 1048576 bytes per gra-
+      heads to predict n future tokens in parallel,        dient step and a warmup of 2000 steps. We use a
+      one per head, following the setup of Gloeckle        learning rate of 3e-4 and the Adam optimizer with
+      et al. (2024) and Medusa (Cai et al., 2024).         a cosine learning rate scheduler. We set Adam β1
+                                                           and β2 to 0.9 and 0.999, respectively, while we set
+   • Efficient FlexiTokens (Eff-FxT): a variant            the ϵ to 1e-8. We employ gradient clipping at 0.25.
+      of FxT that uses a more efficient inference          All models were trained on 4 NVIDIA B200 GPUs.
+      algorithm. Specifically, the LM module is
+      only invoked at predicted boundary positions;           We pretrain multiple models with different con-
+      at all other positions, the cached LM module         figurations. We use a compression rate of 3×. Fol-
+      output is reused. This corresponds exactly to        lowing (Owodunni et al., 2025), we achieve this by
+      Lines 4–8 in Algorithm 1. We note that HNet          setting β and α in the BP loss LBP to 0.261 and
+      (Hwang et al., 2025) uses a similar generation       0.333 respectively. We use 3 heads for MLP-MBP
+      strategy in their work as well.                      and train all models for 1 epoch and we set λ0 = 1,
+                                                           λ1 = 1 and λ2 = 10.
+   To ensure a fair comparison, all models are
+parameter-matched by scaling each baseline to the          4.4 Downstream Fine-tuning and Evaluation
+same total parameter count, which consequently
+increases the floating-point operations (FLOPs) of         We perform supervised finetuning on Tulu-3 SFT
+flat models such as LlamaByte and SpaceByte. See           mix (Lambert et al., 2024) for 5 epochs. We use the
+Table 2 in Appendix A for the number of layers             same hyperparameters as pretraining except for the
+used across all methods.                                   learning rate, which we set to 2e-4, batch size to 64,
+                                                           λ1 = 2. To evaluate on translation, we separately
+                                                           finetune our pretrained models on the Spanish and
+                                                           French datasets in Opus-100 (Zhang et al., 2020)
+
+                                                        5
+                                IfEval                     CoQA                                               DailySum             83         Trans es-en
+
+             48                         30                                                   38                                    82
+             46                         25                                                   36
+Performance  44                         20                                                   34                                    81
+             42                         15                                                   32
+             40                         10                                                   30                                    80
+             38
+                                                                                                                                   79
+
+                                                                                                                                   78
+
+                                        5                                                                                          77
+
+             36  T1h5r0oug1h7p5ut (2b0y0tes2/s2e5c) 250 100 Throug1h5p0ut (byte2s/0s0ec)         100 Throu1g5h0put (byt2e0s0/sec)  76 150Thr2o0u0ghp2u5t0(by3t0e0s/se3c5)0
+
+                 LlamaByte              SpaceByte  FxT                                  Eff-FxT  MLP-MBP                LCA-MBP        Pareto front
+
+Figure 3: Performance vs. throughput across four downstream tasks. Metrics are instruction-loose accuracy on
+IfEval, F1 on CoQA, ROUGE on CNN/DailyMail, and COMET on Spanish–English translation. LCA (⋆) lies on
+the frontier for three of four tasks on the Pareto front, which represents the method with the best tradeoff.
+
+for 2 epochs with the SFT hyperparameters.                                                   with a single decoder head.
+   We evaluate our models on 4 major genera-
+                                                                                                Table 1 reports the overall acceptance rates of
+tive tasks that effectively measure our speed-to-                                            our LCA and MLP-based multi-byte prediction
+performance comparison. These include Sum-                                                   models. The Pareto comparison in Figure 3 re-
+marization (CNN/Daily Mail; Hermann et al.,                                                  veals that despite its high acceptance rate, MLP-
+2015), Question Answering (CoQA; Reddy et al.,                                               MBP consistently underperforms LCA on down-
+2019), Machine translation (Opus-100; Zhang et al.,                                          stream metrics at comparable throughput. This
+2020)), and Instruction Following (IFEval; Zhou                                              indicates that MLP-MBP is highly confident in its
+et al., 2023)). At inference time, we use a tem-                                             speculative predictions, but those predictions are
+perature of 0.7 and top_p of 0.9 for IFEval, while                                           frequently incorrect.
+we use greedy decoding for other tasks since they
+are factual tasks where the output should closely                                                Model  IfEval CoQA DailySum es-en fr-en
+match a reference. Unless otherwise stated, we set
+the acceptance threshold τ = 0.9 and candidate                                                   MLP-MBP 61.91 63.45                   58.08  62.67 65.01
+bytes n = 3 for our main experiments. In all our                                                 LCA-MBP 45.95 46.62                   48.89  51.68 49.74
+evaluations, we report wall-clock on a single B200
+with a batch size of 1.                                                                      Table 1: Byte acceptance rates of MLP and LCA multi-
+                                                                                             byte prediction heads across five downstream tasks. Ac-
+5 Results and Analyses                                                                       ceptance rate measures the fraction of predicted bytes
+                                                                                             accepted. While MLP achieves higher raw acceptance,
+Figure 3 compares all six methods across the four                                            indicating that the model is highly confident about its
+downstream tasks. We highlight two main findings.                                            prediction, it performs worse than LCA-MBP on the
+                                                                                             Pareto front.
+   LCA-MBP lies on the Pareto front in three
+of four tasks. Across IFEval, CoQA, and                                                         We attribute this to the conditional independence
+CNN/DailyMail summarization, LCA matches or                                                  assumption made by the MLP heads: each future to-
+exceeds the throughput of other methods while                                                ken is predicted from a shared hidden state without
+retaining task performance close to the strongest                                            conditioning on the other tokens being predicted in
+non-MBP hierarchical models (FxT and Eff-FxT).                                               parallel. LCA, by contrast, uses transformer layers
+On Spanish–English translation, FxT and Eff-FxT                                              in the MBP head to condition each predicted byte
+achieve slightly higher COMET scores, but at sub-                                            on the previous segment’s context and on its posi-
+stantially lower throughput; LCA trades a small                                              tion within the current segment, producing more
+amount of performance for a meaningful through-                                              coherent multi-byte predictions than independent
+put gain. Notably, this result holds even though                                             MLP heads operating on the same shared hidden
+our pretraining corpus (FineWeb-edu) contains                                                state. The result is a lower acceptance rate but
+no dedicated translation data, suggesting that the                                           higher end-to-end quality—a more useful operat-
+multi-byte prediction structure can transfer to non-                                         ing point in practice.
+English generation after lightweight finetuning.
+Across all four tasks, LCA achieves this trade-off
+
+                                                                                          6
+65.5 t=0.9     t=0.85                                                                      put at τ = 0.75 as n varies from 3 to 7. We find
+65.0 acc=50.1                                                                              that the optimal n can be task-specific: es-en and
+                                                                                           fr-en peak at n = 7 with about +3 points gain over
+64.5           acc=52.0                                                                    n = 3, while DailySum peaks at n = 6 with +2.11
+Performance                                                                                points. Beyond the peak, performance degrades as
+64.0                     t=0.8                                                             the model is asked to predict further past its trained
+                                                                                Performancehorizon, and throughput drops monotonically due
+63.5                     acc=53.7                                                          to falling acceptance rates ( see Table 3). These
+                                                                                           results indicate that n can be tuned per task when
+63.0                               t=0.75                                                  using the threshold acceptance strategy.
+                                   acc=55t.4=0.7
+62.5
+                                   acc=56.7
+      240 245Throu25g0hput (2b5y5tes/se2c6)0 265 270
+
+               0A.7c0ceptance0t.h75reshold t 0.80darker =0lo.8w5er t (fast0e.9r)0
+
+                                                                                                          DailySum  es-en  fr-en  LCA-MBP                            MLP-MBP
+
+Figure 4: Ablation on the acceptance threshold, av-                                          82                                              peak: n=7, 80.94
+eraged across DailySum, es-en, and fr-en. Each
+star marks LCA evaluated at a different value of τ .                                         80
+Lowering τ admits more speculative tokens, increasing
+throughput and acceptance rate.                                                              78
+
+6 Discussion and Ablations                                                                   76                                              peak: n=7, 77.67
+
+6.1 Ablation on the Acceptance Threshold τ                                                   37.5                          peak: n=6, 38.07
+                                                                                             35.0
+In Figure 4, we report average performance,                                                  32.5                   Num4 ber of specul5ative candidate6s n           7
+throughput, and acceptance rate obtained by vary-
+ing τ from 0.9 to 0.7, averaged across DailySum,                                                       3
+es-en, and fr-en. As τ decreases, more specula-
+tive bytes are admitted: the acceptance rate rises                                                        180Throug2h0p0ut (byte2s2/0sec) d24a0rker = f2a6s0ter 280
+from 50.1% to 56.7% and throughput improves
+by roughly 10%, while average performance de-                                         Figure 5: Performance vs. Candidates (n at τ =
+clines by about 3 points. The drop is steep around                                    0.75.) Marker color encodes throughput (darker = faster;
+τ = 0.75, where the marginal throughput gain no                                       full values in Table 3). COMET scores (es-en, fr-en)
+longer justifies the loss in quality. Based on these                                  scaled ×100.
+results, we therefore can deduce that τ = 0.75 of-
+fers a balanced trade-off between speed and down-                                     Increment with Speculative Decoding Accep-
+stream quality for further ablations.                                                 tance: Unlike in probability threshold acceptance
+                                                                                      where increasing n changes both performance and
+6.2 Impact of Increasing Candidate Tokens                                             inference speed, speculative decoding acceptance
+      Beyond Compression Rate                                                         guarantees that all the model’s output matches
+                                                                                      those of decoding with the next-byte prediction
+Our LCA-MBP model allows the number of spec-                                          head. In Figure 6, we find that downstream per-
+ulative candidates n to be varied at inference time                                   formance is constant across n, while throughput
+without retraining, by duplicating the last latent                                    grows monotonically, gaining +29-37% between
+token as described in Line 10 of Algorithm 1. In                                      n = 3 and n = 7-8. LCA also overtakes the MLP-
+this subsection, we study how this concept works                                      MBP baseline on all three tasks. Unlike MLP-MBP,
+by evaluating our model on multiple benchmarks                                        whose number of prediction heads is fixed at train-
+using two candidate acceptance methods: (i) Prob-                                     ing time, LCA allows n to be increased freely at
+ability threshold acceptance as discussed in Algo-                                    inference. Under speculative decoding verification,
+rithm 1, and (ii) speculative decoding acceptance,                                    n therefore acts as a free throughput knob: quality
+where the candidate bytes from the multi-byte pre-                                    is preserved by construction while decoding speed
+diction head are verified with an extra forward pass                                  scales with n.
+through the next-byte prediction head. We employ
+the speculative decoding method as proposed in                                        Analysis of Accepted Bytes with Increasing Can-
+Leviathan et al. (2023).                                                              didates (n): Given the ability to increase the
+                                                                                      number of candidate bytes in the MBP head beyond
+Increment with Probability Threshold Accep-                                           the trained compression rate, we investigate what
+tance: Figure 5 shows performance and through-                                        fraction of candidate bytes are accepted from the
+                                                                                      MBP head alone over 100 decoding steps. Figure 7
+
+                                                                                   7
+                       300                                                                                                       its inference throughput while keeping the perfor-
+                                                                                                                                 mance the same. In Figure 8, where we jointly use
+                                                                                                               +29% from n=3     our LCA model as a drafter and an external FxT
+                                                                                                                                 baseline as the verifier, we observe that verifying
+                       250                                                             +37% from n=3                             LCA’s multi-byte prediction head with the FxT
+                                                                                                                                 model matches FxT’s downstream performance on
+Throughput (toks/sec)  200                                                             DailySum                                  all three tasks while achieving a 2.1-2.3× speedup,
+                                                                                       es-en                                     even though both models are the same size.
+                                                                                       fr-en
+                                                                                       LCA-MBP                                      This result highlights LCA’s role as a drop-in
+                                                                                       MLP-MBP                                   accelerator. Notably, the speedup does not come
+                       150                                                                                                       from a smaller draft model, as is typical in specula-
+                                                                                                                                 tive decoding (Leviathan et al., 2023; Chen et al.,
+                       100                                                             +33% from n=3                             2023), but from predicting an entire latent token’s
+                                                                                                                                 worth of bytes in parallel. This suggests that any
+                       50   3  Nu4mber of specul5ative candidate6s n                   7                                         hierarchical byte-level model can be paired with
+                                                                                                                                 an LCA counterpart to gain substantial throughput
+Figure 6: Throughput vs. candidates n under spec-                                                                                improvements.
+ulative decoding acceptance. Solid lines show LCA
+throughput growing monotonically with n on all three                                                                             7 Related Work
+tasks while downstream performance is maintained (Ta-
+ble 4 in Appendix B).                                                                                                            7.1 Hierarchical Models and the Cost of
+                                                                                                                                       Byte-Level Generation
+shows that the number of accepted bytes varies
+widely from step to step: the model accepts any-                                                                                 Subword tokenization remains the dominant ap-
+where from 0 to all 6 candidates, with a mean of                                                                                 proach for language modeling, but fixed tokenizers
+3.05 accepted per step and 15% of steps accept-                                                                                  introduce well-known limitations for rare words,
+ing the entire window. We also observe that no                                                                                   domain shift, and evolving vocabularies (Sennrich
+candidate byte is accepted at the first decoding                                                                                 et al., 2016). Byte-level models avoid these issues
+step across multiple runs, as the model has not                                                                                  by operating directly on characters or UTF-8 bytes
+yet accumulated enough context to make confident                                                                                 (Xue et al., 2022; Limisiewicz et al., 2024; Wang
+multi-byte predictions.                                                                                                          et al., 2024; Al-Rfou et al., 2018), but this comes
+                                                                                                                                 at the cost of substantially longer sequences. As
+                                                                     mean = 3.05                                                 a result, byte-level models face a higher attention
+                       20                                                                                                        cost during training and slower autoregressive gen-
+                                                                                                                                 eration at inference time.
+                                                                                18.0%
+                                                                                                                                    Recent hierarchical models address this prob-
+Fraction of steps (%)  15                15.0% 15.0%                                               15.0%                         lem by compressing byte or character sequences
+                                                                                       11.0%                                     into shorter latent tokens before applying deeper
+                            13.0% 13.0%                                                                                          sequence modeling. Some works explore sequence
+                                                                                                                                 compression via pooling over fixed-size segments
+                       10                                                                                                        (Nawrot et al., 2022; Clark et al., 2022; Godey
+                                                                                                                                 et al., 2022; Tay et al., 2022; Yu et al., 2023), while
+                       5                                                                                                         others employ boundary predictors that dynami-
+                                                                                                                                 cally determine where to pool (Nawrot et al., 2023;
+                       0    0 Specu1lative byt2es accept3ed per st4ep (out o5f n = 6) 6                                          Hwang et al., 2025). These boundary predictors
+                                                                                                                                 are either trained in isolation, as in BLT (Pagnoni
+Figure 7: Distribution of accepted speculative bytes                                                                             et al., 2025), or jointly optimized with the main
+over 100 decoding steps. LCA accepts a mean of 3.05                                                                              language modeling objective (Hwang et al., 2025;
+of the 6 speculative candidates per step, and 15% of                                                                             Owodunni et al., 2025; Ahia et al., 2023). A related
+steps accept the full window, indicating that LCA’s                                                                              line of work studies how controlling the compres-
+multi-byte predictions are frequently coherent across an                                                                         sion rate of a sequence affects performance across
+entire segment rather than accepted one byte at a time.                                                                          multiple languages and domains (Ahia et al., 2024;
+                                                                                                                                 Owodunni et al., 2025; Limisiewicz et al., 2026).
+6.3 Improving Baseline Throughput with
+      LCA Models
+
+Here, we extend our analysis with speculative de-
+coding acceptance to include generating candidate
+bytes that are then verified by an external baseline
+model. This ablation investigates how LCA can be
+used to accelerate a baseline model by increasing
+
+                                                                                                                              8
+             40.00            DailySum                                           es-en                                                                               fr-en
+             39.75
+             39.50       2s.2a9m×esqpueaeldituyp              0.822           2s.1a8m×esqpueaeldituyp                                                  0.806         2s.1a9m×esqpueaeldituyp
+             39.25
+Performance  39.00                                            0.820                                                                                    0.804
+             38.75
+             38.50                                            0.818                                                                                    0.802
+             38.25
+             38.00                                                                                                  0.800
+                                                              0.816
+                     30
+                                                                                                                                                       0.798
+
+                                                              0.814                                                                                                  T1h5ro0ugh1p75ut (b2y0t0es/s2e2c5)
+                         40Throu5g0hput 6(0bytes7/s0ec)  80   90 100    125   sT1ehl5fr-0voeurigf1yh7p5ut  (2b0Ly0CtAe+s2/Fs2xe5Tc-v)e2ri5fy0all  275     100 125                                        250
+                                                         FxT   LCA NBP   LCA                                                                           Pareto front
+
+Figure 8: Throughput vs. performance across four inference strategies. We compare LCA’s next-byte head only,
+LCA’s self-verified multi-byte prediction, LCA with FxT verifying the MBP head, and the FxT baseline. External
+verification with FxT lets LCA match or exceed FxT’s performance while running 2.1-2.3× faster across all three
+tasks with n = 7. See acceptance rate in Table 5 of Appendix B.
+
+   However, most hierarchical models use latent                                  similar embedded MTP approaches use separate
+tokenization primarily to reduce sequence length                                 lightweight heads for each future position (Cai
+or improve representation learning. At inference,                                et al., 2025). These designs share two limitations
+they still follow standard autoregressive decoding,                              especially relevant to hierarchical byte-level mod-
+producing one byte at a time. Thus, while hierar-                                els: the number of prediction heads grows with the
+chical models reduce the cost of processing byte                                 number of future tokens, adding parameter cost,
+sequences, they do not address the decoding bottle-                              and fixed-offset prediction treats the next n tokens
+neck. Our work builds on hierarchical byte-level                                 as a static horizon, even though byte sequences
+modeling, but uses learned latent tokens not only                                have variable local structure and may be better pre-
+as compressed representations but also as the unit                               dicted as learned segments.
+for parallel multi-byte prediction. A concurrent
+work, FastBLT (Kallini et al., 2026), uses diffusion                                LCA addresses both limitations by tying multi-
+language modeling to accelerate byte-level infer-                                byte prediction to the segments produced by the
+ence; unlike our approach, its boundary predictor                                hierarchical boundary predictor. A single decoder
+is trained independently of the language model, as                               head equipped with the LCA mask predicts all
+in BLT.                                                                          bytes within a segment in parallel, conditioned only
+                                                                                 on previous segments. This removes the per-token
+7.2 Improving Inference Speed with                                               parameter overhead of multi-head MTP and re-
+      Multi-Token Prediction                                                     places fixed-offset prediction with variable-length,
+                                                                                 segment-aligned prediction.
+
+Autoregressive language models generate one to-                                  8 Conclusion
+ken per forward pass, making decoding latency a
+major bottleneck. Multi-token prediction (MTP)                                   We introduced LCA, a dynamic multi-byte predic-
+addresses this limitation by training models to pre-                             tion method for hierarchical byte-level LMs. Un-
+dict multiple future tokens from the same context.                               like prior MBP approaches that scale parameters
+Prior work has shown that predicting multiple fu-                                with the number of tokens predicted in parallel,
+ture tokens can improve sample efficiency and ac-                                LCA uses a single decoder head and a boundary-
+celerate generation (Gloeckle et al., 2024; Li et al.,                           aware attention mask to predict a variable number
+2024; Gerontopoulos et al., 2026; Ankner et al.,                                 of bytes per step. Our method aligns MBP with
+2024). In practice, however, most MTP methods                                    the hierarchical structure already present in modern
+rely on additional prediction heads, auxiliary draft                             byte-level models. Across four downstream tasks,
+modules, or fixed future offsets, while others have                              LCA lies on the Pareto front of performance and
+not be explored for hierarchical models and multi-                               throughput on three of four. We show that latent to-
+lingual settings Grivas et al. (2025).                                           kens learned by hierarchical models can be reused
+                                                                                 as units of parallel generation, removing the need
+   Medusa (Cai et al., 2024), for example, attaches                              for separate per-token MBP heads.
+multiple decoding heads to a base model, and
+
+                                                                              9
+Acknowledgments                                               Tianle Cai, Yuhong Li, Zhengyang Geng, Hongwu Peng,
+                                                                 Jason D Lee, Deming Chen, and Tri Dao. 2024.
+This material is partially based upon work sup-                  Medusa: Simple llm inference acceleration frame-
+ported by OSU Kirwan Institute. We are also grate-               work with multiple decoding heads. arXiv preprint
+ful to Amazon Research Awards (AWS), Ohio Su-                    arXiv:2401.10774.
+percomputing Center (OSC), UFIT Research Com-
+puting, and NAIRR Pilot Program (NAIRR250264)                 Yuxuan Cai, Xiaozhuan Liang, Xinghua Wang, Jin Ma,
+for providing the compute resources for this work.               Haijin Liang, Jinwen Luo, Xinyu Zuo, Lisheng Duan,
+                                                                 Yuyang Yin, and Xi Chen. 2025. Fastmtp: Accelerat-
+Limitations                                                      ing llm inference with enhanced multi-token predic-
+                                                                 tion. arXiv preprint arXiv:2509.18362.
+First, we conduct experiments at a single model
+scale (373M parameters) and training corpus,                  Charlie Chen, Sebastian Borgeaud, Geoffrey Irving,
+which lets us compare LCA against parameter-                     Jean-Baptiste Lespiau, Laurent Sifre, and John
+matched baselines under identical conditions; veri-              Jumper. 2023. Accelerating large language model
+fying that the gains persist at larger scales remains            decoding with speculative sampling. arXiv preprint
+future work and would require more compute re-                   arXiv:2302.01318.
+sources that are not available to us. Second, our
+evaluation covers four English-centric or English-            Jonathan H. Clark, Dan Garrette, Iulia Turc, and John
+paired tasks and does not include low-resource or                Wieting. 2022. Canine: Pre-training an efficient
+morphologically rich languages, though LCA in-                   tokenization-free encoder for language representa-
+herits its tokenization behavior directly from the               tion. Transactions of the Association for Computa-
+boundary predictor and should transfer without ar-               tional Linguistics, 10:73–91.
+chitectural change. Finally, the speculative horizon
+n is task-dependent under threshold acceptance,               Anastasios Gerontopoulos, Spyridon Gidaris, and Nikos
+which adds a small tuning cost; however, this cost               Komodakis. 2026. Multi-token prediction needs reg-
+disappears under speculative decoding verification               isters. Advances in Neural Information Processing
+(Figure 8), where n can be increased without chang-              Systems, 38:60189–60214.
+ing model output.
+                                                              Fabian Gloeckle, Badr Youbi Idrissi, Baptiste Rozière,
+References                                                       David Lopez-Paz, and Gabriel Synnaeve. 2024. Bet-
+                                                                 ter & faster large language models via multi-token
+Orevaoghene Ahia, Sachin Kumar, Hila Gonen, Valentin             prediction. arXiv preprint arXiv:2404.19737.
+   Hofmann, Tomasz Limisiewicz, Yulia Tsvetkov, and
+   Noah A. Smith. 2024. MAGNET: Improving the mul-            Nathan Godey, Roman Castagné, Éric de la Clergerie,
+   tilingual fairness of language models with adaptive           and Benoît Sagot. 2022. MANTa: Efficient gradient-
+   gradient-based tokenization. In The Thirty-eighth An-         based tokenization for end-to-end robust language
+   nual Conference on Neural Information Processing              modeling. In Findings of the Association for Com-
+   Systems.                                                      putational Linguistics: EMNLP 2022, pages 2859–
+                                                                 2870, Abu Dhabi, United Arab Emirates. Association
+Orevaoghene Ahia, Sachin Kumar, Hila Gonen, Jungo                for Computational Linguistics.
+   Kasai, David Mortensen, Noah Smith, and Yulia
+   Tsvetkov. 2023. Do all languages cost the same?            Aaron Grattafiori, Abhimanyu Dubey, Abhinav Jauhri,
+   tokenization in the era of commercial language mod-           Abhinav Pandey, Abhishek Kadian, Ahmad Al-
+   els. In Proceedings of the 2023 Conference on Em-             Dahle, Aiesha Letman, Akhil Mathur, Alan Schelten,
+   pirical Methods in Natural Language Processing,               Alex Vaughan, and 1 others. 2024. The llama 3 herd
+   pages 9904–9923, Singapore. Association for Com-              of models. arXiv preprint arXiv:2407.21783.
+   putational Linguistics.
+                                                              Andreas Grivas, Lorenzo Loconte, Emile van Krieken,
+Rami Al-Rfou, Dokook Choe, Noah Constant, Mandy                  Piotr Nawrot, Yu Zhao, Euan Wielewski, Pasquale
+   Guo, and Llion Jones. 2018. Character-level lan-              Minervini, Edoardo Ponti, and Antonio Vergari. 2025.
+   guage modeling with deeper self-attention. In AAAI            Fast and expressive multi-byte prediction with proba-
+   Conference on Artificial Intelligence.                        bilistic circuits. arXiv preprint arXiv:2511.11346.
+
+Zachary Ankner, Rishab Parthasarathy, Aniruddha               Karl Moritz Hermann, Tomás Kociský, Edward Grefen-
+   Nrusimha, Christopher Rinard, Jonathan Ragan-                 stette, Lasse Espeholt, Will Kay, Mustafa Suleyman,
+   Kelley, and William Brandon. 2024. Hydra:                     and Phil Blunsom. 2015. Teaching machines to read
+   Sequentially-dependent draft heads for medusa de-             and comprehend. In NIPS, pages 1693–1701.
+   coding. arXiv preprint arXiv:2402.05109.
+                                                              Sukjun Hwang, Brandon Wang, and Albert Gu. 2025.
+                                                                 Dynamic chunking for end-to-end hierarchical se-
+                                                                 quence modeling. arXiv preprint arXiv:2507.07955.
+
+                                                              Julie Kallini, Artidoro Pagnoni, Tomasz Limisiewicz,
+                                                                 Gargi Ghosh, Luke Zettlemoyer, Christopher
+                                                                 Potts, Xiaochuang Han, and Srinivasan Iyer. 2026.
+
+                                                          10
+   Fast byte latent transformer. arXiv preprint                Piotr Nawrot, Jan Chorowski, Adrian Lancucki, and
+   arXiv:2605.08044.                                              Edoardo Maria Ponti. 2023. Efficient transformers
+                                                                  with dynamic token pooling. In Proceedings of the
+John Kirchenbauer, Abhimanyu Hans, Brian Bartold-                 61st Annual Meeting of the Association for Compu-
+   son, Micah Goldblum, Ashwinee Panda, and Tom                   tational Linguistics (Volume 1: Long Papers), pages
+   Goldstein. 2026. Multi-token prediction via self-              6403–6417.
+   distillation. arXiv preprint arXiv:2602.06019.
+                                                               Piotr Nawrot, Szymon Tworkowski, Michał Tyrolski,
+Taku Kudo. 2018. Subword regularization: Improv-                  Lukasz Kaiser, Yuhuai Wu, Christian Szegedy, and
+   ing neural network translation models with multiple            Henryk Michalewski. 2022. Hierarchical transform-
+   subword candidates. In Proceedings of the 56th An-             ers are more efficient language models. In Find-
+   nual Meeting of the Association for Computational              ings of the Association for Computational Linguis-
+   Linguistics (Volume 1: Long Papers), pages 66–75.              tics: NAACL 2022, pages 1559–1571, Seattle, United
+                                                                  States. Association for Computational Linguistics.
+Nathan Lambert, Jacob Morrison, Valentina Pyatkin,
+   Shengyi Huang, Hamish Ivison, Faeze Brahman,                Pit Neitemeier, Björn Deiseroth, Constantin Eichenberg,
+   Lester James V. Miranda, Alisa Liu, Nouha Dziri,               and Lukas Balles. 2025. Hierarchical autoregressive
+   Shane Lyu, Yuling Gu, Saumya Malik, Victoria Graf,             transformers: Combining byte-and word-level pro-
+   Jena D. Hwang, Jiangjiang Yang, Ronan Le Bras,                 cessing for robust, adaptable language models. arXiv
+   Oyvind Tafjord, Chris Wilhelm, Luca Soldaini, and              preprint arXiv:2501.10322.
+   4 others. 2024. Tülu 3: Pushing frontiers in open
+   language model post-training.                               Abraham Toluwase Owodunni, Orevaoghene Ahia, and
+                                                                  Sachin Kumar. 2025. Flexitokens: Flexible tokeniza-
+Yaniv Leviathan, Matan Kalman, and Yossi Matias.                  tion for evolving language models. arXiv preprint
+   2023. Fast inference from transformers via spec-               arXiv:2507.12720.
+   ulative decoding. In International conference on
+   machine learning, pages 19274–19286. PMLR.                  Artidoro Pagnoni, Ramakanth Pasunuru, Pedro Ro-
+                                                                  driguez, John Nguyen, Benjamin Muller, Margaret
+Yuhui Li, Fangyun Wei, Chao Zhang, and Hongyang                   Li, Chunting Zhou, Lili Yu, Jason E Weston, Luke
+   Zhang. 2024. Eagle: Speculative sampling re-                   Zettlemoyer, and 1 others. 2025. Byte latent trans-
+   quires rethinking feature uncertainty. arXiv preprint          former: Patches scale better than tokens. In Proceed-
+   arXiv:2401.15077.                                              ings of the 63rd Annual Meeting of the Association
+                                                                  for Computational Linguistics (Volume 1: Long Pa-
+Tomasz Limisiewicz, Terra Blevins, Hila Gonen, Ore-               pers), pages 9238–9258.
+   vaoghene Ahia, and Luke Zettlemoyer. 2024. MYTE:
+   Morphology-driven byte encoding for better and              Weizhen Qi, Yu Yan, Yeyun Gong, Dayiheng Liu,
+   fairer multilingual language modeling. In Proceed-             Nan Duan, Jiusheng Chen, Ruofei Zhang, and Ming
+   ings of the 62nd Annual Meeting of the Association             Zhou. 2020. ProphetNet: Predicting future n-gram
+   for Computational Linguistics (Volume 1: Long Pa-              for sequence-to-SequencePre-training. In Findings
+   pers), pages 15059–15076, Bangkok, Thailand. As-               of the Association for Computational Linguistics:
+   sociation for Computational Linguistics.                       EMNLP 2020, pages 2401–2410, Online. Association
+                                                                  for Computational Linguistics.
+Tomasz Limisiewicz, Artidoro Pagnoni, Srini Iyer, Mike
+   Lewis, Sachin Mehta, Alisa Liu, Margaret Li, Gargi          Siva Reddy, Danqi Chen, and Christopher D. Manning.
+   Ghosh, and Luke Zettlemoyer. 2026. Compute opti-               2019. CoQA: A conversational question answering
+   mal tokenization. arXiv preprint arXiv:2605.01188.             challenge. Transactions of the Association for Com-
+                                                                  putational Linguistics, 7:249–266.
+Anton Lozhkov, Loubna Ben Allal, Leandro von Werra,
+   and Thomas Wolf. 2024. Fineweb-edu: the finest              Rico Sennrich, Barry Haddow, and Alexandra Birch.
+   collection of educational content.                             2016. Neural machine translation of rare words with
+                                                                  subword units. In Proceedings of the 54th Annual
+Mikhail Menschikov, Alexander Kharitonov, Maiia Ko-               Meeting of the Association for Computational Lin-
+   tyga, Vadim Porvatov, Anna Zhukovskaya, David                  guistics (Volume 1: Long Papers), pages 1715–1725,
+   Kagramanyan, Egor Shvetsov, and Evgeny Burnaev.                Berlin, Germany. Association for Computational Lin-
+   2025. Beyond early-token bias: Model-specific                  guistics.
+   and language-specific position effects in multilingual
+   llms. arXiv preprint arXiv:2505.16134.                      Kevin Slagle. 2024. Spacebyte: Towards deleting tok-
+                                                                  enization from large language modeling. Advances in
+Sabrina J Mielke, Zaid Alyafeai, Elizabeth Salesky,               Neural Information Processing Systems, 37:124925–
+   Colin Raffel, Manan Dey, Matthias Gallé, Arun Raja,            124950.
+   Chenglei Si, Wilson Y Lee, Benoît Sagot, and 1 oth-
+   ers. 2021. Between words and characters: A brief            Mitchell Stern, Noam Shazeer, and Jakob Uszkoreit.
+   history of open-vocabulary modeling and tokeniza-              2018. Blockwise parallel decoding for deep autore-
+   tion in nlp. arXiv preprint arXiv:2112.10508.                  gressive models. Advances in Neural Information
+                                                                  Processing Systems, 31.
+
+                                                           11
+Yi Tay, Vinh Q. Tran, Sebastian Ruder, Jai Gupta,             A.1 Hyperparameters
+   Hyung Won Chung, Dara Bahri, Zhen Qin, Simon
+   Baumgartner, Cong Yu, and Donald Metzler. 2022.            Table 2 summarizes the architectural configurations
+   Charformer: Fast character transformers via gradient-      used for the main byte-level model variants. All
+   based subword tokenization. In International Con-          models use the same optimizer family and training
+   ference on Learning Representations.                       hyperparameters unless explicitly noted elsewhere.
+                                                              For the MLP-MBP configuration trained at com-
+Junxiong Wang, Tushaar Gangavarapu, Jing Nathan               pression rate 5, the MB decoder depth is increased
+   Yan, and Alexander M Rush. 2024. Mambabyte:                from 3 to 5 layers.
+   Token-free selective state space model. arXiv
+   preprint arXiv:2401.13660.                                 Model                   Encoder    LM Module  Decoder NB  Decoder MB
+                                                                                                   Module        NT          MB
+Linting Xue, Aditya Barua, Noah Constant, Rami Al-            LlamaByte                  22
+   Rfou, Sharan Narang, Mihir Kale, Adam Roberts,             SpaceByte                   2             0          0           0
+   and Colin Raffel. 2022. ByT5: Towards a token-free         FxT                         2            16          4           0
+   future with pre-trained byte-to-byte models. Transac-      MLP-MBP                     2            16          4           0
+   tions of the Association for Computational Linguis-        LCA-MBP                     2            16          2           3
+   tics, 10:291–306.                                                                                   16          2           2
+
+Lili Yu, Dániel Simig, Colin Flaherty, Armen Agha-            Table 2: Architectural configurations used across model
+   janyan, Luke Zettlemoyer, and Mike Lewis. 2023.            variants. Unless otherwise stated, all models use the
+   Megabyte: Predicting million-byte sequences with           same hidden dimension, training hyperparameters, and
+   multiscale transformers. Advances in Neural Infor-         optimizer settings. For MLP-MBP trained with com-
+   mation Processing Systems, 36:78808–78823.                 pression rate 5, the MB decoder uses 5 layers instead of
+                                                              3.
+Biao Zhang, Philip Williams, Ivan Titov, and Rico Sen-
+   nrich. 2020. Improving massively multilingual neu-         B Extended Results
+   ral machine translation and zero-shot translation. In
+   Proceedings of the 58th Annual Meeting of the Asso-        French Translation Results. Figure 9 re-
+   ciation for Computational Linguistics, pages 1628–         ports performance versus throughput on
+   1639, Online. Association for Computational Linguis-       French→English translation. LCA lies on
+   tics.                                                      the Pareto front, achieving substantially higher
+                                                              BLEU than MLP-MBP at similar throughput.
+Jeffrey Zhou, Tianjian Lu, Swaroop Mishra, Siddhartha         The trend mirrors the Spanish→English result in
+   Brahma, Sujoy Basu, Yi Luan, Denny Zhou, and               Figure 3.
+   Le Hou. 2023. Instruction-following evaluation for
+   large language models. Preprint, arXiv:2311.07911.                                            Trans fr-en
+
+Appendix                                                                          35
+
+A General Architecture, Training                              Performance (BLEU)  30
+     Configurations, and Hyperparameters
+                                                                                  25
+Reading Figure 1. We use a consistent visual
+encoding throughout the figure. The uniform red                                   20
+boxes denote the processed bytes sequence. In
+the boundary predictor, multi-colored bands indi-                                 15
+cate tokenization into segments, with bytes sharing
+a color belonging to the same segment. Deeper                                     10
+shades (green, orange, blue, yellow) mark latent
+tokens, which are pooled aggregates of the bytes in                               5
+each segment, and rotated color blocks indicate po-
+sitions where rotary positional embeddings (RoPE)                                 0
+have been applied. Broken outlines on the latent to-
+kens after the LM module signal that those tokens                                     150 175 T2h0r0ough2p2u5t (b2y5t0es/se2c7)5 300 325
+have been contextualized by the LM transformer
+stack. Finally, module backgrounds encode the                                         LlamaByte  FxT        MLP-MBP  Pareto front
+attention mask used by each module: yellow for                                        SpaceByte  Eff-FxT    LCA-MBP
+standard causal attention and orange for the LCA
+mask.                                                         Figure 9: Performance vs. throughput on French–
+                                                              English translation. LCA (⋆) lies on the Pareto front.
+
+                                                              Throughput for Candidate Bytes n Ablation;
+                                                              Table 3 reports throughput (tokens/second) for the
+                                                              n-ablation in Figure 5. Throughput decreases
+                                                              monotonically with n on all three tasks, as larger
+
+                                                          12
+speculative windows incur more rejected candi-
+dates per step. The drop is steepest on DailySum
+(-22% from n = 3 to n = 7), reflecting its lower
+baseline throughput and tighter sensitivity to rejec-
+tion overhead.
+
+               n DailySum es-en fr-en
+
+               3 210.42 285.75 278.21
+               4 205.42 283.47 278.13
+               5 194.50 254.57 263.99
+               6 181.24 234.55 252.31
+               7 164.18 221.09 230.99
+
+Table 3: Throughput (bytes/sec) of LCA-MBP across
+speculative-candidate counts n ∈ {3, 4, 5, 6, 7} at ac-
+ceptance threshold τ = 0.75. Throughput decreases
+monotonically with n on all three tasks, as larger specu-
+lative windows incur more rejected candidates per step.
+
+Performance and Acceptance Rate with Specu-                    Model            DailySum  es-en    fr-en
+lative Decoding: Here we report acceptance rate
+and performance at n = 3 for our speculative de-               FxT                100.00  100.00  100.00
+coding results in Table 4. We dropped KV caching               LCA NBP            100.00  100.00  100.00
+for all our results that use this method. We note              LCA Self-verify    46.36   45.85   45.85
+that LCA-MBP outperforms MLP-MBP on mul-                       LCA FxT-verify     47.97   50.77   52.04
+tiple tasks despite achieving a lower acceptance
+rate.
+
+Model        IfEval CoQA DailySum es-en fr-en Avg
+
+Performance                                                    Table 5: Token acceptance rates (%) across three tasks
+                                                               under self and external (FxT) verification using n = 7
+MLP-MBP 46.54 20.85  32.73 0.8178 0.8064 –                     candidate bytes.
+LCA-MBP 44.97 22.11  38.09 0.8147 0.7977 –
+
+Acceptance rate (%)
+
+MLP-MBP 71.80 90.15  90.79  91.82 91.82 87.28
+LCA-MBP 51.17 73.93  81.22  79.85 79.85 73.20
+
+Table 4: Performance and acceptance rate under spec-
+ulative decoding acceptance. Performance is constant
+across the number of speculative candidates n; accep-
+tance rates are reported at n = 3.
+
+Throughput and Acceptance rate for LCA with
+External Verification: Table 5 reports the token
+acceptance rates for the external verification exper-
+iment in §6.3. FxT and LCA NBP accept every
+token by construction, since they perform standard
+next-byte decoding without speculation. Under
+speculative decoding, LCA Self-verify and LCA
+FxT-verify accept 78-84% of speculative bytes
+across the three tasks, meaning that most multi-
+byte predictions are confirmed on the first pass and
+only a minority require a fallback to the verifier.
+
+                                                           13
+

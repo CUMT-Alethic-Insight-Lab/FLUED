@@ -1,0 +1,805 @@
+Byte-based Multilingual NMT for Endangered Languages
+
+        Mengjiao Zhang                                               Jia Xu
+Stevens Institute of Technology                        Stevens Institute of Technology
+mzhang49@stevens.edu
+                                                          jxu70@stevens.edu
+
+                Abstract                         Bhattacharya, 2018). Second, out-of-vocabulary
+
+Multilingual neural machine translation          (OOV) words/subwords are still unavoidable and
+(MNMT) jointly trains a shared model             hurt translation performance. Third, some lan-
+for translation with multiple language           guages show a decrease in translation quality with
+pairs. However, traditional subword-based        multilingual training due to specific characteristics
+MNMT approaches suffer from out-of-              of the language variety, a problem known as the
+vocabulary (OOV) issues and representation       representation bottleneck (Dabre et al., 2020; Zoph
+bottleneck, which often degrades translation     and Knight, 2016). It essentially limits the im-
+
+performance on certain language pairs. While     provement of transfer learning from high-resource
+byte tokenization is used to tackle the OOV      NMT, like Chinese-English (Gu et al., 2018) to the
+problems in neural machine translation (NMT),    low-resource NMT, like Aymara-Spanish.
+until now its capability has not been validated
+in MNMT. Additionally, existing work has            Recently, byte-based NMT models show com-
+not studied how byte encoding can benefit        parable performance to word/subword-based mod-
+endangered language translation to our knowl-    els (Shaham and Levy, 2021; Wang et al., 2020).
+
+edge. We propose a byte-based multilingual       Because modern byte encoding systems such as
+neural machine translation system (BMNMT)        UTF-8 have only 256-byte entries in total, i.e.,
+to alleviate the representation bottleneck and   0x00 to 0xff, the unified byte tokenization in
+improve translation performance in endangered    all languages obviates the traditional preprocess-
+languages. Furthermore, we design a random       ing of language-specific subword tokenization and
+byte mapping method with an ensemble             restricts the vocabulary to a fixed and small one.
+prediction to enhance our model robustness.      Therefore, the 256-byte-sized UTF-8 vocabulary
+Experimental results show that our BMNMT         avoids the OOV issues.
+consistently and significantly outperforms
+
+subword/word-based baselines on twelve              Despite the advantages of byte tokenization, the
+language pairs up to +18.5 BLEU points, an       byte encoding has not been investigated in mul-
+840% relative improvement.                       tilingual NMT yet, to the best of our knowledge.
+
+1 Introduction                                   In this paper, we show that byte tokenization can
+                                                 be naturally applied to MNMT systems with great
+
+Neural Machine Translation (NMT) has achieved advantages. Given the unified encoding of byte
+
+great success and dominates recent research on tokenization in all languages, byte encoding is able
+
+translation tasks in both academic and industry to address the representation bottleneck problem in
+
+studies (Wu et al., 2016; Stahlberg, 2020; Chen MNMT systems effectively. For example, Figure 1
+
+et al., 2018). In particular, multilingual neural ma- shows the overlaps of subword and byte vocabular-
+
+chine translation (MNMT) has been shown to ben- ies among multiple languages. We notice with the
+
+efit low-resource language translation by jointly growth of the language number, there is almost no
+
+training MNMT models with high-resource lan- overlap of word vocabularies, while the byte vocab-
+
+guages (Johnson et al., 2017). However, most ex- ulary still has a large overlap. This large overlap
+
+isting NMT/MNMT models are based on word of byte vocabulary enables enhanced knowledge
+
+or subword tokenization, which has three main sharing among different languages and can help
+
+problems. First, language-specific tokenizers, the model learn more generalized representations
+
+such as BPE (Shaham and Levy, 2021), may in- for these languages. Taking the low resource as a
+
+troduce inaccurate segmentations (Banerjee and common property for most endangered languages,
+
+                                                 4407
+
+Proceedings of the 29th International Conference on Computational Linguistics, pages 4407–4417
+                                              October 12–17, 2022.
+                    Overlap Ratio of Multiple Languages.  guage translation that often does not have satis-
+
+Overlap Ratio  0.8                                        factory results due to scarce resources and other
+                                                          linguistic characteristics (Levow et al., 2021; Ens
+               0.6                                        et al., 2019; Liu et al., 2022). We demonstrate
+                                                          that our BMNMT consistently and significantly
+               0.4         Byte vocabulary                enhances the translation performance on all lan-
+                           Word vocabulary                guages, including five high-resource languages,
+               0.2                                        German, Arabic, Chinese, Farsi, Turkish to English,
+                                                          one low-resource language, Slovenian to English,
+               0.0 2 N3umbe4r of Lan5guage6s 7
+
+Figure 1: The vocabulary overlap ratio of byte and sub- and ten endangered languages, Asháninka, Aymara,
+
+word tokens. The area upper/lower bound denotes the       Bribri, Guarani, Nahuatl, Otomí, Quechua, Rará-
+highest/lowest ratio among all language combinations,     muri, Shipibo-Konibo, and Wixarika to Spanish.
+given a language number.                                  For example, the translation BLEU score [%] in-
+
+                                                          creases from 0 to 3.9 for the endangered language
+
+we think byte-based MNMT is particularly helpful          Shipibo-Konibo, and from 2.2 to 20.7 for the low-
+for endangered language translation. Therefore, we        resource language Slovenian to English, i.e., +18
+aim to incorporate byte tokenization in MNMT to           BLEU points. The contributions of this work are
+alleviate the representation bottleneck problem in        summarized as follows:
+
+multilingual translation.                                       • We propose an effective byte-based MNMT
+
+Besides incorporating byte encoding into                        framework to alleviate the representation bot-
+
+MNMT, we aim to further investigate the gener-                  tleneck problem in word/subword-based mul-
+
+alizability of byte encoding. We observed that byte             tilingual translation, especially for endangered
+
+mapping can be arbitrary. For example, the char-                languages.
+
+acters “a”-“z” are represented with bytes 97-122                • We design a novel method of random byte
+using UTF-8. However, we conjecture “a”-“z” can                   encoding with ensemble prediction to enhance
+be any byte from 0 to 255. The byte representation                the generalizability and robustness of our byte-
+does not need to be determined as a single encod-                 based MNMT model.
+ing mapping. However, existing byte-based NMT
+
+systems do not consider such randomness of byte                 • We evaluate BMNMT on various training
+encoding. Moreover, we think language models                      strategies. Extensive experiments validate the
+should provide similar performance given different                effectiveness, generalizability, and robustness
+byte encoding methods to improve the generaliz-                   of our model.
+ability and robustness. Therefore, we design a new
+
+encoding method that we call Random Byte Encod- In the following context, we first outline the pre-
+
+ing by incorporating the random representation of vious work in Section 2, then describe our method
+
+bytes and reduce the variance of model outputs. in Section 3, finally show our experimental results
+
+In this work, to address these challenges, we pro- in Section 4 and conclude this work in Section 6.
+
+pose a Byte-based Multilingual Neural Machine             2 Related Work
+Translation framework (BMNMT). It simultane-
+
+ously considers the byte randomness and the en-           Multilingual Neural Machine Translation
+dangered languages in multilingual translation and        Word and subword-level tokenizations are widely
+works as follows. First, we design a novel MNMT           used in natural language processing, including
+framework that can take the byte encoding of sen-         NMT/MNMT. Morishita et al. (Morishita et al.,
+tences as inputs. Then, we incorporate the ran-           2018) propose to incorporate hierarchical subword
+domness of the byte encoding as discussed above           features to improve neural machine translation.
+by generating random byte mapping to replace the          Massively multilingual NMT models are proposed
+original byte ordering. We finally propose an en-         by Aharoni et al. (Aharoni et al., 2019) and
+semble prediction method by combining different           Arivazhagan et al. (Arivazhagan et al., 2019). They
+encodings for reliable outputs.                           are trained on massive language pairs and show
+
+Our BMNMT achieves amazing results in im- a strong and positive impact on low-resource
+
+proving the low-resource and the endangered lan- languages. However, these models tend to have
+
+                                                          4408
+representation bottlenecks (Dabre et al., 2020), g o o d                          好       gut     iyi
+
+due to large vocabulary size and large diversity of     103 111 111 100 229 165 189 103 117 116 105 121 105
+training languages. Two MNMT systems (Tan
+et al., 2019; Pan et al., 2021) are proposed to solve   (a) en                    (b) zh  (c) de  (d) tr
+
+this problem by modifying the model architectures,      Figure 2: Byte representation of four languages.
+adding special constraints on training, or designing
+
+more complicated preprocessing methods. Pan
+
+et al. (Pan et al., 2021) adopt the contrastive         is a general encoding method and contains almost
+learning scheme in many-to-many MNMT. Tan et            all characters in existing languages. Figure 2 shows
+al. (Tan et al., 2019) propose a distillation based     four different languages represented in bytes, in-
+approach to boost the accuracy of MNMT systems.         cluding English (en), Chinese (zh), German (de),
+However, these word/subword-based models still          and Turkish (tr). A character in each language
+need complex preprocessing steps such as data           is mapped into bytes. Particularly, characters of
+augmentation or special model architecture design.      some languages such as Chinese are mapped into
+
+                                                                 multiple bytes.
+Byte tokenizaiton Recently, byte tokenization
+
+methods are proposed to address the OOV prob-           3.2 Problem Definition
+lems in word/subword-based models. Ruiz et
+al. (Ruiz Costa-Jussà et al., 2017) compare             Here, we first describe the input and output of the
+character-based and byte-based NMT systems and          multilingual translation task.
+show that byte-based systems converge faster.
+Wang et al. (Wang et al., 2020) combine subwords        Definition 1 (Multilingual Domain). We use S =
+tokenization with byte encoding and propose a byte-     {S1, S2, . . . , SN } to denote the source language
+level BPE (BBPE). Shaham and Levy (Shaham and           domain and use T = {T1, T2, . . . , TM } to denote
+Levy, 2021) propose embeddingless byte-to-byte          the target language domain. Si or Tj represents
+machine translation by replacing the token embed-       a type of language. Note that S and T can have
+ding layer in subword-based models with one-hot         intersection.
+encoding for bytes. However, among these mod-
+els, byte-level MNMT is still not studied, and the      Definition 2 (Multilingual Sentence Pair). Given
+randomness of byte tokenization as we discussed         the source domain S and the target domain T ,
+above is not investigated.                              we define the multilingual sentence pair set L =
+                                                        {(si, sj) | si ∈ Si and sj ∈ Tj and Si ≠ Tj}.
+   Therefore, different from the previous work, we      Here, the si and sj denote two parallel sentences
+mainly focus on byte-based MNMT, while simulta-         from different languages.
+neously considering the randomness of bytes and
+endangered languages.                                      Based on the above description, we formally
+                                                        define the multilingual translation task as follow:
+
+3 Methods                                               Definition 3 (Multilingual Translation). Given the
+                                                        multilingual sentence pair L as the training set
+3.1 Preliminary of Byte Representation                  and a translation model M with parameters θ, we
+                                                        aim to find the optimized parameters θˆ of M to
+Any writing system can be encoded with a byte
+sequence (Needleman, 2000; Shaham and Levy,             minimize the following objective function:
+2021), using pre-defined byte encoding methods,
+
+such as UTF-8 for almost all languages, GBK for         θˆ = argmin                  −p(sj) log p(sˆj|si; θ). (1)
+simplified Chinese, and eucJP for Japanese.
+                                                        θ (si,sj )∈L
+   Formally, we use a mapping function f : C →
+
+Bn to denote the mapping from characters in a raw
+
+sentence to bytes. Here, C is the character domain      Here, sˆj is the predicted sentence of the target
+for all languages, B = (0, 1, . . . , 255) is the byte
+domain, and n is the maximum byte number that a         sentence sj. To generate each token xˆtj in sˆj,
+character maps into. Also, we define f −1 on a byte     we use si and the previous tokens s<j t of sj to
+                                                        calculate a probability p(xˆtj) = M(si, s<j t; θ).
+
+sequence to convert it back to the text. In this paper, Assume sj consists of m tokens (byte or sub-
+
+we use UTF-8 as the mapping function, because it word): (xj1, x2j , . . . , xmj ), the conditional probabil-
+
+4409
+                        Byte Decoding                                        htj ∈ Rd for each generated token xˆtj of the target
+                                                                             sentence. Here, d is the dimension of the decoder
+                                       Th        a  n  k          s  .       output. Finally, M calculates a probability p(xˆtj)
+                                                                             with a fully-connected (FC) layer with Softmax:
+                                       84 104 97 110 107 115 46
+
+Model Forward                                 Linear+Softmax
+
+               Encoder                           Decoder
+
+   Positional
+                         Positional
+                             hjt = Dec(Enc(ri), rj<t) ∈ Rd, (4)
+    Encoding                           Encoding                               p(xˆjt ) = Softmax(Whjt ) ∈ R256. (5)
+
+            One-hot Vector                        One-hot Vector
+
+Byte Encoding
+
+232 176 162 232 176 162 227 128 130    0  84 104 97 110 107 115              Here, W ∈ R256×d is the weight in the FC layer
+                                                                             to project the output space of the decoder into the
+谢              谢                。      <s> T     h  a  n          k  s       byte space.
+
+               Source sentence                Target sentence
+
+Figure 3: The overview of the proposed byte-based                            Byte decoding After getting the probability dis-
+multilingual translation model BMNMT.                                        tribution p(xˆjt ) of the current output token xˆtj, we
+                                                                             then use Beam Search (BS) to sample the target
+ity p(sˆj|si; θ) is defined as:                                              byte token xˆtj. Finally, after generating the entire
+                                                                             byte sequence, we use the inverse mapping f −1 to
+                        m                     m
+                                                                             retrieve the real generated text sentence sˆj:
+p(sˆj|si; θ) = p(xˆtj) = M(si, s<j t; θ).
+
+                        t=1               t=1                                 xˆjt = BS(p(xˆjt ))
+
+                                                                        (2)                                          (6)
+
+3.3 Multilingual translation with byte-level                                  sˆj = f −1(xˆ1j , xˆj2, . . . , xˆjm)  (7)
+
+      tokenization                                                           Note that, in the inference process, we auto-
+
+Suppose we are given a sentence pair (si, sj) ∈ L                            regressivelly output the target tokens using the
+and si = (c1i , . . . , cik), sj = (cj1, . . . , cwj ), respec-              previous generated tokens sˆj<t instead of s<j t, i.e.,
+tively. c is a character of si or sj. k and w denote                         p(xˆjt ) = M(si, sˆj<t; θ).
+the character number of the raw source sentence
+
+si and target sentence sj, respectively. Our pro- 3.4 Random byte encoding and ensemble
+
+posed multilingual translation framework BMNMT                                prediction
+
+contains three main parts: byte encoding, model                              As discussed in the previous section, we use a one-
+forward, and byte decoding. The model overview                               hot vector to represent a byte token. For example,
+of BMNMT is shown in Figure 3.                                               in Figure 3, the byte representation of character
+
+Byte encoding We first use the byte mapping                                  “h” is 104 under UTF-8 encoding. In the one-hot
+function f to encode the raw sentence pairs into                             vector, the entry in 104 is one and the others are
+byte sequences. Take sj in Figure 3 as an example.                           0. However, we conjecture UTF-8 is just one of
+We first map w characters in each raw sentence into                          the mapping functions for bytes. The language
+a new sequence rj of m byte tokens:                                          model should not be limited by a single byte encod-
+                                                                             ing method, because a single encoding method can
+               rj = (f (cj1), f (c2j ), . . . , f (cwj ))                    bring possible bias in model representation. Rare
+                                                                             resources of data and other characteristics make it
+               = (x1j , x2j , . . . , xjm).                             (3)  harder for endangered languages on translation task.
+
+It is worth noting that we also consider the punc- Therefore, we propose an additional random byte
+
+tuation and the space symbol in the raw text as encoding method besides the basic byte tokeniza-
+
+characters and encode them into bytes.                                       tion by generating multiple random byte mappings.
+
+Model forward Our byte-level multilingual                                    Then we design an ensemble prediction by training
+translation model is based on the state-of-the-art                           multiple models Ms with different byte mappings
+Transformer architecture (Vaswani et al., 2017),                             and output an average probability among all Ms
+which includes an encoder Enc and a decoder Dec.                             to enhance the robustness of the translation model.
+
+After getting the byte tokens of sentence pairs, we Random byte mapping To generate multiple
+
+convert ri and rj to one-hot vectors ri and rj. Then, random mappings, we define z permutation func-
+
+the encoder encodes the source sequence into hid- tions g1, . . . , gz by shuffling the original bytes
+
+den representations, and the decoder outputs logits B = (0, 1, . . . , 255) to P1, . . . , Pz. Here, gl is
+
+                                                                        4410
+                                 ... ...                              Specifically, in IWSLT14, we select five high-
+                                ..................                 resource language pairs, i.e., Chinese, Arabic,
+                                                                   German, Farsi, Turkish to English, and one low-
+                  Random
+       (b) Ensemble prediction            resource language pair, i.e., Slovenian to English.
+                 mapping                                           When preprocessing IWSLT14, we remove sen-
+                                                                   tences longer than 800 bytes in the training set,
+(a) Random byte mapping                                            following the settings in (Shaham and Levy, 2021).
+                                                                   In total, about 5% samples are removed.
+Figure 4: Random byte mapping and ensemble predic-
+tion. (a) Random byte mapping with z different byte                   The IndCorpus contains ten endangered lan-
+permutations of UTF-8. (b) Ensemble prediction by                  guages. We translate each language to Spanish.
+producing z BMNMT for each byte permutation.                       Because the entire test set of IndCorpus is not pub-
+                                                                   licly available, we adopt the Dev set as the test
+a one-to-one mapping from B to Pl. Figure 4(a)                     data. The statistics of IWSLT14 and IndCorpus
+shows one example of the random byte mapping.                      can be found in Appendix A. Note that, although
+g1(0) = 4 maps byte 0 in B to byte 4 in P1.                        some endangered languages in IndCorpus have a
+                                                                   large number of training samples, we still regard
+Ensemble prediction In the previous section, we                    them as endangered languages because they have
+directly use byte encoding from UTF-8. By in-                      the characteristics of endangered languages.
+troducing random byte encoding, we first update
+Equation (3) using the byte mapping gl:                            4.2 Baselines and Model Settings
+
+rjl = gl x1j , gl xj2 . . . , gl xjm                (8)            To study the representation bottleneck when up-
+                                                                   grading from monolingual translation to multi-
+Then, we have z byte-level input sentence pairs                    lingual translation, we first include a byte-based
+(ri1, rj1), (ri2, rj2), . . . , (riz, rjz) for each (si, sj). For  monolingual model. Next, to validate the effec-
+l-th random byte encoding, we adopt an individ-                    tiveness of byte-based MNMT, we also incorporate
+                                                                   two subword-based monolingual and multilingual
+ual multiliangual Transformer Ml to take the l-th                  models. Specifically, we select the following model
+                                                                   schemes as baselines with different model architec-
+byte-level language pair under mapping gl(·) as                    tures on two datasets:
+
+the the input. As a result, we calculate z probabil-                  • B-N (Shaham and Levy, 2021). To valid the
+ity distributions p1(xˆjt ), p2(xˆtj), . . . , pz(xˆtj) from             ability of our byte-based MNMT model BM-
+Equation (5). Next, we ensemble these z distribu-                        NMT in alleviating the representation bottle-
+tions. pl(xˆtj) is a vector of 256 entries. For each                     neck, we select a byte-based NMT model (B-
+entry v ∈ B, we find the corresponding entry gl(v)                       N) for monolingual translation.
+in probability distributions pl(xˆjt ) of Pl and calcu-
+late an average probability from P1 to Pz:                            • W-N (Mager et al., 2021). To compare
+                                                                         the translation performance between our
+               1           z                                             model and subword-based model, we select a
+               z                                                         subword-based NMT model (W-N) for mono-
+p¯v(xˆjt )  =                   plgl(v)(xˆtj ).     (9)                  lingual translation.
+
+                           l=1                                        • W-M. We implement a subword-based MNMT
+                                                                         model (W-M) for multilingual translation
+We still take Figure 4(a) as an example. When cal-                       based on W-N to further evaluate the effective-
+                                                                         ness of our byte-based model on multilingual.
+culating the probability of byte 0 in B, we find byte
+
+4 in P1, byte 53 in P2, . . . , and byte 18 in Pz. Fi-
+nally, we use p¯(xˆtj) to execute beam search instead
+of p(xˆtj) in Equation (6). The ensemble prediction
+modules are demonstrated in Figure 4(b).
+
+4 Experimental Settings                                            The framework of all models including our model
+                                                                   are Transformers with the same architecture on
+4.1 Dataset                                                        each dataset. For the model scheme in IWSLT14,
+
+In our experiments, we use the English-centric we follow the architecture in (Shaham and Levy,
+
+IWSLT14 dataset (Cettolo et al., 2014) and the 2021). For IndCorpus, we follow the architecture
+
+IndCorpus dataset (Chen et al., 2021).                             in (Mager et al., 2021). For both tokenizations,
+
+                                                         4411
+all language pairs share the same model and                        Byte (BLEU)  Subword (BLEU)
+the same dictionary. For the subword-based
+models, the embedding layers are shared among                B-N BMNMT (Ours)   W-N  W-M
+source and target languages. For byte-based
+models, we remove the embedding layers follow-        ar-en  30.8 30.4 (-0.4)   30.5 28.8 (-1.7)
+ing (Shaham and Levy, 2021). The detailed model       de-en  34.4 34.2 (-0.2)   34.1 33.1 (-1.0)
+settings on two datasets including architecture       fa-en  22.7 24.2 (+1.5)   21.6 23.0 (+1.4)
+and environment are listed in Appendix B. The         tr-en  22.8 22.5 (-0.3)   22.2 21.9 (-0.3)
+source code is available at the Github repo:          zh-en  15.8 15.8 (+0.0)   15.9 15.8 (-0.1)
+https://github.com/MengjiaoZhang/
+Byte-based-multilingual-NMT.                          sl-en  2.2 20.7 (+18.5)   8.9 20.2 (+11.3)
+
+4.3 Hyper-parameters                                  Avg.   21.4 24.6 (+3.2)   22.2 23.8 (+1.6)
+
+Following (Shaham and Levy, 2021) and (Mager          Table 1: Representation bottleneck analysis on Case 1
+et al., 2021), for subword tokenization with BPE,     (T-HL) using the IWSLT14 dataset. Values in “()” repre-
+we use 10,000 merging steps. The dropout rates        sents the BLEU score difference between multilingual
+of models in IWSLT14 and IndCorpus are 0.2 and        and monolingual models. Here, Slovenian (sl) is a rela-
+0.4, respectively. Due to the limited training data   tively low-resource language.
+in IndCorpus 2021, we also set attention dropout as
+0.2 and ReLU dropout as 0.2 to avoid over-fitting     and ensemble prediction (T-H).
+in IndCorpus. The optimizer is Adam (Kingma and
+Ba, 2015) with the inverse square root learning rate  Case 3. Jointly Train BMNMT on the
+scheduler. We set the warm-up steps as 4,000 and      Endangered language pairs without finetuning and
+the minimum learning rate is 10−7. The training       ensemble prediction (T-E).
+epoch for IWSLT14 is 200 with early stop when
+observing no decrease of validation loss within 5     Case 4. Finetune BMNMT with Endangered lan-
+consecutive epochs. The epoch number for IndCor-      guages on pretrained BMNMT in Case 2 (F-E2).
+pus is 50 without early stop because we use the dev
+set in IndCorpus as the test data.                    Case 5. Jointly Train BMNMT on Endangered
+                                                      languages without finetuning but with ensemble
+                                                      prediction (T-E+P).
+
+                                                         For the first four cases without ensemble, we use
+                                                      the original UTF-8 encoding. For the last case, we
+                                                      adopt the proposed random byte encoding method.
+
+4.4 Evaluation Metrics                                5 Experimental Results
+
+To evaluate the translation results of all mod-       In the main paper, we report the BLEU scores of
+els, we use the commonly adopted BLEU scores          all cases. The ChrF for endangered languages in
+on both datasets and use an additional metric         Cases 3-5 can be found in Appendix C.
+ChrF (Popovic´, 2015) to evaluate endangered lan-
+
+guages in IndCorpus. Here, ChrF denotes the char-     5.1 Representation Bottleneck Analysis on
+acter n-gram F-score. We adopt ChrF because not             Cases 1 (T-HL) and 2 (T-H)
+all endangered languages in IndCorpus have a tok-
+
+enization standard (Mager et al., 2021).              To validate the effectiveness of our model in ad-
+
+4.5 Training strategies                               dressing the representation bottleneck in multilin-
+                                                      gual translation with both high and low resource
+
+To analyze the causes of the representation bot- languages, we adopt the training strategies of Cases
+
+tleneck and explore model generalizability while 1 (T-HL) and 2 (T-H). First, we run the subword-
+
+studying the effectiveness of the basic BMNMT based translation baselines on monolingual (W-N)
+
+framework and ensemble prediction, we consider and multilingual (W-M) languages and calculate
+
+multiple scenarios related to languages resource. the difference of BLEU scores between them. Then,
+
+Case 1. Jointly Train BMNMT with both High-           we also calculate such difference between BMNMT
+and Low-resource language pairs without finetun-      and B-N to evaluate whether BMNMT can alleviate
+ing and ensemble prediction (T-HL).                   the representation bottleneck in MNMT.
+
+                                                         Table 1 shows the results of Case 1 (T-HL) on
+
+Case 2. Jointly Train BMNMT only with the IWSLT14 dataset. In this experiment, the high-
+
+High resource language pairs without finetuning resource language pairs are Arabic (ar), German
+
+                                          4412
+ar-en        Byte (BLEU)  Subword (BLEU)               quy-es        Byte (BLEU)  Subword (BLEU)
+de-en
+fa-en  B-N BMNMT (Ours)   W-N W-M                      gn-es   B-N BMNMT (Ours)   W-N W-M
+tr-en                                                  nah-es
+zh-en  30.8 31.5 (+0.7)   30.5 29.6 (-0.9)             shp-es  2.4 3.5 (+0.9)     3.3 2.7 (-0.6)
+       34.4 35.2 (+0.8)   34.1 33.6 (-0.5)
+Avg.   22.7 24.9 (+2.2)   21.6 23.7 (+2.1)             Avg.    3.6 4.4 (+0.8)     2.1 3.0 (+0.9)
+       22.8 23.8 (+1.0)   22.2 22.4 (+0.5)                     0.2 2.6 (+2.4)     0.8 2.1 (+1.3)
+       15.8 16.9 (+1.1)   15.9 16.2 (+0.4)                     0.0 3.9 (+3.9)     0.3 2.8 (+2.5)
+
+       25.3 26.5 (+1.2)   24.9 25.1 (+0.2)                     1.6 3.6 (+2.0)     1.6 2.7 (+1.1)
+
+Table 2: Representation bottleneck analysis on Case 2  Table 3: Representation bottleneck analysis on Case
+(T-H) with all high-resource languages in IWSLT14.     3 (T-E) with endangered languages in IndCorpus.
+                                                       Quechua (quy) is a relatively high-resource endangered
+                                                       language.
+
+(de), Farsi (fa), Turkish (tr), and Chinese (zh) to
+
+English (en), while the low-resource language pair     models, our proposed BMNMT can effectively al-
+is Slovenian (sl) to English. We first notice byte-    leviate this problem.
+level models achieve the best performance on al-
+most all language pairs. It proves the capability of   5.2 Representation Bottleneck Analysis on
+byte tokenization in the translation task. Further-          Endangered Languages: Case 3 (T-E)
+
+more, as a low-resource language, the translation      To evaluate the ability of BMNMT to address the
+from Slovenian to English gains the largest benefit    representation bottleneck in endangered languages,
+from BMNMT, and BMNMT has the best average             we adopt the training strategy of Case 3 (T-E). Here,
+BLEU score. Therefore, we can conclude that the        we still report the BLUE score differences between
+application of byte tokenization to MNMT is able       monolingual and multilingual models.
+to enhance the knowledge sharing among multiple
+languages.                                                Table 3 demonstrates the results of Case 3. Fol-
+                                                       lowing the setting in Case 1, we select four lan-
+   In addition, we notice that subword-based mul-      guage pairs Quechua (quy), Guarani (gn), Nahu-
+tilingual translation (W-M) suffers from repre-        atl (nah), and Shipibo-Konibo (shp) to Spanish (es)
+sentation bottleneck, because the performance of       that have relatively large training sizes in IndCor-
+some high-resource language pairs ar-en, de-en,        pus to avoid the bias in languages of extremely low
+tr-en, and zh-en decrease compared with mono-          resource. Among these pairs, quy has the most
+lingual translation (W-N). However, our proposed       training data that are comparable to high-resource
+byte-based multilingual translation shows a much       languages in IWSLT14, while the others can be
+smaller decrease than word-based models. It fur-       regarded as low-resource languages. We notice
+ther proves the ability of BMNMT to alleviate the      the BLEU score of quy is much lower than lan-
+representation bottleneck problem in MNMT.             guages in IWSLT14. We infer it is because of the
+                                                       characteristics in endangered languages. However,
+   Table 2 shows the results of Case 2 (T-H). Here,    different to the results in Case 1, the BLEU score of
+to further study the influence of language resource    byte-based BMNMT on quy-es does not decrease
+on the representation bottleneck, we remove the        even with multilingual training. To summarize, we
+low-resource language Slovenian (sl) in Case 1 (T-     think our BMNMT can help overcome the repre-
+HL) and re-train BMNMT and other baselines. We         sentation bottleneck of rare resource in endangered
+notice that after removing the language Slovenian,     languages and bring enhancement in translation.
+all MNMT models based on byte and subword gain
+a higher performance in the average BLEU score.        5.3 Generalizability Analysis: Case 4 (F-E2)
+However, subword-based W-M still cannot avoid
+
+the representation bottleneck, while our BMNMT Another property we want to analyze for multi-
+
+achieves improvement on all pairs against the B-N lingual translation is the model generalizability.
+
+model. More importantly, BMNMT has the best Therefore, we adopt Case 4 (F-E2) to generalize
+
+performance on all language pairs.                     the pretrained model on high-resource languages
+
+In summary, when training MNMT with both to endangered languages. As the case indicates, we
+
+high and low-resource languages, the low-resource use the pretrained BMNMT and W-M in Case 2,
+
+languages are a main reason for the representation which are trained on all high-resource languages
+
+bottleneck. Moreover, compared to subword-based and individually finetuned on all endangered lan-
+
+                                            4413
+4.0                        4.3                             3.2                             4.8
+
+BLEU3.7                    3.9                             2.8                             4.5
+                            BLEU
+                                                        BLEU
+                                                                                     BLEU
+
+3.4         4    6  8      3.5 1 2  4       6           8  2.4    4         6  8           4.2    4        6  8
+   12       z                       z                         12  z                           12  z
+
+     (a) quy-es                 (b) shp-es                      (c) nah-es                      (d) gn-es
+
+Figure 5: Robustness analysis on Case 5 (T-E+P): Average BLEU scores of ensemble prediction with different
+ensemble number z.
+
+            Byte (BLEU)         Subword (BLEU) semble number from {1, 2, 4, 6, 8}. For each z, we
+
+     B-N BMNMT (Ours) W-N W-M                              train BMNMT 5 times on IndCorpus with different
+                                                           permutations of bytes in UTF-8. The average and
+gn-es 4.5      5.9 (+1.4)       3.6 4.0 (+0.4)             standard deviation of BLEU scores in 5 runs for
+nah-es 3.4     4.5 (+1.1)       2.8 2.0 (-0.8)             each z are reported in Figure 5.
+quy-es 7.0     7.9 (+0.9)       5.4 5.9 (+0.4)
+shp-es 0.6     2.7 (+2.1)       1.0 1.1 (+0.1)                With the growth of z, the BLUE score shows
+aym-es 3.8     5.1 (+1.3)       2.8 2.7 (-0.1)             an increasing trend. It proves that appropriate en-
+cni-es 0.3     1.8 (+1.5)       0.6 0.6 (+0.0)             semble can improve the translation performance.
+bzd-es 0.7     2.5 (+1.7)       0.9 0.9 (+0.0)             Moreover, BMNMT without ensemble (z = 1)
+oto-es 0.4     1.4 (+1.0)       0.4 0.4 (+0.0)             has the highest standard deviation. We infer byte-
+tar-es 0.2     0.7 (+0.5)       0.2 0.3 (+0.1)
+hch-es 1.7     2.6 (+0.9)       1.1 0.9 (-0.2)
+
+Avg. 2.3 3.5 (+1.2)             1.9 1.9 (+0.0) based translation with only one encoding method
+
+Table 4: Generalizability analysis on Case 4 (F-E2) by     can brings noise to token representations. However,
+finetuning with all endangered languages in IndCorpus      with multiple byte mapping and ensemble predic-
+based on pretrained models in Case 2.                      tion, the translation becomes more stable. There-
+                                                           fore, we think that the random byte mapping and
+
+                                                           ensemble prediction can improve the robustness of
+
+guages. As monolingual models, B-N and W-N are             byte-based translation.
+pretrained on German to English and finetuned on              In summary, based on all analysis for the repre-
+endangered languages. It is worth noting that all
+endangered languages in finetuning do not occur in         sentation bottleneck, generalizability, and robust-
+pretraining to validate the models’ generalizability.      ness, the effectiveness of our proposed BMNMT
+                                                           is validated. We conclude that with the introduce
+   Table 4 shows the finetuning results on IndCor-         of byte in MNMT and the ensemble prediction for
+pus. We first notice that the models pretrained on         byte mappings, the representation bottleneck can
+multilingual languages perform better than mono-           be alleviated, especially on endangered language.
+
+lingual models. It indicates that multilingual mod-
+
+els have a stronger generalizability to endangered 6 Conclusion
+
+languages. Additionally, although the byte-based           Multilingual neural machine translation has been
+monolingual model B-N has worse performance                successful in enhancing low-resource languages
+than W-N on some language pairs, the BLEU                  because of knowledge sharing. To address the rep-
+scores of these pairs are largely increased by our         resentation bottleneck in existing subword-based
+BMNMT compared to W-M. It further validates                multilingual translation systems, we propose a byte-
+the generalizability of BMNMT.                             based MNMT model, BMNMT with the Trans-
+
+5.4 Robustness Analysis: Case 5 (T-E+P)                    former architecture. To improve the model gen-
+                                                           eralizability and robustness, we further design an
+
+To evaluate the translation effectiveness and ro- ensemble prediction method with random byte en-
+
+bustness of our proposed BMNMT on endangered coding. Our experimental results show that BM-
+
+languages, we generate multiple random byte map- NMT can alleviate the representation bottleneck
+
+pings and adopt Case 5 (T-E+P) in the ensemble and has a stronger generalization ability compared
+
+prediction experiment. Specifically, we first choose with subword-based MNMT. Meanwhile, BMNMT
+
+the number z of random byte mappings, i.e., en- with ensemble prediction improves the transla-
+
+                                                4414
+tion performance and robustness on endangered            Jeff Ens, Mika Hämäläinen, Jack Rueter, Philippe
+language translation tasks. Extending our byte-             Pasquier, et al. 2019. Morphosyntactic disam-
+based method to large scale models and datasets             biguation in an endangered language setting. In
+is promising and can improve model performance,             22nd Nordic Conference on Computational Linguis-
+which will be our future work.                              tics (NoDaLiDa) Proceedings of the Conference.
+                                                            Linköping University Electronic Press.
+
+Acknowledgments                                          Jiatao Gu, Yong Wang, Yun Chen, Victor OK Li, and
+                                                            Kyunghyun Cho. 2018. Meta-learning for low-
+We appreciate the National Science Foundation               resource neural machine translation. In Proceedings
+(NSF) Award No. 1747728 and NSF CRAFT                       of the 2018 Conference on Empirical Methods in
+Award, Grant No. 22001 to fund this research.               Natural Language Processing, pages 3622–3631.
+We are also thankful for the support of the Google
+Cloud Research Program. We thank Chang Lu for            Melvin Johnson, Mike Schuster, Quoc V Le, Maxim
+the comments.                                               Krikun, Yonghui Wu, Zhifeng Chen, Nikhil Thorat,
+                                                            Fernanda Viégas, Martin Wattenberg, Greg Corrado,
+References                                                  et al. 2017. Google’s multilingual neural machine
+                                                            translation system: Enabling zero-shot translation.
+Roee Aharoni, Melvin Johnson, and Orhan Firat. 2019.        Transactions of the Association for Computational
+   Massively multilingual neural machine translation.       Linguistics, 5:339–351.
+   In Proceedings of the 2019 Conference of the North
+   American Chapter of the Association for Computa-      Diederik P Kingma and Jimmy Ba. 2015. Adam: A
+   tional Linguistics: Human Language Technologies,         method for stochastic optimization. In ICLR (Poster).
+   Volume 1 (Long and Short Papers), pages 3874–3884.
+                                                         Gina-Anne Levow, Emily P Ahn, and Emily M Bender.
+Naveen Arivazhagan, Ankur Bapna, Orhan Firat,               2021. Developing a shared task for speech process-
+   Dmitry Lepikhin, Melvin Johnson, Maxim Krikun,           ing on endangered languages. In Proceedings of
+   Mia Xu Chen, Yuan Cao, George Foster, Colin              the Workshop on Computational Methods for Endan-
+   Cherry, et al. 2019. Massively multilingual neural       gered Languages, volume 1, pages 96–106.
+   machine translation in the wild: Findings and chal-
+   lenges. arXiv preprint arXiv:1907.05019.              Zoey Liu, Crystal Richardson, Richard Hatcher Jr, and
+                                                            Emily Prud’hommeaux. 2022. Not always about
+                                                            you: Prioritizing community needs when develop-
+                                                            ing endangered language technology. arXiv preprint
+                                                            arXiv:2204.05541.
+
+Tamali Banerjee and Pushpak Bhattacharya. 2018.          Manuel Mager, Arturo Oncevay, Abteen Ebrahimi, John
+   Meaningless yet meaningful: Morphology grounded          Ortega, Annette Rios Gonzales, Angela Fan, Ximena
+   subword-level nmt. NAACL HLT 2018, page 55.              Gutierrez-Vasques, Luis Chiruzzo, Gustavo Giménez-
+                                                            Lugo, Ricardo Ramos, et al. 2021. Findings of the
+Mauro Cettolo, Jan Niehues, Sebastian Stüker, Luisa         americasnlp 2021 shared task on open machine trans-
+   Bentivogli, and Marcello Federico. 2014. Report          lation for indigenous languages of the americas. In
+   on the 11th iwslt evaluation campaign. In Proceed-       Proceedings of the First Workshop on Natural Lan-
+   ings of the 11th International Workshop on Spoken        guage Processing for Indigenous Languages of the
+   Language Translation: Evaluation Campaign.               Americas, pages 202–217.
+
+Mia Xu Chen, Orhan Firat, Ankur Bapna, Melvin John-      Makoto Morishita, Jun Suzuki, and Masaaki Nagata.
+   son, Wolfgang Macherey, George Foster, Llion Jones,      2018. Improving neural machine translation by in-
+   Mike Schuster, Noam Shazeer, Niki Parmar, et al.         corporating hierarchical subword features. In Pro-
+   2018. The best of both worlds: Combining recent ad-      ceedings of the 27th International Conference on
+   vances in neural machine translation. In Proceedings     Computational Linguistics, pages 618–629.
+   of the 56th Annual Meeting of the Association for
+   Computational Linguistics (Volume 1: Long Papers),    Mark Needleman. 2000. The unicode standard. Serials
+   pages 76–86.                                             review, 26(2):51–54.
+
+Wei-Rui Chen, Muhammad Abdul-Mageed, Hasan               Xiao Pan, Mingxuan Wang, Liwei Wu, and Lei Li. 2021.
+   Cavusoglu, et al. 2021. Indt5: A text-to-text trans-     Contrastive learning for many-to-many multilingual
+   former for 10 indigenous languages. In Proceedings       neural machine translation. In Proceedings of the
+   of the First Workshop on Natural Language Process-       59th Annual Meeting of the Association for Compu-
+   ing for Indigenous Languages of the Americas, pages      tational Linguistics and the 11th International Joint
+   265–271.                                                 Conference on Natural Language Processing (Vol-
+                                                            ume 1: Long Papers), pages 244–258.
+
+Raj Dabre, Chenhui Chu, and Anoop Kunchukuttan.          Maja Popovic´. 2015. chrf: character n-gram f-score for
+   2020. A survey of multilingual neural machine trans-     automatic mt evaluation. In Proceedings of the Tenth
+   lation. ACM Computing Surveys (CSUR), 53(5):1–           Workshop on Statistical Machine Translation, pages
+   38.                                                      392–395.
+
+4415
+Marta Ruiz Costa-Jussà, Carlos Escolano Peinado, and      ISO Language Train Dev Test
+   José Adrián Rodríguez Fonollosa. 2017. Byte-based
+   neural machine translation. In Proceedings of the      zh Chinese 166,046 7,547 5,099
+   First Workshop on Subword and Character Level
+   Models in NLP, pages 154–158. Association for Com-     ar Arabic 165,591 7,526 5,357
+   putational Linguistics.
+                                                          de German 158,516 7,205 5,585
+Uri Shaham and Omer Levy. 2021. Neural machine
+   translation without embeddings. In Proceedings of      fa Farsi       99,792 4,536 4,244
+   the 2021 Conference of the North American Chap-
+   ter of the Association for Computational Linguistics:  tr Turkish 142,619 6,482 5,433
+   Human Language Technologies, pages 181–186.
+                                                          sl Slovenian 15,859 720 2,555
+Felix Stahlberg. 2020. Neural machine translation: A
+   review. Journal of Artificial Intelligence Research,   Table 5: Languages from the IWSLT14 dataset with the
+   69:343–418.                                            ISO codes. The Train, Dev, and Test columns denote the
+                                                          number of sentence pairs of each language with English
+Xu Tan, Yi Ren, Di He, Tao Qin, and Tie-Yan Liu.          in the training, validation, and test set.
+   2019. Multilingual neural machine translation with
+   knowledge distillation. In International Conference    ISO Language   Train Dev
+   on Learning Representations.
+                                                          cni Asháninka  3,883 883
+Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob
+   Uszkoreit, Llion Jones, Aidan N Gomez, Łukasz          aym Aymara     6,531 996
+   Kaiser, and Illia Polosukhin. 2017. Attention is all
+   you need. Advances in neural information processing    bzd Bribri     7,508 996
+   systems, 30.
+                                                          gn Guarani     26,032 995
+Changhan Wang, Kyunghyun Cho, and Jiatao Gu. 2020.
+   Neural machine translation with byte-level subwords.   nah Nahuatl    16,145 672
+   In Proceedings of the AAAI Conference on Artificial
+   Intelligence, volume 34, pages 9154–9160.              oto Otomí      4,889 599
+
+Yonghui Wu, Mike Schuster, Zhifeng Chen, Quoc V Le,       quy Quechua    125,008 996
+   Mohammad Norouzi, Wolfgang Macherey, Maxim
+   Krikun, Yuan Cao, Qin Gao, Klaus Macherey, et al.      tar Rarámuri   14,721 995
+   2016. Google’s neural machine translation system:
+   Bridging the gap between human and machine trans-      shp Shipibo-Konibo 14,592 996
+   lation. arXiv preprint arXiv:1609.08144.
+                                                          hch Wixarika   8,966 994
+Barret Zoph and Kevin Knight. 2016. Multi-source
+   neural translation. arXiv preprint arXiv:1601.00710.   Table 6: The languages featured in the IndCorpus, their
+                                                          ISO codes, and dataset statistics.
+A Dataset Statistics
+                                                          feed-forward layer is built upon the hidden layer
+Tables 5 and 6 show the data statistics of IWSLT14        to calculate the output digits. The dimension of
+and endangered language dataset IndCorpus, re-            feed-forward layers in the encoder and decoder is
+spectively. IWSLT datasets contains English scripts       1024. For byte-based models, they do not have the
+of TED talks translated into other languages. All         embedding layer.
+training samples in IWSLT are collected in 2014.
+The test samples are from TED talks from 2010                For the Transformer model in IndCorpus, we
+to 2012. For IndCorpus, there are ten indigenous          shrink the model size to avoid overfitting because
+languages from multiple countries of America.             the languages in IndCorpus only contain limited
+                                                          training samples. The encoder and decoder both
+                                                          have 5 attention layers with 2 heads. The remaining
+                                                          parts keep the same as the model architecture used
+                                                          in IWSLT14.
+
+                                                             We use the transformer model implemented by
+                                                          faiseq1. All the program used in this work is im-
+                                                          plemented using Python 3.8, PyTorch 1.10.0, and
+                                                          CUDA 11.3. For the hardware environment, we run
+                                                          our program on a machine with Intel i9-10900KF
+                                                          CPU, 128G memory, and an NVIDIA GeForce
+                                                          RTX 3090 GPU.
+
+B Model Architecture and Environment                      C Additional Experimental Results on
+                                                               Endangered Languages using ChrF
+In every Transformer model used in IWSLT14, we
+adopt 6 attention layers for both encoder for de-         Table 3 and Table 9 show the translation perfor-
+coder. The number of attention heads is 4. For the        mance of endangered languages with ChrF in Cases
+subword-based models, they contain an embedding           3 (T-E) and 4 (F-E2). Similar to the results in Ta-
+
+layer for tokens. The embedding dimension is 512,         1https://github.com/facebookresearch/
+
+which is the same as the hidden dimension. The fairseq
+
+4416
+Encoder layers    IWSLT14   IndCorpus
+Decoder layers
+Attention heads        6         5
+Hidden dim d           6         5
+Feed-forward dim       4         2
+                     512        512
+                    1024       1024
+
+Table 7: Model architectures on the IWSLT14 and Ind-
+Corpus datasets.
+
+               Byte (ChrF)  Subword (ChrF)
+
+        B-N BMNMT (Ours)    W-N  W-M
+
+quy-es  22.5 25.2 (+2.7)    21.5 20.3 (-0.8)
+
+gn-es   21.8 23.4 (+1.6)    18.3 22.7 (+4.4)
+nah-es  13.0 19.7 (+6.7)    15.0 19.6 (+4.6)
+shp-es  12.0 27.0 (+15.0)   10.5 21.6 (+10.9)
+
+Avg.    17.3 23.8 (+5.5)    16.7 21.2 (+4.5)
+
+Table 8: Representation bottleneck analysis on Case 3             &KU)                 &KU)  
+(T-E) with endangered languages. The evaluation metric                  
+in this table is ChrF.                                            &KU)                 &KU)  
+
+ble 3 and Table 4 with BLEU scores, our proposed                              z             
+BMNMT has the best performance, and it can im-
+prove ChrF on all languages. Evaluation with these                             (a) quy-es              z  
+two metrics proves that the byte tokenization can
+alleviate the representation bottleneck even in en-                                                 (b) shp-es
+dangered languages.
+                                                                                             
+   In Figure 6, we plot the ChrF scores of ensemble                                              
+prediction. With the number of ensemble mod-                                                 
+els increasing, the average translation performance
+shows the same trend while the standard deviation                             z                   z  
+decrease. Both the evaluation on BLEU scores
+and ChrF show that the ensemble prediction with                                (c) nah-es                (d) gn-es
+random byte mapping improve the translation per-
+formance and robustness in MNMT.                        Figure 6: Robustness analysis on Case 5 (T-E+P): Aver-
+                                                        age ChrF of ensemble prediction with different ensem-
+                                                        ble number z.
+
+gn-es          Byte (ChrF)   Subword (ChrF)
+nah-es
+quy-es  B-N BMNMT (Ours)    W-N W-M
+shp-es
+aym-es  25.7 27.1 (+1.4)    22.1 21.6 (-0.5)
+cni-es  23.2 25.3 (+2.1)    18.1 17.7 (-0.4)
+bzd-es  32.1 32.9 (+0.8)    26.3 27.2 (+0.9)
+oto-es  20.3 27.3 (+7.0)    16.2 17.0 (+0.8)
+tar-es  22.9 25.8 (+2.9)    18.2 18.7 (+0.5)
+hch-es  17.0 21.2 (+4.2)    14.1 13.7 (-0.4)
+        19.7 24.4 (+4.7)    14.3 15.0 (+0.7)
+Avg.    17.9 19.4 (+1.5)    12.1 13.2 (+0.0)
+        16.2 19.4 (+3.2)    15.1 14.7 (-0.4)
+        20.3 23.6 (+3.3)    13.6 14.8 (+1.2)
+
+        21.5 24.6 (+3.1)    17.0 17.4 (+0.4)
+
+Table 9: Translation performance (ChrF) on IndCorpus.
+The results are finetune on the model trained in case 2.
+
+                                                            4417
+

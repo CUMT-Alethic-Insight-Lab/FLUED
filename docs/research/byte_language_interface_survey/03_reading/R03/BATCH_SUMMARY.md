@@ -1,0 +1,19 @@
+# R03 — Batch reading summary
+
+Seven assigned works; **7 fresh FULL, 0 PARTIAL, 0 BLOCKED**. No pre-existing FULL was counted. Cards report fixed primary versions, actual sections/pages/appendices, the specific visual table/figure checks, unknown fields, paper-level tying axes, distinct units and BIP backlinks. FULL means full substantive paper/required appendix reading, not independent code verification, mathematical proof or reproduction. Every primary source was obtained successfully on its first public request; no mirrors, authentication bypass, training, installations or subagents were used.
+
+| Work | Card and status | Main reading contribution | Key limits / follow-up |
+|---|---|---|---|
+| BIW-0008 | [MEGABYTE](BIW-0008.md) — FULL | Patch-shifted global/local AR, explicit local byte input/output table tying, fixed-speed/data comparisons and four-cost scoring variants. | Million-byte example is image, not language; longer PG19 context did not help; prompt/EOS and timing hardware/cache not specified. |
+| BIW-0072 | [Hourglass](BIW-0072.md) — FULL | k−1 extra shift, including attention-pooling keys and values; fine-resolution residual/attention and factor dropout. | enwik8 is byte-valued; long-window test uses overlapping scoring; training speed is not serving speed. |
+| BIW-0016 | [HM-RNN](BIW-0016.md) — FULL | Boundary-controlled UPDATE/COPY/FLUSH, straight-through hard decisions and dataset-specific annealing. | Space-visible plots are qualitative; PTB/Text8 are character antecedents, not generic UTF-8; no wall-clock benefit established. |
+| BIW-0059 | [Character-level NMT](BIW-0059.md) — FULL | CNN width 1–8, fixed stride-5 max pooling, highway and bidirectional GRU; multilingual sharing. | Character rather than confirmed byte interface; differing source length filters, transliteration and extra multilingual data confound attribution; supplementary qualitative webpage not inspected. |
+| BIW-0074 | [Patching Leaks](BIW-0074.md) — FULL | Future leakage from convolution and crossing n-grams; 100-symbol random diagnostic; remove/mask versus padding. | Translation uses UTF-8 bytes; leak-free grouping still loses quality. |
+| BIW-0075 | [Subword-Delimited Downsampling](BIW-0075.md) — FULL | External subword boundaries, variable byte groups, causal local decoder, grouped comparison and separate budgets. | Subword tokenizer remains necessary; higher-resource and biomedical counterexamples; causal attribution to morphology not isolated. |
+| BIW-0042 | [Segmental neural LM](BIW-0042.md) — FULL | Character-history semi-Markov marginal, lexicon/spelling mixture, length regularizer and image-conditioned comparison. | Whole-sentence MAP segmentation differs from causal prefix generation; closed alphabet filtering and union-of-splits segmentation evaluation; visual features add pretraining. |
+
+## Cross-card synthesis pointers, not new independent findings
+
+- Causal downsampling is not guaranteed by a downstream triangular mask: the upstream grouping operation, overlapping local features and every attention-pooling input need their own visibility accounting. These papers use different remedies; the SDD boundaries are externally supplied, HM-RNN boundaries are learned, and the fixed MEGABYTE/Hourglass groups are not learned semantic units.
+- Quality, original-text context/exposure, total parameters, trained/evaluated FLOPs, measured wall time, extra passes, deployment tokenizer, and teacher or image-feature budgets remain separate comparison axes. Not all are reported; card unknowns are not zero values.
+- Source PDFs, UTF-8 text conversions and page renderings were downloaded/generated under this owned batch and removed after reading; original public versioned URLs remain in the cards. Download/extraction does not itself count as reading. The cards and this summary are the working deliverables; the central inventory and shared discovery files were not edited.

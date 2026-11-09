@@ -1,0 +1,628 @@
+                                                  Character-Aware Neural Language Models
+
+                                       Yoon Kim†  Yacine Jernite∗                                        David Sontag∗  Alexander M. Rush†
+
+                                        †School of Engineering and Applied Sciences                      ∗Courant Institute of Mathematical Sciences
+                                                        Harvard University                                             New York University
+
+                                       {yoonkim,srush}@seas.harvard.edu                                   {jernite,dsontag}@cs.nyu.edu
+
+arXiv:1508.06615v4 [cs.CL] 1 Dec 2015                                Abstract                               While NLMs have been shown to outperform count-based
+                                                                                                         n-gram language models (Mikolov et al. 2011), they are
+                                             We describe a simple neural language model that re-         blind to subword information (e.g. morphemes). For exam-
+                                             lies only on character-level inputs. Predictions are still  ple, they do not know, a priori, that eventful, eventfully, un-
+                                             made at the word-level. Our model employs a con-            eventful, and uneventfully should have structurally related
+                                             volutional neural network (CNN) and a highway net-          embeddings in the vector space. Embeddings of rare words
+                                             work over characters, whose output is given to a            can thus be poorly estimated, leading to high perplexities
+                                             long short-term memory (LSTM) recurrent neural net-         for rare words (and words surrounding them). This is espe-
+                                             work language model (RNN-LM). On the English                cially problematic in morphologically rich languages with
+                                             Penn Treebank the model is on par with the existing         long-tailed frequency distributions or domains with dynamic
+                                             state-of-the-art despite having 60% fewer parameters.       vocabularies (e.g. social media).
+                                             On languages with rich morphology (Arabic, Czech,
+                                             French, German, Spanish, Russian), the model out-              In this work, we propose a language model that lever-
+                                             performs word-level/morpheme-level LSTM baselines,          ages subword information through a character-level con-
+                                             again with fewer parameters. The results suggest that on    volutional neural network (CNN), whose output is used
+                                             many languages, character inputs are sufﬁcient for lan-     as an input to a recurrent neural network language model
+                                             guage modeling. Analysis of word representations ob-        (RNN-LM). Unlike previous works that utilize subword in-
+                                             tained from the character composition part of the model     formation via morphemes (Botha and Blunsom 2014; Lu-
+                                             reveals that the model is able to encode, from characters   ong, Socher, and Manning 2013), our model does not require
+                                             only, both semantic and orthographic information.           morphological tagging as a pre-processing step. And, unlike
+                                                                                                         the recent line of work which combines input word embed-
+                                                             Introduction                                dings with features from a character-level model (dos Santos
+                                                                                                         and Zadrozny 2014; dos Santos and Guimaraes 2015), our
+                                       Language modeling is a fundamental task in artiﬁcial intel-       model does not utilize word embeddings at all in the input
+                                       ligence and natural language processing (NLP), with appli-        layer. Given that most of the parameters in NLMs are from
+                                       cations in speech recognition, text generation, and machine       the word embeddings, the proposed model has signiﬁcantly
+                                       translation. A language model is formalized as a probability      fewer parameters than previous NLMs, making it attractive
+                                       distribution over a sequence of strings (words), and tradi-       for applications where model size may be an issue (e.g. cell
+                                       tional methods usually involve making an n-th order Markov        phones).
+                                       assumption and estimating n-gram probabilities via count-
+                                       ing and subsequent smoothing (Chen and Goodman 1998).                To summarize, our contributions are as follows:
+                                       The count-based models are simple to train, but probabilities
+                                       of rare n-grams can be poorly estimated due to data sparsity      • on English, we achieve results on par with the existing
+                                       (despite smoothing techniques).                                      state-of-the-art on the Penn Treebank (PTB), despite hav-
+                                                                                                            ing approximately 60% fewer parameters, and
+                                          Neural Language Models (NLM) address the n-gram data
+                                       sparsity issue through parameterization of words as vectors       • on morphologically rich languages (Arabic, Czech,
+                                       (word embeddings) and using them as inputs to a neural net-          French, German, Spanish, and Russian), our model
+                                       work (Bengio, Ducharme, and Vincent 2003; Mikolov et al.             outperforms various baselines (Kneser-Ney, word-
+                                       2010). The parameters are learned as part of the training            level/morpheme-level LSTM), again with fewer parame-
+                                       process. Word embeddings obtained through NLMs exhibit               ters.
+                                       the property whereby semantically close words are likewise
+                                       close in the induced vector space (as is the case with non-       We have released all the code for the models described in
+                                       neural techniques such as Latent Semantic Analysis (Deer-         this paper.1
+                                       wester, Dumais, and Harshman 1990)).
+                                                                                                             1https://github.com/yoonkim/lstm-char-cnn
+                                       Copyright c 2016, Association for the Advancement of Artiﬁcial
+                                       Intelligence (www.aaai.org). All rights reserved.
+                          Model
+
+The architecture of our model, shown in Figure 1, is straight-
+forward. Whereas a conventional NLM takes word embed-
+dings as inputs, our model instead takes the output from
+a single-layer character-level convolutional neural network
+with max-over-time pooling.
+
+   For notation, we denote vectors with bold lower-case (e.g.
+xt, b), matrices with bold upper-case (e.g. W, Uo), scalars
+with italic lower-case (e.g. x, b), and sets with cursive upper-
+case (e.g. V, C) letters. For notational convenience we as-
+sume that words and characters have already been converted
+into indices.
+
+Recurrent Neural Network
+
+A recurrent neural network (RNN) is a type of neural net-
+work architecture particularly suited for modeling sequen-
+tial phenomena. At each time step t, an RNN takes the input
+vector xt ∈ Rn and the hidden state vector ht−1 ∈ Rm and
+produces the next hidden state ht by applying the following
+recursive operation:
+
+ht = f (Wxt + Uht−1 + b)       (1)
+
+Here W ∈ Rm×n, U ∈ Rm×m, b ∈ Rm are parameters                    Figure 1: Architecture of our language model applied to an exam-
+of an afﬁne transformation and f is an element-wise nonlin-       ple sentence. Best viewed in color. Here the model takes absurdity
+earity. In theory the RNN can summarize all historical in-        as the current input and combines it with the history (as represented
+formation up to time t with the hidden state ht. In practice      by the hidden state) to predict the next word, is. First layer performs
+however, learning long-range dependencies with a vanilla          a lookup of character embeddings (of dimension four) and stacks
+RNN is difﬁcult due to vanishing/exploding gradients (Ben-        them to form the matrix Ck. Then convolution operations are ap-
+gio, Simard, and Frasconi 1994), which occurs as a result of      plied between Ck and multiple ﬁlter matrices. Note that in the
+the Jacobian’s multiplicativity with respect to time.             above example we have twelve ﬁlters—three ﬁlters of width two
+                                                                  (blue), four ﬁlters of width three (yellow), and ﬁve ﬁlters of width
+   Long short-term memory (LSTM) (Hochreiter and                  four (red). A max-over-time pooling operation is applied to obtain
+Schmidhuber 1997) addresses the problem of learning long          a ﬁxed-dimensional representation of the word, which is given to
+range dependencies by augmenting the RNN with a memory            the highway network. The highway network’s output is used as the
+cell vector ct ∈ Rn at each time step. Concretely, one step       input to a multi-layer LSTM. Finally, an afﬁne transformation fol-
+of an LSTM takes as input xt, ht−1, ct−1 and produces ht,         lowed by a softmax is applied over the hidden representation of
+ct via the following intermediate calculations:                   the LSTM to obtain the distribution over the next word. Cross en-
+                                                                  tropy loss between the (predicted) distribution over next word and
+it = σ(Wixt + Uiht−1 + bi)                                        the actual next word is minimized. Element-wise addition, multi-
+                                                                  plication, and sigmoid operators are depicted in circles, and afﬁne
+ft = σ(Wf xt + Uf ht−1 + bf )                                     transformations (plus nonlinearities where appropriate) are repre-
+                                                                  sented by solid arrows.
+ot = σ(Woxt + Uoht−1 + bo)     (2)
+gt = tanh(Wgxt + Ught−1 + bg)                                     input at t is ht (from the ﬁrst network). Indeed, having mul-
+                                                                  tiple layers is often crucial for obtaining competitive perfor-
+ct = ft ct−1 + it gt                                              mance on various tasks (Pascanu et al. 2013).
+
+ht = ot tanh(ct)                                                  Recurrent Neural Network Language Model
+
+Here σ(·) and tanh(·) are the element-wise sigmoid and hy-        Let V be the ﬁxed size vocabulary of words. A language
+perbolic tangent functions, is the element-wise multipli-         model speciﬁes a distribution over wt+1 (whose support is
+cation operator, and it, ft, ot are referred to as input, for-    V) given the historical sequence w1:t = [w1, . . . , wt]. A re-
+get, and output gates. At t = 1, h0 and c0 are initialized to     current neural network language model (RNN-LM) does this
+zero vectors. Parameters of the LSTM are Wj, Uj, bj for
+j ∈ {i, f, o, g}.
+
+   Memory cells in the LSTM are additive with respect to
+time, alleviating the gradient vanishing problem. Gradient
+exploding is still an issue, though in practice simple opti-
+mization strategies (such as gradient clipping) work well.
+LSTMs have been shown to outperform vanilla RNNs on
+many tasks, including on language modeling (Sundermeyer,
+Schluter, and Ney 2012). It is easy to extend the RNN/LSTM
+to two (or more) layers by having another network whose
+by applying an afﬁne transformation to the hidden layer fol-         where Ck[∗, i : i+w−1] is the i-to-(i+w−1)-th column of
+lowed by a softmax:                                                  Ck and A, B = Tr(ABT ) is the Frobenius inner product.
+
+                          exp(ht · pj + qj)                          Finally, we take the max-over-time
+                        j ∈V exp(ht · pj + qj )
+Pr(wt+1 = j|w1:t) =                              (3)                                  yk = max f k[i]                    (6)
+
+                                                                                      i
+
+where pj is the j-th column of P ∈ Rm×|V| (also referred to          as the feature corresponding to the ﬁlter H (when applied to
+as the output embedding),2 and qj is a bias term. Similarly,         word k). The idea is to capture the most important feature—
+                                                                     the one with the highest value—for a given ﬁlter. A ﬁlter is
+for a conventional RNN-LM which usually takes words as               essentially picking out a character n-gram, where the size of
+inputs, if wt = k, then the input to the RNN-LM at t is              the n-gram corresponds to the ﬁlter width.
+the input embedding xk, the k-th column of the embedding
+matrix X ∈ Rn×|V|. Our model simply replaces the input                  We have described the process by which one feature is
+embeddings X with the output from a character-level con-             obtained from one ﬁlter matrix. Our CharCNN uses multiple
+                                                                     ﬁlters of varying widths to obtain the feature vector for k.
+volutional neural network, to be described below.                    So if we have a total of h ﬁlters H1, . . . , Hh, then yk =
+   If we denote w1:T = [w1, · · · , wT ] to be the sequence of       [y1k, . . . , yhk] is the input representation of k. For many NLP
+                                                                     applications h is typically chosen to be in [100, 1000].
+words in the training corpus, training involves minimizing
+the negative log-likelihood (N LL) of the sequence
+
+                     T                                               Highway Network
+
+N LL = − log Pr(wt|w1:t−1)                       (4)                 We could simply replace xk (the word embedding) with yk
+
+t=1                                                                  at each t in the RNN-LM, and as we show later, this simple
+
+which is typically done by truncated backpropagation                 model performs well on its own (Table 7). One could also
+through time (Werbos 1990; Graves 2013).                             have a multilayer perceptron (MLP) over yk to model in-
+
+Character-level Convolutional Neural Network                         teractions between the character n-grams picked up by the
+
+In our model, the input at time t is an output from a                ﬁlters, but we found that this resulted in worse performance.
+character-level convolutional neural network (CharCNN),                 Instead we obtained improvements by running yk through
+which we describe in this section. CNNs (LeCun et al.
+1989) have achieved state-of-the-art results on computer vi-         a highway network, recently proposed by Srivastava et al.
+sion (Krizhevsky, Sutskever, and Hinton 2012) and have also
+been shown to be effective for various NLP tasks (Collobert          (2015). Whereas one layer of an MLP applies an afﬁne trans-
+et al. 2011). Architectures employed for NLP applications
+differ in that they typically involve temporal rather than spa-      formation followed by a nonlinearity to obtain a new set of
+tial convolutions.
+                                                                     features,
+   Let C be the vocabulary of characters, d be the dimen-
+sionality of character embeddings,3 and Q ∈ Rd×|C| be the                             z = g(Wy + b)                      (7)
+matrix character embeddings. Suppose that word k ∈ V is
+made up of a sequence of characters [c1, . . . , cl], where l is     one layer of a highway network does the following:
+the length of word k. Then the character-level representation
+of k is given by the matrix Ck ∈ Rd×l, where the j-th col-                      z = t g(WH y + bH ) + (1 − t) y          (8)
+umn corresponds to the character embedding for cj (i.e. the
+cj-th column of Q).4                                                 where g is a nonlinearity, t = σ(WT y + bT ) is called the
+                                                                     transform gate, and (1−t) is called the carry gate. Similar to
+   We apply a narrow convolution between Ck and a ﬁlter
+(or kernel) H ∈ Rd×w of width w, after which we add a                the memory cells in LSTM networks, highway layers allow
+bias and apply a nonlinearity to obtain a feature map f k ∈          for training of deep networks by adaptively carrying some
+Rl−w+1. Speciﬁcally, the i-th element of f k is given by:            dimensions of the input directly to the output.5 By construc-
+                                                                     tion the dimensions of y and z have to match, and hence
+         f k[i] = tanh( Ck[∗, i : i + w − 1], H + b) (5)             WT and WH are square matrices.
+
+    2In our work, predictions are at the word-level, and hence we               Experimental Setup
+still utilize word embeddings in the output layer.
+                                                                     As is standard in language modeling, we use perplexity
+    3Given that |C| is usually small, some authors work with one-    (P P L) to evaluate the performance of our models. Perplex-
+hot representations of characters. However we found that using       ity of a model over a sequence [w1, . . . , wT ] is given by
+lower dimensional representations of characters (i.e. d < |C|) per-
+formed slightly better.                                                         P P L = exp  N LL                        (9)
+
+    4Two technical details warrant mention here: (1) we append                               T
+start-of-word and end-of-word characters to each word to better
+represent preﬁxes and sufﬁxes and hence Ck actually has l + 2        where N LL is calculated over the test set. We test the model
+columns; (2) for batch processing, we zero-pad Ck so that the num-   on corpora of varying languages and sizes (statistics avail-
+ber of columns is constant (equal to the max word length) for all    able in Table 1).
+words in V.
+                                                                        We conduct hyperparameter search, model introspection,
+                                                                     and ablation studies on the English Penn Treebank (PTB)
+                                                                     (Marcus, Santorini, and Marcinkiewicz 1993), utilizing the
+
+                                                                         5Srivastava et al. (2015) recommend initializing bT to a neg-
+                                                                     ative value, in order to militate the initial behavior towards carry.
+                                                                     We initialized bT to a small interval around −2.
+                    DATA-S     DATA-L                                                     Small                 Large
+
+               |V| |C| T    |V| |C| T                                         d 15               15
+
+English (EN)  10 k 51 1 m   60 k 197 20 m                            CNN      w [1, 2, 3, 4, 5, 6] [1, 2, 3, 4, 5, 6, 7]
+Czech (CS)    46 k 101 1 m
+German (DE)   37 k 74 1 m   206 k 195 17 m                                    h [25 · w]         [min{200, 50 · w}]
+Spanish (ES)  27 k 72 1 m
+French (FR)   25 k 76 1 m   339 k 260 51 m                                    f tanh             tanh
+Russian (RU)  62 k 62 1 m
+Arabic (AR)   86 k 132 4 m  152 k 222 56 m                           Highway  l  1               2
+                                                                              g  ReLU            ReLU
+                            137 k 225 57 m
+
+                            497 k 111 25 m                                    l2                 2
+                                                                              m 300              650
+                            –  –       –                             LSTM
+
+Table 1: Corpus statistics. |V| = word vocabulary size; |C| = char-  Table 2: Architecture of the small and large models. d =
+acter vocabulary size; T = number of tokens in training set. The     dimensionality of character embeddings; w = ﬁlter widths;
+small English data is from the Penn Treebank and the Arabic data     h = number of ﬁlter matrices, as a function of ﬁlter width
+is from the News-Commentary corpus. The rest are from the 2013       (so the large model has ﬁlters of width [1, 2, 3, 4, 5, 6, 7] of
+ACL Workshop on Machine Translation. |C| is large because of         size [50, 100, 150, 200, 200, 200, 200] for a total of 1100 ﬁlters);
+(rarely occurring) special characters.                               f, g = nonlinearity functions; l = number of layers; m = number
+                                                                     of hidden units.
+
+standard training (0-20), validation (21-22), and test (23-24)       greater efﬁciency). Gradients are averaged over each batch.
+splits along with pre-processing by Mikolov et al. (2010).           We train for 25 epochs on non-Arabic and 30 epochs on Ara-
+With approximately 1m tokens and |V| = 10k, this version             bic data (which was sufﬁcient for convergence), picking the
+has been extensively used by the language modeling com-              best performing model on the validation set. Parameters of
+munity and is publicly available.6                                   the model are randomly initialized over a uniform distribu-
+                                                                     tion with support [−0.05, 0.05].
+   With the optimal hyperparameters tuned on PTB, we ap-
+ply the model to various morphologically rich languages:                For regularization we use dropout (Hinton et al. 2012)
+Czech, German, French, Spanish, Russian, and Arabic. Non-            with probability 0.5 on the LSTM input-to-hidden layers
+Arabic data comes from the 2013 ACL Workshop on Ma-                  (except on the initial Highway to LSTM layer) and the
+chine Translation,7 and we use the same train/validation/test        hidden-to-output softmax layer. We further constrain the
+splits as in Botha and Blunsom (2014). While the raw data            norm of the gradients to be below 5, so that if the L2 norm
+are publicly available, we obtained the preprocessed ver-            of the gradient exceeds 5 then we renormalize it to have
+sions from the authors,8 whose morphological NLM serves              || · || = 5 before updating. The gradient norm constraint
+as a baseline for our work. We train on both the small               was crucial in training the model. These choices were largely
+datasets (DATA-S) with 1m tokens per language, and the               guided by previous work of Zaremba et al. (2014) on word-
+large datasets (DATA-L) including the large English data             level language modeling with LSTMs.
+which has a much bigger |V| than the PTB. Arabic data
+comes from the News-Commentary corpus,9 and we per-                     Finally, in order to speed up training on DATA-L we em-
+form our own preprocessing and train/validation/test splits.         ploy a hierarchical softmax (Morin and Bengio 2005)—a
+                                                                     common strategy for training language models with very
+   In these datasets only singleton words were replaced with         large |V|—instead of the usual softmax. We pick the number
+<unk> and hence we effectively use the full vocabulary. It
+is worth noting that the character model can utilize surface         of clusters c = |V| and randomly split V into mutually
+forms of OOV tokens (which were replaced with <unk>), but            exclusive and collectively exhaustive subsets V1, . . . , Vc of
+we do not do this and stick to the preprocessed versions (de-        (approximately) equal size.10 Then Pr(wt+1 = j|w1:t) be-
+spite disadvantaging the character models) for exact com-            comes,
+parison against prior work.
+                                                                     Pr(wt+1 = j|w1:t) =     exp(ht · sr + tr)
+Optimization
+                                                                                          c  =1  exp(ht  ·  sr  + tr )
+The models are trained by truncated backpropagation                                       r
+through time (Werbos 1990; Graves 2013). We backprop-                                                                     (10)
+agate for 35 time steps using stochastic gradient descent                                   exp(ht · prj + qrj )
+where the learning rate is initially set to 1.0 and halved if                    ×        j ∈Vr exp(ht · pjr + qrj )
+the perplexity does not decrease by more than 1.0 on the
+validation set after an epoch. On DATA-S we use a batch              where r is the cluster index such that j ∈ Vr. The ﬁrst term
+size of 20 and on DATA-L we use a batch size of 100 (for             is simply the probability of picking cluster r, and the second
+
+    6http://www.ﬁt.vutbr.cz/∼imikolov/rnnlm/                            10While Brown clustering/frequency-based clustering is com-
+    7http://www.statmt.org/wmt13/translation-task.html               monly used in the literature (e.g. Botha and Blunsom (2014) use
+    8http://bothameister.github.io/                                  Brown clusering), we used random clusters as our implementation
+    9http://opus.lingﬁl.uu.se/News-Commentary.php                    enjoys the best speed-up when the number of words in each clus-
+                                                                     ter is approximately equal. We found random clustering to work
+                                                                     surprisingly well.
+                                   PPL    Size                                                 DATA-S
+
+LSTM-Word-Small                     97.6   5m                                      CS DE ES FR RU AR
+LSTM-Char-Small                     92.3   5m
+LSTM-Word-Large                     85.4  20 m                        Botha  KN-4  545  366    241  274  396  323
+LSTM-Char-Large                     78.9  19 m                               MLBL  465  296    200  225  304   –
+
+KN-5 (Mikolov et al. 2012)         141.2   2m                                   Word 503 305 212 229 352 216
+RNN† (Mikolov et al. 2012)         124.7   6m                         Small Morph 414 278 197 216 290 230
+RNN-LDA† (Mikolov et al. 2012)     113.7   7m
+genCNN† (Wang et al. 2015)         116.4   8m                                   Char 401 260 182 189 278 196
+FOFE-FNNLM† (Zhang et al. 2015)    108.0   6m
+Deep RNN (Pascanu et al. 2013)     107.5   6m                                   Word 493 286 200 222 357 172
+Sum-Prod Net† (Cheng et al. 2014)  100.0   5m                         Large Morph 398 263 177 196 271 148
+LSTM-1† (Zaremba et al. 2014)       82.7  20 m
+LSTM-2† (Zaremba et al. 2014)       78.4  52 m                                  Char 371 239 165 184 261 148
+
+Table 3: Performance of our model versus other neural language        Table 4: Test set perplexities for DATA-S. First two rows are from
+models on the English Penn Treebank test set. P P L refers to per-    Botha (2014) (except on Arabic where we trained our own KN-4
+plexity (lower is better) and size refers to the approximate number   model) while the last six are from this paper. KN-4 is a Kneser-
+of parameters in the model. KN-5 is a Kneser-Ney 5-gram language      Ney 4-gram language model, and MLBL is the best performing
+model which serves as a non-neural baseline. †For these models the    morphological logbilinear model from Botha (2014). Small/Large
+authors did not explicitly state the number of parameters, and hence  refer to model size (see Table 2), and Word/Morph/Char are models
+sizes shown here are estimates based on our understanding of their    with words/morphemes/characters as inputs respectively.
+papers or private correspondence with the respective authors.
+                                                                      from a morphological standpoint, and thus our next set of
+term is the probability of picking word j given that cluster r        results (and arguably the main contribution of this paper)
+is picked. We found that hierarchical softmax was not nec-            is focused on languages with richer morphology (Table 4,
+essary for models trained on DATA-S.                                  Table 5).
+
+                         Results                                         We compare our results against the morphological log-
+                                                                      bilinear (MLBL) model from Botha and Blunsom (2014),
+English Penn Treebank                                                 whose model also takes into account subword information
+                                                                      through morpheme embeddings that are summed at the input
+We train two versions of our model to assess the trade-off            and output layers. As comparison against the MLBL mod-
+between performance and size. Architecture of the small               els is confounded by our use of LSTMs—widely known
+(LSTM-Char-Small) and large (LSTM-Char-Large) models                  to outperform their feed-forward/log-bilinear cousins—we
+is summarized in Table 2. As another baseline, we also                also train an LSTM version of the morphological NLM,
+train two comparable LSTM models that use word em-                    where the input representation of a word given to the LSTM
+beddings only (LSTM-Word-Small, LSTM-Word-Large).                     is a summation of the word’s morpheme embeddings. Con-
+LSTM-Word-Small uses 200 hidden units and LSTM-Word-                  cretely, suppose that M is the set of morphemes in a lan-
+Large uses 650 hidden units. Word embedding sizes are                 guage, M ∈ Rn×|M| is the matrix of morpheme embed-
+also 200 and 650 respectively. These were chosen to keep              dings, and mj is the j-th column of M (i.e. a morpheme
+the number of parameters similar to the corresponding                 embedding). Given the input word k, we feed the following
+character-level model.                                                representation to the LSTM:
+
+   As can be seen from Table 3, our large model is on                              xk +        mj             (11)
+par with the existing state-of-the-art (Zaremba et al. 2014),
+despite having approximately 60% fewer parameters. Our                                   j∈Mk
+small model signiﬁcantly outperforms other NLMs of sim-
+ilar size, even though it is penalized by the fact that the           where xk is the word embedding (as in a word-level model)
+dataset already has OOV words replaced with <unk> (other              and Mk ⊂ M is the set of morphemes for word k. The
+models are purely word-level models). While lower perplex-            morphemes are obtained by running an unsupervised mor-
+ities have been reported with model ensembles (Mikolov and            phological tagger as a preprocessing step.11 We emphasize
+Zweig 2012), we do not include them here as they are not              that the word embedding itself (i.e. xk) is added on top of the
+comparable to the current work.                                       morpheme embeddings, as was done in Botha and Blunsom
+                                                                      (2014). The morpheme embeddings are of size 200/650 for
+Other Languages                                                       the small/large models respectively. We further train word-
+                                                                      level LSTM models as another baseline.
+The model’s performance on the English PTB is informative
+to the extent that it facilitates comparison against the large           On DATA-S it is clear from Table 4 that the character-
+body of existing work. However, English is relatively simple          level models outperform their word-level counterparts de-
+
+                                                                         11We use Morfessor Cat-MAP (Creutz and Lagus 2007), as in
+                                                                      Botha and Blunsom (2014).
+                       DATA-L
+
+             CS DE ES FR RU EN
+
+Botha  KN-4  862  463  219  243  390  291
+       MLBL  643  404  203  227  300  273
+
+          Word 701 347 186 202 353 236
+Small Morph 615 331 189 209 331 233
+
+          Char 578 305 169 190 313 216
+
+Table 5: Test set perplexities on DATA-L. First two rows are from   Figure 2: Plot of character n-gram representations via PCA for
+Botha (2014), while the last three rows are from the small LSTM     English. Colors correspond to: preﬁxes (red), sufﬁxes (blue), hy-
+models described in the paper. KN-4 is a Kneser-Ney 4-gram lan-     phenated (orange), and all others (grey). Preﬁxes refer to character
+guage model, and MLBL is the best performing morphological log-     n-grams which start with the start-of-word character. Sufﬁxes like-
+bilinear model from Botha (2014). Word/Morph/Char are models        wise refer to character n-grams which end with the end-of-word
+with words/morphemes/characters as inputs respectively.             character.
+
+spite, again, being smaller.12 The character models also out-       also makes some clear mistakes (e.g. his and hhs), highlight-
+perform their morphological counterparts (both MLBL and             ing the limits of our approach, although this could be due to
+LSTM architectures), although improvements over the mor-            the small dataset.
+phological LSTMs are more measured. Note that the mor-
+pheme models have strictly more parameters than the word               The learned representations of OOV words (computer-
+models because word embeddings are used as part of the in-          aided, misinformed) are positioned near words with the
+put.                                                                same part-of-speech. The model is also able to correct for
+                                                                    incorrect/non-standard spelling (looooook), indicating po-
+   Due to memory constraints13 we only train the small              tential applications for text normalization in noisy domains.
+models on DATA-L (Table 5). Interestingly we do not ob-
+serve signiﬁcant differences going from word to morpheme            Learned Character N -gram Representations
+LSTMs on Spanish, French, and English. The character
+models again outperform the word/morpheme models. We                As discussed previously, each ﬁlter of the CharCNN is es-
+also observe signiﬁcant perplexity reductions even on En-           sentially learning to detect particular character n-grams. Our
+glish when V is large. We conclude this section by noting           initial expectation was that each ﬁlter would learn to activate
+that we used the same architecture for all languages and did        on different morphemes and then build up semantic repre-
+not perform any language-speciﬁc tuning of hyperparame-             sentations of words from the identiﬁed morphemes. How-
+ters.                                                               ever, upon reviewing the character n-grams picked up by
+                                                                    the ﬁlters (i.e. those that maximized the value of the ﬁlter),
+                       Discussion                                   we found that they did not (in general) correspond to valid
+                                                                    morphemes.
+Learned Word Representations
+                                                                       To get a better intuition for what the character composi-
+We explore the word representations learned by the models           tion model is learning, we plot the learned representations
+on the PTB. Table 6 has the nearest neighbors of word rep-          of all character n-grams (that occurred as part of at least two
+resentations learned from both the word-level and character-        words in V) via principal components analysis (Figure 2).
+level models. For the character models we compare the rep-          We feed each character n-gram into the CharCNN and use
+resentations obtained before and after highway layers.              the CharCNN’s output as the ﬁxed dimensional representa-
+                                                                    tion for the corresponding character n-gram. As is appar-
+   Before the highway layers the representations seem to            ent from Figure 2, the model learns to differentiate between
+solely rely on surface forms—for example the nearest neigh-         preﬁxes (red), sufﬁxes (blue), and others (grey). We also ﬁnd
+bors of you are your, young, four, youth, which are close to        that the representations are particularly sensitive to character
+you in terms of edit distance. The highway layers however,          n-grams containing hyphens (orange), presumably because
+seem to enable encoding of semantic features that are not           this is a strong signal of a word’s part-of-speech.
+discernable from orthography alone. After highway layers
+the nearest neighbor of you is we, which is orthographically        Highway Layers
+distinct from you. Another example is while and though—
+these words are far apart edit distance-wise yet the composi-       We quantitatively investigate the effect of highway network
+tion model is able to place them near each other. The model         layers via ablation studies (Table 7). We train a model with-
+                                                                    out any highway layers, and ﬁnd that performance decreases
+   12The difference in parameters is greater for non-PTB corpora    signiﬁcantly. As the difference in performance could be
+as the size of the word model scales faster with |V|. For example,  due to the decrease in model size, we also train a model
+on Arabic the small/large word models have 35m/121m parameters      that feeds yk (i.e. word representation from the CharCNN)
+while the corresponding character models have 29m/69m parame-
+ters respectively.
+
+   13All models were trained on GPUs with 2GB memory.
+                                    In Vocabulary                                             Out-of-Vocabulary
+
+                   while   his      you            richard trading computer-aided misinformed looooook
+
+                 although  your conservatives jonathan advertised                          –                –       –
+                  letting
+LSTM-Word         though   her      we                           robert advertising        –                –       –
+                  minute
+                           my       guys                         neil  turnover            –                –       –
+
+                           their    i                            nancy turnover            –                –       –
+
+                 chile     this     your            hard               heading       computer-guided   informed     look
+                                    young           rich               training        computerized    performed    cook
+LSTM-Char        whole     hhs       four          richer              reading           disk-drive   transformed   looks
+                                    youth          richter             leading           computer                   shook
+(before highway) meanwhile is                                                                            inform
+
+                 white     has
+
+                 meanwhile hhs      we             eduard               trade        computer-guided    informed     look
+                                                   gerard              training      computer-driven   performed     looks
+LSTM-Char        whole     this     your           edward              traded                         outperformed  looked
+                                                                        trader         computerized   transformed   looking
+(after highway)  though their       doug             carl                                computer
+
+                 nevertheless your  i
+
+Table 6: Nearest neighbor words (based on cosine similarity) of word representations from the large word-level and character-level (before
+and after highway layers) models trained on the PTB. Last three words are OOV words, and therefore they do not have representations in the
+word-level model.
+
+                            LSTM-Char                                                                 |V |
+
+                           Small Large                                                     10 k 25 k 50 k 100 k
+
+No Highway Layers          100.3 84.6                                                1 m 17% 16% 21% –
+One Highway Layer           92.3 79.7
+Two Highway Layers          90.1 78.9                                  T              5m   8% 14% 16% 21%
+One MLP Layer                                                                        10 m  9% 9% 12% 15%
+                           111.2 92.6
+                                                                                     25 m 9% 8% 9% 10%
+
+Table 7: Perplexity on the Penn Treebank for small/large models        Table 8: Perplexity reductions by going from small word-level to
+trained with/without highway layers.                                   character-level models based on different corpus/vocabulary sizes
+                                                                       on German (DE). |V| is the vocabulary size and T is the number
+through a one-layer multilayer perceptron (MLP) to use as              of tokens in the training set. The full vocabulary of the 1m dataset
+input into the LSTM. We ﬁnd that the MLP does poorly, al-              was less than 100k and hence that scenario is unavailable.
+though this could be due to optimization issues.
+                                                                       ity reductions as a result of going from a small word-level
+   We hypothesize that highway networks are especially                 model to a small character-level model. To vary the vocabu-
+well-suited to work with CNNs, adaptively combining lo-                lary size we take the most frequent k words and replace the
+cal features detected by the individual ﬁlters. CNNs have              rest with <unk>. As with previous experiments the character
+already proven to be been successful for many NLP tasks                model does not utilize surface forms of <unk> and simply
+(Collobert et al. 2011; Shen et al. 2014; Kalchbrenner,                treats it as another token. Although Table 8 suggests that the
+Grefenstette, and Blunsom 2014; Kim 2014; Zhang, Zhao,                 perplexity reductions become less pronounced as the corpus
+and LeCun 2015; Lei, Barzilay, and Jaakola 2015), and we               size increases, we nonetheless ﬁnd that the character-level
+posit that further gains could be achieved by employing                model outperforms the word-level model in all scenarios.
+highway layers on top of existing CNN architectures.
+                                                                       Further Observations
+   We also anecdotally note that (1) having one to two high-
+way layers was important, but more highway layers gener-               We report on some further experiments and observations:
+ally resulted in similar performance (though this may de-
+pend on the size of the datasets), (2) having more convolu-            • Combining word embeddings with the CharCNN’s out-
+tional layers before max-pooling did not help, and (3) high-              put to form a combined representation of a word (to be
+way layers did not improve models that only used word em-                 used as input to the LSTM) resulted in slightly worse
+beddings as inputs.                                                       performance (81 on PTB with a large model). This was
+                                                                          surprising, as improvements have been reported on part-
+Effect of Corpus/Vocab Sizes                                              of-speech tagging (dos Santos and Zadrozny 2014) and
+                                                                          named entity recognition (dos Santos and Guimaraes
+We next study the effect of training corpus/vocabulary sizes              2015) by concatenating word embeddings with the out-
+on the relative performance between the different models.                 put from a character-level CNN. While this could be due
+We take the German (DE) dataset from DATA-L and vary the
+training corpus/vocabulary sizes, calculating the perplex-
+   to insufﬁcient experimentation on our part,14 it suggests       and Guimaraes 2015) by representing a word as a concatena-
+   that for some tasks, word embeddings are superﬂuous—            tion of its word embedding and an output from a character-
+   character inputs are good enough.                               level CNN, and using the combined representation as fea-
+                                                                   tures in a Conditional Random Field (CRF). Zhang, Zhao,
+• While our model requires additional convolution opera-           and LeCun (2015) do away with word embeddings com-
+   tions over characters and is thus slower than a comparable      pletely and show that for text classiﬁcation, a deep CNN
+   word-level model which can perform a simple lookup at           over characters performs well. Ballesteros, Dyer, and Smith
+   the input layer, we found that the difference was manage-       (2015) use an RNN over characters only to train a transition-
+   able with optimized GPU implementations—for example             based parser, obtaining improvements on many morpholog-
+   on PTB the large character-level model trained at 1500 to-      ically rich languages.
+   kens/sec compared to the word-level model which trained
+   at 3000 tokens/sec. For scoring, our model can have the            Finally, Ling et al. (2015) apply a bi-directional LSTM
+   same running time as a pure word-level model, as the            over characters to use as inputs for language modeling and
+   CharCNN’s outputs can be pre-computed for all words in          part-of-speech tagging. They show improvements on various
+   V. This would, however, be at the expense of increased          languages (English, Portuguese, Catalan, German, Turkish).
+   model size, and thus a trade-off can be made between            It remains open as to which character composition model
+   run-time speed and memory (e.g. one could restrict the          (i.e. CNN or LSTM) performs better.
+   pre-computation to the most frequent words).
+                                                                                         Conclusion
+                     Related Work
+                                                                   We have introduced a neural language model that utilizes
+Neural Language Models (NLM) encompass a rich fam-                 only character-level inputs. Predictions are still made at the
+ily of neural network architectures for language modeling.         word-level. Despite having fewer parameters, our model
+Some example architectures include feed-forward (Bengio,           outperforms baseline models that utilize word/morpheme
+Ducharme, and Vincent 2003), recurrent (Mikolov et al.             embeddings in the input layer. Our work questions the ne-
+2010), sum-product (Cheng et al. 2014), log-bilinear (Mnih         cessity of word embeddings (as inputs) for neural language
+and Hinton 2007), and convolutional (Wang et al. 2015) net-        modeling.
+works.
+                                                                      Analysis of word representations obtained from the char-
+   In order to address the rare word problem, Alexandrescu         acter composition part of the model further indicates that
+and Kirchhoff (2006)—building on analogous work on                 the model is able to encode, from characters only, rich se-
+count-based n-gram language models by Bilmes and Kirch-            mantic and orthographic features. Using the CharCNN and
+hoff (2003)—represent a word as a set of shared factor em-         highway layers for representation learning (e.g. as input into
+beddings. Their Factored Neural Language Model (FNLM)              word2vec (Mikolov et al. 2013)) remains an avenue for fu-
+can incorporate morphemes, word shape information (e.g.            ture work.
+capitalization) or any other annotation (e.g. part-of-speech
+tags) to represent words.                                             Insofar as sequential processing of words as inputs is
+                                                                   ubiquitous in natural language processing, it would be in-
+   A speciﬁc class of FNLMs leverages morphemic infor-             teresting to see if the architecture introduced in this paper is
+mation by viewing a word as a function of its (learned)            viable for other tasks—for example, as an encoder/decoder
+morpheme embeddings (Luong, Socher, and Manning 2013;              in neural machine translation (Cho et al. 2014; Sutskever,
+Botha and Blunsom 2014; Qui et al. 2014). For example Lu-          Vinyals, and Le 2014).
+ong, Socher, and Manning (2013) apply a recursive neural
+network over morpheme embeddings to obtain the embed-                                Acknowledgments
+ding for a single word. While such models have proved use-
+ful, they require morphological tagging as a preprocessing         We are especially grateful to Jan Botha for providing the
+step.                                                              preprocessed datasets and the model results.
+
+   Another direction of work has involved purely character-                               References
+level NLMs, wherein both input and output are charac-
+ters (Sutskever, Martens, and Hinton 2011; Graves 2013).           Alexandrescu, A., and Kirchhoff, K. 2006. Factored Neural Lan-
+Character-level models obviate the need for morphological          guage Models. In Proceedings of NAACL.
+tagging or manual feature engineering, and have the attrac-
+tive property of being able to generate novel words. How-          Ballesteros, M.; Dyer, C.; and Smith, N. A. 2015. Im-
+ever they are generally outperformed by word-level models          proved Transition-Based Parsing by Modeling Characters instead
+(Mikolov et al. 2012).                                             of Words with LSTMs. In Proceedings of EMNLP.
+
+   Outside of language modeling, improvements have                 Bengio, Y.; Ducharme, R.; and Vincent, P. 2003. A Neural Prob-
+been reported on part-of-speech tagging (dos Santos and            abilistic Language Model. Journal of Machine Learning Research
+Zadrozny 2014) and named entity recognition (dos Santos            3:1137–1155.
+
+   14We experimented with (1) concatenation, (2) tensor products,  Bengio, Y.; Simard, P.; and Frasconi, P. 1994. Learning Long-term
+(3) averaging, and (4) adaptive weighting schemes whereby the      Dependencies with Gradient Descent is Difﬁcult. IEEE Transac-
+model learns a convex combination of word embeddings and the       tions on Neural Networks 5:157–166.
+CharCNN outputs.
+                                                                   Bilmes, J., and Kirchhoff, K. 2003. Factored Language Models
+                                                                   and Generalized Parallel Backoff. In Proceedings of NAACL.
+Botha, J., and Blunsom, P. 2014. Compositional Morphology for         Marcus, M.; Santorini, B.; and Marcinkiewicz, M. 1993. Building
+Word Representations and Language Modelling. In Proceedings           a Large Annotated Corpus of English: the Penn Treebank. Compu-
+of ICML.                                                              tational Linguistics 19:331–330.
+
+Botha, J. 2014. Probabilistic Modelling of Morphologically Rich       Mikolov, T., and Zweig, G. 2012. Context Dependent Recurrent
+Languages. DPhil Dissertation, Oxford University.                     Neural Network Language Model. In Proceedings of SLT.
+
+Chen, S., and Goodman, J. 1998. An Empirical Study of Smooth-         Mikolov, T.; Karaﬁat, M.; Burget, L.; Cernocky, J.; and Khudanpur,
+ing Techniques for Language Modeling. Technical Report, Har-          S. 2010. Recurrent Neural Network Based Language Model. In
+vard University.                                                      Proceedings of INTERSPEECH.
+
+Cheng, W. C.; Kok, S.; Pham, H. V.; Chieu, H. L.; and Chai, K. M.     Mikolov, T.; Deoras, A.; Kombrink, S.; Burget, L.; and Cernocky,
+2014. Language Modeling with Sum-Product Networks. In Pro-            J. 2011. Empirical Evaluation and Combination of Advanced Lan-
+ceedings of INTERSPEECH.                                              guage Modeling Techniques. In Proceedings of INTERSPEECH.
+
+Cho, K.; van Merrienboer, B.; Gulcehre, C.; Bahdanau, D.;             Mikolov, T.; Sutskever, I.; Deoras, A.; Le, H.-S.; Kombrink, S.;
+Bougares, F.; Schwenk, H.; and Bengio, Y. 2014. Learning Phrase       and Cernocky, J. 2012. Subword Language Modeling with Neural
+Representations using RNN Encoder-Decoder for Statistical Ma-         Networks. preprint: www.ﬁt.vutbr.cz/i˜mikolov/rnnlm/char.pdf.
+chine Translation. In Proceedings of EMNLP.
+                                                                      Mikolov, T.; Chen, K.; Corrado, G.; and Dean, J. 2013. Ef-
+Collobert, R.; Weston, J.; Bottou, L.; Karlen, M.; Kavukcuoglu, K.;   ﬁcient Estimation of Word Representations in Vector Space.
+and Kuksa, P. 2011. Natural Language Processing (almost) from         arXiv:1301.3781.
+Scratch. Journal of Machine Learning Research 12:2493–2537.
+                                                                      Mnih, A., and Hinton, G. 2007. Three New Graphical Models for
+Creutz, M., and Lagus, K. 2007. Unsupervised Models for Mor-          Statistical Language Modelling. In Proceedings of ICML.
+pheme Segmentation and Morphology Learning. In Proceedings of
+the ACM Transations on Speech and Language Processing.                Morin, F., and Bengio, Y. 2005. Hierarchical Probabilistic Neural
+                                                                      Network Language Model. In Proceedings of AISTATS.
+Deerwester, S.; Dumais, S.; and Harshman, R. 1990. Indexing by
+Latent Semantic Analysis. Journal of American Society of Infor-       Pascanu, R.; Culcehre, C.; Cho, K.; and Bengio, Y. 2013. How to
+mation Science 41:391–407.                                            Construct Deep Neural Networks. arXiv:1312.6026.
+
+dos Santos, C. N., and Guimaraes, V. 2015. Boosting Named Entity      Qui, S.; Cui, Q.; Bian, J.; and Gao, B. 2014. Co-learning of Word
+Recognition with Neural Character Embeddings. In Proceedings of       Representations and Morpheme Representations. In Proceedings
+ACL Named Entities Workshop.                                          of COLING.
+
+dos Santos, C. N., and Zadrozny, B. 2014. Learning Character-         Shen, Y.; He, X.; Gao, J.; Deng, L.; and Mesnil, G. 2014. A Latent
+level Representations for Part-of-Speech Tagging. In Proceedings      Semantic Model with Convolutional-pooling Structure for Infor-
+of ICML.                                                              mation Retrieval. In Proceedings of CIKM.
+
+Graves, A. 2013. Generating Sequences with Recurrent Neural           Srivastava, R. K.; Greff, K.; and Schmidhuber, J. 2015. Training
+Networks. arXiv:1308.0850.                                            Very Deep Networks. arXiv:1507.06228.
+
+Hinton, G.; Srivastava, N.; Krizhevsky, A.; Sutskever, I.; and        Sundermeyer, M.; Schluter, R.; and Ney, H. 2012. LSTM Neural
+Salakhutdinov, R. 2012. Improving Neural Networks by Prevent-         Networks for Language Modeling.
+ing Co-Adaptation of Feature Detectors. arxiv:1207.0580.
+                                                                      Sutskever, I.; Martens, J.; and Hinton, G. 2011. Generating Text
+Hochreiter, S., and Schmidhuber, J. 1997. Long Short-Term Mem-        with Recurrent Neural Networks.
+ory. Neural Computation 9:1735–1780.
+                                                                      Sutskever, I.; Vinyals, O.; and Le, Q. 2014. Sequence to Sequence
+Kalchbrenner, N.; Grefenstette, E.; and Blunsom, P. 2014. A Con-      Learning with Neural Networks.
+volutional Neural Network for Modelling Sentences. In Proceed-
+ings of ACL.                                                          Wang, M.; Lu, Z.; Li, H.; Jiang, W.; and Liu, Q. 2015. genCNN:
+                                                                      A Convolutional Architecture for Word Sequence Prediction. In
+Kim, Y. 2014. Convolutional Neural Networks for Sentence Clas-        Proceedings of ACL.
+siﬁcation. In Proceedings of EMNLP.
+                                                                      Werbos, P. 1990. Back-propagation Through Time: what it does
+Krizhevsky, A.; Sutskever, I.; and Hinton, G. 2012. ImageNet          and how to do it. In Proceedings of IEEE.
+Classiﬁcation with Deep Convolutional Neural Networks. In Pro-
+ceedings of NIPS.                                                     Zaremba, W.; Sutskever, I.; and Vinyals, O. 2014. Recurrent Neural
+                                                                      Network Regularization. arXiv:1409.2329.
+LeCun, Y.; Boser, B.; Denker, J. S.; Henderson, D.; Howard, R. E.;
+Hubbard, W.; and Jackel, L. D. 1989. Handwritten Digit Recogni-       Zhang, S.; Jiang, H.; Xu, M.; Hou, J.; and Dai, L. 2015. The Fixed-
+tion with a Backpropagation Network. In Proceedings of NIPS.          Size Ordinally-Forgetting Encoding Method for Neural Network
+                                                                      Language Models. In Proceedings of ACL.
+Lei, T.; Barzilay, R.; and Jaakola, T. 2015. Molding CNNs for
+Text: Non-linear, Non-consecutive Convolutions. In Proceedings        Zhang, X.; Zhao, J.; and LeCun, Y. 2015. Character-level Convo-
+of EMNLP.                                                             lutional Networks for Text Classiﬁcation. In Proceedings of NIPS.
+
+Ling, W.; Lui, T.; Marujo, L.; Astudillo, R. F.; Amir, S.; Dyer, C.;
+Black, A. W.; and Trancoso, I. 2015. Finding Function in Form:
+Compositional Character Models for Open Vocabulary Word Rep-
+resentation. In Proceedings of EMNLP.
+
+Luong, M.-T.; Socher, R.; and Manning, C. 2013. Better Word
+Representations with Recursive Neural Networks for Morphology.
+In Proceedings of CoNLL.
+

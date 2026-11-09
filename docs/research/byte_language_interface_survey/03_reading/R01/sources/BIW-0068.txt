@@ -1,0 +1,462 @@
+Neural Machine Translation without Embeddings
+
+                    Uri Shaham♦ Omer Levy♦♠
+♦The Blavatnik School of Computer Science, Tel Aviv University
+
+                         ♠Facebook AI Research
+
+Abstract                                             and in doing so, improve the models’ performance
+
+Many NLP models operate over sequences of            consistently.
+subword tokens produced by hand-crafted to-             We replace the dense trainable embedding ma-
+kenization rules and heuristic subword induc-
+tion algorithms. A simple universal alterna-         trix with a ﬁxed one-hot encoding of the vocabulary
+                                                     as the ﬁrst and last layers of a standard transformer
+
+tive is to represent every computerized text         model. Machine translation experiments on 10 lan-
+as a sequence of bytes via UTF-8, obviat-            guage pairs show that byte-to-byte models without
+ing the need for an embedding layer since            an embedding layer achieve higher BLEU scores
+there are fewer token types (256) than dimen-        than byte-based models with parameterized em-
+sions. Surprisingly, replacing the ubiquitous        beddings (+0.5 on average), thus closing the perfor-
+embedding layer with one-hot representations         mance gap with subword and character models. We
+of each byte does not hurt performance; ex-          observe this result consistently throughout a wide
+periments on byte-to-byte machine translation        variety of target languages and writing systems.
+from English to 10 different languages show
+
+     a consistent improvement in BLEU, rivaling         The fact that removing parameters improves per-
+     character-level and even standard subword-      formance is counter-intuitive, especially given re-
+     level models. A deeper investigation reveals    cent trends in machine learning that advocate for
+     that the combination of embeddingless models    increasingly larger networks. We further investi-
+     with decoder-input dropout amounts to token     gate why embeddingless models yield better re-
+     dropout, which beneﬁts byte-to-byte models in   sults and ﬁnd implicit token dropout (commonly
+     particular.1                                    referred to as “word dropout”) as the main source
+                                                     of that boost. While prior work shows that ran-
+1 Introduction
+
+Neural NLP models often operate on the subword       domly masking tokens from the decoder input can
+level, which requires language-speciﬁc tokenizers    improve the performance of language generation
+(Koehn et al., 2007; Adler and Elhadad, 2006) and    models (Bowman et al., 2016), we ﬁnd that this
+subword induction algorithms, such as BPE (Sen-      effect is ampliﬁed when operating at the byte level.
+nrich et al., 2016; Kudo, 2018). Instead, working    Overall, our results suggest that, even without addi-
+at the byte level by representing each character as  tional parameters, byte-based models can compete
+a variable number of Unicode (UTF-8) bytes, does     and potentially outperform subword models, but
+not require any form of preprocessing, allowing      that they may require alternative optimization tech-
+the model to read and predict every computerized     niques to achieve that goal.
+
+text using a single vocabulary of 256 types. While   2 Byte Tokenization
+previous work found that byte-level models tend
+
+to underperform models based on subword tokens Modern software typically represents text using
+
+(Wang et al., 2019), byte-based models exhibit an    Unicode strings (UTF-8), which allows one to en-
+interesting property: their vocabulary is smaller    code virtually any writing system using a variable
+than the number of latent dimensions (256 < d).      number of bytes per token; English characters are
+
+In this work, we demonstrate that this property typically represented by a single byte, with other
+allows us to remove the input and output embed- writing systems taking two (e.g. Arabic), three (e.g.
+
+ding layers from byte-to-byte translation models, Chinese), or four (e.g. emojis) bytes per character.
+
+1Our code is publicly available at: https://github. By treating each byte as a separate token, we can
+
+com/UriSha/EmbeddinglessNMT                          encode any natural language text using a single uni-
+
+                                                    181
+
+          Proceedings of the 2021 Conference of the North American Chapter of the
+Association for Computational Linguistics: Human Language Technologies, pages 181–186
+
+              June 6–11, 2021. ©2021 Association for Computational Linguistics
+Original Text                                                     Будь здоров.
+Subwords (BPE)
+Characters         Бу@        дь                                     здо@                    ров  .
+Bytes (UTF-8)
+                Б       у  д      ь                               з  д          о  р         о    в.
+
+                D0 91 D1 83 D0 B4 D1 8C 20 D0 B7 D0 B4 D0 BE D1 80 D0 BE D0 B2 2E
+
+Figure 1: Subword (BPE), character, and byte tokens of the string “Будь здоров.” UTF-8 uses two bytes to
+represent each character in the Cyrillic script, making the byte sequence longer than the number of characters.
+
+versal vocabulary of only 256 token types. More-                                   Original     Embeddingless
+
+over, byte tokenization obviates the need for any                    Input      XE + Pn              X + Pn
+heuristic preprocessing, such as splitting spaces,                                                softmaxd (Y )
+                                                                     Output softmax|V | Y E
+
+punctuation, and contractions. Figure 1 illustrates               Figure 2: The main differences between the original
+subword, character, and byte tokenization.
+                                                                  encoder-decoder model and the new embeddingless
+3 Embeddingless Model                                             model. X ∈ Rn×|V | is the one-hot representation of n
+                                                                  input tokens (bytes); Pn are the positional embeddings
+Our model is based on the original transformer                    up to length n.
+
+encoder-decoder (Vaswani et al., 2017) with one
+
+main difference: we eliminate the input and output                consumption increases when working on longer se-
+token embedding layers. These layers typically use                quences, since the space complexity of transform-
+a common parameter matrix E ∈ R|V |×d that con-                   ers is O(n2 + n · d). In our case, d (512) is typically
+tains a d-dimensional embedding vector for each                   larger than n (see Table 1), entailing an increase
+source and target vocabulary item in V .2                         in memory consumption that is roughly linear in
+                                                                  the sequence length n, and a similar decrease in
+   Instead, we use a ﬁxed one-hot representation                  processing speed when compared to character and
+of our byte vocabulary. For instance, the character               subword models.
+“R” could be represented as a vector with 1 at di-
+mension 82 and 0 elsewhere. Since it is standard                     In addition to replacing the embedding layers,
+practice to use representations of more than 256                  we also remove the dropout layers on the encoder
+dimensions, every possible byte can be represented                input and decoder output, since zeroing out entries
+by such one-hot vectors. To predict the next token                of one-hot vectors is equivalent to randomly mask-
+for a decoder input of n tokens, we take the output               ing out input tokens or deleting signiﬁcant parts
+of the last transformer decoder layer, Y ∈ Rn×d,                  of the model’s predicted distribution. The dropout
+and apply a softmax across each vector’s dimen-                   on the decoder input (preﬁx of the target fed with
+sions. Formal expressions of the input and output                 teacher forcing) remains intact at this point and is
+of our model are detailed in Figure 2.                            applied throughout our main experiments. Further
+                                                                  analysis shows that decoder input dropout is in fact
+   Omitting the embedding layer reduces the num-                  a signiﬁcant source of performance gains, which
+ber of parameters by a factor of O(|V | · d).3 We do              we further investigate in Section 6.
+add a total of 3 parameters to scale the encoder and
+decoder’s (one-hot) inputs and the decoder’s output
+
+(√before the softmax). We initialize all three with               4 Experiments
+  d, akin to the constant scaling factor typically
+                                                                  We train byte-tokenized embeddingless models for
+applied to the input embedding layer in transform-                machine translation and compare them to standard
+                                                                  byte, character, and subword-based models on a
+ers. Despite the reduction in model size, memory                  diverse set of languages. We adopt a standard ex-
+                                                                  perimental setup that was designed and tuned for
+    2One could argue that the ﬁrst layer of each transformer      the subword baseline and limits our hyperparame-
+stack (the key, query, and value matrices) qualify as some        ter tuning to dropout probabilities.
+form of multi-head multi-purpose embedding layer, where
+each token type is effectively represented by 3h different        Datasets We use the IWSLT4 datasets of English
+vectors (h being the number of attention heads) in the encoder    TED talks translated into other languages (Cettolo
+and 3h additional vectors in the decoder. This is very different
+from the standard notion of embeddings, where each token              4All languages used the IWSLT2014 data except for Viet-
+type has a universal representation that can be shared across     namese (IWSLT2015) and Japanese (IWSLT2017).
+the encoder input, decoder input, and decoder output.
+
+    3For subword tokenization, this accounts for a signiﬁcant
+portion of the parameter budget, but for byte-based models
+the added parameter cost is negligible.
+
+                                                     182
+Language  ID   #Sentences    Average length                       Benchmark Embedding-based Models Embed-less
+                           BPE Char Byte
+                                                                  Src Tgt Subword Char Byte  Byte
+
+Chinese   zh   166k        20.9 32.4 90.1                         en zh  19.9  20.8 20.2     21.0
+
+Spanish   es   167k        25.4 100.2 100.2                       en es  36.8  36.3 36.3     36.8
+
+Arabic    ar   166k        24.4 79.3 142.2                        en ar  12.5  12.5 12.3     12.9
+
+Russian   ru   164k        26.3 93.9 169.7                        en ru  18.1  17.6 17.4     18.2
+
+German    de   159k        26.6 106.5 107.9                       en de  29.4  28.6 28.7     29.1
+
+Japanese ja    215k        20.9 42.4 115.3                        en ja  12.0  12.5 12.5     13.1
+
+Turkish   tr   143k        24.1 93.6 102.0                        en tr  13.6  13.7 13.8     14.1
+
+Vietnamese vi  124k        26.9 99.8 132.5                        en vi  29.7  28.2 28.0     28.7
+
+Farsi     fa   100k        27.4 93.1 165.9                        en fa  11.5  11.7 12.0     12.1
+
+Hebrew    he   171k        23.0 72.8 129.2                        en he  26.1  26.9 26.4     26.7
+
+English   en   -           25.6 97.0 97.1                         zh en  16.8  16.6 15.6     16.1
+
+                                                                  es en  39.6  38.5 38.4     38.8
+
+Table 1: Languages from the IWSLT dataset, along ar en                   31.5  30.2 30.3     30.8
+
+with the number of sentence pairs in the training set and ru en          22.7  21.9 22.0     22.0
+
+the average sequence length per tokenization method.              de en  35.4  34.0 34.1     34.5
+
+                                                                  ja en  13.1  12.6 11.4     12.2
+
+                                                                  tr en  23.3  22.5 22.3     23.3
+
+                                                                  vi en  26.8  25.0 24.7     25.3
+et al., 2014), selecting 10 additional languages with fa en
+                                                                         23.5  22.4 22.1     22.6
+
+varying characteristics5 (see Table 1). For each one, he en              37.8  36.9 37.0     37.4
+
+we train translation models from English to the tar-
+
+get language (the original direction of translation Table 2: Test BLEU scores of the baseline and embed-
+
+), and also in the opposite direction for complete- dingless models on the IWSLT dataset.
+
+ness. We clean the training data for every language
+
+pair by ﬁrst removing sentences longer than 800              ing rate of 5 × 10−4, label smoothing of 0.1, and
+bytes, and then the sentences with the largest byte-         weight decay of 1 × 10−4. We train each model
+length ratio between source and target such that we          for 50k steps and average the top 5 checkpoints
+remove a total of 5% of the training examples.               according to the validation loss. We tune dropout
+
+Baselines In addition to the byte-based embed-               (0.2 or 0.3) on the validation set. We set the batch
+dingless transformer, we train standard transformer          size according to a maximum of 64,000 bytes per
+encoder-decoder models as baselines, each one us-            batch, which controls for the number of batches per
+ing a different tokenization scheme: subword, char-          epoch across different tokenization methods.
+
+acter, and byte. For subword tokenization, we apply          Evaluation We evaluate our models using Sacre-
+the Moses tokenizer (Koehn et al., 2007) followed            BLEU, case-sensitive, with the 13a tokenizer for
+by BPE (Sennrich et al., 2016). Both character and           all languages except Chinese (ZH tokenizer) and
+byte tokenizations apply no additional preprocess-           Japanese (MeCab tokenizer). We use the raw text
+ing at all and include whitespaces as valid tokens.          as the reference for all of our experiments, instead
+
+Hyperparameters The code for our model and                   of using the default tokenized-detokenized version,
+baselines is based on Fairseq (Ott et al., 2019) im-         which normalizes the text and gives an artiﬁcial
+plementation of the transformer encoder-decoder              advantage to text processed with Moses.
+
+model. During preprocessing we use 10,000 merg-
+
+ing steps when building the BPE vocabulary for 5 Results
+
+every language pair. The vocabularies and embed-             Table 2 shows our experiments’ results. Every row
+dings are always shared among source and target              describes the test BLEU scores of our model and
+languages. In every transformer we use 6 encoder             the three baselines trained on a different language
+and decoder layers, 4 attention heads, a hidden di-          pair. We discuss the implications of these below.
+mension of 512, and a feed-forward dimension of
+
+1024. We optimize with Adam (Kingma and Ba, Are embeddings essential? The results show
+
+2014), using the inverse square root learning rate that it is indeed possible to train embeddingless
+
+scheduler with 4000 warmup steps and a peak learn- machine translation models that perform competi-
+
+    5While in this work we prioritized language and writing  tively. The performance gaps between models with
+system diversity, there is room to test embedingless models  different tokenization schemes are relatively small.
+on larger datasets in future work.                           Except for Vietnamese, the difference between
+
+                                                             183
+the embeddingless model and the best embedding-                   Embedding-based Models Embed-less
+based model is always under 1 BLEU.
+                                                                  Subword Char Byte   Byte
+
+   In the most controlled setting, where we compare        en→xx  +0.33  +0.53 +0.42  +0.62
+byte-based models with and without learnable em-           xx→en  +0.69  +0.67 +0.92  +0.83
+
+beddings, models without embeddings consistently      Table 3: The validation set performance gain of token
+achieve higher BLEU scores in 19 of 20 cases (and     dropout (0.2), averaged across languages and model
+an equal score for ru-en), with a boost of about      dropout values.
+0.5 BLEU on average. When compared to models
+
+based on character embeddings, the embeddingless
+
+byte-to-byte approach yields higher BLEU scores       controlling for token dropout (p = 0.2) to deter-
+in 17 out of 20 cases, though the average difference  mine its effect on our results.
+is quite small in practice (0.3 BLEU).
+                                                         Table 3 shows that decoder-side token dropout
+
+Is subword tokenization superior to bytes or          improves the performance of all models, with a
+characters? Previous work in machine transla-         larger impact on byte-based models and embeddin-
+tion shows that subword models consistently out-      gless models in particular. This effect is largely
+perform character or byte-based models (Gupta         consistent, with only 7 out of 160 cases in which
+et al., 2019; Wang et al., 2019; Gao et al., 2020).   token dropout decreased performance on the valida-
+However, our results indicate that this is not nec-   tion set. We suspect that dropping out target tokens
+essarily the case. When translating from English      softens the effects of exposure bias by injecting
+to a foreign language, the original direction of the  noise into the ground-truth preﬁx.
+IWSLT dataset, embeddingless byte-to-byte mod-
+els achieve performance that is equal or better than     Given the beneﬁts of token dropout on the base-
+subword embedding models’ in 8 out of 10 cases.       line models, we re-evaluate the results from Sec-
+We observe a different trend when translating into    tion 5, while allowing for token dropout as a poten-
+English, where subword models surpass other mod-      tial hyperparameter. Table 4 shows that, when trans-
+els for every source language; the fact that Moses    lating from the original English text to a foreign
+is a particularly good tokenizer for English – and    language, the different models perform roughly
+less so for other languages – is perhaps related to   on par, with no single tokenization method domi-
+this phenomenon. Whereas prior work proposed          nating the others. Furthermore, byte-level models
+closing the performance gap by adding layers to       with and without embeddings achieve almost iden-
+the basic architecture, under the assumption that     tical results. In contrast, when translating in the
+character-based models lack capacity or expres-       opposite direction, subword models consistently
+siveness, our results show that actually removing     outperform the other methods with an average gap
+a component from the model can improve perfor-        of 0.76 BLEU from the next best model. Also,
+mance under certain conditions. It is possible that   removing the embeddings from byte-based mod-
+character and byte-based transformer models en-       els decreases performance by an average of 0.45
+counter an optimization issue rather than one of      BLEU when generating English. This discrepancy
+capacity or expressivity.                             might stem from artifacts of reverse translation, or
+                                                      perhaps from the English-centric nature of subword
+                                                      tokenization, which is based on Moses preprocess-
+
+6 Analysis                                            ing and BPE. Overall, these results suggest that de-
+
+Why does removing the embedding matrix improve        spite the greater number of parameters in subword
+the performance of byte-based models? As men-         models, character and byte models can perform
+tioned in Section 3, the embeddingless models do      competitively, but may require slightly different
+not use dropout on the encoder input and decoder      optimization techniques to do so.
+
+output, but do apply dropout on the decoder input 7 Related Work
+
+while training. Since the embeddingless decoder’s
+
+inputs are ﬁxed one-hot vectors, using dropout im- There is prior work on replacing language-speciﬁc
+
+plicitly drops out complete tokens. In prior work, tokenizers with more universal tokenization ap-
+
+token dropout (“word dropout”) has been shown to proaches. Schütze (2017) shows how character
+
+have a consistently positive effect (Bowman et al., n-gram embeddings can be effectively trained by
+
+2016). We, therefore, rerun our experiments while segmenting text using a stochastic process. Sen-
+
+                                                      184
+Benchmark Embedding-based Models Embed-less               the same does not hold for transformers (Gupta
+                                                          et al., 2019; Wang et al., 2019; Gao et al., 2020). To
+Src Tgt Subword Char Byte  Byte
+
+en zh  20.3  21.2 20.8     21.0                           narrow the gap, recent work suggests using deeper
+                                                          models (Gupta et al., 2019) or specialized architec-
+en es  36.7  36.8 36.8     36.8                           tures (Gao et al., 2020). Our work deviates from
+                                                          this trend by removing layers to improve the model.
+en ar  12.7  13.1 12.7     12.9                           This observation contests the leading hypothesis in
+                                                          existing literature – that the performance gap re-
+en ru  18.5  18.2 17.7     18.2                           sults from reduced model capacity – and suggests
+                                                          that the problem may be one of optimization.
+en de  29.8  29.3 29.2     29.1
+                                                          8 Conclusions
+en ja  12.4  13.1 12.5     13.1
+                                                          This work challenges two key assumptions in neu-
+en tr  13.9  14.3 14.4     14.1                           ral machine translation models: the necessity of em-
+                                                          bedding layers, and the superiority of subword tok-
+en vi  30.0  29.1 28.9     28.7                           enization. Experiments on 10 different languages
+                                                          show that, despite their ubiquitous usage, compet-
+en fa  11.5  12.2 12.1     12.1
+
+en he  26.8  27.1 27.1     26.7
+
+zh en  17.3  17.2 16.3     16.1
+
+es en  40.0  39.1 39.1     38.8
+
+ar en  32.0  31.1 31.2     30.8
+
+ru en  22.9  22.4 22.5     22.0
+
+de en  35.6  34.9 35.0     34.5
+
+ja en  13.5  12.8 12.3     11.2
+
+tr en  24.3  23.3 23.7     23.3
+
+vi en  27.4  25.9 25.9     25.3
+
+fa en  24.5  23.2 23.3     22.6
+
+he en  38.2  37.8 37.4     37.4
+
+                                                          itive models can be trained without any embed-
+
+Table 4: Test BLEU scores of the baseline and embed-      dings by treating text as a sequence of bytes. Our
+dingless models on the IWSLT dataset, when decoder-       investigation suggests that different tokenization
+side token dropout is considered as a potential hyperpa-  methods may require revisiting the standard opti-
+rameter setting.                                          mization techniques used with transformers, which
+
+                                                          are primarily geared towards sequences of English
+
+tencePiece (Kudo and Richardson, 2018) tokenizes subwords.
+
+raw Unicode strings into subwords using BPE (Sen-         Acknowledgements
+nrich et al., 2016) or unigram LM (Kudo, 2018).
+
+Byte BPE (Wang et al., 2019) extends Senten-              This work was supported in part by Len Blavat-
+cePiece to operate at the byte level. While this          nik and the Blavatnik Family foundation, the Alon
+approach is indeed more language-agnostic than            Scholarship, and the Tel Aviv University Data Sci-
+heuristic tokenizers, it does suffer from perfor-         ence Center.
+mance degradation when no pre-tokenization (e.g.
+splitting by whitespace) is applied.6 Moreover, the       References
+assumption that subword units must be contigu-
+
+ous segments does not hold for languages with             Meni Adler and Michael Elhadad. 2006. An unsuper-
+non-concatenative morphology such as Arabic and              vised morpheme-based HMM for Hebrew morpho-
+Hebrew.                                                      logical disambiguation. In Proceedings of the 21st
+                                                             International Conference on Computational Linguis-
+   Character and byte-based language models (Lee             tics and 44th Annual Meeting of the Association for
+et al., 2017; Al-Rfou et al., 2019) treat the raw            Computational Linguistics, pages 665–672, Sydney,
+text as a sequence of tokens (characters or bytes)           Australia. Association for Computational Linguis-
+and do not require any form of preprocessing or              tics.
+
+word tokenization, and Choe et al. (2019) even            Rami Al-Rfou, Dokook Choe, Noah Constant, Mandy
+demonstrate that byte-based language models can              Guo, and Llion Jones. 2019. Character-level lan-
+perform comparably to word-based language mod-               guage modeling with deeper self-attention. Proceed-
+els on the billion-word benchmark (Chelba et al.,            ings of the AAAI Conference on Artiﬁcial Intelli-
+2013). Although earlier results on LSTM-based                gence, 33:3159–3166.
+
+machine translation models show that character to-        Samuel R. Bowman, Luke Vilnis, Oriol Vinyals, An-
+kenization can outperform subword tokenization               drew Dai, Rafal Jozefowicz, and Samy Bengio.
+(Cherry et al., 2018), recent literature shows that          2016. Generating sentences from a continuous
+                                                             space. In Proceedings of The 20th SIGNLL Con-
+    6https://github.com/google/                              ference on Computational Natural Language Learn-
+sentencepiece/blob/master/doc/                               ing, pages 10–21, Berlin, Germany. Association for
+experiments.md                                               Computational Linguistics.
+
+                                                    185
+Mauro Cettolo, Jan Niehues, Sebastian Stüker, Luisa        Jason Lee, Kyunghyun Cho, and Thomas Hofmann.
+   Bentivogli, and Marcello Federico. 2014. Report            2017. Fully character-level neural machine trans-
+   on the 11th iwslt evaluation campaign, iwslt 2014.         lation without explicit segmentation. Transactions
+   In Proceedings of the International Workshop on            of the Association for Computational Linguistics,
+   Spoken Language Translation, Hanoi, Vietnam, vol-          5:365–378.
+   ume 57.
+                                                           Myle Ott, Sergey Edunov, Alexei Baevski, Angela
+Ciprian Chelba, Tomas Mikolov, Mike Schuster, Qi Ge,          Fan, Sam Gross, Nathan Ng, David Grangier, and
+   Thorsten Brants, Phillipp Koehn, and Tony Robin-           Michael Auli. 2019. fairseq: A fast, extensible
+   son. 2013. One billion word benchmark for measur-          toolkit for sequence modeling. In Proceedings of
+   ing progress in statistical language modeling.             the 2019 Conference of the North American Chap-
+                                                              ter of the Association for Computational Linguistics
+Colin Cherry, George Foster, Ankur Bapna, Orhan               (Demonstrations), pages 48–53, Minneapolis, Min-
+   Firat, and Wolfgang Macherey. 2018. Revisiting             nesota. Association for Computational Linguistics.
+   character-based neural machine translation with ca-
+   pacity and compression. In Proceedings of the 2018      Hinrich Schütze. 2017. Nonsymbolic text representa-
+   Conference on Empirical Methods in Natural Lan-            tion. In Proceedings of the 15th Conference of the
+   guage Processing, pages 4295–4305, Brussels, Bel-          European Chapter of the Association for Computa-
+   gium. Association for Computational Linguistics.           tional Linguistics: Volume 1, Long Papers, pages
+                                                              785–796, Valencia, Spain. Association for Compu-
+Dokook Choe, Rami Al-Rfou, Mandy Guo, Heeyoung                tational Linguistics.
+   Lee, and Noah Constant. 2019. Bridging the gap for
+   tokenizer-free language models.                         Rico Sennrich, Barry Haddow, and Alexandra Birch.
+                                                              2016. Neural machine translation of rare words
+Yingqiang Gao, Nikola I. Nikolov, Yuhuang Hu, and             with subword units. Proceedings of the 54th Annual
+   Richard H.R. Hahnloser. 2020. Character-level              Meeting of the Association for Computational Lin-
+   translation with self-attention. In Proceedings of the     guistics (Volume 1: Long Papers).
+   58th Annual Meeting of the Association for Compu-
+   tational Linguistics, pages 1591–1604, Online. As-      Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob
+   sociation for Computational Linguistics.                   Uszkoreit, Llion Jones, Aidan N. Gomez, Lukasz
+                                                              Kaiser, and Illia Polosukhin. 2017. Attention is all
+Rohit Gupta, Laurent Besacier, Marc Dymetman, and             you need.
+   Matthias Gallé. 2019. Character-based nmt with
+   transformer. arXiv preprint arXiv:1911.04997.           Changhan Wang, Kyunghyun Cho, and Jiatao Gu.
+                                                              2019. Neural machine translation with byte-level
+Diederik P. Kingma and Jimmy Ba. 2014. Adam: A                subwords.
+   method for stochastic optimization.
+
+Philipp Koehn, Hieu Hoang, Alexandra Birch, Chris
+   Callison-Burch, Marcello Federico, Nicola Bertoldi,
+   Brooke Cowan, Wade Shen, Christine Moran,
+   Richard Zens, Chris Dyer, Ondˇrej Bojar, Alexandra
+   Constantin, and Evan Herbst. 2007. Moses: Open
+   source toolkit for statistical machine translation. In
+   Proceedings of the 45th Annual Meeting of the As-
+   sociation for Computational Linguistics Companion
+   Volume Proceedings of the Demo and Poster Ses-
+   sions, pages 177–180, Prague, Czech Republic. As-
+   sociation for Computational Linguistics.
+
+Taku Kudo. 2018. Subword regularization: Improving
+   neural network translation models with multiple sub-
+   word candidates. In Proceedings of the 56th Annual
+   Meeting of the Association for Computational Lin-
+   guistics (Volume 1: Long Papers), pages 66–75, Mel-
+   bourne, Australia. Association for Computational
+   Linguistics.
+
+Taku Kudo and John Richardson. 2018. SentencePiece:
+   A simple and language independent subword tok-
+   enizer and detokenizer for neural text processing. In
+   Proceedings of the 2018 Conference on Empirical
+   Methods in Natural Language Processing: System
+   Demonstrations, pages 66–71, Brussels, Belgium.
+   Association for Computational Linguistics.
+
+                                                             186
+

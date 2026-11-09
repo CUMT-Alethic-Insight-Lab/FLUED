@@ -1,0 +1,497 @@
+Generating Text with Recurrent Neural Networks
+
+Ilya Sutskever                                                                 ILYA@CS.UTORONTO.CA
+James Martens                                                            JMARTENS@CS.TORONTO.EDU
+Geoffrey Hinton
+                                                                            HINTON@CS.TORONTO.EDU
+University of Toronto, 6 King’s College Rd., Toronto, ON M5S 3G4 CANADA
+
+                        Abstract                                mainstream tool in machine learning due to the difﬁculty
+                                                                of training them effectively. The cause of this difﬁculty
+      Recurrent Neural Networks (RNNs) are very                 is the very unstable relationship between the parameters
+      powerful sequence models that do not enjoy                and the dynamics of the hidden states, which manifests it-
+      widespread use because it is extremely difﬁ-              self in the “vanishing/exploding gradients problem” (Ben-
+      cult to train them properly. Fortunately, re-             gio et al., 1994). As a result, there has been surprisingly lit-
+      cent advances in Hessian-free optimization have           tle research on standard RNNs in the last 20 years, and only
+      been able to overcome the difﬁculties associated          a few successful applications using large RNNs (Robin-
+      with training RNNs, making it possible to apply           son, 2002; Pollastri et al., 2002), including a recent no-
+      them successfully to challenging sequence prob-           table application of RNNs as a word-level language model
+      lems. In this paper we demonstrate the power              (Mikolov et al., 2010).
+      of RNNs trained with the new Hessian-Free op-
+      timizer (HF) by applying them to character-level          Recently, Martens (2010) developed a greatly improved
+      language modeling tasks. The standard RNN ar-             variant of Hessian-Free optimization (HF) which was pow-
+      chitecture, while effective, is not ideally suited        erful enough to train very deep neural networks from ran-
+      for such tasks, so we introduce a new RNN                 dom initializations. Since an RNN can be viewed as an
+      variant that uses multiplicative (or “gated”) con-        extremely deep neural network with weight sharing across
+      nections which allow the current input charac-            time, the same HF optimizer should be able to train RNNs.
+      ter to determine the transition matrix from one           Fortunately, Martens & Sutskever (2011) were able to show
+      hidden state vector to the next. After training           that this is indeed the case, and that this form of non-
+      the multiplicative RNN with the HF optimizer              diagonal, 2nd-order optimization provides a principled so-
+      for ﬁve days on 8 high-end Graphics Processing            lution to the vanishing gradients problem in RNNs. More-
+      Units, we were able to surpass the performance            over, with the addition of a novel damping mechanism,
+      of the best previous single method for character-         Martens & Sutskever (2011) showed that the HF optimizer
+      level language modeling – a hierarchical non-             is robust enough to train RNNs, both on pathological syn-
+      parametric sequence model. To our knowledge               thetic datasets known to be impossible to learn with gra-
+      this represents the largest recurrent neural net-         dient descent, and on complex and diverse real-world se-
+      work application to date.                                 quence datasets.
+
+1. Introduction                                                 The goal of the paper is to demonstrate the power of large
+                                                                RNNs trained with the new Hessian-Free optimizer by ap-
+Recurrent Neural Networks (RNNs) form an expressive             plying them to the task of predicting the next character in a
+model family for sequence tasks. They are powerful be-          stream of text. This is an important problem because a bet-
+cause they have a high-dimensional hidden state with non-       ter character-level language model could improve compres-
+linear dynamics that enable them to remember and process        sion of text ﬁles (Rissanen & Langdon, 1979) and make it
+past information. Furthermore, the gradients of the RNN         easier for people with physical disabilities to interact with
+are cheap to compute with backpropagation through time.         computers (Ward et al., 2000). More speculatively, achiev-
+Despite their attractive qualities, RNNs failed to become a     ing the asymptotic limit in text compression requires an
+                                                                understanding that is “equivalent to intelligence” (Hutter,
+Appearing in Proceedings of the 28 th International Conference  2006). Good compression can be achieved by exploiting
+on Machine Learning, Bellevue, WA, USA, 2011. Copyright 2011    simple regularities such as the vocabulary and the syntax of
+by the author(s)/owner(s).                                      the relevant languages and the shallow associations exem-
+Generating Text with Recurrent Neural Networks
+
+pliﬁed by the fact that the word “milk” often occurs soon     Figure 1. A Recurrent Neural Network is a very deep feedforward
+after the word “cow”, but beyond a certain point any im-      neural network whose weights are shared across time. The non-
+provement in performance must result from a deeper un-        linear activation function used by the hidden units is the source of
+derstanding of the text’s meaning.                            the RNN’s rich dynamics.
+
+Although standard RNNs are very expressive, we found          guage, and to our surprise, the text generated by the
+that achieving competitive results on character-level lan-    MRNNs we trained exhibited a signiﬁcant amount of inter-
+guage modeling required the development of a different        esting and high-level linguistic structure, featuring a large
+type of RNN that was better suited to our application.        vocabulary, a considerable amount of grammatical struc-
+This new “MRNN” architecture uses multiplicative con-         ture, and a wide variety of highly plausible proper names
+nections to allow the current input character to determine    that were not in the training set. Mastering the vocabulary
+the hidden-to-hidden weight matrix. We trained MRNNs          of English did not seem to be a problem for the MRNN: it
+on over a hundred of megabytes of text for several days       generated very few uncapitalized non-words, and those that
+using 8 Graphics Processing Units in parallel to perform      it did generate were often very plausible, like “homosoma-
+signiﬁcantly better than one of the best word-agnostic sin-   list” or “un-ameliary”. Of particular interest was the fact
+gle character-level language models: the sequence memo-       that the MRNN learned to balance parentheses and quotes
+izer (Wood et al., 2009; Gasthaus et al., 2010), which is a   over long distances (e.g., 30 characters). A character-
+hierarchical nonparametric Bayesian method. It deﬁnes a       level N -gram language model could only do this by mod-
+prior process on the set of predictions at every conceivable  eling 31-grams, and neither Memoizer nor PAQ are rep-
+context, with judiciously chosen details that make approx-    resentationally capable of balancing parentheses because
+imate inference computationally tractable. The memoizer       of their need for exact context matches. In contrast, the
+induces dependencies between its predictions by making        MRNN’s nonlinear dynamics enables it to extract higher
+similar predictions at similar contexts. Although intelli-    level “knowledge” from the text, and there are no obvious
+gent marginalization techniques are able to eliminate all     limits to its representational power because of the ability of
+but a relatively small number of the random variables (so     its hidden states to perform general computation.
+the datastructures used scale linearly with the amount of
+data), its memory requirements are still prohibitively ex-    2. Recurrent Neural Networks
+pensive for large datasets, which is a direct consequence of
+its nonparametric nature.                                     A Recurrent Neural Network is a straightforward adapta-
+                                                              tion of the standard feed-forward neural network to allow
+While our method performs at the state of the art for pure    it to model sequential data. At each timestep, the RNN
+character-level models, its compression performance falls     receives an input, updates its hidden state, and makes a
+short of the best models which have explicit knowledge of     prediction (ﬁg. 1). The RNN’s high dimensional hidden
+words, the most powerful of these being PAQ8hp12 (Ma-         state and nonlinear evolution endow it with great expres-
+honey, 2005). PAQ is a mixture model of a large number        sive power, enabling the hidden state of the RNN to inte-
+of well-chosen context models whose mixing proportions        grate information over many timesteps and use it to make
+are computed by a neural network whose weights are a          accurate predictions. Even if the non-linearity used by each
+function of the current context, and whose predictions are    unit is quite simple, iterating it over time leads to very rich
+further combined with a neural-network like model. Un-        dynamics.
+like standard compression techniques, some of PAQ’s con-
+text models not only consider contiguous contexts but also    The standard RNN is formalized as follows: Given a se-
+contexts with “gaps”, allowing it to capture some types of    quence of input vectors (x1, . . . , xT ), the RNN computes a
+longer range structures cheaply. More signiﬁcantly, PAQ       sequence of hidden states (h1, . . . , hT ) and a sequence of
+is not word-agnostic, because it uses a combination of        outputs (o1, . . . , oT ) by iterating the following equations
+character-level and word-level models. PAQ also prepro-
+cesses the data with a dictionary of common English words
+which we disabled, because it gave PAQ an unfair advan-
+tage over models that do not use such task-speciﬁc (and
+indeed, English-speciﬁc) explicit prior knowledge. The nu-
+merous mixture components of PAQ were chosen because
+they improved performance on a development set, so in this
+respect PAQ is similar in model complexity to the winning
+entry of the netﬂix prize (Bell et al., 2007).
+
+Finally, language models can be used to “generate” lan-
+                  Generating Text with Recurrent Neural Networks
+
+for t = 1 to T :
+
+ht = tanh(Whxxt + Whhht−1 + bh)  (1)
+
+ot = Wohht + bo                  (2)
+
+In these equations, Whx is the input-to-hidden weight ma-       Figure 2. An illustration of the signiﬁcance of the multiplicative
+trix, Whh is the hidden-to-hidden (or recurrent) weight ma-     connections (the product is depicted by a triangle). The presence
+trix, Woh is the hidden-to-output weight matrix, and the        of the multiplicative connections enables the RNN to be sensitive
+vectors bh and bo are the biases. The undeﬁned expres-          to conjunctions of context and character, allowing different con-
+sion Whhht−1 at time t = 1 is replaced with a special ini-      texts to respond in a qualitatively different manner to the same
+tial bias vector, hinit, and the tanh nonlinearity is applied   input character.
+coordinate-wise.
+                                                                are carefully initialized so that the intrinsic dynamics of the
+The gradients of the RNN are easy to compute via back-          network exhibits a rich reservoir of temporal behaviours
+propagation through time (Rumelhart et al., 1986; Werbos,       that can be selectively coupled to the output.
+1990)1, so it may seem that RNNs are easy to train with
+gradient descent. In reality, the relationship between the      3. The Multiplicative RNN
+parameters and the dynamics of the RNN is highly unsta-
+ble which makes gradient descent ineffective. This intu-        Having applied a modestly-sized standard RNN archi-
+ition was formalized by Hochreiter (1991) and Bengio et al.     tecture to the character-level language modeling problem
+(1994) who proved that the gradient decays (or, less fre-       (where the target output at each time step is deﬁned as the
+quently, blows up) exponentially as it is backpropagated        the input character at the next time-step), we found the
+through time, and used this result to argue that RNNs can-      performance somewhat unsatisfactory, and that while in-
+not learn long-range temporal dependencies when gradi-          creasing the dimensionality of the hidden state did help,
+ent descent is used for training. In addition, the occasional   the per-parameter gain in test performance was not sufﬁ-
+tendency of the backpropagated gradient to exponentially        cient to allow the method to be both practical and com-
+blow-up greatly increases the variance of the gradients and     petitive with state-of-the-art approaches. We address this
+makes learning very unstable. As gradient descent was the       problem by proposing a new temporal architecture called
+main algorithm used for training neural networks at the         the Multiplicative RNN (MRNN) which we will argue is
+time, these theoretical results and the empirical difﬁculty     better suited to the language modeling task.
+of training RNNs led to the near abandonment of RNN re-
+search.                                                         3.1. The Tensor RNN
+
+One way to deal with the inability of gradient descent to       The dynamics of the RNN’s hidden states depend on the
+learn long-range temporal structure in a standard RNN is        hidden-to-hidden matrix and on the inputs. In a standard
+to modify the model to include “memory” units that are          RNN (as deﬁned by eqs. 1-2), the current input xt is ﬁrst
+specially designed to store information over long time pe-      transformed via the visible-to-hidden weight matrix Whx
+riods. This approach is known as “Long-Short Term Mem-          and then contributes additively to the input for the current
+ory” (Hochreiter & Schmidhuber, 1997) and has been suc-         hidden state. A more powerful way for the current input
+cessfully applied to complex real-world sequence mod-           character to affect the hidden state dynamics would be to
+eling tasks (e.g., Graves & Schmidhuber, 2009). Long-           determine the entire hidden-to-hidden matrix (which de-
+Short Term Memory makes it possible to handle datasets          ﬁnes the non-linear dynamics) in addition to providing an
+which require long-term memorization and recall but even        additive bias.
+on these datasets it is outperformed by using a standard
+RNN trained with the HF optimizer (Martens & Sutskever,         One motivation for this approach came from viewing an
+2011).                                                          RNN as a model of an unbounded tree in which each node
+                                                                is a hidden state vector and each edge is labelled by a char-
+Another way to avoid the problems associated with back-         acter that determines how the parent node gives rise to the
+propagation through time is the Echo State Network (Jaeger      child node. This view emphasizes the resemblance of an
+& Haas, 2004) which forgoes learning the recurrent con-         RNN to a Markov model that stores familiar strings of char-
+nections altogether and only trains the non-recurrent out-      acters in a tree, and it also makes it clear that the RNN tree
+put weights. This is a much easier learning task and it         is potentially much more powerful than the Markov model
+works surprisingly well provided the recurrent connections      because the distributed representation of a node allows dif-
+
+    1In contrast, Dynamic Bayes Networks (Murphy, 2002), the
+probabilistic analogues of RNNs, do not have an efﬁcient algo-
+rithm for computing their gradients.
+                             Generating Text with Recurrent Neural Networks
+
+ferent nodes to share knowledge. For example, the charac-          Figure 3. The Multiplicative Recurrent Neural Network “gates”
+ter string “ing” is quite probable after “ﬁx” and also quite       the recurrent weight matrix with the input symbol. Each triangle
+probable after “break”. If the hidden state vectors that rep-      symbol represents a factor that applies a learned linear ﬁlter at
+resent the two histories “ﬁx” and “break” share a common           each of its two input vertices. The product of the outputs of these
+representation of the fact that this could be the stem of a        two linear ﬁlters is then sent, via weighted connections, to all the
+verb, then this common representation can be acted upon            units connected to the third vertex of the triangle. Consequently
+by the character “i” to produce a hidden state that predicts       every input can synthesize its own hidden-to-hidden weight ma-
+an “n”. For this to be a good prediction we require the            trix by determining the gains on all of the factors, each of which
+conjunction of the verb-stem representation in the previous        represents a rank one hidden-to-hidden weight matrix deﬁned by
+hidden state and the character “i”. One or other of these          the outer-product of its incoming and outgoing weight-vectors to
+alone does not provide half as much evidence for predict-          the hidden units. The synthesized weight matrices share “struc-
+ing an “n”: It is their conjunction that is important. This        ture” because they are all formed by blending the same set of rank
+strongly suggests that we need a multiplicative interaction.       one matrices. In contrast, an unconstrained tensor model ensures
+To achieve this goal we modify the RNN so that its hidden-         that each input has a completely separate weight matrix.
+to-hidden weight matrix is a (learned) function of the cur-
+rent input xt:
+
+ht = tanh Whxxt + Wh(xht)ht−1 + bh         (3)
+
+ot = Wohht + bo                            (4)
+
+These are identical to eqs. 1 and 2, except that Whh is re-        If the dimensionality of the vector Wfxxt, denoted by F ,
+placed with Wh(xht), allowing each character to specify a          is sufﬁciently large, then the factorization is as expressive
+different hidden-to-hidden weight matrix.                          as the original tensor. Smaller values of F require fewer
+                                                                   parameters while hopefully retaining a signiﬁcant fraction
+It is natural to deﬁne Wh(xht) using a tensor. If we store         of the tensor’s expressive power.
+M matrices, Wh(1h), . . . , Wh(M h ), where M is the number of
+dimensions of xt, we could deﬁne Wh(xht) by the equation
+
+           M                                                       The Multiplicative RNN (MRNN) is the result of factoriz-
+                                                                   ing the Tensor RNN by expanding eq. 6 within eq. 3. The
+Wh(xht) =                    xt(m)Wh(mh )  (5)                     MRNN computes the hidden state sequence (h1, . . . , hT ),
+                                                                   an additional “factor state sequence” (f1, . . . , fT ), and the
+           m=1                                                     output sequence (o1, . . . , oT ) by iterating the equations
+
+where x(tm) is the m-th coordinate of xt. When the input           ft = diag(Wfxxt) · Wfhht−1  (7)
+
+xt is a 1-of-M encoding of a character, it is easily seen that     ht = tanh(Whf ft + Whxxt)   (8)
+every character has an associated weight matrix and Wh(xht)
+is the matrix assigned to the character represented by xt. 2
+
+                                                                   ot = Wohht + bo             (9)
+
+3.2. The Multiplicative RNN
+
+The above scheme, while appealing, has a major drawback:           which implement the neural network in ﬁg. 3. The tensor
+Fully general 3-way tensors are not practical because of           factorization of eq. 6 has the interpretation of an additional
+their size. In particular, if we want to use RNNs with a           layer of multiplicative units between each pair of consec-
+large number of hidden units (say, 1000) and if the dimen-         utive layers (i.e., the triangles in ﬁg. 3), so the MRNN ac-
+sionality of xt is even moderately large, then the storage         tually has two steps of nonlinear processing in its hidden
+required for the tensor Wh(xht) becomes prohibitive.               states for every input timestep. Each of the multiplicative
+                                                                   units outputs the value ft of eq. 7 which is the product of
+It turns out we can remedy the above problem by factoring          the outputs of the two linear ﬁlters connecting the multi-
+the tensor Wh(xh) (e.g., Taylor & Hinton, 2009). This is done      plicative unit to the previous hidden states and to the inputs.
+by introducing the three matrices Wfx, Whf , and Wfh, and
+reparameterizing the matrix Wh(xht) by the equation                We experimentally veriﬁed the advantage of the MRNN
+                                                                   over the RNN when the two have the same number of pa-
+Wh(xht) = Whf · diag(Wfxxt) · Wfh          (6)                     rameters. We trained an RNN with 500 hidden units and
+                                                                   an MRNN with 350 hidden units and 350 factors (so the
+    2The above model, applied to discrete inputs represented with  RNN has slightly more parameters) on the “machine learn-
+their 1-of-M encodings, is the nonlinear version of the Observ-    ing” dataset (dataset 3 in the experimental section). After
+able Operator Model (OOM; Jaeger, 2000) whose linear nature        extensive training, the MRNN achieved 1.56 bits per char-
+makes it closely related to an HMM in terms of expressive power.   acter and the RNN achieved 1.65 bits per character on the
+                                  Generating Text with Recurrent Neural Networks
+
+test set.                                                              Owing to its nonparametric nature and the nature of the
+                                                                       data-structures it uses, the sequence memoizer is very
+3.3. The difﬁculty of learning multiplicative units                    memory intensive, so it can only be applied to training
+In an MRNN, the effective weight Wi(jc) 3 from hidden unit             datasets of roughly 130MB on a machine with 32GB of
+i to hidden unit j contributed by character c is given by:             RAM. In contrast, the MRNN can be applied to datasets
+                                                                       of unlimited size although it typically requires consider-
+                Wi(jc) =     Wif WfcWfj         (10)                   ably more total FLOPS to achieve good performance (but,
+                                                                       unlike the memoizer, it is easily parallelized). However,
+                          f                                            to make the experimental comparison fair, we train the
+                                                                       MRNN, the memoizer, and PAQ on datasets of the same
+This product of parameters makes gradient descent learning             size.
+difﬁcult. If, for example, Wif is very small and Wfj is
+very large we get a very large deriviative for the very small          5.1. The datasets
+weight and a very small derivative for the very large weight.
+Fortunately, this type of difﬁculty is exactly what second-            We now describe the datasets. Each dataset is a long
+order methods are good at handling, so multiplicative units            string of characters from an 86-character alphabet of about
+should be better handled by a 2nd-order approach like the              100MB that includes digits and punctuation, together with
+HF optimizer.                                                          a special symbol which indicates that the character in the
+                                                                       original text was not one of the other 85 characters in our
+4. The RNN as a Generative Model                                       alphabet. The last 10 million characters of each dataset are
+                                                                       used as a test set.
+The goal of character-level language modeling is to pre-
+                                                                       1. The ﬁrst dataset is a sequence of characters from the En-
+dict the next character in a sequence. More formally,                  glish Wikipedia. We removed the XML and the Wikipedia
+                                                                       markup to clean the dataset. Since Wikipedia is extremely
+given a training sequence (x1, . . . , xT ), the RNN uses              nonuniform, we randomly permuted its articles before par-
+                                                                       titioning it into a train and a test set.
+the sequence of its output vectors (o1, . . . , oT ) to ob-
+                                                                       2. The second dataset is a collection of articles from the
+tain a sequence of predictive distributions P (xt+1|x≤t) =             New York Times (Sandhaus, 2008).
+
+softmax(ot), where the softmax distribution is deﬁned by               3. The third dataset is a corpus of machine learning pa-
+                                                                       pers. We constructed this dataset by downloading every
+P (softmax(ot) = j) = exp(o(tj))/ k exp(o(tk)). The lan-               NIPS and JMLR paper, and converting them to plain text
+                                                                       using the pdftotext utility. We then translated a large num-
+guage modeling objective is to maximize the total log prob-            ber of special characters to their ascii equivalents (includ-
+                                                                       ing non-ascii punctuation, greek letters, and the “ﬁ” and
+ability of the training sequence  T −1  log  P  (xt+1|x≤t),            “if” symbol) to clean the dataset, and removed most of the
+                                  t=0                                  unstructured text by using only sentences consisting of at
+                                                                       least 70% alphanumeric characters. Finally, we randomly
+which implies that the RNN learns a probability distribu-              permuted the papers.
+
+tion over sequences. Even though the hidden units are de-              The ﬁrst two corpora are subsets of larger corpora (over
+                                                                       1GB large), but the semi-online nature of our optimizer
+terministic, we can sample from an MRNN stochastically                 makes it easy to train the MRNN on a dataset of any size.
+
+because the states of its output units deﬁne the conditional           5.2. Training details
+
+distribution P (xt+1|x≤t). We can sample from this condi-              To compute the exact gradient of the log probability of the
+                                                                       training set (eq. 4), the MRNN needs to process the entire
+tional distribution to get the next character in a generated           training set sequentially and store the hidden state sequence
+                                                                       in order to apply backpropagation-through-time. This is in-
+string and provide it as the next input to the RNN. This               feasible due to the size of the training set but it is also un-
+                                                                       necessary: Training the MRNN on many shorter sequences
+means that the RNN is a directed non-Markov model and,                 is just as effective, provided they are several hundred char-
+                                                                       acters or more long. If the sequences are too short, we fail
+in this respect, it resembles the sequence memoizer (Wood              to utilize the ability of the HF optimizer to capture long-
+
+et al., 2009).
+
+5. The experiments
+
+The goal of our experiments is to demonstrate that the
+MRNN, when trained by HF, learns high-quality language
+models. We demonstrate this by comparing the MRNN to
+the sequence memoizer and to PAQ on three real-world lan-
+guage datasets. After splitting each dataset into a training
+and test set, we trained a large MRNN, a sequence memo-
+izer4, and PAQ, and report the bits per character (bpc) each
+model achieves on the test set.
+
+    3We slightly abuse notation, using Wi(jc) to stand for Wh(ch)ij .
+    4Which has no hyper-parameters and strictly speaking isn’t
+’trained’ but rather conditioned the training set.
+                       Generating Text with Recurrent Neural Networks
+
+Table 1. This table shows the test bits per character for each ex-   cient to adequately train an MRNN. More speciﬁcally, we
+periment, with the training bits in brackets (where available). The  used 160 steps of HF, with each of these steps using a max-
+MRNN achieves lower bits per character than the sequence mem-        imum of 150 conjugate gradient iterations to approach the
+oizer but higher than PAQ on each of the three datasets. The         minimum of the quadratic Gauss-Newton-based approxi-
+MRNN (full set) column refers to MRNNs trained on the larger         mation to the objective function, which remains ﬁxed dur-
+(1GB) training corpora (except for the ML dataset which is not a     ing the conjugate gradient iterations. The small number of
+subset of a larger corpus). Note, also, that the improvement re-     weight updates, each requiring a massive amount of com-
+sulting from larger dataset is modest, implying that the an MRNN     putation, makes the HF optimizer much easier to parallelize
+with 1500 units and factors is fairly well-trained with 100MB of     than stochastic gradient descent.
+text.
+                                                                     In all our experiments we use MRNNs with 1500 hidden
+DATA SET MEMOIZER PAQ  MRNN     MRNN                                 units and 1500 factors (F ), which have 4,900,000 parame-
+                              (FULL SET)                             ters. The MRNNs were initialized with sparse connections:
+                                                                     each unit starts out with 15 nonzero connections to other
+WIKI  1.66  1.51 1.60 (1.53) 1.55 (1.54)                             units (see Martens & Sutskever, 2011). Note that if we un-
+NYT                                                                  roll the MRNN in time (as in ﬁg. 3) we obtain a neural
+ML    1.49  1.38 1.48 (1.44) 1.47 (1.46)                             network with 500 layers of size 1500 if we view the mul-
+                                                                     tiplicative units ft as layers. This is arguably the deepest
+      1.33  1.22 1.31 (1.27)                                         and largest neural network ever trained.
+
+term dependencies spanning hundreds of timesteps.                    5.3. The results
+
+An advantage of using a large number of relatively short             The main experimental results are shown in table 5.2. We
+sequences over using a single long sequence is that the for-         see that the MRNN predicts the test set more accurately
+mer is much easier to parallelize. This is essential, since          than the sequence memoizer but less accurately than the
+our preliminary experiments suggested that HF applied to             dictionary-free PAQ on the three datasets.
+MRNNs works best when the gradient is computed us-
+ing millions of characters and the curvature-matrix vec-             5.4. Debagging
+tor products are computed using hundreds of thousands of
+characters. Using a highly parallel system (consisting of            It is easy to convert a sentence into a bag of words, but it
+8 high-end GPUs with 4GB of RAM each), we computed                   is much harder to convert a bag of words into a meaningful
+the gradient on 160·300=48000 sequences of length 250,               sentence. We name the latter the debagging problem. We
+of which 8·300=2400 sequences were used to compute the               perform an experiment where a character-level language
+curvature-matrix vector products that are needed for the HF          model evaluates every possible ordering of the words in
+optimizer (Martens & Sutskever, 2011) (so each GPU pro-              the bag, and returns and the ordering it deems best. To
+cesses 300 sequences at a time).                                     make the experiment tractable, we only considered bags of
+                                                                     7 words, giving a search space of size 5040.
+The ﬁrst few characters of any sequence are much harder
+to predict because they do not have a sufﬁciently large con-         For our experiment, we used the MRNN and the memo-
+text, so it is not beneﬁcial to have the MRNN spend neural           izer5 to debag 500 bags of randomly chosen words from
+resources predicting these characters. We take this effect           “Ana Karenina”. We use 11 words for each bag, where the
+into account by having the MRNN predict only the last 200            ﬁrst two and the last two words are used as context to aid
+timesteps of the 250-long training sequences, thus provid-           debagging the middle seven words.
+ing every prediction with at least 50 characters of context.
+                                                                     We say that the model correctly debags a sentence if the
+The Hessian-Free optimizer (Martens, 2010) and its RNN-              correct ordering is assigned the highest log probability. We
+specialized variant (Martens & Sutskever, 2011) have a               found that the wikipedia-trained MRNN recovered the cor-
+small number of meta-parameters that must be speciﬁed.               rect ordering 34% of the time, and the wikipedia-trained
+We set the structural damping coefﬁcient µ to 0.1, and ini-          memoizer did so 27% of the time. Given that the problem
+tialized λ to 10 (see Martens & Sutskever (2011) for a de-           is “word-level”, utilizing large character contexts is essen-
+scription of these meta-parameters). Our HF implemen-                tial to achieve good performance.
+tation uses a different subset of the training data at every
+iteration, so at a coarse temporal scale it is essentially on-           5We were unable to modify the implementation of PAQ to
+line. In this setup, training lasted roughly 5 days for each         make debagging feasible.
+dataset.
+
+We found that a total of 160·150 weight updates was sufﬁ-
+Generating Text with Recurrent Neural Networks
+
+6. Qualitative experiments                                            is also able to balance parentheses (e.g., the third line of the
+                                                                      sample):
+In this section we qualitatively investigate the nature of the
+models learned by the MRNN.                                           Recurrent network with the Stiefel information for logistic regres-
+                                                                      sion methods Along with either of the algorithms previously (two
+6.1. Samples from the models                                          or more skewprecision) is more similar to the model with the same
+                                                                      average mismatched graph. Though this task is to be studied un-
+The simplest qualitative experiment is to inspect the sam-            der the reward transform, such as (c) and (C) from the training
+ples generated by the three MRNNs. The most salient char-             set, based on target activities for articles a ? 2(6) and (4.3). The
+acteristic of the samples is the richness of their vocabular-         PHDPic (PDB) matrix of cav’va using the three relevant informa-
+ies. Further inspection reveals that the text is mostly gram-         tion contains for tieming measurements. Moreover, because of
+matical, and that parentheses are usually balanced over               the therap tor, the aim is to improve the score to the best patch
+many characters. The artifacts of the generated text, such            randomly, but for each initially four data sets. As shown in Figure
+as consecutive commas or quotes, are the result of the data           11, it is more than 100 steps, we used ?? \to \infty with 1000
+preprocessing and are frequently found in the training set.
+                                                                      6.2. Structured sentence completion
+6.1.1. SAMPLES FROM THE WIKIPEDIA MODEL
+                                                                      In this section, we investigate the MRNN’s response in var-
+We now present a sample from the Wikipedia model. We                  ious situations by sampling from the MRNN’s distribution
+use ? to indicate the “unknown” character. The sample be-             conditioned on a preﬁx. The goal is to see whether the
+low was obtained by running the MRNN less than 10 times               MRNN is able to generate “plausible” continuations to the
+and selecting the most intriguing sample. The beginning               initial strings. In our ﬁrst experiment, we use the Wikipedia
+of the paragraph and the parentheses near the end are par-            MRNN to complete the string “England, Spain, France,
+ticularly interesting. The MRNN was initialized with the              Germany,”:
+phrase “The meaning of life is”:
+                                                                        England, Spain, France, Germany, and Massachusetts.
+The meaning of life is the tradition of the ancient human repro-        England, Spain, France, Germany, cars, and direct schools
+duction: it is less favorable to the good boy for when to remove        England, Spain, France, Germany, , or New Orleans and Uganda.
+her bigger. In the show’s agreement unanimously resurfaced. The         England, Spain, France, Germany, , Westchester,
+wild pasteured with consistent street forests were incorporated
+by the 15th century BE. In 1996 the primary rapford undergoes                    Jet State, Springﬁeld, Athleaves and Sorvinhee
+an effort that the reserve conditioning, written into Jewish cities,
+sleepers to incorporate the .St Eurasia that activates the popula-    In the above completions, the MRNN correctly interpreted
+tion. Mar??a Nationale, Kelli, Zedlat-Dukastoe, Florendon, Ptu’s      the string to be a list of locations, so the generated text was
+thought is. To adapt in most parts of North America, the dynamic      also a part of a list.
+fairy Dan please believes, the free speech are much related to the
+                                                                      Next, we performed a similar experiment using the ML
+6.1.2. SAMPLES FROM THE NYT MODEL                                     model and the pair of strings “(ABC et al” and “ABC et
+                                                                      al”. The system has never seen the string “(ABC et al” in
+Below is a sample from the model trained on the full NYT              its training set (simply because there is no machine learn-
+dataset, where the MRNN was initialized with a single                 ing author named ABC, and its capitalization is particularly
+space. The spaces surrounding the punctuation are an ar-              uncommon for a citation), so the MRNN needed to gener-
+tifact of the preprocessing.                                          alize over an entirely new author name:
+
+while he was giving attention to the second advantage of school         (ABC et al., 2003), ?13?, and for a supervised Mann-¡Whitnaguing
+building a 2-for-2 stool killed by the Cultures saddled with a half-    (ABC et al., 2002), based on Lebanon and Haussler, 1995b)
+suit defending the Bharatiya Fernall ’s ofﬁce . Ms . Claire Parters     ABC et al. (2003b), or Penalization of Information
+will also have a history temple for him to raise jobs until naked       ABC et al. (2008) can be evaluated and motivated by
+Prodiena to paint baseball partners , provided people to ride both
+of Manhattan in 1978 , but what was largely directed to China in                    providing optimal estimate
+1946 , focusing on the trademark period is the sailboat yesterday
+and comments on whom they obtain overheard within the 120th           This example shows that the MRNN is sensitive to the ini-
+anniversary , where many civil rights deﬁned , ofﬁcials said early    tial bracket before “ABC”, illustrating its representational
+that forms , ” said Bernard J. Marco Jr. of Pennsylvania , was        power. The above effect is extremely robust. In con-
+monitoring New York                                                   trast, both N -gram models and the sequence memoizer
+                                                                      cannot make such predictions unless these exact strings
+6.1.3. SAMPLES FORM THE ML MODEL                                      (e.g., “(ABC et al., 2003)”) occur in the training set, which
+                                                                      cannot be counted on. In fact, any method which is based
+Finally, we generate text from an MRNN trained on the ML              on precise context matches is fundamentally incapable of
+corpus conditioned on the string “Recurrent”. This MRNN               utilizing long contexts, because the probability that a long
+                                                                      context occurs more than once is vanishingly small. We
+                                                                      experimentally veriﬁed that neither the sequence memoizer
+Generating Text with Recurrent Neural Networks
+
+nor PAQ are not sensitive to the initial bracket.                    zen. Diploma thesis. PhD thesis, Institut fur Informatik, Tech-
+                                                                     nische Universitat Munchen, 1991.
+7. Discussion                                                     Hochreiter, S. and Schmidhuber, J. Long short-term memory.
+                                                                     Neural Computation, 9(8):1735–1780, 1997. ISSN 0899-7667.
+Modeling language at the character level seems unneces-           Hutter, M. The Human knowledge compression prize, 2006.
+sarily difﬁcult because we already know that morphemes            Jaeger, H. Observable operator models for discrete stochastic time
+are the appropriate units for making semantic and syntactic          series. Neural Computation, 12(6):1371–1398, 2000.
+predictions. Converting large databases into sequences of         Jaeger, H. and Haas, H. Harnessing nonlinearity: Predicting
+morphemes, however, is non-trivial compared with treating            chaotic systems and saving energy in wireless communication.
+them as character strings. Also, learning which character            Science, 304(5667):78, 2004.
+strings make words is a relatively easy task compared with        Mahoney, M. Adaptive weighing of context models for lossless
+discovering the subtleties of semantic and syntactic struc-          data compression. Florida Inst. Technol., Melbourne, FL, Tech.
+ture. So, given a powerful learning system like an MRNN,             Rep. CS-2005-16, 2005.
+the convenience of using characters may outweigh the ex-          Martens, J. Deep learning via Hessian-free optimization. In
+tra work of having to learn the words All our experiments            Proceedings of the 27th International Conference on Machine
+show that an MRNN ﬁnds it very easy to learn words. With             Learning (ICML). ICML 2010, 2010.
+the exception of proper names, the generated text contains        Martens, J. and Sutskever, I. Training Recurrent Neural Networks
+very few non-words. At the same time, the MRNN also as-              with Hessian-Free optimizaiton. ICML 2011, 2011.
+signs probability to (and occasionally generates) plausible       Mikolov, T., Karaﬁa´t, M., Burget, L., Cˇ ernocky`, J., and Khudan-
+words that do not appear in the training set (e.g., “cryptoli-       pur, S. Recurrent Neural Network Based Language Model. In
+ation”, “homosomalist”, or “un-ameliary”). This is a desir-          Eleventh Annual Conference of the International Speech Com-
+able property which enabled the MRNN to gracefully deal              munication Association, 2010.
+with real words that it nonetheless didn’t see in the train-      Mnih, A. and Hinton, G. A scalable hierarchical distributed lan-
+ing set. Predicting the next word by making a sequence               guage model. Advances in Neural Information Processing Sys-
+of character predictions avoids having to use a huge soft-           tems, 21:1081–1088, 2009.
+max over all known words and this is so advantageous that         Mnih, Volodymyr. Cudamat: a CUDA-based matrix class for
+some word-level language models actually make up binary              python. Technical Report UTML TR 2009-004, Department
+“spellings” of words so that they can predict them one bit           of Computer Science, University of Toronto, November 2009.
+at a time (Mnih & Hinton, 2009).                                  Murphy, K.P. Dynamic bayesian networks: representation, infer-
+                                                                     ence and learning. PhD thesis, Citeseer, 2002.
+MRNNs already learn surprisingly good language models             Pollastri, G., Przybylski, D., Rost, B., and Baldi, P. Improving
+using only 1500 hidden units, and unlike other approaches            the prediction of protein secondary structure in three and eight
+such as the sequence memoizer and PAQ, they are easy to              classes using recurrent neural networks and proﬁles. Proteins:
+extend along various dimensions. If we could train much              Structure, Function, and Bioinformatics, 47(2):228–235, 2002.
+bigger MRNNs with millions of units and billions of con-          Rissanen, J. and Langdon, G.G. Arithmetic coding. IBM Journal
+nections, it is possible that brute force alone would be suf-        of Research and Development, 23(2):149–162, 1979.
+ﬁcient to achieve an even higher standard of performance.         Robinson, A.J. An application of recurrent nets to phone proba-
+But this will of course require considerably more computa-           bility estimation. Neural Networks, IEEE Transactions on, 5
+tional power.                                                        (2):298–305, 2002. ISSN 1045-9227.
+                                                                  Rumelhart, D.E., Hintont, G.E., and Williams, R.J. Learning rep-
+Acknowledgements                                                     resentations by back-propagating errors. Nature, 323(6088):
+This work was supported by a Google fellowship and NSERC.            533–536, 1986.
+The experiments were implemented with software packages by        Sandhaus, E. The new york times annotated corpus. Linguistic
+Tieleman (2010) and Mnih (2009).                                     Data Consortium, Philadelphia, 2008.
+                                                                  Taylor, G.W. and Hinton, G.E. Factored conditional restricted
+REFERENCES                                                           boltzmann machines for modeling motion style. In Proceed-
+                                                                     ings of the 26th Annual International Conference on Machine
+Bell, R.M., Koren, Y., and Volinsky, C. The BellKor solution to      Learning, pp. 1025–1032. ACM, 2009.
+   the Netﬂix prize. KorBell Team’s Report to Netﬂix, 2007.       Tieleman, T. Gnumpy: an easy way to use GPU boards in Python.
+                                                                     Technical Report UTML TR 2010-002, University of Toronto,
+Bengio, Y., Simard, P., and Frasconi, P. Learning long-term de-      Department of Computer Science, 2010.
+   pendencies with gradient descent is difﬁcult. IEEE Transac-    Ward, D.J., Blackwell, A.F., and MacKay, D.J.C. Dasher–a data
+   tions on Neural Networks, 5(2):157–166, 1994.                     entry interface using continuous gestures and language models.
+                                                                     In Proceedings of the 13th annual ACM symposium on User
+Gasthaus, J., Wood, F., and Teh, Y.W. Lossless compression based     interface software and technology, pp. 129–137. ACM, 2000.
+   on the Sequence Memoizer. In Data Compression Conference       Werbos, P.J. Backpropagation through time: What it is and how
+   (DCC), 2010, pp. 337–345. IEEE, 2010.                             to do it. Proceedings of the IEEE, 78(10):1550–1560, 1990.
+                                                                  Wood, F., Archambeau, C., Gasthaus, J., James, L., and Teh, Y.W.
+Graves, A. and Schmidhuber, J. Ofﬂine handwriting recognition        A stochastic memoizer for sequence data. In Proceedings of the
+   with multidimensional recurrent neural networks. Advances in      26th Annual International Conference on Machine Learning,
+   Neural Information Processing Systems, 21, 2009.                  pp. 1129–1136. ACM, 2009.
+
+Hochreiter, S. Untersuchungen zu dynamischen neuronalen Net-
+

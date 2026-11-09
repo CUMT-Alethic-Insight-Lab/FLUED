@@ -1,0 +1,1128 @@
+              Causal Estimation of Tokenisation Bias
+
+Pietro Lesci  Clara Meister Thomas Hofmann Andreas Vlachos                   Tiago Pimentel
+                            University of Cambridge ETH Zürich
+
+                       {pl487, av308}@cam.ac.uk, tiago.pimentel@inf.ethz.ch
+
+              pietrolesci/tokenisation-bias                      pietrolesci/Tokenisation-Bias
+
+              Abstract
+
+     Modern language models are typically trained                Figure 1: Tokenisation bias. Consider subword ⟨hello⟩.
+     over subword sequences, but ultimately define               If it is included in the vocabulary, then each occurrence
+     probabilities over character-strings. Ideally, the          of “hello” in the training data is represented as a single
+     choice of the tokeniser—which maps character-               subword; otherwise, it is split into two subwords, i.e.,
+     strings to subwords—should not affect the prob-             ⟨he, llo⟩. If two models are trained under these two
+     ability assigned to the underlying character-               settings, the difference in the probability they assign to
+     string; in practice, it does. We define this                “hello” is the tokenisation bias we aim to estimate.
+     mismatch as tokenisation bias. In this work,
+     we quantify one particular type of tokenisation             these subword-strings are produced by a tokeniser,
+     bias: the effect of including or not a subword              where each subword represents a sequence of char-
+     (e.g., ⟨hello⟩) in a tokeniser’s vocabulary on the          acters. While in practice LMs thus output dis-
+     probability a trained model assigns to the corre-           tributions over subword-strings, we can still map
+     sponding characters (i.e., “hello”). Estimating             them back to distributions over character-strings
+     this effect is challenging because each model               (Pimentel and Meister, 2024; Phan et al., 2025).
+     is trained with only one tokeniser. We address
+     this by framing tokenisation bias as a causal                  Notably, a tokeniser’s behaviour is constrained
+     effect and estimating it using the regression dis-          by its vocabulary: a finite set of subwords which it
+     continuity design. Specifically, we exploit the             may produce. Given a character-string, a tokeniser
+     fact that tokenisation algorithms rank subwords             deterministically maps it to a sequence of subwords
+     and add the first K to a tokeniser’s vocabulary,            from its vocabulary. Different tokenisers (with dif-
+     where K is an arbitrary cutoff point. As such,              ferent vocabularies) thus map character-strings to
+     we can estimate a causal effect by comparing                different subword-strings (e.g., map “hello” to ei-
+     similar subwords around this cutoff. Experi-                ther ⟨he, llo⟩ or ⟨hello⟩). While an ideal LM would
+     mentally, we find that tokenisation consistently            assign the same probability to a string regardless
+     affects models’ outputs across scales, vocab-               of tokenisation (§3.2), in practice, tokenisation is
+     ularies, and tokenisers. Notably, a subword’s
+     presence in a small model’s vocabulary may
+     increase its characters’ probability by up to 17
+     times, highlighting tokenisation as a key design
+     choice in language modelling.
+
+1 Introduction
+
+Language models (LMs) define probability distri-
+butions over character-strings (e.g., “hello”), i.e.,
+finite sequences of characters1 from an alphabet.
+Directly modelling character-strings, however, can
+be inefficient, as it might require processing long
+sequences. To improve computational efficiency,
+modern LMs (e.g., Touvron et al., 2023) typically
+model subwords-strings instead (e.g., ⟨he, llo⟩);
+
+    1We use characters as a generic term to refer to either raw
+bytes (e.g., in ASCII), Unicode symbols, or graphemes.
+
+                                                                28325
+
+Proceedings of the 63rd Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers), pages 28325–28340
+                                     July 27 - August 1, 2025 ©2025 Association for Computational Linguistics
+an influential design choice for model performance               ther, this bias grows during training and in models
+(Rust et al., 2021; Toraman et al., 2023; Ali et al.,            under 100M parameters, it reaches 2.88 nats for
+2024, inter alia). How tokenisation affects trained              BPE and 2.51 for WP. In 850M-parameter models,
+models, however, remains poorly understood.                      this bias is around 1 nat: a subword’s characters
+                                                                 would thus be assigned roughly 2.7 times less prob-
+   In this work, we first define the effect of                   ability if it were not in the tokeniser’s vocabulary.
+a tokenisation choice on model behaviour as
+tokenisation bias. We then quantify one particular               2 Tokenisation
+type of tokenisation bias: the effect of including
+or not a subword (e.g., ⟨hello⟩) in a tokeniser’s                Let c ∈ Σ be a character, where Σ is an alphabet
+vocabulary on the log-probability a trained model                representing either a set of bytes, or the graphemes
+assigns to its characters (i.e., “hello”). While                 in a language (including whitespace and punctua-
+tokenisation bias may be an intuitive concept,                   tion). Further, let c ∈ Σ∗ be a character-string,
+estimating it is not straightforward. We cannot                  i.e., a finite sequences of characters; we will repre-
+simply compare a model’s log-probabilities on                    sent these strings as c = “c1c2 · · · c|c|”. The goal
+in- vs. out-of-vocabulary words (e.g., “hello” vs.               of language modelling is to learn a language’s prob-
+“appoggiatura”); as vocabularies are built based                 ability distribution over character-strings. We write
+on, e.g., frequency, there are systematic differences            these probabilities autoregressively as:
+between these groups. Further, we cannot compare
+log-probabilities on the same word under different                                |c|
+tokenisations (e.g., ⟨he, llo⟩ or ⟨hello⟩); as the
+model only sees one of them during training.2                    p(c) = p(eos | c) p(ct | c<t)  (1)
+
+   To quantify tokenisation bias, we first frame it                               t=1
+as a causal effect, asking: how would a word’s
+log-probability change if its subword was removed                where eos ∈/ Σ is a special symbol denoting the
+from the vocabulary (see Fig. 1)? This question                  end of a string.3 Most modern LMs, however, do
+requires comparing two values: (i) an observed
+value, the log-probability the model assigns the                 not model eq. (1) directly. Rather, they model dis-
+word in question; (ii) a counterfactual value, the               tributions over subword-strings v ∈ V∗:
+log-probability the model would assign the word
+had it not been in the vocabulary. We estimate this                                                           |v|
+causal effect by noting that tokenisers’ vocabularies
+are typically built incrementally. This effectively                       p(v) = p(eos | v) p(vt | v<t) (2)
+creates a ranking over subwords, which is arbitrar-
+ily cut off by a fixed vocabulary size: e.g., the first                                                       t=1
+32k subwords under this ranking are included in
+the vocabulary; later ones are excluded. Regres-                 In words, subword-strings are finite sequences of
+sion discontinuity (RD) design (Thistlewaite and                 subwords v ∈ V, where V is a finite set typically
+Campbell, 1960) then gives us a principled way to                called a vocabulary; we thus represent these strings
+estimate our causal effect: we can compare sub-                  as v = ⟨v1, ..., v|v|⟩. As we explain later, subwords
+words near the cutoff—as they are bound to have                  represent character spans, denoted here as cv = v.
+similar features—using subwords before the cut-                  How do eqs. (1) and (2) connect? This is the job of
+off to estimate our observed values, and the ones                a tokeniser, which we describe next.
+after the cutoff to input the counterfactual value.
+                                                                 τ2.1 Characters-strings ↔ Subword-strings
+   Experimentally, we show that tokenisation con-                              τ
+sistently affects LM performance across vocabu-                  Tokenisers map character-strings to subword-
+lary sizes, model scales, and tokenisers. Text rep-              strings and back, and can be formally defined as
+resented as a single subword receives more log-
+probability (on average) than if split into two. Fur-            a tuple T =def (V, τ, ). The first item in this tu-
+
+                                                                 ple is a vocabulary: a finite set of character-spans
+                                                                 V ⊂ Σ+, whose elements are called subwords
+                                                                 v ∈ V.4 The second item is known as the tokeni-
+                                                                 sation function: a function τ : Σ∗ → V∗ which
+                                                                 maps character-strings to subword-strings. Finally,
+
+                                                                 the third item in T is a detokenisation function: a
+
+                                                                 function : V∗ → Σ∗ which maps subword-strings
+                                                                 back to character-strings.
+
+    2A brute-force approach—e.g., training separate models           3The eos symbol is required to define probability distribu-
+under the different possible tokenisers—is (i) computationally   tions over strings autoregressively (Du et al., 2023).
+impractical and (ii) estimates expected bias for a LM family,
+rather than the tokenisation bias in a specific model instance.      4To ensure any character-string can be represented with V,
+                                                                 the original alphabet is typically included in this set: Σ ⊆ V.
+
+28326
+   As subwords represent character-spans, deto-                              this probability would change had v not been in V.
+kenisation is typically defined as the simple con-
+catenation of the subwords in a subword-string:                              More generally, we can ask: how does our choice
+                                                                                                                           pTθ ?
+                                                                             of tokeniser T bias our       trained  model         We  term
+
+         (v) =def v1 ◦ v2 ◦ · · · ◦ v|v|  (3)                                this tokenisation bias.5
+
+e.g., (⟨he, llo⟩) = “hello”. Further, to guaran-τ                            Definition 1. The tokenisation bias induced by a
+tee that a tokeniser is lossless, τ is designed suchτ                        property of the tokeniser is its effect on a model’s
+that detokenising its output returns the original                            ability to predict some character-string c.
+character-string: i.e., c = (τ (c)). We describe                                                     τ
+two popular tokenisation functions in App. A.                                We can define different kinds of tokenisation
+                                  τ
+       τ                                                                     bias, considering different properties of a tokeniser.
+
+              τ                                                              The property we will focus on here is the inclusion
+
+2.2 Language Modelling                                                       of a subword in its vocabulary, i.e., v ∈ V, and how
+
+Language modelling is the task of defining a prob-                           it affects predictions on its characters, cv.
+ability distribution over character-strings, arguably
+being the most prominent use case of tokenisa-                               T Definition 2. The tokenisation bias of v ∈ is its
+tion. During LM training, we typically start with a
+dataset of character-strings: D = {cn}nN=1, where                            effect on a model’s ability to predict cv.6
+
+cn ∼ p(c). We then use a tokeniser T to convert                              We now frame this tokenisation bias as a causal
+                                                                             effect: it compares the performance of an observed
+each of these into a subword-string: vn = τ (cn),                            model pθT,  with     the performance of       a counterfac-
+which are the actual inputs to our model. Given this                                     pθT′′ .  This counterfactual      model repre-
+setup, we can deduce a distribution over subword-                            tual model
+strings from the tokeniser:
+                                                                             sents what our model would have been if trained
+
+                                                                             with tokeniser T′ = (V′, τ ′, ′) which did not in-
+
+                                                                             clude subword v. We define this causal effect for-
+
+                                                                             mally in the next section. First, however, note that:
+
+         pT(v) =     p(c)  if v = τ (c)   (4)                                 v = τ (cv),                  v′cv = τ ′(cv)             (6)
+                     0     otherwise
+                                                                             observed subword              counterfactual subwords
+
+where we denote this distribution as pT now to                               where v′cv is the sequence of subwords which
+                                                                             would be used to represent cv in the counterfactual
+make its dependence on T explicit. Eq. (4) thus                              case. Assuming no tokenisation mismatch (Phan
+                                                                             et al., 2024), i.e., that τ (c<t) is a prefix of τ (c) in
+connects eqs. (1) and (2). Notably, training an                              this context (and similarly under τ ′), we then have:
+                     parogdouocdesapapmrooxdieml paTθtio(vn)o—f pwTh(ivch).
+LM on    strings vn
+ideally  should be
+
+We can then recover a character-level distribution                           pTθ (cv | c<t) = pTθ (v | τ (c<t))                       (7)
+
+pTθ (c) from this model by marginalising over all v                                               |v′cv |
+
+which are detokenised to this character-string:
+
+         pθT(c) =         pTθ (v) 1{c = (v)} (5)                             pTθ′′(cv | c<t) =             pθT′′ (vt′c′ v | τ ′(c<t) ◦ v′<ctv′ )
+
+                   v∈V ∗                                                                          t′=1
+
+Notably, while this equation depends on an infinite                          In words, we can compute pTθ′′(cv | c<t) by multi-
+sum over V∗, it can be approximated efficiently                              plying the probabilities of subwords in v′cv .
+(Phan et al., 2024, 2025; Vieira et al., 2024).
+                                                                             3.1 A Subword’s Causal Effect
+
+3 Tokenisation Bias                                                          We now define tokenisation bias in terms of poten-
+                                                                             tial outcomes (Rubin, 1974, 2005); this framework
+Now, consider tokeniser T = (V, τ, ) and assume                              allows us to formally describe the causal effect of
+                                                                             a treatment on some target outcome. In our case,
+we use it for training a LM; out data-generating
+                                                                                 5We note that Phan et al. (2024) use the term tokenisation
+distribution is thus pT (from eq. (4)) and our LM is                         bias to describe an issue arising when one applies τ to a prefix
+pTθ . Further, consider a specific subword v in this                         of c: namely, when τ (c<t) is not necessarily a prefix of τ (c).
+                                                                             We interpret this not as a bias, but as a misuse of tokenisers
+tokeniser’s vocabulary. We can measure how well                              by the LM’s users. We will thus term Phan et al.’s analysed
+the model predicts this subword’s associated char-                           phenomenon tokenisation mismatch here, instead of bias.
+acters cv in a given context c<t as how large of a
+probability it assigns to this sequence of characters                          T 6We use the shorthand notation v ∈ to denote that v is
+
+pθT(cv | c<t). We are interested in studying how                             in the tokeniser’s vocabulary V.
+
+                                          28327
+we want to estimate the causal effect of including a                                      or smaller than this expected effect; the expected
+                                                                                          effect we measure, however, gives us a best guess
+subword v in tokeniser T on a model pθT’s ability                                         (in terms of mean squared error) of what their effect
+                                                                                          would be, given no additional information.
+to predict the character-string cv. Before defining
+the effect of interest, however, we must formally                                         3.2 Tokenisation Bias in Perfect and in
+                                                                                                Untrained Models
+introduce its treatment and outcome. We define a
+treatment assignment variable as:                                                         We now analyse this causal effect under perfect
+
+              Wv =def 1{v ∈ T}                                                     (8)    dmaotad-eglesn:eLraMtinsgfodriswtrihbiucthiopnTθpTex.actly matches the
+
+and we define a potential outcome variable as:                                            Theorem 1. Assume we have a training process
+
+YW       (v)  =def  E    log pθT(cv | c<t)                                         (9)    that—regardless of the choice of tokeniser T—
+
+                    c<t                                                                   always returns perfect models, i.e., models for
+
+where we quantify a model’s ability to predict a                                          which pθT(v) = pT(v). In this case, the causal ef-
+character-string cv as its log-probability averaged
+across contexts c<t.7 Given these definitions, we                                         fect of a subword v is always zero, i.e., ψv = 0.
+can write the causal effect of interest as follows.
+                                                                                          Proof. See the proof in App. B.1.
+Definition 3. The causal effect of a subword v on
+a model’s ability to predict character-string cv is:                                         If the ideal effect is always zero, why bother
+                                                                                          estimating it? In practice, LMs are imperfect,
+ψv =def     Y1(v)                                      −        Y0(v)              (10)   and biases—both inductive and learned—may lead
+                                                                                          models to assign different probabilities to the same
+         performance on cv                                      performance on cv         character-string under different tokenisations (all
+         when trained with v when trained without v                                       else held equal). Measuring this effect in practice
+                                                                                          is thus important. As an example, we show that at
+   Importantly, a model is trained with a tokeniser                                       initialisation this causal effect is relatively large.
+that either includes v or does not. Thus, for
+any model, we can only observe either Y1(v) or                                            Theorem 2. Assume that at initialisation our
+Y0(v) with the other term being counterfactual.                                           language model outputs the uniform distribution
+The causal analysis literature provides us with                                           pTθ (v | v<t) =           8
+methods—and the relative assumptions that need                                                              1    .     In  this  case,  the  causal  effect  of
+to be met—to impute the counterfactual term from                                                           |V |
+observable outcomes in a principled way. Defi-                                            a subword v at initialisation is ψv ⪆ log |V|.
+nition 3 represents an individual treatment effect
+(ITE), as it defines the causal effect of a specific                                      Proof. See the proof in App. B.2.
+subword. Methods to estimate an ITE, however,
+require strong assumptions, if at all applicable (Lu                                      4 Estimating Tokenisation Bias
+et al., 2018). To avoid this requirement, we thus fo-
+cus on average effects, as is common in the econo-                                        Now, we get to estimating the causal effect we de-
+metrics literature (Angrist and Pischke, 2015).                                           fined; this is typically done in three steps. First, we
+                                                                                          define a causal estimand, the theoretical quantity
+Definition 4. The expected effect of a subword on                                         that represents the effect of interest; this is the value
+the model’s ability to predict its character-string is:                                   in Definition 4. Second, we rewrite this causal esti-
+                                                                                          mand in terms of quantities that we can actually ob-
+         ψ    =def  E  [Y1(v)                                −  Y0(v)]             (11)   serve, thus defining a statistical estimand. Finally,
+                                                                                          we define an estimator, a statistical procedure to
+                    v                                                                     approximate the statistical estimand.
+
+   In other words, we simplify the causal estimation                                         Importantly, the causal estimand in eq. (11) is
+problem by focusing on the expected causal effect                                         non-trivial to estimate, as it contains a counterfac-
+across a population of subwords. The causal effect                                        tual; this is exposed by a simple decomposition:
+for each specific subword v might thus be larger
+
+7Our framework also generalises beyond mean effects                                       ψ                =     E     [Y1(v)]   −  E   [Y0(v)]      (12)
+across contexts. For instance, replacing the expectation in
+eq. (9) with a standard deviation yields the tokenisation bias of                                                v                  v
+
+T v ∈ on a model’s variability when predicting cv. Similarly,                                                          1                2
+T dcoenfitneixntg-sYpeWcc<iftic(vto) k=enliosagtipoθn
+                                                       (cv   | c<t) allows us to study a  8See support for this in, e.g., Chang and Bergen (2022).
+                                                       bias  instead of aggregated ones.
+
+                                                                                   28328
+Notably, we can observe the potential outcomes in                                             4.2 The Regression Discontinuity Design
+expectation 1 only for subwords in the given to-
+                                                                                              We define a principled estimator for tokenisation
+keniser (v ∈ T), while expectation 2 is observable                                            bias based on the regression discontinuity (RD)
+only for subwords not in that tokeniser (v ∈/ T).                                             design (Thistlewaite and Campbell, 1960).9 Let
+                                                                                              us consider running the algorithm above (§4.1) for
+Naively comparing a model’s average performance                                               K+ ≫ K iterations and obtain a list of subwords:
+in these two groups of in- and out-of-vocabulary
+items would return a biased estimate of the causal                                            [v[1new],  v  [new]  ,  ...,  v  [new]  ,  ...,  v[new]  ]  (14)
+effect. This is due to the way tokenisers are de-
+veloped: subwords are not randomly included in                                                              2                  K                 K+
+the vocabulary, but carefully selected under some
+objective. As a subword’s assigned treatment is                                               The index k ∈ {1, ..., K+} of a subword in this
+not random, the two subgroups are not comparable,                                             sequence represents the iteration at which it
+and there may thus be confounders.                                                            would be selected by the tokenisation algorithm.
+                                                                                              Index k thus determines a natural ordering of
+   Luckily, a popular class of tokenisation                                                   how subwords are added to a bottom-up tokeniser.
+algorithms—which includes byte-pair encoding                                                  Now, let us denote it as an index-valued random
+(BPE, Sennrich et al., 2016) and WordPiece (WP,                                               variable γv; this variable deterministically defines
+Schuster and Nakajima, 2012)—select subwords                                                  a subword’s treatment assignment:
+iteratively, one-at-a-time, to compose their vocab-
+ularies. This creates a ranking among subwords                                                     Wv = 1{γv ≤ K}                                         (15)
+which deterministically defines their treatment as-
+                                                                                              In words, a subword is thus included in the
+signment (i.e., whether v ∈ T or not); we will                                                vocabulary if its index γv is smaller than K. In RD
+                                                                                              design, γv is termed a running variable and K
+leverage the non-randomness in this treatment as-                                             is the cutoff of this running variable.
+signment to estimate our desired effect. We de-
+scribe these methods next.                                                                       For RD design to be applicable, this cutoff must
+                                                                                              be predetermined and exogenous—i.e., indepen-
+4.1 Sequential Vocabulary Construction                                                        dent of potential outcomes—ensuring an unbiased
+                                                                                              treatment assignment. This holds for bottom-up
+Let D = {cn}Nn=1 be a dataset of character-strings.                                           tokenisers, where vocabulary sizes are set before-
+Bottom-up tokenisers typically define an objective                                            hand. Notably, we still cannot directly compare in-
+function, ϕ(v[1], v[2], D), which measures the bene-                                          and out-of-vocabulary subwords, as they have dif-
+fit of including a new subword v[new] = v[1]◦v[2] in the                                      ferent values of the running variable: by definition
+                                                                                              these groups have, respectively, running variable
+vocabulary. Given a target vocabulary size K +|Σ|,                                            values of γv ≤ K or γv > K. This makes them
+                                                                                              systematically different and introduces bias. The
+their algorithm initialises a vocabulary as V0 = Σ                                            RD design addresses this issue by focusing on a
+and a dataset as D0 = D. For K iterations, it then                                            local treatment effect instead:
+selects the pair of subwords vk[1], vk[2] which max-
+imises objective ϕ over the current dataset, adds it
+
+to  the  vocabulary  Vk  =  V k−1  ∪  {v  [new]  },  and  applies
+
+                                          k
+mit teorgDekre=pla{cmesercgoenvs[ke1]c⊚uvtik[2v] (evo)c|cuvrr∈enDceks−1o}f,vwk[1]h, evrk[2e]
+                                                                                              ψγv  =def  E  [Y1(v)          −  Y0(v)           |  γv ]    (16)
+
+with vk[new]. The algorithm then returns VK .                                                            v
+
+    While the choice of objective function is arbi-                                           Notably, ψγv is thus a localised causal effect repre-
+                                                                                              senting the effect expected for subwords added to
+trary, most tokenisers employed by current LMs                                                the vocabulary at a specific index γv.
+
+use either the objective from BPE or WP:                                                         We now leverage the cutoff point K to estimate
+                                                                                              this local causal effect. In short, since treatment
+ϕbpe(v[1], v[2], Dk) =def #(⟨v[1], v[2]⟩, Dk)             (13)                                assignment is deterministic and the cutoff is exoge-
+                                                                                              nous, this assignment mechanism is “as good as
+ϕwp(v[1], v[2], Dk)  =def       #(⟨v[1], v[2]⟩, Dk)                                           random” (Angrist and Pischke, 2015). If the out-
+                           #(⟨v[1]⟩, Dk) #(⟨v[2]⟩, Dk)                                        come Y(v) is a continuous function of the running
+
+where we use #(v, D) to denote the number of
+
+occurrences of subword-string v in dataset D. At
+
+each iteration, BPE’s objective (ϕbpe) selects the                                                9RD design is a quasi-experimental paradigm that exploits
+most frequent subword-pair in dataset D, while                                                a deterministic relationship between an observed characteris-
+                                                                                              tic, known as the running variable, and the treatment assign-
+WP’s (ϕwp) selects the subword-pair with the largest                                          ment. Unlike a true experiment, a quasi-experiment does not
+pointwise mutual information in it.                                                           randomly assign participants to control and treatment groups.
+
+                                                          28329
+variable, thus, it should transition smoothly across              4.4 The Regression Discontinuity Estimator
+the cutoff in the absence of treatment, making any
+discontinuity at this point solely due to treatment.10            In the limit of eq. (20), the functional terms f (γv)
+                                                                  in the observed effects cancel out. However, we
+4.3 The Regression Discontinuity Estimand                         do not have a large number of samples exactly at
+                                                                  the cutoff. In practice, thus, RD is estimated by
+Before introducing a statistical estimand, we need                extrapolating over values of the running variable in
+to introduce the functional relationship between                  a window around the cutoff; in this case, these func-
+potential outcomes and the running variable. We                   tional terms f (γv) do not cancel out. To control
+can write this formally as:                                       for them, we first take a conditional expectation of
+                                                                  Yobs(v), which we write in terms of eq. (17):
+Ev [Y0(v) | γv] = f (γv)                            (17a)
+Ev [Y1(v) | γv] = f (γv) + ψγv                      (17b)                  Ev [Yobs(v) | γv] = f (γv) + ψγv Wv (21)
+
+where eq. (17b) immediately follows from eq. (16).                We then assume a parametric form for f (e.g., lin-
+As typical in RD, we posit a smooth relationship be-              ear in γv) and ψγv (e.g., a constant). Given a set of
+tween the running variable and potential outcomes.                observed subwords K in a window around the cut-
+                                                                  off, we obtain an estimator of ψγv by minimising
+Assumption 1 (Continuity Assumption). The con-                    the squared error of the functional fit of f and ψγv .
+ditional expectation of a potential outcome is con-
+tinuous at the cutoff. That is, both limits exist:                Estimator 1. Given a parametric function f and a
+                                                                  set of observed subwords around the cutoff K, the
+        lim    Ev [Y0(v)    |  γv  =  k]            (18a)         regression discontinuity estimator ψRD is:
+                                                    (18b)
+        k→K                                                          argmin (Yobs(v)−f (γv)−ψRD Wv)2 (22)
+
+        lim    Ev [Y1(v)    |  γv  =  k]                                 f,ψRD v∈K
+
+        k→K                                                       This is an unbiased estimator of the local effect
+                                                                  ψγv at γv = K under Assump. 1 and assuming
+   Now, we note that eq. (15) implies that there is               f provides an adequate description of expected
+no value of the running variable for which we can                 potential effects (Angrist and Pischke, 2009).
+observe both potential outcomes, where we write
+an observed outcome as:11                                            Notably, the validity of an RD estimator hinges
+                                                                  on the correct specification of f and on the size of
+     Yobs(v) =    Y1(v)        if Wv = 1                (19)      the window used to obtain the set K. On the one
+                  Y0(v)        otherwise                          hand, a larger window allows for a bigger sample
+                                                                  size but relies more on the correct estimation of
+Luckily, Hahn et al. (2001) show that the only re-                f . On the other hand, a smaller window depends
+quired assumption to identify the causal estimand                 less strongly on f but may not have enough sam-
+in eq. (16) is that Assump. 1 holds. We can write a               ples for precise statistical estimation. Thus, RD
+statistical estimand at the cutoff as:                            requires careful tuning of the window size to con-
+                                                                  trol this bias-variance trade-off. In Fig. 2, we show
+ψRD  =   lim   Ev [Yobs(v)  |  γv  =  k]                (20)      an example of this method in practice.
+
+        k→K −                                                     5 Experimental Setup
+
+               −   lim      Ev [Yobs(v)   |  γv  =  k]
+
+                  k→K +
+
+In words, the RD estimand is the discontinuity in
+the conditional expectation function at the cutoff.12
+
+   10Notably, our running variable γv is discrete, and thus not   We conduct experiments on a suite of Llama-
+continuous by definition. In our experiments, we consider         style transformer models of varying scales, trained
+large enough windows around the cutoff and thus assume our        with different tokenisation schemes and vocabulary
+variable is fine-grained enough to allow for such an estimation.  sizes.13 More details in App. C.
+Alternatively, we could have used other running variables for
+our experiments instead, such as, e.g., the objective function    have a principled (non-parametric) estimator for  ψanγdv  . Obtain-
+ϕ. We also note that, while the RD design typically assumes       ing such estimates, however, is tricky (Angrist           Pischke,
+continuous running variables, it can be applied to discrete       2009, chapter 6). First, working in a small neighbourhood of
+ones, such as the rank in our case (Cattaneo et al., 2024).       the cutoff means we would have little data. Second, sample
+                                                                  averages are biased when estimated on one side of a boundary.
+   11Assuming consistency, i.e., assuming that a potential out-   13Since our method requires knowing which subwords
+come under the observed treatment assignment equals the           would be added after the cutoff, we could not use open-source
+observed outcome (Cole and Frangakis, 2009).
+
+   12If we could estimate eq. (20)’s expectations, we would
+
+                                                        28330
+                                                     Treatment True False
+
+                  Mean                            Median                 Standard Deviation      Interquartile Range
+    0                                0                          15
+
+-10                                  -10                        10                           20
+
+-20                                  -20                        5                            10
+
+     ATE: 2.88                            ATE: 1.52             0 ATE: -3.17                 0 ATE: -4.42
+
+     28k 30k 32k 34k 36k                  28k 30k 32k 34k 36k       28k 30k 32k 34k 36k          28k 30k 32k 34k 36k
+
+T Figure 2: Tokenisation bias of v ∈ for the last cheMckeprgoeinInt doefxa model trained with BPE tokeniser and K = 32k.
+The x-axis shows the running variable γv, and the y-axis shows different outcome variables: mean, standard
+deviation, median, and interquartile range of a cv’s log-probability across contexts. Subwords on the left-hand side
+of the cutoff are in the tokeniser. The dashed orange line indicates the estimated counterfactual outcome.
+
+    Vocabulary Size 8k 32k 128k           BPE BPE2WP WP         aggregate them across the contexts in which they
+                                                                appear. For our regression discontinuity estimation,
+12                               10                             we focus on a window of 5k subwords around the
+                                                                tokeniser’s vocabulary cutoff.
+8                                8
+                                                                6 Results
+6                                6
+                                                                In this section, we report the estimated tokenisa-
+4                                4                              tion bias ψγv in our models. Fig. 2 (left) presents
+3                                                               tokenisation bias in BPE with default parameters.
+                                 3                              We estimate this bias to be 2.88 nats, with treated
+2                                                               character-strings cv having a log-probability of
+                                                                −7.72 and untreated ones −10.60. This means
+1                                2                              a cv can be assigned roughly 17 times less proba-
+                                                                bility due solely to tokenisation, implying LMs are
+    0 10k 20k 30k 40k 50k            0 10k 20k 30k 40k 50k      highly susceptible to tokenisation bias. We next
+                                                                examine this effect in detail.
+               Training Step                    Training Step
+                                                                Effect Across Training. Fig. 3 (left; orange line)
+Figure 3: Tokenisation bias ψγv of 57M across training          shows the causal effect evolving through training.
+for (left) BPE across vocabulary sizes 8k, 32k, and 128k;       As predicted (Thm. 2), this effect is large at the start
+and for (right) vocabulary size 32k across tokenisers           of training. Notably, it drops sharply by step 2k
+BPE, WP, and BPE2WP.                                            and then slowly grows again. This is counterintu-
+                                                                itive. Since an ideal model would be unaffected by
+Models and Tokenisers. Unless otherwise speci-                  tokenisation (Thm. 1), one would expect a decline
+fied, we run our experiments with a BPE tokeniser               in ψγv across training. Instead, our results suggest
+with vocabulary size K = 32k, and a Llama (Tou-                 models become more biased as they improve.
+vron et al., 2023) LM with 57M non-embedding
+parameters trained on the MiniPile (Kaddour, 2023)              Comparison Across Vocabulary Sizes. Fig. 3
+dataset for 50k steps. To explore how tokenisation              (left) also shows how tokenisation bias varies with
+bias changes as a function of: (i) model size, we fur-          vocabulary size (K ∈ {8k, 32k, 128k}). We find
+ther train Llama variants with approximately 340M,              weaker biases when using smaller vocabularies.
+and 850M non-embedding parameters; (ii) vocabu-                 This might be because for smaller K, the character-
+lary size, we experiment with BPE’s with K equal                strings cv near the cutoff will be more frequent;
+8k, 32k, and 128k; (iii) tokenisation algorithm, we             untreated strings cv will thus see more training,
+experiment with a standard WP tokeniser, and a to-              which potentially reduces tokenisation bias. Be-
+keniser using WP’s tokenisation function but BPE’s              yond a critical size, the effect stabilises, with 128k
+vocabulary, which we call BPE2WP; (iv) embed-                   and 32k showing similar biases despite a large dif-
+ding tying and training dataset, we train a 100M                ference in vocabulary size (see also Fig. 6, App. D).
+parameter model with and without tied input-output
+embeddings on 20B tokens from the Fineweb-Edu
+corpus (Penedo et al., 2024).
+
+Evaluation and Data Collection. All models are
+evaluated on the MiniPile validation set. To compute
+Yobs(v), we collect subwords’ log-probabilities and
+
+LMs, as this information is typically not published even for
+open-source models like Pythia (Biderman et al., 2023) and
+OLMo (Groeneveld et al., 2024). Further, their tokeniser con-
+struction details are often unreproducible. We therefore train
+new tokenisers and models from scratch.
+
+                                                          28331
+                                    4                                   3                                         3
+
+3
+
+                                    3                                                                                                         57M-tied
+
+2                                                                       2                                         2                           100M-tied
+
+                                    2
+
+                                                                                                                                              100M
+
+1                                   1                                   1                                         1                           340M-tied
+
+                                                                                                                                              850M
+
+                                    0
+
+0                                                                                                                    0
+                                                                                                                  4.0 2k 10k 20k 30k 40k 50k
+2.5  3.0  3.5                  4.0  2.5  3.0  3.5                  4.0     2.5     3.0  3.5
+                                                                                   Validation Cross-Entropy                   Training Step
+     Validation Cross-Entropy            Validation Cross-Entropy
+
+Figure 4: (Left to Center-right) Tokenisation bias ψγv vs. validation cross-entropy of trained models. Each point
+represents a training step of a model trained with a specific tokeniser. (Left) Linear fits per tokeniser and across
+training steps, size fixed to 57M; (Center-left) Linear fits per training step and across tokenisers, size fixed to
+57M; (Center-right) Linear fits per training step and across model sizes, tokeniser fixed as BPE with K = 32k.
+(Right-most) Tokenisation bias ψγv across training of models with different sizes and BPE tokeniser with K = 32k.
+
+Comparison Across Tokenisers. Fig. 3 (right)                                            Vocabulary Size 8k 32k 128k
+shows how the causal effect changes as a function
+of the used tokenisation and objective functions,                                                Mean                             Standard Deviation
+displaying results for BPE (with τ↑, ϕbpe), BPE2WP                                                                     1
+(with τ↑, ϕwp), and WP (with τlong, ϕwp). In this fig-                     20
+ure, we see that tokenisation bias seems consistent                        10                                          0
+across these tokenisers (see also Fig. 8, App. D).
+                                                                            5                                         -1
+Comparison Across Model Sizes. Fig. 4 (right)                               12
+shows how tokenisation bias changes as a func-
+tion of model size. In this figure, we see that bias                            0                                     -2
+is smaller on larger (e.g., 340M parameters) than
+in small models (e.g., 57M). Among our largest                             -1
+models, however (with either 340M or 850M pa-                              -2
+rameters), we see little difference in tokenisation                                                                   -5
+bias. Further, even in the largest models, bias does                       -5
+not seem to decrease across training. Together,
+these results suggest that tokenisation bias may be                        -10                                        -10
+a persisting property of LMs.
+                                                                                   5 20 100 500                   5k       5 20 100 500               5k
+
+                                                                                                             Window Size
+
+                                                                           Figure 5: Estimated effect ψRD (y-axis) vs. window size
+                                                                           used to estimate it (x-axis). Results for fully trained
+                                                                           model with BPE and K ∈ {8k, 32k, 128k}. Shaded
+                                                                           regions correspond to standard errors.
+
+                                                                           effect of tokenisation bias on the stability of model
+                                                                           outputs across contexts. To this end, we define new
+                                                                           potential outcome variables:
+
+                                                                                   YWM(v)              =def  M    log pTθ (cv | c<t)                  (23)
+
+                                                                                                             c<t
+
+Tokenisation Bias vs. Model Quality. We next                               where we consider standard deviation, median, and
+explore in more detail the previous observation that                       interquartile range as M. Results are in Fig. 2
+tokenisation bias grows across training (Fig. 3)—                          (also in Fig. 6 and 8, App. D). In particular, stan-
+suggesting an inverse-scaling effect where tokenisa-                       dard deviation results show that whether a subword
+tion bias strengthens as models improve (McKenzie                          is present in an LM’s vocabulary significantly af-
+et al., 2023). Fig. 4 plots the estimated ψγv against                      fects output stability: cv of in-vocabulary subwords
+model quality (quantified as cross-entropy). As                            exhibit far less variation in log-probability across
+can be seen, two opposing trends emerge: across                            contexts than out-of-vocabulary ones. This again
+training, better models show larger causal effects                         underscores the strong influence of tokenisation on
+(shown on the left); across tokenisers with differ-                        model behaviour.
+ent vocabulary sizes, better models show smaller
+effects (shown on the center-left). Further, this                          Robustness of the RD Estimation. Finally, we
+relationship seems to change across model scales                           analyse the robustness of our estimates with respect
+(shown on the center-right). This highlights that                          to: (i) window size used to select K, and (ii) func-
+tokenisation bias is a complex phenomenon, which                           tional form of f used for the regression fit. First,
+can either improve or worsen as models get better.                         Fig. 5 shows that the estimated effect is unstable for
+                                                                           window sizes smaller than 500, but stabilises when
+Other Causal Effects. Our framework also al-                               using at least 1k subwords on both sides of the cut-
+lows us to study tokenisation-related biases beyond                        off (see also Fig. 7, App. D). Second, Fig. 9 (in
+average model performance. Here, we examine the                            App. D, due to space constraints) shows that more
+
+                                                                        28332
+flexible specifications of f return similar estimates  prompts or indirect correlates (Chai et al., 2024;
+to our linear choice, though fitting noise.            Wang et al., 2025). Our estimator, by contrast, en-
+                                                       ables a more principled study of how vocabulary
+7 Tokenisation Bias in Context                         construction choices affect a LM’s behaviour. We
+                                                       sketch two concrete use cases for ψ below.
+We now place our findings in the broader context of
+existing work on tokenisation, highlighting theoret-   Measuring Impact on Lexical Generalisation.
+ical implications, potential links to known biases,    Adding subwords to the vocabulary causes mod-
+and opportunities for improved fairness.               els to treat the corresponding character span as
+                                                       an indivisible unit. This can be beneficial (e.g.,
+7.1 Implications of Tokenisation Bias                  in English, ⟨pl ⟩ and ⟨ay⟩ do not have meanings
+                                                       on their own, but ⟨play⟩ does), but may hinder
+Theoretical Underpinnings of Tokenisation.             generalisation across morphological variants (e.g.,
+Our results align with recent theoretical work on      ⟨play⟩ and ⟨plays⟩). Tokenisation may thus im-
+the role of tokenisation in language modelling. Ra-    pact model generalisation across orthographically
+jaraman et al. (2024) show that subword vocabu-        similar lexical items. Prior work already hints at
+laries endow Transformers with inductive biases        this tradeoff: Schäfer et al. (2024) show that du-
+suited to modelling higher-order Markov sources,       plicated entries in a vocabulary may hurt general-
+while character-level models lag behind. This          isation, while Toraman et al. (2023) and Schmidt
+is supported by our finding that representing a        et al. (2024) show that vocabulary expansion helps
+character-string as two subwords instead of one        only under morphology-aware tokenisation. These
+reliably lowers its log-probability.                   results suggest that adding too many subwords to
+                                                       the vocabulary can hurt lexical generalisation, a
+Length Bias. Tokenisation bias may help explain        hypothesis our estimator could be adapted to test.
+the well-documented length bias in LMs (Murray
+and Chiang, 2018; Stahlberg and Byrne, 2019),          Optimising Tokenisation. Finding an optimal
+where longer subword sequences are less likely         tokeniser is NP-complete (Whittington et al., 2025;
+to be generated. We find that character-strings to-    Kozma and Voderholzer, 2024). Further, existing
+kenised as multiple subwords are systematically as-    heuristic metrics for tokeniser selection, such as
+signed lower probabilities, which may cause mod-       subword frequency thresholds (Gowda and May,
+els to prefer generating shorter sequences.            2020) or Rényi efficiency (Zouhar et al., 2023), are
+                                                       often poorly correlated with downstream model
+Multilingual Fairness. Tokenisation can also           performance (Schmidt et al., 2024). Our causal
+contribute to performance disparities across lan-      estimator offers a more grounded alternative. If a
+guages. Petrov et al. (2023) show that under typical   practitioner aims to optimise held-out perplexity, a
+multilingual tokenisers, lower-resource languages      positive ψ would signal that expanding the vocab-
+tend to have longer tokenisations. While originally    ulary (i.e., including more subwords) could help.
+noted for its cost implications, we show this may      Conversely, a negligible or negative ψ might justify
+also hurt performance as, ceteris paribus, (i) longer  shrinking the vocabulary to gain efficiency without
+subword-strings receive lower probability due to       hurting performance. This moves us beyond heuris-
+tokenisation bias and, thus, (ii) they may reduce      tic selection toward a more systematic, model-level
+the model’s likelihood of generating low-resource      approach to tokeniser design.
+language content, reinforcing data sparsity effects.
+These effects echo Rust et al.’s (2021) findings,      8 Conclusion
+which show that language-specific tokenisers close
+much of the performance gap between monolingual        We study a phenomenon we call tokenisation bias:
+and multilingual models, highlighting tokenisation     the extent to which a model’s outputs are affected
+as a key factor in multilingual performance.           by whether a subword appears in its tokeniser’s vo-
+                                                       cabulary. We propose a new method to measure it
+7.2 Going Forward: Uses for ψγv                        without re-training the model. We empirically show
+                                                       that character-strings tokenised as a single subword
+This paper provides new empirical evidence that        receive significantly more probability than when
+tokenisation choices bias model predictions. Prior     split, and that this effect intensifies over training.
+studies have largely focused on observational ev-
+idence of these effects, often through adversarial
+
+28333
+Limitations                                              Stella Biderman, Hailey Schoelkopf, Quentin An-
+                                                            thony, Herbie Bradley, Kyle O’Brien, Eric Halla-
+This work estimates tokenisation bias: the extent           han, Mohammad Aflah Khan, Shivanshu Purohit,
+to which a model’s output depends on whether a              USVSN Sai Prashanth, Edward Raff, Aviya Skowron,
+subword appears in its tokeniser’s vocabulary. Un-          Lintang Sutawika, and Oskar Van Der Wal. 2023.
+fortunately, due to the costs associated with train-        Pythia: A suite for analyzing large language models
+ing large LMs, most of our experiments focused              across training and scaling. In Proceedings of the
+on relatively small models trained in a single lan-         40th International Conference on Machine Learning,
+guage (English). Investigating whether other model          ICML’23.
+architectures, training procedures, and natural lan-
+guages result in similar causal effects would be         Matias D. Cattaneo, Nicolas Idrobo, and Rocío Titiunik.
+important to strengthen our conclusions. Moreover,          2024. A Practical Introduction to Regression Discon-
+our method estimates a local causal effect (i.e., the       tinuity Designs: Extensions. Cambridge University
+effect for subwords in a window around the cutoff).         Press.
+However, our results suggest that the estimated ef-
+fect can be extrapolated further beyond the window       Yekun Chai, Yewei Fang, Qiwei Peng, and Xuhong Li.
+size, as our regression estimates show an almost            2024. Tokenization falling short: On subword robust-
+flat trend with respect to the running variable.            ness in large language models. In Findings of the
+                                                            Association for Computational Linguistics: EMNLP
+Acknowledgments                                             2024, pages 1582–1599, Miami, Florida, USA. Asso-
+                                                            ciation for Computational Linguistics.
+                             Pietro and Andreas re-
+                             ceived funding from the     Tyler A. Chang and Benjamin K. Bergen. 2022. Word
+                             European Research Coun-        acquisition in neural language models. Transactions
+                             cil (ERC) under the Euro-      of the Association for Computational Linguistics,
+pean Union’s Horizon 2020 Research and Innova-              10:1–16.
+tion programme grant AVeriTeC (Grant agreement
+No. 865958). We thank the anonymous reviewers            Stephen R. Cole and Constantine E. Frangakis. 2009.
+for their helpful questions and comments. We also           The consistency statement in causal inference: A
+thank Gregor Bachmann for his feedback on an                definition or an assumption? Epidemiology, 20(1).
+earlier version of this paper.
+                                                         Li Du, Lucas Torroba Hennigen, Tiago Pimentel, Clara
+                                                            Meister, Jason Eisner, and Ryan Cotterell. 2023. A
+                                                            measure-theoretic characterization of tight language
+                                                            models. In Proceedings of the 61st Annual Meet-
+                                                            ing of the Association for Computational Linguistics
+                                                            (Volume 1: Long Papers), pages 9744–9770, Toronto,
+                                                            Canada. Association for Computational Linguistics.
+
+References                                               Philip Gage. 1994. A new algorithm for data compres-
+                                                            sion. C Users Journal, 12(2):23–38.
+Mehdi Ali, Michael Fromm, Klaudia Thellmann,
+   Richard Rutmann, Max Lübbering, Johannes Lev-         Leo Gao, Stella Biderman, Sid Black, Laurence Gold-
+   eling, Katrin Klug, Jan Ebert, Niclas Doll, Jasper       ing, Travis Hoppe, Charles Foster, Jason Phang,
+   Buschhoff, Charvi Jain, Alexander Weber, Lena Ju-        Horace He, Anish Thite, Noa Nabeshima, Shawn
+   rkschat, Hammam Abdelwahab, Chelsea John, Pedro          Presser, and Connor Leahy. 2020. The Pile: An
+   Ortiz Suarez, Malte Ostendorff, Samuel Weinbach,         800GB dataset of diverse text for language modeling.
+   Rafet Sifa, Stefan Kesselheim, and Nicolas Flores-       arXiv preprint 2101.00027.
+   Herr. 2024. Tokenizer choice for LLM training: Neg-
+   ligible or crucial? In Findings of the Association    Thamme Gowda and Jonathan May. 2020. Finding the
+   for Computational Linguistics: NAACL 2024, pages         optimal vocabulary size for neural machine transla-
+   3907–3924, Mexico City, Mexico. Association for          tion. In Findings of the Association for Computa-
+   Computational Linguistics.                               tional Linguistics: EMNLP 2020, pages 3955–3964,
+                                                            Online. Association for Computational Linguistics.
+
+Joshua Angrist and Jörn-Steffen Pischke. 2015. Master-   Dirk Groeneveld, Iz Beltagy, Evan Walsh, Akshita
+   ing ’Metrics: The Path from Cause to Effect. Prince-     Bhagia, Rodney Kinney, Oyvind Tafjord, Ananya
+   ton University Press.                                    Jha, Hamish Ivison, Ian Magnusson, Yizhong Wang,
+                                                            Shane Arora, David Atkinson, Russell Authur,
+Joshua D. Angrist and Jörn-Steffen Pischke. 2009.           Khyathi Chandu, Arman Cohan, Jennifer Dumas,
+   Mostly harmless econometrics: An empiricist’s com-       Yanai Elazar, Yuling Gu, Jack Hessel, Tushar Khot,
+   panion. Princeton university press.                      William Merrill, Jacob Morrison, Niklas Muen-
+                                                            nighoff, Aakanksha Naik, Crystal Nam, Matthew
+Stella Biderman, Kieran Bicheno, and Leo Gao. 2022.         Peters, Valentina Pyatkin, Abhilasha Ravichander,
+   Datasheet for the Pile. arXiv preprint 2201.07311.       Dustin Schwenk, Saurabh Shah, William Smith,
+
+28334
+   Emma Strubell, Nishant Subramani, Mitchell Worts-       Adam Paszke, Sam Gross, Francisco Massa, Adam
+   man, Pradeep Dasigi, Nathan Lambert, Kyle Richard-         Lerer, James Bradbury, Gregory Chanan, Trevor
+   son, Luke Zettlemoyer, Jesse Dodge, Kyle Lo, Luca          Killeen, Zeming Lin, Natalia Gimelshein, Luca
+   Soldaini, Noah Smith, and Hannaneh Hajishirzi.             Antiga, Alban Desmaison, Andreas Kopf, Edward
+   2024. OLMo: Accelerating the science of language           Yang, Zachary DeVito, Martin Raison, Alykhan Te-
+   models. In Proceedings of the 62nd Annual Meeting          jani, Sasank Chilamkurthy, Benoit Steiner, Lu Fang,
+   of the Association for Computational Linguistics (Vol-     Junjie Bai, and Soumith Chintala. 2019. PyTorch:
+   ume 1: Long Papers), pages 15789–15809, Bangkok,           An imperative style, high-performance deep learning
+   Thailand. Association for Computational Linguistics.       library. In Advances in Neural Information Process-
+Jinyong Hahn, Petra Todd, and Wilbert Van der Klaauw.         ing Systems, volume 32. Curran Associates, Inc.
+   2001. Identification and estimation of treatment ef-
+   fects with a regression-discontinuity design. Econo-    Guilherme Penedo, Hynek Kydlícˇek, Loubna Ben al-
+   metrica, 69(1):201–209.                                    lal, Anton Lozhkov, Margaret Mitchell, Colin Raffel,
+Shengding Hu, Yuge Tu, Xu Han, Ganqu Cui, Chaoqun             Leandro Von Werra, and Thomas Wolf. 2024. The
+   He, Weilin Zhao, Xiang Long, Zhi Zheng, Yewei              FineWeb datasets: Decanting the web for the finest
+   Fang, Yuxiang Huang, Xinrong Zhang, Zhen Leng              text data at scale. In The Thirty-eight Conference on
+   Thai, Chongyi Wang, Yuan Yao, Chenyang Zhao, Jie           Neural Information Processing Systems Datasets and
+   Zhou, Jie Cai, Zhongwu Zhai, Ning Ding, Chao Jia,          Benchmarks Track.
+   Guoyang Zeng, dahai li, Zhiyuan Liu, and Maosong
+   Sun. 2024. MiniCPM: Unveiling the potential of          Aleksandar Petrov, Emanuele La Malfa, Philip
+   small language models with scalable training strate-       H. S. Torr, and Adel Bibi. 2023. Language model to-
+   gies. In First Conference on Language Modeling.            kenizers introduce unfairness between languages. In
+Jean Kaddour. 2023. The MiniPile challenge for                Advances in Neural Information Processing Systems.
+   data-efficient language models. arXiv preprint
+   2304.08442.                                             Buu Phan, Brandon Amos, Itai Gat, Marton Havasi,
+Diederik P. Kingma and Jimmy Ba. 2015. Adam: A                Matthew J. Muckley, and Karen Ullrich. 2025. Ex-
+   method for stochastic optimization. In 3rd Interna-        act byte-level probabilities from tokenized language
+   tional Conference on Learning Representations.             models for FIM-tasks and model ensembles. In
+László Kozma and Johannes Voderholzer. 2024. Theo-            The Thirteenth International Conference on Learning
+   retical analysis of byte-pair encoding. arXiv preprint     Representations.
+   2411.08671.
+Ilya Loshchilov and Frank Hutter. 2019. Decoupled          Buu Phan, Marton Havasi, Matthew J. Muckley, and
+   weight decay regularization. In International Confer-      Karen Ullrich. 2024. Understanding and mitigating
+   ence on Learning Representations.                          tokenization bias in language models. In ICML 2024
+Min Lu, Saad Sadiq, Daniel J Feaster, and Hemant Ish-         Workshop on Theoretical Foundations of Foundation
+   waran. 2018. Estimating individual treatment effect        Models.
+   in observational data using random forest methods.
+   Journal of Computational and Graphical Statistics,      Tiago Pimentel and Clara Meister. 2024. How to com-
+   27(1):209–219.                                             pute the probability of a word. In Proceedings of the
+Ian R. McKenzie, Alexander Lyzhov, Michael Martin             2024 Conference on Empirical Methods in Natural
+   Pieler, Alicia Parrish, Aaron Mueller, Ameya Prabhu,       Language Processing, pages 18358–18375, Miami,
+   Euan McLean, Xudong Shen, Joe Cavanagh, An-                Florida, USA. Association for Computational Lin-
+   drew George Gritsevskiy, Derik Kauffman, Aaron T.          guistics.
+   Kirtland, Zhengping Zhou, Yuhui Zhang, Sicong
+   Huang, Daniel Wurgaft, Max Weiss, Alexis Ross,          Nived Rajaraman, Jiantao Jiao, and Kannan Ramchan-
+   Gabriel Recchia, Alisa Liu, Jiacheng Liu, Tom Tseng,       dran. 2024. An analysis of tokenization: Transform-
+   Tomasz Korbak, Najoung Kim, Samuel R. Bowman,              ers under Markov data. In Advances in Neural Infor-
+   and Ethan Perez. 2023. Inverse scaling: When big-          mation Processing Systems, volume 37, pages 62503–
+   ger isn’t better. Transactions on Machine Learning         62556. Curran Associates, Inc.
+   Research. Featured Certification.
+Kenton Murray and David Chiang. 2018. Correcting           Donald B. Rubin. 1974. Estimating causal effects of
+   length bias in neural machine translation. In Proceed-     treatments in randomized and nonrandomized studies.
+   ings of the Third Conference on Machine Translation:       Journal of Educational Psychology, 66(5):688–701.
+   Research Papers, pages 212–223, Brussels, Belgium.
+   Association for Computational Linguistics.              Donald B. Rubin. 2005. Causal inference using poten-
+                                                              tial outcomes. Journal of the American Statistical
+                                                              Association, 100(469):322–331.
+
+                                                           Phillip Rust, Jonas Pfeiffer, Ivan Vulic´, Sebastian Ruder,
+                                                              and Iryna Gurevych. 2021. How good is your tok-
+                                                              enizer? On the monolingual performance of multi-
+                                                              lingual language models. In Proceedings of the 59th
+                                                              Annual Meeting of the Association for Computational
+                                                              Linguistics and the 11th International Joint Confer-
+                                                              ence on Natural Language Processing (Volume 1:
+                                                              Long Papers), pages 3118–3135, Online. Association
+                                                              for Computational Linguistics.
+
+28335
+Anton Schäfer, Thomas Hofmann, Imanol Schlag, and           Zheng Yan, Iliyan Zarov, Yuchen Zhang, Angela Fan,
+   Tiago Pimentel. 2024. On the effect of (near) dupli-     Melanie Kambadur, Sharan Narang, Aurelien Ro-
+   cate subwords in language modelling. In Findings of      driguez, Robert Stojnic, Sergey Edunov, and Thomas
+   the Association for Computational Linguistics: ACL       Scialom. 2023. Llama 2: Open foundation and fine-
+   2024, pages 9580–9597, Bangkok, Thailand. Associ-        tuned chat models. arXiv preprint 2307.09288.
+   ation for Computational Linguistics.                  Tim Vieira, Ben LeBrun, Mario Giulianelli, Juan Luis
+                                                            Gastaldi, Brian DuSell, John Terilla, Timothy J.
+Craig W. Schmidt, Varshini Reddy, Haoran Zhang, Alec        O’Donnell, and Ryan Cotterell. 2024. From lan-
+   Alameddine, Omri Uzan, Yuval Pinter, and Chris           guage models over tokens to language models over
+   Tanner. 2024. Tokenization is more than compres-         characters. arXiv preprint 2412.03719.
+   sion. In Proceedings of the 2024 Conference on        Dixuan Wang, Yanda Li, Junyuan Jiang, Zepeng Ding,
+   Empirical Methods in Natural Language Processing,        Ziqin Luo, Guochao Jiang, Jiaqing Liang, and De-
+   pages 678–702, Miami, Florida, USA. Association          qing Yang. 2025. Tokenization matters! Degrading
+   for Computational Linguistics.                           large language models through challenging their tok-
+                                                            enization. arXiv preprint 2405.17067.
+Mike Schuster and Kaisuke Nakajima. 2012. Japanese       Kaiyue Wen, Zhiyuan Li, Jason S. Wang, David
+   and Korean voice search. In 2012 IEEE Interna-           Leo Wright Hall, Percy Liang, and Tengyu Ma. 2025.
+   tional Conference on Acoustics, Speech and Signal        Understanding warmup-stable-decay learning rates:
+   Processing (ICASSP), pages 5149–5152.                    A river valley loss landscape view. In The Thirteenth
+                                                            International Conference on Learning Representa-
+Rico Sennrich, Barry Haddow, and Alexandra Birch.           tions.
+   2016. Neural machine translation of rare words with   Philip Whittington, Gregor Bachmann, and Tiago Pi-
+   subword units. In Proceedings of the 54th Annual         mentel. 2025. Tokenisation is NP-complete. In Pro-
+   Meeting of the Association for Computational Lin-        ceedings of the 63rd Annual Meeting of the Associa-
+   guistics (Volume 1: Long Papers), pages 1715–1725,       tion for Computational Linguistics (Volume 1: Long
+   Berlin, Germany. Association for Computational Lin-      Papers). Association for Computational Linguistics.
+   guistics.                                             Thomas Wolf, Lysandre Debut, Victor Sanh, Julien
+                                                            Chaumond, Clement Delangue, Anthony Moi, Pier-
+Felix Stahlberg and Bill Byrne. 2019. On NMT search         ric Cistac, Tim Rault, Remi Louf, Morgan Funtow-
+   errors and model errors: Cat got your tongue? In         icz, Joe Davison, Sam Shleifer, Patrick von Platen,
+   Proceedings of the 2019 Conference on Empirical          Clara Ma, Yacine Jernite, Julien Plu, Canwen Xu,
+   Methods in Natural Language Processing and the           Teven Le Scao, Sylvain Gugger, Mariama Drame,
+   9th International Joint Conference on Natural Lan-       Quentin Lhoest, and Alexander Rush. 2020. Trans-
+   guage Processing (EMNLP-IJCNLP), pages 3356–             formers: State-of-the-art natural language processing.
+   3362, Hong Kong, China. Association for Computa-         In Proceedings of the 2020 Conference on Empirical
+   tional Linguistics.                                      Methods in Natural Language Processing: System
+                                                            Demonstrations, pages 38–45, Online. Association
+Donald L. Thistlewaite and Donald T. Campbell. 1960.        for Computational Linguistics.
+   Regression-discontinuity analysis: An alternative to  Xiaohua Zhai, Alexander Kolesnikov, Neil Houlsby,
+   the ex-post facto experiment. Journal of Educational     and Lucas Beyer. 2022. Scaling vision transform-
+   Psychology, 51(6):309–317.                               ers. In Proceedings of the IEEE/CVF conference
+                                                            on computer vision and pattern recognition, pages
+Cagri Toraman, Eyup Halit Yilmaz, Furkan S¸ ahin˙uç,        12104–12113.
+   and Oguzhan Ozcelik. 2023. Impact of tokenization     Vilém Zouhar, Clara Meister, Juan Gastaldi, Li Du,
+   on language models: An analysis for Turkish. ACM         Mrinmaya Sachan, and Ryan Cotterell. 2023. To-
+   Trans. Asian Low-Resour. Lang. Inf. Process., 22(4).     kenization and the noiseless channel. In Proceedings
+                                                            of the 61st Annual Meeting of the Association for
+Hugo Touvron, Louis Martin, Kevin Stone, Peter Al-          Computational Linguistics (Volume 1: Long Papers),
+   bert, Amjad Almahairi, Yasmine Babaei, Nikolay           pages 5184–5207, Toronto, Canada. Association for
+   Bashlykov, Soumya Batra, Prajjwal Bhargava, Shruti       Computational Linguistics.
+   Bhosale, Dan Bikel, Lukas Blecher, Cristian Canton
+   Ferrer, Moya Chen, Guillem Cucurull, David Esiobu,
+   Jude Fernandes, Jeremy Fu, Wenyin Fu, Brian Fuller,
+   Cynthia Gao, Vedanuj Goswami, Naman Goyal, An-
+   thony Hartshorn, Saghar Hosseini, Rui Hou, Hakan
+   Inan, Marcin Kardas, Viktor Kerkez, Madian Khabsa,
+   Isabel Kloumann, Artem Korenev, Punit Singh Koura,
+   Marie-Anne Lachaux, Thibaut Lavril, Jenya Lee, Di-
+   ana Liskovich, Yinghai Lu, Yuning Mao, Xavier Mar-
+   tinet, Todor Mihaylov, Pushkar Mishra, Igor Moly-
+   bog, Yixin Nie, Andrew Poulton, Jeremy Reizen-
+   stein, Rashi Rungta, Kalyan Saladi, Alan Schelten,
+   Ruan Silva, Eric Michael Smith, Ranjan Subrama-
+   nian, Xiaoqing Ellen Tan, Binh Tang, Ross Tay-
+   lor, Adina Williams, Jian Xiang Kuan, Puxin Xu,
+
+28336
+A Definitions of Tokenisation Functions                               Under this condition, we can rewrite the potential
+                                                                      outcome in eq. (9) as:
+Merge-based Tokenisation Function. The most
+common tokenisation function to date—used by,                         YW         (v)   =  E            log pθT(cv | c<t)                             (28a)
+e.g., byte pair encoding (BPE; Gage, 1994; Sen-                                                                                                      (28b)
+nrich et al., 2016)—builds subword-strings by                                             c<t               pTθp(Tθc<(ct <◦t c◦v                     (28c)
+merging a string’s symbols two-at-a-time in a fixed                                                                                                  (28d)
+pre-determined order. The building blocks of this                                      =E              log                        ◦ Σ∗     )
+function are merges. A merge m ∈ V × V rep-                                                                                       Σ∗)
+resents a pair of subwords; it can thus be writ-                                           c<t
+ten as: m = v[1] ⊚ v[2]. Given a list of merges
+m = [m1,m2, ..., m|m|], this function is defined as:                                   =E              log  p(c<t ◦ cv ◦ Σ∗)
+                                                                                                              p(c<t ◦ Σ∗)
+    τ↑(c) =def mergem|m|(· · · (mergem1(c))) (24)                                          c<t
+
+where mergem : V∗ → V∗ is a function which                                             =  E         [log   p(cv     |  c<t)]
+scans a string left-to-right, replacing any appear-
+ance of v[1] followed by v[2] with another subword                                        c<t
+v[m] which represents their concatenation v[m] =
+v[1] ◦ v[2]. E.g., mergehe⊚llo(⟨he, llo⟩) = ⟨hello⟩.                  where we denote as p(c ◦ Σ∗) the sum of the proba-
+                                                                      bility assigned to all character-strings starting with
+Longest Prefix-match Tokenisation Function.                           c. As the potential outcomes are a function of p,
+A common alternative to eq. (24)—used by, e.g.,                       which does not depend on the used tokeniser, the
+WordPiece (WP; Schuster and Nakajima, 2012)—                          values of Y0(v) and Y1(v) will be the same, and
+is to select the longest subword v ∈ V matching                       the causal effect ψv will thus be 0.
+a prefix of c, and then recursively tokenising the
+remaining string. This function is defined as:                        B.2 Proof of Thm. 2
+
+                                                                      Theorem 2. Assume that at initialisation our
+                                                                      language model outputs the uniform distribution
+                                                                      pTθ (v
+                                                                              |  v<t)  =       1    .  In  this  case,  the       causal         effect   of
+                                                                                              |V |
+                                                                      a subword v at initialisation is ψv ⪆ log |V|.
+
+                                                                      Proof. For treatment assignment 1, we have v ∈
+
+    τlong(c) =def  arsg.tm. ca1x:v|v∈|V=v|v|, τlong(c|v|:|c|)  (25)   T and τ (cv) = v; for any context, thus, the
+                                                                      model will approximately assign this character-
+B Proofs                                                              string probability pθT(v                                             14
+                                                                                                                 |  v<t)  =        1    .      For   treat-
+                                                                                                                                  |V |
+                                                                      ment assignment 0, we have v ∈/ T and τ (cv) =
+We provide the proofs for Thm. 1 and 2 here.                          ⟨v ,[1] v ,[2] ...⟩, i.e., this subword now gets tokenised
+
+B.1 Proof of Thm. 1                                                   into multiple subwords instead; for any context,
+
+Theorem 1. Assume we have a training process                          thus, the model will approximately assign cv prob-
+                                                                      ability
+that—regardless of the choice of tokeniser T—
+                                                                      |τ (cv)|         pθT(v[i]                                    1       |τ (cv)|
+always returns perfect models, i.e., models for                                                                                   |V |
+                                                                                                 |  v<t    ◦τ  (cv )<i )  =                           (29)
+which pθT(v) = pT(v). In this case, the causal ef-
+                                                                           i=1
+fect of a subword v is always zero, i.e., ψv = 0.
+
+Proof. Note that tokenisation functions τ are nec-                    For treatment assignment 0, we have |τ (cv)| ≥ 2.
+essarily injective and, thus, each character-string                   The ψγv is thus approximately lower-bounded by:
+is mapped to a unique subword-string. For any                                              12
+tokeniser, we can thus rewrite eq. (4) as:                            log   1    −log     |V |      = log   |V |.
+                                                                           |V |
+
+                   p(c) = pT(τ (c))                            (26)   C Implementation Details
+
+Further, for perfect models pTθ (v) = pT(v). We                       We implement all experiments using PyTorch
+                                                                      (Paszke et al., 2019) and implement variants of the
+can thus show that:                                                   Llama architecture using components implemented
+                                                                      in the transformers library (Wolf et al., 2020).
+pTθ (c) =                 pθT(v) 1{c = (v)}τ                   (27a)
+                                     τ                         (27b)
+                   v∈V ∗
+
+=                         pT(v) 1{c = (v)}                            14The character-string probabilities will only be approxi-
+                                                                      mately      1    since  other    subword-strings    might            also  map  to  cv .
+    v∈V ∗                                                                        |V |
+                                                                      However, these alternative subword-strings will be longer, and
+= pT(τ (c))                                                    (27c)  thus have exponentially less probability mass. Once subword-
+                                                                      string probabilities are marginalised out, they will thus make
+= p(c)                                                         (27d)  little difference to results.
+
+                                                               28337
+Data. We use the MiniPile dataset (Kaddour,             Regression Model. Given observed outcomes
+2023), a curated 6GB subset of the deduplicated         and subword indices, we estimate ψRD by fitting
+Pile corpus (Gao et al., 2020; Biderman et al.,         the regression:
+2022). The training set consists of 1M documents,
+which we use to train both tokenisers and models.       Yobs(v)    =  α  +  β   γv   +  ψRDWv  +  ηv  (30)
+Additionally, we train two 100M-parameter mod-                                 1000
+els on 20B tokens from Fineweb-Edu (Penedo et al.,
+2024). For evaluation, we use the 10k-document          where ηv is a zero-mean error term. To avoid con-
+validation set to collect the subwords’ in-context      founding, we exclude subwords that are nested
+                                                        within larger subwords also present in the vocab-
+log-probabilities pθT(cv | c<t).                        ulary (e.g., if both ⟨he⟩ and ⟨hello⟩ are included,
+                                                        only the latter is used).17
+Tokenisers. Our method requires knowing which
+subwords would have been added if we allowed for        Hardware Details. We use a server with one
+a larger vocabulary. To identify which subwords         NVIDIA A100 80GB PCIe, 32 CPUs, and 32 GB
+would be added with a larger vocabulary, we con-        of RAM for all experiments. Below, we report a
+struct a tokeniser with a vocabulary size of 320k,      subset of the output of the lscpu command:
+then truncate it to define smaller tokenisers while
+retaining the full ranked list of subwords. Tokenis-    Architecture:          x86_64
+ers are built using the tokenisers library,15 and we
+encourage others to report similar details to support   CPU op-mode(s):        32-bit, 64-bit
+reproducibility. We evaluate vocabularies of sizes
+8,024, 32k, and 128k, which allows us to study          Address sizes:         46 bits physical,
+how tokenisation bias varies with vocabulary size.
+As the vocabulary grows, the added subwords are                                48 bits virtual
+naturally of lower frequency. We compare BPE
+and WP tokenisers, trained identically using byte-      Byte Order:            Little Endian
+level pre-tokenisers, processors, decoders, and a
+byte-based alphabet.                                    CPU(s):                32
+
+Model Training. We use variants of the LLaMA            On-line CPU(s) list: 0-31
+2 architecture. Our default model has 57M pa-
+rameters, with 6 layers, 24 attention heads, a hid-     Vendor ID:             GenuineIntel
+den size of 768, and tied input–output embed-
+dings. Details for other model configurations are       Model name:            Intel(R) Xeon(R)
+available in our repository.16 Models are trained
+with AdamW (Kingma and Ba, 2015; Loshchilov                                    Silver 4210R CPU
+and Hutter, 2019) using learning rate 6 × 10−4,
+β1 = 0.9, β2 = 0.95, ϵ = 1 × 10−8, and weight de-                              @ 2.40GHz
+cay 0.1. We adopt the warmup-stable-decay sched-
+ule (Zhai et al., 2022), which maintains a flat learn-  CPU family:            6
+ing rate after warmup and applies cosine decay
+only during cooldown—an approach shown to be            Model:                 85
+effective for small LMs (Hu et al., 2024; Wen et al.,
+2025) and which avoids requiring a fixed compute        Thread(s) per core: 1
+budget. Training uses a context size of 2,048 to-
+kens, batch size 128, gradient clipping to 1.0, and     Core(s) per socket: 1
+runs for 50k steps with checkpoints saved every 2k
+steps. All experiments are run with the same seed       Socket(s):             8
+for consistent data order and initialisation.
+                                                        Stepping:              7
+   15github.com/huggingface/tokenisers.
+   16github.com/pietrolesci/tokenisation-bias.          BogoMIPS:              4800.11
+
+                                                        Reproducibility. We release all experimental
+                                                        artefacts as a HuggingFace Hub collection.18 This
+                                                        includes: (i) the raw and tokenised data in model-
+                                                        consumed order; (ii) the full 320k-subword tokenis-
+                                                        ers; (iii) the reduced-vocabulary tokenisers used in
+                                                        our experiments; and (iv) all model checkpoints.
+                                                        We encourage others to adopt similar practices and
+                                                        make tokeniser design choices more transparent.
+
+                                                        D Additional Plots
+
+                                                        Additional plots follow on the next pages.
+
+                                                           17Following standard causal analysis, we assume SUTVA:
+                                                        treating one unit does not affect others. This assumption is
+                                                        violated by overlapping subwords—i.e., subwords that are
+                                                        themselves part of larger subwords—which we thus exclude.
+
+                                                           18https://huggingface.co/collections/pietrolesci/tokenisation-
+
+                                                        bias-66d5d0b40cb82a2d789b19db.
+
+28338
+                                    Treatment True False
+
+                        8k                      32k                                     128k
+ 0
+                                                                                                             Mean
+-10
+                                    ATE: 2.88                    ATE: 2.81
+-20
+                                                                                                             Median
+-30 ATE: 1.05
+                                    ATE: 1.52                    ATE: 2.15
+ 0
+                                    ATE: -3.17                   ATE: -2.48                                  Standard Deviation
+-10
+
+-20
+
+-30 ATE: 0.4
+
+20
+15
+10
+ 5
+
+ 0 ATE: -1.18
+
+30
+
+20                                                                                                           Interquartile Range
+
+10
+
+0 ATE: -1.24                        ATE: -4.42                   ATE: -1.88
+
+    -5k -2k 0k +2k +5k -5k -2k 0k +2k +5k -5k -2k 0k +2k +5k
+
+                                    Relative Subword Index
+
+Figure 6: Average treatment effect for BPE with K ∈ {8k, 32k, 128k} at the last model checkpoints. Each row refers
+to a different outcome variable: mean, standard deviation, median, and interquartile range of a cv’s log-probability
+across contexts. Subwords on the left-hand side of the cutoff are treated (i.e., added to the vocabulary).
+
+                                    Vocabulary Size 8k 32k 128k
+
+                Mean                Median       1           Standard Deviation         Interquartile Range
+20                                               0
+150                         12500                -1                              150
+ 21                          21                  -2                               21
+ 0                           --120               -5                               0
+ --21                       -1-50               -10                               --21
+-1-50                                                                            -1-50
+
+     5 20 100 500           5k 5 20 100 500 5k 5 20 100 500 5k 5 20 100 500 5k
+
+                                                Window Size
+
+Figure 7: Estimated effect ψRD (y-axis) vs. window size used to estimate it. Results for fully trained model with BPE
+and K ∈ {8k, 32k, 128k}. Shaded regions correspond to standard errors. The columns refer to different outcome
+variables: mean, standard deviation, median, and interquartile range of a cv’s log-probability across contexts.
+
+                                                28339
+                                           Treatment            True      False
+
+                                 BPE                       BPE2WP                                WordPiece
+  0
+                                                                                                                      Mean
+-10
+                                           ATE: 3.14                             ATE: 2.51
+-20
+       ATE: 2.88                                                                                                      Median
+
+-30                                        ATE: 1.77                             ATE: 1.23
+  0
+                                                                                                                      Standard Deviation
+-10
+-20                                        ATE: -3.23                            ATE: -2.76
+-30 ATE: 1.52
+
+ 15
+ 10
+
+  5
+  0 ATE: -3.17
+
+20                                                                                                                    Interquartile Range
+
+10
+
+0 ATE: -4.42                               ATE: -4.35                            ATE: -3.04
+         28k 30k 32k 34k 36k                  28k 30k 32k 34k 36k                   28k 30k 32k 34k 36k
+
+                                                           Subword Index
+
+Figure 8: Average treatment effect for fully trained models with BPE, BPE2WP, and WP and K = 32k. Each row
+refers to a different outcome variable: mean, standard deviation, median, and interquartile range of a cv’s log-
+probability across contexts. Subwords on the left-hand side of the cutoff are treated (i.e., added to the vocabulary).
+
+                                           Treatment True False
+
+              Mean                                 Median                Standard Deviation      Interquartile Range
+0                                     0                         15
+
+-10                                   -10                       10                           20
+
+-20                                   -20                       5                            10
+
+                                                                0                            0
+                                                                                                 28k 30k 32k 34k 36k
+     28k 30k 32k 34k 36k                   28k 30k 32k 34k 36k        28k 30k 32k 34k 36k
+
+                                                           Subword Index
+
+Figure 9: Stability of the average treatment effect with respect to the functional form of f , for fully trained models
+with BPE and K = 32k. Columns refer to different outcome variables: mean, standard deviation, median, and
+interquartile range of a cv’s log-probability across contexts. Subwords on the left-hand side of the cutoff are treated
+(i.e., added to the vocabulary). Conditional mean lines and confidence intervals are computed using the LOESS
+(locally estimated scatterplot smoothing) method.
+
+                                                           28340
+

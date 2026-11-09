@@ -1,0 +1,938 @@
+Tokenization and Representation Biases in Multilingual Models on
+                             Dialectal NLP Tasks
+
+     Vani Kanjirangat1, Tanja Samardžic´1, Ljiljana Dolamic2, Fabio Rinaldi1
+                                  1SUPSI, IDSIA, Switzerland
+                                 2armasuisse S+T, Switzerland
+
+           {vani.kanjirangat, tanja.samardzic, fabio.rinaldi}@supsi.ch, Ljiljana.Dolamic@armasuisse.ch
+
+                      Abstract                             2023). Including this variation is hard, although
+                                                           important for more human-like interactions with
+     Dialectal data are characterized by linguistic        LLMs (Amadeus et al., 2024). It is especially im-
+     variation that appears small to humans but has a      portant for a wide linguistic coverage, as many
+     significant impact on the performance of mod-         languages are not standardized or have multiple
+     els. This dialect gap has been related to various     standards (Samardžic´ and Ljubešic´, 2021).
+     factors (e.g., data size, economic and social
+     factors) whose impact, however, turns out to             In previous studies, dialect variances have been
+     be inconsistent. In this work, we investigate         related to economic and social factors (Kan-
+     factors impacting the model performance more          tharuban et al., 2023), but the effects were incon-
+     directly: we correlate Tokenization Parity (TP)       sistent across different settings. Looking for more
+     and Information Parity (IP), as measures of rep-      consistent factors directly related to how LLMs
+     resentational biases in pre-trained multilingual      work, we turn to the representational biases in mul-
+     models, with the downstream performance. We           tilingual LLMs.
+     compare state-of-the-art decoder-only LLMs
+     with encoder-based models across three tasks:            We study two aspects where the biases can be
+     dialect classification, topic classification, and     quantified with recently proposed measures. First,
+     extractive question answering, controlling for        the tokenization bias has been shown to impact
+     varying scripts (Latin vs. non-Latin) and re-         not only the performance, but also the costs of de-
+     source availability (high vs. low). Our analysis      ploying LLMs across languages (Ahia et al., 2023).
+     reveals that TP is a better predictor of the perfor-  Recently, this bias was quantified as Tokenization
+     mance on tasks reliant on syntactic and morpho-       Parity (TP) (Petrov et al., 2024). Second, Informa-
+     logical cues (e.g., extractive QA), while IP bet-     tion Parity (IP) (Tsvetkov and Kipnis, 2024) mea-
+     ter predicts performance in semantic tasks (e.g.,     sures how well an LLM compresses or represents
+     topic classification). Complementary analyses,        the same content across languages. In both cases,
+     including tokenizer behavior, vocabulary cov-         the measures show a difference between a given
+     erage, and qualitative insights, reveal that the      language and English as a reference language.
+     language support claims of LLMs often might
+     mask deeper mismatches at the script or token            To address the dialect gap, we correlate these
+     level1.                                               measures to downstream performance on three di-
+                                                           alect NLP tasks, each targeting a different level of
+1 Introduction                                             representation: Dialect Identification (DI), which
+                                                           mostly relies on surface-level clues, Topic Clas-
+Large Language Models (LLMs) pre-trained on                sification (TC) as a primarily semantic task, and
+massive text data in many languages have become            Extractive Question Answering (EQA) as a task
+the preferred solution for various Natural Language        that relies on both kinds of features. In all three
+Processing (NLP) tasks. The use of this technol-           cases, we work with multiple data sets represent-
+ogy for processing dialects and regional varieties         ing different economic and cultural settings. This
+remains limited. Small variations in pronuncia-            allows us to control for additional factors that are
+tion and writing (Zampieri et al., 2018; Scherrer          known to play an important role in creating biases.
+et al., 2023; Habash et al., 2024), which humans           In particular, we control for the script (Latin vs.
+can easily ignore, lead to significant performance         non-Latin) and resource level (high vs. low) (van
+drops known as the dialect gap (Kantharuban et al.,        Esch et al., 2022). On the model side, we control
+                                                           for the general type of pre-trained LLMs, distin-
+    1Code at https://github.com/vanikanjirangat/
+Tokenizer_Fairness_Dialect
+
+                                                     23992
+
+Proceedings of the 2025 Conference on Empirical Methods in Natural Language Processing, pages 23992–24010
+                         November 4-9, 2025 ©2025 Association for Computational Linguistics
+guishing between encoder-only (BERT-based) and                 surface-level differences between dialects. This
+decoder-only (E.g., GPT) multilingual models.                  task is included in the DialectBench benchmark
+                                                               (Faisal et al., 2024) as the SIB-200 dataset (Ade-
+   The Key Findings are:                                       lani et al., 2024) representing 200 languages. The
+                                                               topic classes include: {science/technology travel,
+  1. Encoder-based models consistently outper-                 politics, sports, health, entertainment, geography}.
+      form decoder-only LLMs2 across the evalu-                We conducted the fine-tuning experiments on 29
+      ated dialectal tasks.                                    languages belonging to different scripts, along
+                                                               with the availability of language resources: eight
+  2. TP is more sensitive to the type of the script,           Latin-high, nine Latin-low, five non-Latin-high,
+      while IP reflects biases influenced by both              and seven non-Latin-low.
+      script and resource availability. Additionally,
+      both metrics show model-dependent variation,             Extractive Question Answering (EQA) This
+      highlighting how architectural and training              task combines in some way the features of the previ-
+      differences contribute to representational dis-          ous two, as it requires identifying the relevant spans
+      parities.                                                (surface features) but relying on deeper semantic
+                                                               representation (understanding the question-answer
+  3. Information Parity (IP) shows more substan-               relationships). We experimented on 24 dialectal
+      tial alignment with tasks requiring semantic             variants - eleven Latin-high, two Latin-low, nine
+      understanding and complex reasoning, while               non-Latin-High, and two non-Latin-low, from the
+      Tokenization Parity (TP) is more predictive for          dataset SDQA (Faisal et al., 2021) also provided
+      tasks that rely on morphological and syntac-             via the DialectBench.
+      tic features, especially span-based extractive
+      tasks. These correlations are further modu-                 The general statistics and further details of
+      lated by language resource availability and              datasets are given in Appendix A. The class distri-
+      script type.                                             butions for DI and TC tasks are shown in Figures
+                                                               7, 8 in Appendix A.
+2 Dialect Tasks, Data and Models
+                                                               3 The Bias Metrics
+Our selection of dialect NLP tasks, data and mod-
+els was guided by the goal of covering as diverse              3.1 Models & Tokenizers
+settings as possible while keeping the computation
+feasible.                                                      Encoder type We used the multilingual mBERT
+                                                               for the encoder variant in all the tasks. Specifi-
+2.1 Tasks                                                      cally, in the case of the DI task, we performed addi-
+                                                               tional comparisons between mBERT and language-
+Dialect Identification (DI) This task consists of              specific variants such as MARBERT (Arabic), In-
+assigning a dialect or region label to each input              dicBERT(Indic), German-BERT3 (Swiss-German),
+sentence or utterance. This task comes in two                  SpanBERTa (Spanish), and CamemBERT (French).
+versions: monolabel (each utterance can belong                 We use the respective models from HuggingFace4.
+to only one dialect) and multilabel (some utter-
+ances can belong to multiple dialects), with the               Decoder type Among the multilingual decoder-
+latter being more realistic but harder to perform              type models, we selected Phi-3.5-mini, Llama
+and evaluate. We used the datasets from several                3.2-3B, Mistral-7B, Falcon-7B, Gemma-7B, and
+VarDial shared tasks: Nuanced Arabic Dialect                   SILMA-9B models. SILMA-9B represents an
+Identification (NADI-2023), Swiss German dialect               Arabic-specific LLM, while the other models dis-
+identification (GDI), Indo-Aryan Language Iden-                cussed are English-centric or generalized multi-
+tification (ILI), and multi-label DSL-ML datasets              lingual LLMs, claiming support for a broad spec-
+(Abdul-Mageed et al., 2023; Samardzic et al., 2016;            trum of languages. For the downstream task per-
+Zampieri et al., 2018; Chifu et al., 2024).                    formance evaluation, we considered Phi-3.5 and
+                                                               Llama-3.2 by supervised fine-tuning (SFT) experi-
+Topic Classification (TC) This task is similar                 ments to compare with the encoder variants.
+to the monolabel DI task in that each snippet of
+text is assigned a single topic label. The difference              3We also did experiments with Swiss-BERT, which gave
+is that predicting the label requires neutralizing             similar performance as German-BERT
+
+    2All models are referred to as LLMs and are distinguished      4https://huggingface.co/
+as encoder-only or decoder-only where relevant
+
+23993
+Figure 1: Tokenization Parity (TP) across languages resulting from the tokenizers used in encoder-type models.
+
+Tokenizer & Languages: Language and tok-               |t(sA)|/|t(sB)| ≈ 1, where t(sA) is the tokeniza-
+enization are deeply intertwined, shaping LLMs’        tion of the sentence sA and |t(sA)| represents its
+multilingual capabilities. Most current models use     length. The premium for A relative to B is the ratio
+subword tokenization strategies such as BPE, Sen-      |t(sA)|/|t(sB)| (Petrov et al., 2024). A value close
+tencePiece, or byte-level methods. Newer mod-          to 1 indicates fewer splits into subwords, which
+els like LLaMA and Phi adopt the OpenAI tikto-         indicates that the tokenizer vocabulary covers the
+ken tokenizer5, which operates at the byte level       language well. When the value is greater than 1,
+using UTF-8 encoding. This approach is language-       it indicates that the language tokenizer requires
+agnostic, breaking input into bytes or fragments       more tokens to represent the same content. This
+when unknown tokens are encountered. In con-           may indicate a suboptimal representation of the
+trast, SentencePiece typically defaults to character-  language by the LLM, leading to inefficient repre-
+level segmentation. Non-Latin scripts (e.g., Arabic,   sentation and potentially poorer downstream task
+Hindi, Bengali) involve multi-byte characters in       performance. At the same time, these values are
+UTF-8, making them more prone to token frag-           language-dependent, and hence, the number of to-
+mentation under byte-level fallback. This behavior     kens required to represent the same sentence in
+impacts the vocabulary coverage and can hinder         different languages can affect TP values.
+effective representation of non-Latin text. Details
+on tokenizer configurations and vocabulary sizes       Information Parity Following Tsvetkov and
+are provided in Table 3, Appendix B. The fairness      Kipnis (2024), we adopt Information Parity (IP) as
+or, inversely, the biases of pre-trained multilingual  another metric for evaluating multilingual, specif-
+models can be measured considering either the sur-     ically dialectal fairness in large language mod-
+face level or deeper semantic features.                els (LLMs). IP draws on information-theoretic
+                                                       principles and quantifies the LLM’s efficiency in
+Tokenization Parity Following Petrov et al.            compressing text in a given language relative to
+(2024), we use TP as a metric to analyze the to-       a reference language. For a text in language L,
+kenization fairness. The metric systematically as-     IP is defined as the ratio between the negative
+sesses how well the tokenizers treat parallel sen-     log-likelihood of the text in English and the neg-
+tences across different languages. Parity occurs       ative log-likelihood of the same text in language
+when a tokenizer exhibits similar tokenized lengths    L. In this context, English serves as a language-
+for the same sentence in different languages. Con-     agnostic reference compressor. IP expresses the
+sider a sentence sA in language A and its transla-     total amount of information or uncertainty in a
+tion sB to language B. Then, a tokenizer t achieves    sequence perceived by the LLM relative to the ref-
+parity for A with respect to B at sA and sB if         erence language. Unlike similar metrics such as
+                                                       perplexity, IP is less sensitive to variations in tok-
+    5https://github.com/openai/tiktoken
+
+23994
+Figure 2: Tokenization Parity (TP) across languages resulting from the tokenizers used in decoder-type models.
+
+enization across languages and models.                 ficiency. Four-bit quantizations with LoRA R=16
+                                                       or 8 and alpha =8, drop-out = 0.1, batch_sizes =
+4 Experiments                                          1, 2 or 4 with gradient accumulation = 8, learning
+                                                       rate lr= 2e-4 or 5e-5 and lr scheduler, mostly co-
+Our first goal is to evaluate the LLMs’ performance    sine else linear were used. Parameter optimizations
+on the dialectal downstream tasks, controlling for     were done using the hyperparameter optimization
+various factors, namely scripts (Latin vs. non-        framework, Optuna6. Further details of general
+Latin) and resource levels (High vs. Low). The         experimental settings can be found in Appendix E.
+latter categorization can be slightly biased as some-  The prompts for instruction tuning each task are
+times the distinction between high, medium, and        reported in Appendix D.
+low resources can be fine-lined. The categoriza-
+tion is reported in Table 4 of Appendix C. We then        For the encoder-only models, we used full-
+quantitatively analyze the model’s script and repre-   finetuning (FFT), with 3 epochs of training,
+sentation biases, measuring the correlation between    AdamW optimizer with learning rate of 2e-5, batch
+the observed performance on one side and the two       size of 8 or 16, and weight decay of 0.01.
+bias metrics — tokenization parity (TP) and infor-
+mation parity (IP) — on the other. We complement          In the multi-label setup of the DI task, we cre-
+these analyses with a vocabulary analysis and a        ated a representative train-test sample dataset for
+manual inspection of the model tokenizers’ output.     the French dataset. This reduced the size of this au-
+                                                       tomatically curated dataset (details in Appendix A)
+4.1 Model Fine-Tuning Methods and                      allowing us to avoid unnecessary computing costs.
+      Parameters                                       We used a custom trainer function to compute the
+                                                       multi-label loss using Binary Cross-Entropy with
+We performed supervised fine-tuning (SFT) of the       Logits (BCELoss with Logits).
+decoder-only LLMs - Phi-3.5 and Llama 3.2 mod-
+els and compared them with encoder-only mod-           4.2 Bias Metrics Measurements
+els, mainly mBERT, on the datasets described in
+Section 2. We decided to select fewer representa-      We measure Tokenization Parity (TP) and Infor-
+tive models to economize computing time. On the        mation Parity (IP) across six multilingual mod-
+other hand, the parity score does not require a lot    els: Phi-Mini-3.5, Gemma-7B, LLaMA-3.2 (3B),
+of computation, so we decided to keep multiple         Mistral-7B, SILMA-9B, and Falcon-7B. Although
+models to have a better overview. For decoder-only     SILMA is Arabic-focused, it builds on the multi-
+LLMs’ fine-tuning, we used the parameterization        lingual Gemma architecture. The initial evaluation
+techniques (PEFT) (Ding et al., 2023) with LoRA        is conducted on 54 languages and dialectal vari-
+(Low-Rank Adaptation) (Hu et al., 2021) and bit        ants from the FLORES-200 dataset—a parallel cor-
+quantizations to cope with memory issues and ef-
+                                                           6https://optuna.org/
+
+23995
+Figure 3: Information Parity (IP) across languages resulting from decoder-type models.
+
+pus of 2,000 human-translated Wikipedia sentences              present, especially on the EQA task.
+across 200 languages (Costa-jussà et al., 2022). A
+subset of these score is then used for the correlation         5.1 The distribution of the bias metrics values
+analysis on the dialect NLP tasks.                                   across languages
+
+5 Results                                                      Figures 1 and 2 show the distribution of the TP
+                                                               score on the sample of 54 FLORES languages
+Table 1 shows the F1-scores on the DI task. The                sorted (and colored) according to the controlled cat-
+encoder-type models outperform the heavily pre-                egories (resource level and script type). A compari-
+trained decoder-type models across all datasets in             son of these two graphs shows that encoder-type to-
+both mono-label (ML) and multi-label (MuL) se-                 kenizers result in a more stable TP than the tokeniz-
+tups. Language-specific BERT models score bet-                 ers of the decoder-type models. However, a clear
+ter than mBERT in all cases except for the Swiss-              divide emerges in both model types: Latin-script
+German.7.                                                      languages maintain relatively stable TP and closer
+                                                               to 1 across all models, whereas non-Latin lan-
+   Figure 4 shows the results for the TC and EQA               guages show substantial variability—particularly
+tasks. Here we report F1-score averages for the                in lower-resource settings. Among decoder-type
+script and resource level groups, the detailed tabu-           models, Gemma and SILMA demonstrate more
+lar results per dialectal variety are presented in Ta-         consistent TP across language groups, while others
+bles 6 and 7 in Appendix F. On these tasks too, the            show language-specific disparities.
+encoder-type model, mBERT performs much bet-
+ter than the fine-tuned decoder multilingual LLMs.                When the TP values deviate more from 1, it
+Regarding the controlled categories, it can be noted           shows larger disparities. For instance, with the
+that the resource level affected the performance               mBERT tokenizer, the TP in German (Latin-High)
+more than the script (the skewness of the poly-                is 1.26, while mBERT in Kannada (non-Latin-
+gons to the right), especially in decoder-type mod-            Low)is 2.19. This means the tokenizer produces
+els. The differences between the model-types are               26% more tokens for German than for English,
+smaller on the EQA task, as well as the impact                 which is a good tokenizer premium, indicating
+of the resource level (except for Phi-3.5). Even               that German is fairly close to English in efficiency,
+though the impact of the script is smaller than that           since it uses Latin script and shares vocabulary
+of the resource level, a bias towards Latin scripts is         with English. In contrast, with Kannada, the tok-
+                                                               enizer produces 119% more tokens than English
+    7For curiosity, we tested also SILMA, the best performing  for the same content, splitting the text into smaller
+Arabic decoder-type LLM on the NADI dataset. Although          fragments.
+being an Arabic-specific model, it lags behind the mBERT
+model by almost 6 points and the Arabic-specific BERT model       Figure 3 illustrates IP performance (this score ap-
+by about 28 points                                             plies only to decoder-type models). High-resource
+
+23996
+Language (Type)          Decoder-only                          Encoder-only
+                                                            Language-Specific
+Arabic (ML)        Phi-3.5 Llama 3.2                 mBERT  0.84 (MARBERT)
+Swiss-German (ML)                                           0.60 (SwissBERT)
+Indo-Aryan (ML)    0.54  0.26                        0.62   0.90 (IndicTransformers)
+French (MuL)                                         0.59   0.75 (CamemBERT)
+Spanish (MuL)      0.49  0.46                        0.88   0.85 (spanBERTa)
+                                                     0.70
+                   0.74  0.32                        0.83
+
+                   0.61  0.35
+
+                   0.40  0.79
+
+Table 1: Performance (F1-scores) on dialect identification task across models. ML = Mono-label version of the
+task, MuL = Multi-label version of the task.
+
+Figure 4: Average performance (F1-score) of models per category on TC (left) and EQA (right) tasks.
+
+Latin-script languages generally exhibit higher IP,  longer, which increases the complexity of the at-
+while non-Latin and low-resource languages dis-      tention mechanism and makes modeling harder,
+play wider variation. Unlike TP, IP appears to be    which can impact the performance. In contrast, the
+more dependent on resource levels.                   expected correlation between IP and downstream
+                                                     performance is intuitively strongly positive, since
+5.2 Correlation analysis of TP & IP metrics          a higher IP indicates greater representational effi-
+      with the downstream tasks                      ciency, which should have a positive impact on the
+                                                     performance.
+To examine whether trends in Tokenization Par-
+ity (TP) and Information Parity (IP) across lan-        Figure 5 visualizes these correlations as
+guages correlate with model performance on dialec-   heatmaps, with detailed tabular values provided in
+tal downstream tasks, we compute Pearson correla-    Appendix F, Table 8. To make the trends easier to
+tion coefficients between downstream task scores     follow, color codes show the expected correlations:
+and the TP/IP metrics, using fine-tuned versions of  blue for the expected, red for the opposite.
+Phi-3.5-Mini, LLaMA-3.2, and mBERT. Note that
+the direction of the correlation score is important  Dialect Identification (DI) Contrary to the ex-
+for a meaningful interpretation of the results.      pected direction, we see a positive correlation be-
+                                                     tween TP and DI performance in the two models
+   In the case of TP, scores closer to 1 are con-    that perform better (mBERT and Phi-3.5 in the map
+sidered better, while TP > 1 indicates that the      Figure 5a, cf. Table 1), while the expected negative
+tokenizer uses more tokens to encode the same        correlation is observed only in Llama-3.2, whose
+content compared to English (more fragmentation).    performance is low. On the other hand, higher IP,
+Intuitively, we would expect a negative correlation  reflecting more efficient information compression,
+between the value of TP and the downstream per-      is correlated with worse performance on dialect
+formance. High text fragmentation compared to        classification in Phi-3.5 (map Figure 5b). This out-
+the reference means that the input sequences are     come is also contrary to what we expected. The
+
+                               23997
+fact that the correlation is positive in Llama-3.2       correlation with TP, but the correlation with IP is
+only confirms this observation because the low per-      negligible. These findings suggest that tokeniza-
+formance of Llama-3.2 indicates that the task was        tion disparities play a more significant role than
+not learned, and the model might be performing           general information preservation in extractive QA
+some other classification. Note also that the corre-     tasks, where accurate token-level span prediction
+lations are stronger in models that perform the task     is crucial.
+better.
+                                                            Taken together, our results suggest that higher
+   While we expected that higher tokenization dis-       TP (more tokens per word for some languages) usu-
+parity would lead to a performance drop, another         ally hurts the performance in both surface-level and
+picture appeared: it turns out that more fragmented      semantically rich tasks as long as semantic repre-
+text (compared to the reference), might, in fact,        sentations are needed for the task. Higher IP scores
+help models make surface-level distinctions if the       (more similar compression), on the other hand, are
+task is learned at all. This could be attributed to      associated with better downstream performance
+the fact that dialects differ mostly at the surface      in both cases. The stronger association between
+level (spelling, morphology, and token patterns).        the TP scores and the surface-level tasks, on one
+If diacritics or other surface-level phenomena end       hand, and between the IP scores and the seman-
+up encoded as separate tokens due to higher text         tically rich tasks, on the other, is in line with the
+fragmentation, they might be exploited by models         previous results reported by Tsvetkov and Kipnis
+as useful dialect features even if the meaning of        (2024), where TP was better correlated with extrac-
+these units is not well captured in their vector rep-    tive or text similarity tasks (e.g., PAWSX, XQuAD).
+resentation. In other words, models do not need to       At the same time, IP correlated better with tasks
+“understand” the meaning of the small fragments to       requiring semantic consistency (e.g., reasoning),
+grasp their dialect specificity. In contrast, higher IP  corresponding to our TC setting. The results on
+scores (expressing more equal compression) can be        the DI task suggest an inverse relation between the
+indicative of deeper level (semantic) similarity be-     TP and IP scores and the downstream task, which
+tween the texts written in different dialects, making    has not been reported in previous studies. In this
+their differentiation harder even if the meaning is      case, higher TP is associated with better perfor-
+better captured. This would explain the surprising       mance, while higher IP with worse downstream
+negative correlation between the IP score and the        performance. As discussed above, the explanation
+performance on the DI task.                              for these effects comes from the fact that the task
+                                                         of distinguishing between dialect does not require
+Topic Classification (TC) Comparing the two              deep semantic representation of surface-level fea-
+maps in Figure 5, we can see that IP is more             tures, while deeper semantic similarity (potentially
+strongly correlated with downstream performance          captured by a high IP score) can even hurt the per-
+than TP on this task, which applies more to the          formance making the dialects harder to distinguish.
+better model (Phi-3.5) than to the one with worse
+performance (Llama-3.2). This suggests that im-          5.3 A closer look at the Llama tokenizer
+proved information compression across languages
+enhances performance on the TC task, but TP also         As the Llama-3.2 model performance was behind
+shows a moderate correlation, indicating that tok-       all other models on all tasks, we take a closer look
+enization may still impact the performance.              into its tokenizer and how it deals with non-Latin
+                                                         scripts. For this, we output the tokenization of a
+Extractive Question Answering (EQA) It is es-            given input text as shown in the Arabic example in
+pecially interesting to see in Figure 5a that the cor-   Figure 6. It can be observed that Llama-3.2 outputs
+relation between TP and the performance on this          misaligned tokens, which turned out to be charac-
+task is strong both in mBERT and Phi-3.5. This sug-      ters misinterpreted as Latin-1, which is induced
+gests that variation in tokenization can significantly   by the byte-level fallbacks. For instance, the to-
+impact the model’s ability to extract the correct        ken Ø³ has the following Unicode description:
+span. There is also a moderate correlation with IP       [’LATIN CAPITAL LETTER O WITH STROKE,’
+(the map Figure 5b), indicating that more consis-        ’SUPERSCRIPT THREE’]. The characters may
+tent information representation across dialects may      break into smaller byte-level components if not di-
+help the model extract relevant answers more ef-         rectly present in the tokenizer vocabulary. These
+fectively. In contrast, Llama-3.2 shows a moderate       byte sequences may be aligned to Latin-character
+
+23998
+(a) Correlations to TP across tasks and models         (b) Correlations to IP cross tasks and models
+
+Figure 5: Correlation heatmaps showing Tokenization and Information Parity across dialectal tasks for different
+models; blue for the expected, red for the opposite of the expected.
+
+English reference:                                     token à¤° . Similar observations were made in all
+The find also grants insight into the evolution of     non-Latin scripts experimented with, where Latin
+feathers in birds                                      characters were recognized. It should be noted,
+Arabic:                                                though (from Appendix B) that both Phi-3 and
+                                                       Llama-3 tokenizers are based on TikToken. This
+Llama3_Tokenizer_Output: ['ÙI˘', 'Ù˝hÙ˜I',             means that the tokenization behavior also largely
+'ØŃ', '˙GØ§ÙH˝', 'Ø§Ùhˆ', 'ØªØ´', 'Ø§Ùg‘ ',            depends on the tokenizer’s knowledge of the pre-
+'G˙Ø£ÙI˘Ø¶Ø§', 'Ùı˘', '˙GÙ˜IØ¸', 'Ø±Ø©',               trained language.
+'G˙Ø¹Ù˝HÙı¯', '˙GØª', 'Ø·ÙI¯Ø±', 'G˙Ø§ÙH˝',
+'Ø±ÙI˘', 'Ø´', 'G˙Ùg‘ ÙI˘', '˙GØ§Ù˝HØ·',                  As additional analyses, we examined the corre-
+'ÙI˘', 'ÙI¯Ø±']                                        lation between missing character proportions and
+                                                       downstream performance and investigated the lan-
+   Figure 6: Example of Llama-3.2 tokenizer output.    guage support specifications of the LLMs. Our
+                                                       findings suggest that these relationships remain
+                                                       highly model- and task-dependent. Detailed results
+                                                       and discussions are provided in Appendix G.
+
+tokens due to a high bias toward Latin script in pre-  6 Related Work
+training data. During decoding, the tokenizer may
+reassemble these tokens into the correct Unicode       The fairness and biases of LLM tokenizations have
+characters that match the non-Latin script. How-       been analyzed using parallel language corpora by
+ever, this can degrade the performance of non-Latin    (Petrov et al., 2024; Ahia et al., 2023; Rust et al.,
+language tasks, as the model may not be able to        2021). Language-specific investigations (Toraman
+capture the semantics and produce longer token         et al., 2023), temporal evaluations (Spathis and
+sequences. Also, this script raises questions about    Kawsar, 2024), and adversarial impacts (Wang
+how well the model captures the semantic meaning       et al., 2024) and tokenizer comparisons (Kanjiran-
+and linguistic nuances.                                gat et al., 2023; Batsuren et al., 2024) are other
+                                                       directions. The general conclusion pinpointed the
+   The same behavior was also noted in the non-        importance of tokenization - tokenization matters.
+Latin script language Hindi. For instance,             Following the limitations of tokenizers and other
+was tokenized as [’à¤°’, ’à¤¾à¤µà¤¨’], where the       multilingual biases, another research dimension
+Hindi character corresponds to the UTF-8 bytes         proposes alternative tokenization approaches (Hof-
+[E0 A4 B0] 8. This sequence is interpreted as [à       mann et al., 2022) and even tokenless models (Bar-
+¤ °] in Latin-1, which is then represented as the      rault et al., 2024; Pagnoni et al., 2024). Extending
+                                                       the understanding and analysis of representational
+    8https://www.utf8-chartable.de/                    biases in multilingual LLMs, some potential works
+unicode-utf8-table.pl?start=2304&number=128
+
+                                                23999
+on metrics related to information theory perspec-     that can mitigate pre-training biases and flexibly
+tives (Tsvetkov and Kipnis, 2024) and (Land and       operate across multiple levels of granularity.
+Bartolo, 2024). The primary line of existing re-
+search in dialectal tasks focus on performance im-    8 Limitations
+provements across various datasets using LLMs
+(Scherrer et al., 2024; Alam et al., 2024; Frei and   There is significant scope for further enhancing
+Schneider, 2023), with a recent focus on multi-       the LLMs examined in this work. The tokeniza-
+label DI (Bernier-Colborne et al., 2023; Keleg and    tion analysis can be improved by leveraging more
+Magdy, 2023; Chifu et al., 2024; Kanjirangat et al.,  extensive and diverse corpora, enabling more pro-
+2024). The primary research focused on assessing      found insights into tokenization strategies and
+GPT-based models’ multilingual capabilities, high-    their implications. While the primary focus here
+lighting their limitations, with a few exceptions.    was to analyze the relationship between tokeniza-
+GPT capability in Arabic was evaluated in (Khon-      tion, language-specific factors, and their impact
+daker et al., 2023), unveiling the shortcomings of    on language-dependent tasks, future work could
+dialectal Arabic and the supremacy of encoder mod-    explore additional use cases by identifying and in-
+els. In (Lai et al., 2023; Bang et al., 2023), Chat-  corporating relevant tasks. In this study, we concen-
+GPT was evaluated in diverse languages, show-         trated on the dialectal tasks: first, as a challenging
+ing the predominance of high-resource languages.      language-dependent task, it offers a robust testbed
+Recently, a comprehensive dialectal benchmark         for examining tokenization impacts; and second,
+dataset was introduced, DialectBench (Faisal et al.,  this aspect has largely been overlooked in prior
+2021), which encompasses various dialectal tasks      research, where the emphasis has predominantly
+covering a wide range of dialectal varieties. While   been on performance metrics. Expanding this
+there has been notable research in dialectal tasks    investigation to include other complex language-
+and multilingual NLP individually, efforts to bridge  dependent tasks could further elucidate the role of
+the two remain limited. Existing work has largely     tokenization in multilingual LLM performance.
+focused on performance comparisons, with less at-
+tention to understanding the underlying causes of     Acknowledgments
+degraded performance.
+                                                      This work was supported by the project "fairTOK",
+7 Conclusion                                          funded by armasuisse S&T. The authors also grate-
+                                                      fully acknowledge the reviewers for their insightful
+In this paper, we go beyond traditional               and constructive feedback, which helped improve
+performance-based evaluations of dialectal            the quality of this work.
+downstream tasks to examine multilingual fairness
+and potential biases arising from disparities in      References
+tokenization and representation. We show that
+Tokenization Parity (TP) and Information Parity       Marah Abdin, Jyoti Aneja, Hany Awadalla, Ahmed
+(IP) correlate with downstream task performance          Awadallah, Ammar Ahmad Awan, Nguyen Bach,
+in a consistent, although sometimes surprising,          Amit Bahree, Arash Bakhtiari, Jianmin Bao, Harkirat
+way. Our results reveal consistent disparities in        Behl, et al. 2024. Phi-3 technical report: A highly ca-
+TP between Latin and non-Latin scripts, while            pable language model locally on your phone. arXiv
+IP variations are influenced by both script and          preprint arXiv:2404.14219.
+resource availability. TP is more strongly associ-
+ated with tasks involving syntactic, morphological,   Muhammad Abdul-Mageed, Abdelrahim Elmadany,
+and span-based features, whereas IP aligns more          Chiyu Zhang, Houda Bouamor, Nizar Habash, et al.
+closely with tasks requiring semantic understand-        2023. Nadi 2023: The fourth nuanced arabic dialect
+ing and reasoning. The role of token-level disparity     identification shared task. In Proceedings of Arabic-
+is especially interesting in surface-level tasks         NLP 2023, pages 600–613.
+such as dialect identification, which can help
+models make distinctions between dialects. As a       David Adelani, Hannah Liu, Xiaoyu Shen, Nikita Vassi-
+future direction, we emphasize the importance of         lyev, Jesujoba Alabi, Yanke Mao, Haonan Gao, and
+developing language-aware, adaptive tokenizers           En-Shiun Lee. 2024. Sib-200: A simple, inclusive,
+                                                         and big evaluation dataset for topic classification in
+                                                         200+ languages and dialects. In Proceedings of the
+                                                         18th Conference of the European Chapter of the As-
+                                                         sociation for Computational Linguistics (Volume 1:
+                                                         Long Papers), pages 226–245.
+
+24000
+Orevaoghene Ahia, Sachin Kumar, Hila Gonen, Jungo              Similar Languages, Varieties and Dialects, pages 1–
+   Kasai, David R Mortensen, Noah A Smith, and Yulia           15. The Association for Computational Linguistics.
+   Tsvetkov. 2023. Do all languages cost the same? tok-     Marta R Costa-jussà, James Cross, Onur Çelebi, Maha
+   enization in the era of commercial language models.         Elbayad, Kenneth Heafield, Kevin Heffernan, Elahe
+   In Proceedings of the 2023 Conference on Empiri-            Kalbassi, Janice Lam, Daniel Licht, Jean Maillard,
+   cal Methods in Natural Language Processing, pages           et al. 2022. No language left behind: Scaling
+   9904–9923.                                                  human-centered machine translation. arXiv preprint
+                                                               arXiv:2207.04672.
+Firoj Alam, Shammur Absar Chowdhury, Sabri                  Jacob Devlin. 2018. Bert: Pre-training of deep bidi-
+   Boughorbel, and Maram Hasanain. 2024. Llms for              rectional transformers for language understanding.
+   low resource languages in multilingual, multimodal          arXiv preprint arXiv:1810.04805.
+   and dialectal settings. In Proceedings of the 18th       Ning Ding, Yujia Qin, Guang Yang, Fuchao Wei,
+   Conference of the European Chapter of the Associ-           Zonghan Yang, Yusheng Su, Shengding Hu, Yulin
+   ation for Computational Linguistics: Tutorial Ab-           Chen, Chi-Min Chan, Weize Chen, et al. 2023.
+   stracts, pages 27–33.                                       Parameter-efficient fine-tuning of large-scale pre-
+                                                               trained language models. Nature Machine Intelli-
+Marcellus Amadeus, Jose Roberto Homeli da Silva, and           gence, 5(3):220–235.
+   Joao Victor Pessoa Rocha. 2024. Bridging the lan-        Abhimanyu Dubey, Abhinav Jauhri, Abhinav Pandey,
+   guage gap: Integrating language variations into con-        Abhishek Kadian, Ahmad Al-Dahle, Aiesha Letman,
+   versational AI agents for enhanced user engagement.         Akhil Mathur, Alan Schelten, Amy Yang, Angela
+   In Proceedings of the 1st Worskhop on Towards Eth-          Fan, et al. 2024. The llama 3 herd of models. arXiv
+   ical and Inclusive Conversational AI: Language At-          preprint arXiv:2407.21783.
+   titudes, Linguistic Diversity, and Language Rights       Fahim Faisal, Orevaoghene Ahia, Aarohi Srivastava,
+   (TEICAI 2024), pages 16–20, St Julians, Malta. As-          Kabir Ahuja, David Chiang, Yulia Tsvetkov, and An-
+   sociation for Computational Linguistics.                    tonios Anastasopoulos. 2024. Dialectbench: An nlp
+                                                               benchmark for dialects, varieties, and closely-related
+Yejin Bang, Samuel Cahyawijaya, Nayeon Lee, Wen-               languages. In Proceedings of the 62nd Annual Meet-
+   liang Dai, Dan Su, Bryan Wilie, Holy Lovenia, Ziwei         ing of the Association for Computational Linguistics
+   Ji, Tiezheng Yu, Willy Chung, et al. 2023. A multi-         (Volume 1: Long Papers), pages 14412–14454.
+   task, multilingual, multimodal evaluation of chatgpt     Fahim Faisal, Sharlina Keshava, Md Mahfuz Ibn Alam,
+   on reasoning, hallucination, and interactivity. In Pro-     and Antonios Anastasopoulos. 2021. Sd-qa: Spoken
+   ceedings of the 13th International Joint Conference         dialectal question answering for the real world. In
+   on Natural Language Processing and the 3rd Confer-          Findings of the Association for Computational Lin-
+   ence of the Asia-Pacific Chapter of the Association         guistics: EMNLP 2021, pages 3296–3315.
+   for Computational Linguistics (Volume 1: Long Pa-        Claudio Frei and Philippe Schneider. 2023. Automatic
+   pers), pages 675–718.                                       identification of swiss german dialects using large
+                                                               language models.
+Loïc Barrault, Paul-Ambroise Duquenne, Maha El-             Nizar Habash, Houda Bouamor, Ramy Eskander, Nadi
+   bayad, Artyom Kozhevnikov, Belen Alastruey, Pierre          Tomeh, Ibrahim Abu Farha, Ahmed Abdelali, Samia
+   Andrews, Mariano Coria, Guillaume Couairon,                 Touileb, Injy Hamed, Yaser Onaizan, Bashar Alhafni,
+   Marta R Costa-jussà, David Dale, et al. 2024. Large         et al. 2024. Proceedings of the second arabic natural
+   concept models: Language modeling in a sentence             language processing conference. In Proceedings of
+   representation space. arXiv e-prints, pages arXiv–          The Second Arabic Natural Language Processing
+   2412.                                                       Conference.
+                                                            Valentin Hofmann, Hinrich Schuetze, and Janet B Pier-
+Khuyagbaatar Batsuren, Ekaterina Vylomova, Verna               rehumbert. 2022. An embarrassingly simple method
+   Dankers, Tsetsuukhei Delgerbaatar, Omri Uzan, Yu-           to mitigate undesirable properties of pretrained lan-
+   val Pinter, and Gábor Bella. 2024. Evaluating               guage model tokenizers. Association for Computa-
+   subword tokenization: Alien subword composition             tional Linguistics.
+   and oov generalization challenge. arXiv preprint         Edward J Hu, Yelong Shen, Phillip Wallis, Zeyuan
+   arXiv:2404.13292.                                           Allen-Zhu, Yuanzhi Li, Shean Wang, Lu Wang,
+                                                               and Weizhu Chen. 2021. Lora: Low-rank adap-
+Gabriel Bernier-Colborne, Cyril Goutte, and Serge              tation of large language models. arXiv preprint
+   Leger. 2023. Dialect and variant identification as          arXiv:2106.09685.
+   a multi-label classification task: A proposal based
+   on near-duplicate analysis. In Tenth Workshop on
+   NLP for Similar Languages, Varieties and Dialects
+   (VarDial 2023), pages 142–151.
+
+Adrian-Gabriel Chifu, Goran Glavaš, Radu Tudor
+   Ionescu, Nikola Ljubešic´, Aleksandra Miletic Had-
+   dad, Filip Miletic´, Yves Scherrer, and Ivan Vulic´.
+   2024. Vardial evaluation campaign 2024: Common-
+   sense reasoning in dialects and multi-label similar
+   language identification. In Workshop on NLP for
+
+24001
+Albert Q Jiang, Alexandre Sablayrolles, Antoine            Phillip Rust, Jonas Pfeiffer, Ivan Vulic´, Sebastian Ruder,
+   Roux, Arthur Mensch, Blanche Savary, Chris Bam-            and Iryna Gurevych. 2021. How good is your tok-
+   ford, Devendra Singh Chaplot, Diego de las Casas,          enizer? on the monolingual performance of multilin-
+   Emma Bou Hanna, Florian Bressand, et al. 2024.             gual language models. In Proceedings of the 59th
+   Mixtral of experts. arXiv preprint arXiv:2401.04088.       Annual Meeting of the Association for Computational
+                                                              Linguistics and the 11th International Joint Confer-
+Vani Kanjirangat, Tanja Samardzic, Ljiljana Dolamic,          ence on Natural Language Processing (Volume 1:
+   and Fabio Rinaldi. 2023. Optimizing the size of sub-       Long Papers), pages 3118–3135.
+   word vocabularies in dialect classification. In Tenth
+   Workshop on NLP for Similar Languages, Varieties        Tanja Samardžic´ and Nikola Ljubešic´. 2021. Data Col-
+   and Dialects (VarDial 2023), pages 14–30.                  lection and Representation for Similar Languages,
+                                                              Varieties and Dialects, page 121–137. Studies in
+Vani Kanjirangat, Tanja Samardzic, Ljiljana Dolamic,          Natural Language Processing. Cambridge University
+   and Fabio Rinaldi. 2024. Nlp_di at nadi 2024 shared        Press.
+   task: Multi-label arabic dialect classifications with
+   an unsupervised cross-encoder. In Proceedings of        Tanja Samardzic, Yves Scherrer, and Elvira Glaser.
+   The Second Arabic Natural Language Processing              2016. Archimob-a corpus of spoken swiss german.
+   Conference, pages 742–747.                                 In Proceedings of the Tenth International Conference
+                                                              on Language Resources and Evaluation (LREC’16),
+Anjali Kantharuban, Ivan Vulic´, and Anna Korhonen.           pages 4061–4066.
+   2023. Quantifying the dialect gap and its correlates
+   across languages. In Findings of the Association        Yves Scherrer, Tommi Jauhiainen, Nikola Ljubešic´,
+   for Computational Linguistics: EMNLP 2023, pages           Preslav Nakov, Jörg Tiedemann, and Marcos
+   7226–7245, Singapore. Association for Computa-             Zampieri. 2023. Tenth workshop on nlp for simi-
+   tional Linguistics.                                        lar languages, varieties and dialects (vardial 2023):
+                                                              Proceedings of the workshop. In Workshop on NLP
+Amr Keleg and Walid Magdy. 2023. Arabic dialect iden-         for Similar Languages, Varieties and Dialects. The
+   tification under scrutiny: Limitations of single-label     Association for Computational Linguistics.
+   classification. arXiv preprint arXiv:2310.13661.
+                                                           Yves Scherrer, Tommi Jauhiainen, Nikola Ljubešic´,
+Md Tawkat Islam Khondaker, Abdul Waheed, Muham-               Marcos Zampieri, Preslav Nakov, and Jörg Tiede-
+   mad Abdul-Mageed, et al. 2023. Gptaraeval: A com-          mann. 2024. Proceedings of the eleventh workshop
+   prehensive evaluation of chatgpt on arabic nlp. In         on nlp for similar languages, varieties, and dialects
+   Proceedings of the 2023 Conference on Empirical            (vardial 2024). In Proceedings of the Eleventh Work-
+   Methods in Natural Language Processing, pages 220–         shop on NLP for Similar Languages, Varieties, and
+   247.                                                       Dialects (VarDial 2024).
+
+T Kudo. 2018. Sentencepiece: A simple and lan-             Xinying Song, Alex Salcianu, Yang Song, Dave Dopson,
+   guage independent subword tokenizer and detok-             and Denny Zhou. 2021. Fast wordpiece tokenization.
+   enizer for neural text processing. arXiv preprint          In Proceedings of the 2021 Conference on Empiri-
+   arXiv:1808.06226.                                          cal Methods in Natural Language Processing, pages
+                                                              2089–2103.
+Viet Lai, Nghia Ngo, Amir Pouran Ben Veyseh, Hiéu
+   Mãn, Franck Dernoncourt, Trung Bui, and Thien           Dimitris Spathis and Fahim Kawsar. 2024. The first step
+   Nguyen. 2023. Chatgpt beyond english: Towards a            is the hardest: Pitfalls of representing and tokenizing
+   comprehensive evaluation of large language models          temporal data for large language models. Journal
+   in multilingual learning. In Findings of the Associ-       of the American Medical Informatics Association,
+   ation for Computational Linguistics: EMNLP 2023,           31(9):2151–2158.
+   pages 13171–13189.
+                                                           Gemma Team, Thomas Mesnard, Cassidy Hardin,
+Sander Land and Max Bartolo. 2024. Fishing for                Robert Dadashi, Surya Bhupatiraju, Shreya Pathak,
+   magikarp: Automatically detecting under-trained to-        Laurent Sifre, Morgane Rivière, Mihir Sanjay Kale,
+   kens in large language models. In Proceedings of the       Juliette Love, et al. 2024. Gemma: Open models
+   2024 Conference on Empirical Methods in Natural            based on gemini research and technology. arXiv
+   Language Processing, pages 11631–11646.                    preprint arXiv:2403.08295.
+
+Artidoro Pagnoni, Ram Pasunuru, Pedro Rodriguez,           Cagri Toraman, Eyup Halit Yilmaz, Furkan S¸ ahinuç,
+   John Nguyen, Benjamin Muller, Margaret Li, Chunt-          and Oguzhan Ozcelik. 2023. Impact of tokenization
+   ing Zhou, Lili Yu, Jason Weston, Luke Zettlemoyer,         on language models: An analysis for turkish. ACM
+   et al. 2024. Byte latent transformer: Patches scale        Transactions on Asian and Low-Resource Language
+   better than tokens. arXiv preprint arXiv:2412.09871.       Information Processing, 22(4):1–21.
+
+Aleksandar Petrov, Emanuele La Malfa, Philip Torr,         Alexander Tsvetkov and Alon Kipnis. 2024. Informa-
+   and Adel Bibi. 2024. Language model tokenizers             tion parity: Measuring and predicting the multilin-
+   introduce unfairness between languages. Advances           gual capabilities of language models. In Findings
+   in Neural Information Processing Systems, 36.              of the Association for Computational Linguistics:
+                                                              EMNLP 2024, pages 7971–7989.
+
+24002
+Daan van Esch, Tamar Lucassen, Sebastian Ruder, Isaac
+   Caswell, and Clara Rivera. 2022. Writing system and
+   speaker metadata for 2,800+ language varieties. In
+   Proceedings of the Thirteenth Language Resources
+   and Evaluation Conference, pages 5035–5046.
+
+Changhan Wang, Kyunghyun Cho, and Jiatao Gu. 2020.
+   Neural machine translation with byte-level subwords.
+   In Proceedings of the AAAI conference on artificial
+   intelligence, volume 34, pages 9154–9160.
+
+Dixuan Wang, Yanda Li, Junyuan Jiang, Zepeng Ding,
+   Guochao Jiang, Jiaqing Liang, and Deqing Yang.
+   2024. Tokenization matters! degrading large lan-
+   guage models through challenging their tokenization.
+   arXiv preprint arXiv:2405.17067.
+
+Marcos Zampieri, Shervin Malmasi, Preslav Nakov,
+   Ahmed Ali, Suwon Shon, James Glass, Yves Scher-
+   rer, Tanja Samardžic´, Nikola Ljubešic´, Jörg Tiede-
+   mann, et al. 2018. Language identification and mor-
+   phosyntactic tagging. the second vardial evaluation
+   campaign.
+
+                                                           24003
+Figure 7: Class distributions of dialect classification Figure 8: Class distributions topic classification task
+task (Appendix A)                                     (Appendix A)
+
+A Dataset Details                                     1878 (multi)) train and 4120 (4000+120) test sam-
+                                                      ples.
+Table 2 shows the general statistics of DI task
+datasets. In the DI task, NADI-2023 has 18 dialects      The class distributions of the DI and TC tasks
+from Arabic-speaking regions such as Iraq, Oman,      are shown in Figures 7 and 8.
+Saudi Arabia, Palestine, Bahrain, Egypt, Jordan,
+Libya, Sudan, UAE, Algeria, Kuwait, Tunisia,          B Tokenizer details
+Lebanon, Morocco, Yemen, Syria, and Qatar. In
+GDI, we had four dialects: Zurich, Luzern, Basel,     The details of the tokenizers and pre-trained vocab-
+and Bern. For ILI, it was Hindi, Braj Bhasha,         ulary sizes used by the evaluated models are shown
+Awadhi, Bhojpuri, and Magahi. In multi-label set-     in Table 3.
+tings, we used the datasets from the Multi-label
+classification of similar languages (DSL-ML) 2024     C Script & resource Categorizations
+shared task, focusing on manually labeled Span-
+ish and automatically labeled French data. For        The details of the languages under different scripts
+French, data was from the FreCDo dataset, includ-     and resource categories are shown in Table 4.
+ing French (FR-FR), Swiss (FR-CH), Canadian
+(FR-CA), and Belgian (FR-BE) with {’FR-BE’:           D Prompt details
+120653, ’FR-CH’: 115664, ’FR-FR’: 83127, ’FR-
+CA’: 19041, ’FR-BE, FR-FR’: 1052, ’FR-BE, FR-         This section presents the instruction-tuning
+CH’: 603, ’FR-CH, FR-FR’: 162, ’FR-BE, FR-CH,         prompts used for the experiments in decoder-only
+FR-FR’: 61} as multi-label samples. For Spanish,      LLMs. Figures 9, 10, and 11 represent the prompts
+the two varieties were Argentinian and peninsular     for DI, TC, and EQA tasks, respectively.
+Spanish, with 1131 multi-label samples.
+                                                      E Experimental settings details
+   Under the multi-lingual setup, we created a rep-
+resentative train-test sample dataset for the French  We evaluated the experiments on HPC clusters with
+dataset due to the massive size of the automatically  a100 and v100 GPUs. The runtime varied between
+curated dataset. We selected 5000 mono-label sam-     approximately. 4 hours - 1.5 days for decoder mod-
+ples from each class and all the multi-label samples  els and 1-2 hours for encoder models. All experi-
+comprising the train set. 1000 mono-label samples     mental models were accessed from the Hugging-
+with all multi-label samples were selected for the    Face library.
+test set. This constitutes 21878 (20000 (mono)+
+                                                      F Result details
+
+                                                      In this section, we present the detailed tabular re-
+                                                      sults for the TC and EQA tasks per dialectal variety.
+
+                   24004
+Train          14G6D47I 684IL53I N18A0D00I DSL-M34L0-3F6R3 DSL-ML3-4E6S7
+Test           4752 9032 1800                                17090           989
+No. of labels  4  5                                      18  4               2
+
+               Table 2: Dataset statistics (Appendix A)
+
+Models        Tokenizer                                             Model_Vocab_Sizes
+Phi3          tiktoken (Abdin et al., 2024) 9                       32011
+Gemma         SentencePiece tokenizer(Kudo, 2018; Team et al.,      256000
+Llama3        2024)                                                 128256
+Bloom         tiktoken (Dubey et al., 2024)                         250680
+Mistral       Byte-level BPE (Wang et al., 2020)                    32000
+NLLB          tekken- Modified tiktoken (Jiang et al., 2024)        256204
+BERT-based    SentencePiece tokenizer tailored                      30522
+MmBAERRBTERT  WordPiece (Song et al., 2021; Devlin, 2018)           110109500470
+IndicBERT     WWoorrddPPiieeccee                                    200000
+SpanBERTa     WordPiece                                             50265
+CamemBERT     WordPiece                                             32005
+              WordPiece
+
+              Table 3: Tokenizers and vocabulary Sizes of LLMs (Appendix B)
+
+TRAINING_CLASSIFIER_PROMPT = """[INST]What is the dialect of the given input
+sentence.
+Sentence:{sentence}
+Class:{label}[/INST]"""
+INFERENCE_CLASSIFIER_PROMPT = """[INST] Classify the dialect of the sentence.
+Choose from one of the following options:{allowed_labels}.
+Sentence:
+{sentence}
+[/INST]
+Class:"""
+
+             Figure 9: Instruction-tuning prompt for dialect classification task (Appendix D)
+
+Table 6 and 7 present the results on TC and EQA          G.2 Missing character proportions
+tasks, respectively. Table 8 presents the detailed
+correlation values of TP and IP over different down-     In this experiment, we compute the percentage of
+stream tasks across Phi-3.5, Llama-3.2 and mBERT         missing characters—those not represented as stan-
+models.                                                  dalone tokens—in the vocabulary of each LLM.
+                                                         This analysis is limited to high-resource languages
+G Vocabulary analysis details                            such as English, German, Spanish, French, Arabic,
+                                                         and Hindi across various LLMs. We aim to investi-
+G.1 Language support details                             gate potential correlations between character-level
+                                                         coverage and performance on dialectal downstream
+Table 9 presents the language support details of         tasks. Although character-level analysis may ini-
+the decoder-only LLMs. The information is based          tially seem counterintuitive given that most LLMs
+on the support claims of each model from their re-       employ subword tokenizers, it sometimes becomes
+spective HuggingFace pages. When a model claims          relevant due to their reliance on byte-level fallback
+"support", it may often refer to some representation     mechanisms. Our qualitative analysis reveals that
+of the language in its training data and the ability to  this fallback can sometimes negatively impact non-
+generate or understand basic text in that language       Latin scripts.
+under ideal tokenization conditions. It may not
+guarantee robust handling of the language’s words,          The Unicode ranges of the main character set
+characters, or scripts.                                  used and the special characters are given in Ta-
+                                                         ble 5. As shown in Figure 12, all LLMs exhibit
+                                                         nearly complete character coverage for English,
+
+                     24005
+Category          Languages (Flores Code)
+Latin-High
+Latin-Middle      Spanish (spa_Latn), German (deu_Latn), French (fra_Latn)
+Latin-Low         Dutch (nld_Latn), Italian (ita_Latn), Romanian (ron_Latn), Turkish (tur_Latn), Portuguese (por_Latn)
+                  Ayacucho Quechua (quy_Latn), Haitian Creole (hat_Latn), Basque (eus_Latn), Hungarian (hun_Latn),
+Non-Latin-High    Catalan (cat_Latn), Danish (dan_Latn), Estonian (est_Latn), Indonesian (ind_Latn), Standard Latvian
+Non-Latin-Middle  (lvs_Latn), Standard Malay (zsm_Latn), Finnish (fin_Latn), Swahili (swh_Latn), Norwegian Bokmål
+Non-Latin-Low     (nob_Latn), Croatian (hrv_Latn), Czech (ces_Latn), Ligurian (lij_Latn)
+                  Standard Arabic (arb_Arab), Russian (rus_Cyrl), Chinese (Simplified) (zho_Hans), Hindi (hin_Deva)
+                  Urdu (urd_Arab), Korean (kor_Hang), Vietnamese (vie_Latn), Japanese (jpn_Jpan)
+                  North Azerbaijani (azj_Latn), Thai (tha_Thai), Marathi (mar_Deva), Odia (ory_Orya), Gujarati
+                  (guj_Gujr), Nepali (npi_Deva), Burmese (mya_Mymr), Assamese (asm_Beng), Central Kurdish
+                  (ckb_Arab), Tamil (tam_Taml), Malayalam (mal_Mlym), Bulgarian (bul_Cyrl), Eastern Panjabi
+                  (pan_Guru), Ukrainian (ukr_Cyrl), Bengali (ben_Beng), Kannada (kan_Knda), Greek (ell_Grek),
+                  Northern Sotho (nso_Latn), Serbian (srp_Cyrl), Telugu (tel_Telu), Hebrew (heb_Hebr), Georgian
+                  (kat_Geor)
+
+Table 4: Language categories and corresponding languages with FLORES codes: Appendix C
+
+TRAINING_CLASSIFIER_PROMPT = """[INST]What is the topic of the following text?
+\nSentence:{sentence}\nClass:{label}[/INST]"""
+INFERENCE_CLASSIFIER_PROMPT = """[INST] Classify the topic of the following
+sentence.
+Choose from one of the following options:{allowed_labels}.
+Sentence:
+{sentence}
+[/INST]
+Class:"""
+
+              Figure 10: Instruction-tuning prompt for topic classification task (Appendix D)
+
+TRAINING_CLASSIFIER_PROMPT = """[INST]Extract the answer of the question from the
+given context
+\nQuestion:{sentence}\nContext:{context}\nAnswer:{label}[/INST]"""
+INFERENCE_CLASSIFIER_PROMPT = """[INST] Answer the question based on
+given context. Output from the given context only as in extractive QA.
+Question:
+{sentence}
+Context:{context}
+[/INST]
+Answer: """
+
+                      Figure 11: Instruction-tuning prompt for EQA task (Appendix D)
+
+                                                       with a missing proportion of 0.0 (lower is better).
+                                                       In contrast, the missing proportion for non-Latin
+                                                       languages is considerably higher than for Latin
+                                                       languages across most multilingual decoder-based
+                                                       models (e.g., LLaMA, Phi, Mixtral), with the ex-
+                                                       ception of the Gemma model. Among language-
+                                                       specific decoder models, the missing proportion is
+                                                       notably lower—for instance, SILMA reports only
+                                                       23% missing characters in Arabic.
+
+Figure 12: Missing proportions of language characters     For encoder-only models (see Figure 13),
+in decoder-only tokenizer vocabulary (Appendix G.2)    language-specific encoders tend to achieve better
+                                                       character coverage in their respective languages.
+
+                  24006
+Language       Unicode ranges & special char-                 Notably, mBERT maintains reasonable coverage
+Hindi          acters                                         over non-Latin scripts. However, MARBERT ex-
+EAnragbliisch  (0x0900, 0x097F + 1)                           hibits a substantial proportion of missing Arabic
+Spanish        ((00xx4061,000x, 05xB0)6aFnFd +(01x)61, 0x7B)  characters at the token level. This is likely due
+French         [’á’, ’é’, ’í’, ’ó’, ’ú’, ’ü’, ’ñ’,            to its frequency-based subword tokenizer, where
+               ’Á’, ’É’, ’Í’, ’Ó’, ’Ú’, ’Ü’, ’Ñ’]             individual characters are often absorbed into larger
+Swiss-         [’à’, ’â’, ’ä’, ’ç’, ’é’, ’è’, ’ê’, ’ë’,       subword units.
+German         ’î’,’ï’, ’ô’, ’ö’, ’ù’, ’û’,
+               ’ü’,’À’, ’Â’, ’Ä’, ’Ç’, ’É’, ’È’, ’Ê’,            While such missing character coverage does
+               ’Ë’, ’Î’, ’Ï’, ’Ô’, ’Ö’, ’Ù’,                  not necessarily impair performance in language-
+               ’Û’, ’Ü’]                                      specific models—owing to their strong modeling
+               [’ä’, ’ö’, ’ü’, ’Ä’, ’Ö’, ’Ü’, ’ß’]            of linguistic structure across granularities—it can
+                                                              pose challenges for broader multilingual LLMs.
+Table 5: Character Unicode ranges and special char-           Ensuring at least character-level granularity in
+acters for different languages - all special characters       these models may help mitigate issues arising from
+are contained in the Latin-1 supplement Unicode block         multibyte representations of non-Latin scripts.
+0x0080-0x00FF. (Appendix G.2)
+                                                                 We used the three models for correlation analy-
+                                                              sis - mBERT, Phi-3.5, and Llama-3.2. From Figure
+                                                              14, it can be observed that negative correlations
+                                                              dominate, especially for Phi-3.5 and Llama-3.2.
+                                                              All models show high negative correlations with
+                                                              EQA task, indicating that higher character coverage
+                                                              (fewer missing characters) improves performance.
+                                                              In TC, both decoder-only LLMs show positive cor-
+                                                              relations.
+
+Figure 13: Missing proportions of language characters
+in encoder-only tokenizer vocabulary (Appendix G.2)
+
+Figure 14: Correlation of missing character proportions
+to dialectal tasks
+
+                                                           24007
+Category        Language                     LLaMA-3.2 Phi-3.5  mBERT
+
+Latin-High      Dutch (nld_Latn)             0.1096  0.4178      0.894
+                English (eng_Latn)           0.0494  0.3210      0.897
+                French (fra_Latn)            0.1436  0.4274      0.910
+                German (deu_Latn)            0.1187  0.3692      0.862
+                Italian (ita_Latn)           0.1137  0.3309      0.872
+                Portuguese (por_Latn)        0.0823  0.3523      0.868
+                Spanish (spa_Latn)           0.1313  0.3813      0.821
+                Romanian (ron_Latn)          0.0791  0.3762      0.857
+
+Latin-Low       Catalan (cat_Latn)           0.1010  0.3502      0.858
+                Croatian (hrv_Latn)          0.0972  0.4823      0.858
+                Estonian (est_Latn)          0.1686  0.4508      0.766
+                Finnish (fin_Latn)           0.1241  0.3067      0.809
+                Haitian Creole (hat_Latn)    0.0700  0.1946       0.61
+                Hungarian (hun_Latn)         0.1206  0.3671      0.861
+                Indonesian (ind_Latn)        0.0937  0.3666      0.847
+                Norwegian Bokmål (nob_Latn)  0.1024  0.3592      0.862
+                Basque (eus_Latn)            0.0630  0.2946       0.82
+
+Non-Latin-High  Arabic (arb_Arab)            0.1491  0.5194      0.811
+                Hebrew (heb_Hebr)            0.1507  0.3685       0.83
+                Hindi (hin_Deva)             0.0888  0.4972      0.742
+                Japanese (jpn_Jpan)          0.0704  0.4043      0.888
+                Russian (rus_Cyrl)           0.1565  0.3897      0.827
+
+Non-Latin-Low   Bengali (ben_Beng)           0.0288  0.2192      0.773
+                Gujarati (guj_Gujr)          0.0000  0.0824      0.597
+                Kannada (kan_Knda)           0.0287  0.0952       0.78
+                Malayalam (mal_Mlym)         0.0089  0.0938       0.66
+                Marathi (mar_Deva)           0.1011  0.3732      0.744
+                Nepali (npi_Deva)            0.0503  0.3610      0.762
+                Orya (ory_Orya)              0.0281  0.1056      0.461
+
+Table 6: Macro F1 scores for languages under different resource-script categories in the topic classification task.
+(Appendix F )
+
+                                     24008
+Category                       Language Code     Llama3     Phi-3.5  mBERT
+Latin-High                     english-kenya     0.431337  0.540717   0.725
+Latin-Low                      english-nzl       0.462533  0.596464   0.767
+Non-Latin-High                 english-irl       0.462224  0.600408   0.755
+Non-Latin-Low                  english-ind_n     0.443038  0.573698   0.746
+                               english-phl       0.455140  0.588592   0.764
+                               english-nga       0.452876  0.566533   0.736
+                               english-aus       0.458323  0.593847   0.757
+                               english-ind_s     0.431355  0.543300   0.719
+                               english-usa       0.479512  0.608536   0.772
+                               english-gbr       0.471987  0.596156   0.764
+                               english-zaf       0.464280  0.594952   0.766
+
+                               swahili-kenya     0.443695  0.350143   0.724
+                               swahili-tanzania  0.410629  0.320931   0.635
+
+                               arabic-sau        0.361613  0.457623   0.778
+                               arabic-mar        0.361082  0.445782   0.767
+                               arabic-jor        0.360686  0.45141    0.773
+                               arabic-tun        0.358351  0.448329   0.767
+                               arabic-bhr        0.359525  0.456000   0.775
+                               arabic-dza        0.357209  0.455835   0.778
+                               arabic-egy        0.345871  0.441766   0.765
+                               korean-korn       0.432525  0.481986    0.10
+                               korean-kors       0.414520  0.500209   0.092
+
+                               bengali-ind       0.325579  0.176780   0.686
+                               bengali-dhaka     0.349494  0.192330   0.673
+
+Table 7: F1 and EM scores by language code and category for EQA task -Appendix F
+
+Task                           Model / Category  Tokenization Parity  Information Parity
+Dialect Classification (DI)          Phi-3.5              0.638               -0.413
+Topic Classification (TC)                                -0.380               0.268
+                                    Llama-3.2            0.4836                 —
+Dialectal Extractive QA (EQA)        mBERT               -0.683               0.812
+                                     Phi-3.5              0.873               0.765
+                                     Latin-High          -0.785               0.165
+                                     Latin-Low            0.202               -0.862
+                                 Non-Latin-High           0.876               0.634
+                                  Non-Latin-Low          -0.716               0.687
+                                    Llama-3.2             0.974               0.671
+                                     Latin-High           0.077               0.328
+                                     Latin-Low           -0.547               0.209
+                                 Non-Latin-High          -0.805               0.623
+                                  Non-Latin-Low          -0.605                 —
+                                     mBERT               -0.242                 —
+                                     Latin-High          -0.706                 —
+                                     Latin-Low           -0.826                 —
+                                 Non-Latin-High          -0.828                 —
+                                  Non-Latin-Low          -0.834               0.618
+                                     Phi-3.5             -0.528               0.097
+                                    Llama-3.2            -0.938                 —
+                                     mBERT
+
+Table 8: Correlation values (overall and per category) between model tokenization/information parity and dialectal
+task performance-Appendix F
+
+                               24009
+                            English  Arabic  German    Spanish                French  Hindi
+                                             Encoder-
+BERT-base                   ✓           ✗                  ✗                     ✗      ✗
+                                        ✗      only        ✗                     ✗      ✗
+BERT-base-uncased           ✓           ✓        ✗        ✓                      ✓      ✓
+                                        ✓        ✗         ✗                     ✗      ✗
+mBERT                       ✓           ✗        ✗         ✗                     ✗      ✓
+                                        ✗        ✗         ✗                     ✓      ✗
+MARBERT-V2                  ✗           ✗        ✗        ✓                      ✗      ✗
+                                        ✗        ✓         ✗                     ✓      ✗
+Indic-Transformers          ✓                    ✗
+                                        ✗        ✗        ✓                      ✓      ✗
+Swiss-BERT                  ✗           ✗                  ✗                     ✗      ✗
+                                        ✗    Decoder-      ✗                     ✗      ✗
+SpanBERTa                   ✗           ✓      only       ✓                      ✓      ✗
+                                        ✓        ✗        ✓                      ✓      ✗
+CamemBERT                   ✗           ✓        ✗        ✓                      ✓      ✓
+                                        ✗        ✗        ✓                      ✓      ✓
+Mixtral-8x7B-Instruct-v0.1  ✓           ✓        ✗         ✗                     ✗      ✗
+                                                 ✗
+Mistral-7B-Instruct-v0.2    ✓                    ✗
+                                                 ✗
+Falcon-7B                   ✓                    ✗
+
+phi3-mini                   ✓
+
+phi3-MOE                    ✓
+
+Gemma-7B                    ✓
+
+Llama3.2-3B                 ✓
+
+SILMA-9B                    ✓
+
+                    Table 9: Language support details of LLMs (Appendix G.1)
+
+                                     24010
+

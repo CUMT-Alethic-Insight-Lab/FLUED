@@ -1,0 +1,999 @@
+                                       Distilling Token-Trained Models into Byte-Level Models
+
+                                       Zishuo Bao 1 * Jiaqi Leng 2 Junxiong Wang 3 Bowen Peng 4 Yucheng Lu 5
+
+arXiv:2602.01007v1 [cs.CL] 1 Feb 2026                          Abstract                                   natural opportunity for knowledge transfer. In particular, it
+                                                                                                          enables initializing the transformer backbone from powerful
+                                             Byte Language Models (BLMs) have emerged as                  pretrained token-based (subword) LMs.
+                                             a promising direction for scaling language models
+                                             beyond tokenization. However, existing BLMs                  However, while several prior works explore initializing byte-
+                                             typically require training from scratch on trillions         level models with weights from pretrained token-trained
+                                             of bytes, making them prohibitively expensive.               LMs to accelerate convergence (Hwang et al., 2025; Pagnoni
+                                             In this paper, we propose an efficient distillation          et al., 2024), these approaches have not succeeded in closing
+                                             recipe that converts existing token-trained LLMs             the performance gap: the resulting BLMs still substantially
+                                             into BLMs while retaining comparable capabili-               underperform their token-based counterparts. To address
+                                             ties. Our recipe follows a two-stage curriculum:             this gap, in this paper we study the following question:
+                                             (1) Progressive Knowledge Distillation, which
+                                             aligns byte-level representations with the embed-            Can we obtain a byte-level model through distillation from
+                                             dings of the token-trained teacher model; and                   a token-trained model, without training from scratch?
+                                             (2) Byte-Level Supervised Fine-Tuning, which en-
+                                             ables end-to-end generation entirely in the byte             We answer this question in the affirmative by proposing
+                                             space. We validate our approach across multi-                a novel distillation recipe. Our approach distills a stan-
+                                             ple model families, including Llama, Qwen, and               dard Transformer-based language model into a hierarchical
+                                             OLMo, and demonstrate that the distilled BLMs                byte-level model, such as H-Net (Hwang et al., 2025). The
+                                             retain most of the teacher models’ performance               central challenge here lies in the boundary mismatch be-
+                                             using only approximately 125B bytes.                         tween the two representations: token-based models impose
+                                                                                                          fixed, discrete boundaries over raw byte sequences, whereas
+                                       1. Introduction                                                    byte models dynamically group bytes into variable-length
+                                                                                                          units. This mismatch falls outside the scope of traditional
+                                       Recent developments have witnessed a surge of interest in          distillation methods, which typically assume a fixed and
+                                       Byte Language Models (BLMs), which operate directly in             shared output space. To resolve this, as illustrated in Fig-
+                                       the byte space by consuming and generating bytes, thereby          ure 1, we introduce a two-stage distillation pipeline that
+                                       eliminating the inductive bias imposed by tokenization. A          progressively aligns fine-grained byte-level representations
+                                       growing body of work has demonstrated that modeling lan-           with pretrained token embeddings. Unlike prior approaches
+                                       guage at the byte level can achieve strong performance while       that rely on extensive retraining from scratch, our method
+                                       mitigating tokenization-induced artifacts (Nawrot et al.,          follows a structured curriculum:
+                                       2022; 2023b; Yu et al., 2023; Slagle, 2024; Ho et al., 2024;
+                                       Wang et al., 2024a; Pagnoni et al., 2024; Hwang et al., 2025).     Stage 1: Progressive Knowledge Distillation. The main
+                                                                                                          challenge in distillation arises from mismatched boundaries
+                                       A common thread across these successful architectures is           between LLMs and BLMs in byte space. We address this
+                                       the use of a hierarchical structure: they typically leverage a     challenge with a three-stage process: (1) embedding align-
+                                       lightweight encoder to first compress raw bytes into chunks,       ment, (2) joint distillation, and (3) boundary learning, which
+                                       which are then processed by a transformer backbone before          trains the student model to process raw bytes while faithfully
+                                       being decoded back into bytes. This structural similarity          mimicking the teacher model’s token-level outputs. This
+                                       to standard Large Language Models (LLMs) suggests a                stage allows the distilled BLM to take raw bytes as inputs
+                                                                                                          and generate in the token space.
+                                          *Work done during the internship at NYU Shanghai.
+                                       1Fuzhou University 2Fudan University 3Together AI 4Nous Re-        Stage 2: Byte-Level Supervised Fine-Tuning (SFT).
+                                       search 5NYU Shanghai. Correspondence to: Yucheng Lu                Building on Stage 1, we introduce a dechunking module
+                                       <lu.yucheng@nyu.edu>.                                              and apply supervised fine-tuning (SFT) with a next-byte
+                                                                                                          prediction objective, enabling the model to generate entirely
+                                       Preprint. February 3, 2026.                                        in the byte space.
+
+                                                                                                       1
+Distilling Token-Trained Models into Byte-Level Models
+
+We substantiate our recipe over a variety of model families,       such as Nawrot et al. (2022), Yu et al. (2023), Ho et al.
+including Llama (Grattafiori et al., 2024), Qwen (Yang et al.,     (2024), Yu et al. (2023), and Egli et al. (2025) partition
+2025) and OLMo (OLMo et al., 2024). The empirical results          inputs into fixed-size chunks. Although computationally
+demonstrate unprecedented data efficiency. With approx-            efficient, these content-agnostic boundaries often disrupt
+imately 125 B training bytes in total, our distilled model         meaningful semantic units. To preserve semantic integrity,
+retains the vast majority of teacher models’ capabilities in       external chunking strategies define boundaries using heuris-
+downstream tasks. For instance, on the MMLU benchmark,             tics or auxiliary signals. Slagle (2024) segments text based
+our method achieves scores of 51.8 and 68.5 for Llama-3.2          on natural delimiters such as whitespace, whereas Nawrot
+3B and Qwen-3 4B respectively, retaining over 92% of the           et al. (2023a) and Pagnoni et al. (2024) employ an entropy-
+original performance. This represents a significant reduc-         based mechanism to identify information-dense transitions.
+tion in resource consumption compared with state-of-the-art        Finally, dynamic chunking offers the most flexible solution
+baselines.                                                         by learning the segmentation boundaries end-to-end within
+                                                                   the model itself. Hwang et al. (2025) exemplifies this ap-
+Our main contributions in this paper can be summarized as          proach by utilizing a learnable routing module to segment
+follows:                                                           sequences based on intrinsic semantic granularity. We adopt
+                                                                   H-Net as our backbone to leverage this balance between
+ • We propose a novel two-stage distillation framework that        efficiency and linguistic plausibility.
+   effectively transforms token-trained LLMs into BLMs,
+   which drastically reduces the data requirement compared         2.2. Token-to-Byte Knowledge Distillation
+   with training BLMs from scratch.
+                                                                   Hinton et al. (2015) is a fundamental technique for transfer-
+ • We validate our approach across various models (includ-         ring capabilities from a teacher model to a student model.
+   ing Llama, Qwen, and OLMo). Furthermore, we explore             Prior work has explored cross architecture distillation (Ka-
+   post-training strategies, demonstrating that On-Policy          sai et al., 2021; Wang et al., 2024b) from Transform-
+   Distillation can further enhance the student model’s ca-        ers (Vaswani et al., 2017) to linear RNNs (Katharopoulos
+   pabilities.                                                     et al., 2020; Dao & Gu, 2024) or hybrid models. However,
+                                                                   while KD can transfer knowledge across architectures when
+ • We valid the effectiveness of our architectural choices         the tokenizer is same, distilling knowledge from token to
+   through extensive ablation. Furthermore, we provide a           byte poses unique challenges due to boundary misalignment
+   comprehensive analysis of the intrinsic characteristics         introduced by varying vocabularies and sequence lengths
+   and behaviors of the distilled student models on byte-          (Minixhofer et al., 2025b).
+   level tasks.
+                                                                   In the realm of byte-level modeling, early strategies such
+ • We open-source all components of our recipe, including          as Pagnoni et al. (2024) leverage weights from pretrained
+   the distillation code and pretrained model checkpoints,         token models (e.g., Llama-2 7B) to initialize their latent
+   for the community to build upon1.                               transformers. Similarly, Hwang et al. (2025) begins with
+                                                                   weights of token LMs and incorporates auxiliary losses for
+2. Related Work                                                    alignment. However, these methods are essentially SFT.
+                                                                   As a result, they still demand significant data to replicate
+2.1. Efficient Byte-Level Architectures                            teacher models’ capabilities.
+
+Directly modeling raw bytes removes the biases associated          Concurrent to this paper, Bolmo introduced a “byteification”
+with tokenization but presents significant computational           process that employs a direct distillation strategy (Minix-
+challenges due to the quadratic complexity of self-attention       hofer et al., 2025a), which makes the first attempt with mul-
+over extended sequences. To mitigate this, recent research         tiple approximation methods for vocabulary and sequence
+has explored various architectural innovations that can gen-       alignment. Although these approximations work well for
+erally be divided into isotropic and hierarchical approaches.      OLMo families (OLMo et al., 2024; Olmo et al., 2025),
+                                                                   their applicability to other model families remains uncer-
+Isotropic architectures process the full byte sequence with-       tain, likely necessitating substantial manual hyperparameter
+out downsampling, typically employing linear-time mecha-           tuning across different settings.
+nisms to bypass the cost of standard attention. For instance,
+Wang et al. (2024a) leverages Selective State Space Mod-           3. Preliminary
+els (SSMs) for linear efficiency. In contrast, hierarchical
+architectures aim to reduce the effective sequence length          We develop our distillation recipe on a representative hi-
+by grouping bytes into coarser chunks, thereby enabling the        erarchical byte model named H-Net (Hwang et al., 2025).
+use of standard transformer backbones. The most straight-
+forward realization of this is static chunking, where models
+
+    1https://github.com/heavyball-research/DistillBytes
+
+                                                                2
+ Stage2 Byte-Level SFT  Distilling Token-Trained Models into Byte-Level Models
+
+ h e _ ca t _                                     Stage1 Progressive Knowledge Distillation
+                                                                       Joint Distillation
+            Decoder
+                        LM Head                                    KL  LM Head                   Transformer Blocks
+Null Null
+                        Routing Module  Boundary Learning              Tokenizer                       Embedding
+            Dechunk                           BCE Loss                                                  Tokenizer
+      Core Transformer
+                                                                                             The_ca t
+        Routing Module
+             Encoder                                                                              Teacher Model
+                                                                                                   (Transformer)
+ The_ca t
+                        Encoder         Embeding Alignment             Embedding
+      Student Model                            MSE Loss
+           (H-Net)
+
+Figure 1. Overview of the Two-Stage Distillation Framework. Stage 1: Progressive Knowledge Distillation includes: (a) Embedding
+Alignment to map byte patches to the token space (Lalign); (b) Joint Distillation to synchronize hidden states and logits (Ldistill); (c)
+Boundary Learning to align tokenization via the One-Byte Lookahead Router (Lboundary). Stage 2: Full Byte-Level SFT enables
+end-to-end generation in the byte space via Dechunk and Decoder modules.
+
+Such recipe can be easily extended to other hierarchical           representations with the teacher model’s semantic space and
+byte models. Here we provide a short overview for H-Net            allow the model to generate end-to-end in the byte space
+architecture.                                                      (4.2).
+
+H-Net is a U-Net-like architecture crafted for multi-              4.1. Student Model Architecture Design
+granularity sequence modeling. As illustrated in left hand
+side of Figure 1, it employs a hierarchical data flow: raw         4.1.1. ONE-BYTE LOOKAHEAD ROUTING
+byte sequences are first processed by an encoder, com-
+pressed into a much shorter sequence of latent chunks (e.g.        In standard dynamic chunking, the start of a chunk is typ-
+group of bytes), and then expanded back to the original            ically identified as the boundary. However, to align with
+byte-level resolution using a decoder.                             the tokenization behavior, it is more intuitive to define the
+                                                                   boundary at the end of each chunk. To achieve this, we
+The core of this architecture is the Dynamic Chunking mech-        introduce a one-byte lookahead mechanism in the Routing
+anism. A routing module predicts the adaptive boundary             Module.
+probabilities for each position, segmenting the sequence into
+compressed representations that encapsulate higher-level           Instead of predicting the boundary probability p based solely
+semantic information. During reconstruction, a smooth-             on the current state, our router computes the similarity be-
+ing module interpolates these representations to restore the       tween the current byte hidden state xcurr and the next byte
+original resolution while maintaining end-to-end differentia-      hidden state xnext as follows:
+bility. To preserve fine-grained details, H-Net integrates a
+residual connection that projects the initial encoder outputs                     1          xc⊤urrxnext             (1)
+directly to the dechunking stage, effectively bridging the             p=1− ·
+gap between the local byte-level features and the global                                     2 ∥xcurr∥∥xnext∥
+context.
+                                                                   On top of which a boundary indicator b = I(p ≥ 0.5) is
+4. Methodology                                                     derived, which marks the end of a chunk. This lookahead
+                                                                   mechanism ensures that the hidden state for each byte ag-
+In this section, we introduce our main distillation recipe. We     gregates information up to the closure of the current chunk
+start by illustrating the adaptions made to the original H-Net     before entering the core transformer.
+architecture (student model), which ensures alignment that
+is essential for distillation (4.1). Subsequently, we propose      4.1.2. DECODING STRATEGY
+a two-stage framework to systematically align byte-level
+                                                                   Although the one-byte lookahead routing described above
+                                                                   is effective during the parallel prefill stage, it hinders au-
+                                                                   toregressive generation as future bytes are unavailable. To
+
+                                                                3
+Distilling Token-Trained Models into Byte-Level Models
+
+reconcile the need for lookahead with the causality con-              teacher model to a byte-level student model. As illustrated
+straints of inference, we explore two distinct strategies to          in our pipeline in Figure 1, this framework is structured into
+predict boundaries in decoding.                                       two distinct phases: Stage 1, which focuses on progressive
+                                                                      representation alignment and boundary learning; and Stage
+Joint Boundary Prediction (JBP). A straightforward ap-                2, which transitions the model to generate entirely in the
+proach, introduced in Bolmo (Minixhofer et al., 2025a),               byte space.
+encodes boundary information directly into the output vo-
+cabulary. Specifically, the decoder’s vocabulary is expanded          4.2.1. STAGE 1: PROGRESSIVE KNOWLEDGE
+to Vtotal = Vbyte × 2, where each byte is paired with a bound-                DISTILLATION
+ary indicator. At each generation step t, the model predicts
+a logit yt ∈ 0, . . . , 511 that jointly represents the next byte     The main challenges in the distillation process are the vo-
+and its boundary status: values in [0, 256) indicate an inter-        cabulary and sequence length mismatch: while the teacher
+nal byte, while values in [256, 512) mark a chunk boundary.           model operates on discrete semantic tokens, the student
+The model is trained end-to-end to generate directly in this          model must learn to derive these chunks from raw byte
+augmented space.                                                      sequences. To address this, we design three specific loss
+                                                                      objectives to align the student model’s embedding space,
+Multi-Byte Prediction (MBP). Alternatively, we propose                semantic probabilities, and boundary decisions with those
+a Multi-Byte Prediction mechanism designed to explicitly              of the teacher model, which are illustrated in the middle of
+simulate the lookahead behavior of the router during infer-           Figure 1.
+ence. Because our routing logic relies on comparing the
+current byte with the next byte to determine a boundary, we           Loss Definitions. First, to handle mismatches, we define the
+introduce an auxiliary language modeling head alongside
+the primary head.                                                     Embedding Alignment Objective (Lalign). For a byte span
+
+At time step t, whereas the primary head predicts the next            corresponding to a token tk, we minimize the difference
+byte xt+1, the auxiliary MBP head is trained to predict
+the next-next byte xt+2. This auxiliary prediction serves             between the hidden state of the student model encoder at the
+a specialized purpose: it provides a proxy for the future
+state required by the routing module. By feeding the pre-             boundary byte eˆk and the static embedding of the teacher
+dicted embedding of xt+2 into the router, the model can
+compute the boundary probability for xt+1 using the same              model ek:
+look-ahead logic, effectively maintaining consistency be-
+tween training and inference without violating causality.                                Lalign = ∥ek − eˆk∥22  (2)
+
+4.1.3. ENSURING GENERATION CAUSALITY WITH                             Second, to further transfer capabilities of teacher model, we
+        SHIFTED UP-SAMPLING                                           employ the Teacher-Forced Distillation Objective (Ldistill).
+                                                                      By utilizing the teacher model’s segmentation boundaries
+To map chunk-level representations back to the byte space,            to synchronize the sequence lengths, we minimize the KL
+we employ a Dechunk module that upsamples chunk rep-                  divergence between the student model’s and teacher model’s
+resentations H = [h1, . . . , hN ] into byte-level states U =         output distributions:
+[u1, . . . , uL]. Because each chunk representation hk aggre-
+gates information from its entire chunk, na¨ıvely broadcast-                                      N
+ing it to all corresponding byte positions would leak future
+information (Pagnoni et al., 2024).                                          Ldistill = DKL(PT (·|t<k)∥PS (·|x<pos(k))) (3)
+
+Following the dynamic pooling strategy of (Nawrot et al.,                                       k=1
+2023b), we avoid this issue by revealing hk only at the
+final byte of the k-th chunk. For non-final bytes, the model          Here, N denotes the total number of tokens in the se-
+instead uses the representation of the previous chunk (or a           quence, t<k represents the teacher model’s prefix tokens,
+learned NULL state for the first chunk). This preserves the           and x<pos(k) corresponds to the student model’s byte se-
+autoregressive property while providing maximal context at            quence up to the boundary index of the k-th token.
+chunk boundaries.
+                                                                      Third, to enable autonomous tokenization, we introduce the
+4.2. Two-stage Distillation Framework                                 Boundary Learning Objective (Lboundary), where the Routing
+                                                                      Module is trained to predict token boundaries via binary
+With the modification to H-Net, we propose a unified                  classification on each byte:
+framework for transferring knowledge from a token-trained
+                                                                      Lboundary  =  1L        [yi log(pi) + (1 − yi) log(1 − pi)] (4)
+                                                                                    −
+                                                                                      L  i=1
+
+                                                                      where L is the total length of the byte sequence, yi ∈ {0, 1}
+                                                                      is the ground-truth boundary label derived from the teacher
+                                                                      tokenizer, and pi is the predicted probability that byte i is a
+                                                                      boundary.
+
+                                                                   4
+Distilling Token-Trained Models into Byte-Level Models
+
+Optimization Strategy. While a holistic objective Ltotal =          byte boundaries.
+λ1Lalign + λ2Ldistill + λ3Lboundary, as adopted in (Minix-
+hofer et al., 2025a), is theoretically possible, it often leads     Second, the two methods adopt distinct distillation
+to training instability due to the competition between bound-       paradigms. Bolmo follows an end-to-end formulation in
+ary learning and semantic alignment and requires extensive          which the student model is trained to directly approximate
+hand-tuning of multiple hyperparameters.                            the target byte-level distribution. In contrast, our approach
+                                                                    introduces a deliberate intermediate stage, allowing the stu-
+In contrast, our framework adopts a sequential curriculum           dent model to first learn to dynamically group raw bytes
+that eliminates these sensitivities:                                into chunks while generating outputs in the token space. By
+                                                                    retaining the teacher model’s token-level LM head during
+1. Encoder Alignment: Optimize Lalign to establish a foun-          Stage 1, we explicitly align the student with the teacher’s
+   dational mapping from bytes to the teacher model’s               token-level distribution before transitioning to fully byte-
+   space.                                                           level generation in the final stage.
+
+2. Joint Distillation: Train the Encoder and Core Trans-            5. Experiments
+   former using Ldistill to adapt the backbone to byte-derived
+   representations.                                                 Our experiments aim to verify the data efficiency of our two-
+                                                                    stage curriculum and the plasticity of the model for post-
+3. Boundary Learning: Freeze the backbone and optimize              training. Following the setup in Section 5.1, Section 5.2
+   Lboundary to finalize the Routing Module.                        demonstrates our framework’s superior performance against
+                                                                    baselines such as BLT and H-Net, highlighting the critical
+This curriculum ensures that each module is trained on              role of the intermediate alignment stage. Finally, Section
+top of a stable representation, making the framework highly         5.3 validates the model’s extensibility through standard on-
+robust and generalizable to diverse models without extensive        policy optimization.
+hyperparameter searching.
+                                                                    5.1. Experimental Setup
+Upon completion of this stage, the student model success-
+fully learn to dynamically group raw bytes into chunks and          Models and Architecture. To evaluate the universality
+generate in the token space.                                        of the proposed approach, experiments are conducted two
+                                                                    open-weight model families: Llama-3.2 3B and Qwen-3 4B.
+4.2.2. STAGE 2: SFT FOR BYTE-TO-BYTE MODELING                       These models function as token-trained LM teacher models.
+                                                                    In the student models, the core transformer layers and lan-
+The student model after Stage 1 still relies on a token LM          guage modeling head are initialized with the corresponding
+head for generation, necessitating the subsequent stage for         teacher model’s weights. Notice that all the models employ
+end-to-end byte generation. We replace the token LM head            JBP decoding strategy mentioned in Sec 4.1.2. A detailed
+with Dechunk and Decoder modules and train the model                ablation study about these decoding strategy can be found
+using the Next Byte Prediction loss.                                in Sec 6.2. The detailed model configurations are provided
+                                                                    in Appendix E.
+This process follows a two-step fine-tuning process. First,
+we perform Head Adaptation, training only the newly ini-            Training Data. We utilize the FineWeb dataset (Penedo
+tialized Dechunk and Decoder modules to align with the              et al., 2024) for all training phases. Stage 1 is conducted on a
+distilled backbone representations. Subsequently, we pro-           30B byte subset (approximately 7B tokens), which provides
+ceed to end-to-end fine-tuning, where all parameters are            sufficient semantic coverage for knowledge transfer. For
+unfrozen to optimize the entire model. This ensures that            Stage 2, we further employ 95B bytes of data to refine the
+the model retains the linguistic richness acquired in Stage 1       model’s autonomous generation capabilities. In total, our
+while gaining the flexibility of pure byte-level modeling.          framework requires only 125B bytes of training data.
+
+4.2.3. COMPARISON WITH BOLMO                                        Evaluation Metrics. The performance is evaluated on
+                                                                    a comprehensive suite of downstream benchmarks: Hel-
+Our framework diverges from the approach introduced in              laSwag (Zellers et al., 2019), PIQA (Bisk et al., 2019),
+Bolmo (Minixhofer et al., 2025a) in two fundamental re-             ARC-Easy, ARC-Challenge (Clark et al., 2018), Wino-
+spects.                                                             Grande (Sakaguchi et al., 2019), OpenBookQA (Mihaylov
+                                                                    et al., 2018), and Massive Multitask Language Understand-
+First, while Bolmo attempts to perform distillation in a            ing (MMLU) (Hendrycks et al., 2021). We do all of the
+single, end-to-end step, our framework decomposes this              evaluations using lm-evaluation-harness (Gao et al., 2024)
+process into a sequential curriculum. We explicitly sepa-           for reproducibility.
+rate representation alignment and capability transfer from
+boundary learning: the model first aligns encoder repre-
+sentations and transfers capabilities from the teacher, after
+which the backbone is frozen to focus on learning dynamic
+
+                                                                 5
+                          Distilling Token-Trained Models into Byte-Level Models
+
+Table 1. Main Results: Comparison of Byte-Level Distillation Methods. We evaluate our two-stage recipe against leading baselines
+across various model families. Avg Drop measures the mean performance degradation relative to each method’s respective token-trained
+teacher model. Compared to existing baselines, our approach achieves higher performance retention using fewer training bytes.
+
+Method                   Role / Model        Bytes  LMB      HellA  PIQA  Task Performance  Open  MMLU   Retention
+                                                                          ARC-E ARC-C WINO              Avg Drop ↓
+
+                                             Existing Leading Baselines
+
+BLT Distill              Teacher (Llama 2 7B) - - 80.7 80.7 83.4 55.2 -                     - 66.3      -
+
+(Pagnoni et al., 2024) Student (Byte)        220B - 76.1 77.4 66.6 45.8 -                   - 63.7      7.34
+
+ALM                      Teacher (Llama 3.2 3B) - - - 76.9 -                        43.9 -  - 62.4      -
+
+(Minixhofer et al., 2025b) Student (Byte)    - - - 73.7 - 40.1 -                            - 55.9      4.50
+
+H-Net Distill            Teacher (Llama 3.2 3B) - 70.1 73.7 76.8 74.5 46.0 66.5 41.4 56.1               -
+
+(Hwang et al., 2025)     Student (Byte)      189B 63.4 70.2 76.1 72.1 43.3 66.5 41.4 51.9               9.85
+
+                                             Ours: Two-stage Distillation Pipeline
+
+Ours                     Teacher (Baseline)  - 70.1 73.7 76.8 74.6 46.0 66.5 41.4 56.0                  -
+(Llama 3.2 3B)
+                         Ours (Stage 1)      30B 69.5 72.9 76.1 73.6 43.9 67.2 41.1 51.6                1.15
+
+                         Ours (Stage 2)      95B 69.3 71.2 73.7 69.5 41.9 65.9 39.4 51.8                2.80
+
+Ours                     Teacher (Baseline)  - 69.1 73.6 77.7 78.9 51.3 70.4 40.6 73.0                  -
+(Qwen 3 4B)
+                         Ours (Stage 1)      30B 68.4 72.5 77.0 76.8 50.2 69.0 40.2 66.8                1.71
+
+                         Ours (Stage 2)      95B 66.2 69.7 75.4 77.1 52.6 66.4 41.2 68.5                2.19
+
+Table 2. Impact of On-Policy Distillation in Stage 1. We compare the Llama-3.2 3B Instruct teacher model with its byte-level student
+model before and after on-policy distillation. On-Policy distillation improving performance across nearly all benchmarks and narrowing
+the gap with the teacher.
+
+                Model Phase Role LMB HellA PIQA ARC-E ARC-C WINO Open MMLU
+
+                Baseline  Teacher 65.98 70.40 75.79 74.03                 45.82     67.64 36.00 59.68
+                                                                          43.52     65.98 36.20 52.52
+                Stage I   Student 49.16 69.09 75.24 72.01                 45.05     66.93 36.00 54.64
+
+                + On-Policy Student 55.95 69.44 76.06 72.52
+
+Hyperparameters. Across all training stages, we utilize         Analysis of Distillation Dynamics. We further plot the
+the AdamW optimizer with a cosine decay schedule and a          training dynamics in Stage 1. Figure 2 presents the evalua-
+weight decay of 0.1. The detailed hyperparameter configu-       tion accuracy during Step 1 (Encoder Alignment) and Step 2
+rations for each stage are provided in Appendix E.              (Joint Distillation).
+
+5.2. Effectiveness of the Proposed Recipe                       Step 1 (Rapid Alignment): The sharp increase to the left
+                                                                of the dash line demonstrates that aligning the encoder with
+5.2.1. PERFORMANCE OF STAGE 1                                   the teacher model’s static embedding space effectively solve
+                                                                the boundary misalignment. This process is sufficient to
+Comparison with Leading Baselines. We evaluated our             recover the performance of surface-level tasks (e.g., PIQA)
+method against leading byte-level distillation baselines:       with less than 5 B bytes of data.
+BLT (Pagnoni et al., 2024), ALM (Minixhofer et al., 2025b),
+and H-Net (Hwang et al., 2025). Given the differences in        Step 2 (Reasoning Transfer): The shift to joint distillation
+base model capabilities, we report Avg Drop to isolate dis-     is crucial for complex reasoning. While simple tasks reach
+tillation efficiency from the varying strengths of teacher      a plateau, knowledge-intensive tasks such as MMLU and
+models, which is defined as the mean accuracy reduction         ARC-Challenge continue to show growth in performance.
+of the student model relative to its specific teacher model     This confirms that while embedding alignment addresses
+across all tasks.                                               modality, sequence-level distillation is vital for inheriting
+                                                                deep-semantic reasoning.
+As shown in Table 1, our approach results in the lowest
+performance drop across all benchmarks. For Llama-3.2 3B        Data Efficiency. Table 1 shows the relationship between
+and Qwen-3 4B, the degradation is limited to just 1.15 and      training data volume and accuracy. Our method achieves
+1.71 points, respectively, outperforming BLT (7.34 drop)        convergence with 30B bytes, a six-fold reduction from H-
+and ALM (4.50 drop). Compared with H-Net, our student           Net’s 189B bytes, while matching its downstream perfor-
+model achieves better retention with less data.                 mance.
+
+                                                             6
+                                    Distilling Token-Trained Models into Byte-Level Models
+
+Table 3. Necessity of Stage 1 Embedding Alignment. We conduct an ablation using Llama-3.2 3B to evaluate the impact of embedding
+alignment before full distillation. Results show that omitting embedding alignment leads to a significant performance collapse across all
+benchmarks, confirming it as a critical foundation for our recipe.
+
+               Method               LMB HellA PIQA ARC-E ARC-C WINO Open
+
+               Baseline             69.9 73.8 76.7 74.6 46.8 67.4 41.4
+
+               Distill              70.7 73.6 76.2 74.3 44.9 69.4 41.2
+
+               Distill w/o emb 31.2 46.7 58.8 37.0 21.6 60.3 33.4
+
+Table 4. Comparison of Decoding Strategies. We evaluate Joint Boundary Prediction (JBP) versus Multi-Byte Prediction (MBP) using
+the Qwen-based student model. Although MBP shows marginal gains on some common-sense tasks, JBP exhibits superior robustness in
+complex reasoning, as evidenced by the substantial performance lead in GSM8.
+
+          Decoding Strategy  LMB    HellA  PIQA         ARC-E          ARC-C   WINO   Open  MMLU    GSM8K
+
+          JBP                66.2    69.7   75.4          77.1           52.6   66.4  41.2    68.4    53.5
+          MBP                66.7    70.3   74.8          77.8           53.4   66.5  38.2    69.2    37.4
+
+          0.9                             Step 2:                      dent model, confirming our two-stage distillation pipeline’s
+                         Step 1:    Joint Distillation                 effectiveness over previous SFT approaches.
+
+                 Encoder Alignment                                     5.3. Applicability of Post-Training Techniques
+          0.8
+                                                                       To further validate the extensibility of our framework, we
+          0.7                                                          explore whether the Stage 1 model can be enhanced using
+                                                                       standard post-training techniques. Specifically, we seek
+Accuracy  0.6                                                          to determine whether the model can benefit from on-policy
+                                                                       optimization to further address performance gaps or enhance
+          0.5                                                          reasoning capabilities.
+
+          0.4                              PIQA                        Methodology. We adapt a hybrid approach that integrates
+                                                                       GOLD (Patin˜o et al., 2025) with On-Policy Distillation (Lu
+                                           Hellaswag                   & Lab, 2025). Although GOLD facilitates token-to-byte dis-
+                                                                       tillation, its theoretical effectiveness is linked to an overlap
+          0.3                              ARC-C                       of the vocabularies of the models. This is where the archi-
+                                                                       tectural strength of the Stage 1 student model becomes ap-
+                                           MMLU                        parent. The learned Routing Module achieves exceptionally
+                                                                       high boundary detection accuracy compared to the teacher
+          0.2                                                          model, ensuring that the student model’s dynamic segmenta-
+              1 3 5 7 9 11 13 15 17 19                                 tion trajectory closely aligns with that of the teacher model.
+                                                                       This precise alignment meets the requirements of the GOLD
+               Training Amount (Billions of Bytes)                     algorithm, allowing for effective on-policy learning despite
+                                                                       architectural differences.
+Figure 2. Training Dynamics across Stage 1. We track student
+performance in Stage 1. While simple tasks (e.g., PIQA) converge       In our implementation, we employ a subset of 77k prompts
+rapidly during Encoder Alignment (Step 1), knowledge-intensive         from the Tulu V3 Mix dataset (Lambert et al., 2024). We
+tasks like MMLU exhibit a distinct phase transition, requiring         unfrozen the entire Stage 1 model and optimized it using
+the distribution matching of Joint Distillation (Step 2) to unlock     AdamW with a learning rate of 2 × 10−5 and a cosine decay
+performance gains.                                                     schedule. To maintain the stability of the Routing Mod-
+                                                                       ule during these updates, we integrated the Binary Cross-
+5.2.2. PERFORMANCE OF STAGE 2                                          Entropy (BCE) loss from Stage 1 as an auxiliary objective.
+                                                                       We utilized Llama-3.2 3B Instruct model as the teacher
+We summarize the comparison between our Stage 2 model                  model to assess the transfer of instruction following and the
+and baseline results in Table 1. The results show superior             reasoning capabilities of the model.
+capability retention of our recipe versus baseline methods.
+Our Llama-3.2 3B student model restricts Avg Drop to 2.80,             Results. As illustrated in Table 2, the implementation of
+outperforming H-Net Distill (9.85), BLT Distill (7.34), and            GOLD and On-Policy distillation consistently boosts per-
+ALM (4.50). This indicates effective mitigation of repre-
+sentation collapse in byte-level adaptation. Our method
+achieves this alignment with higher data efficiency than
+these baselines. The robustness extends across architectures,
+shown by low degradation (2.19) in our Qwen-3 4B stu-
+
+                                                                    7
+                                              Distilling Token-Trained Models into Byte-Level Models
+
+Table 5. Impact of Encoder Architecture. We compare the performance of Mamba2 against a standard Transformer encoder. Results
+indicate that the Transformer’s attention mechanism struggles to align fine-grained byte sequences with high-level semantic embeddings,
+leading to a significant performance collapse, particularly on knowledge-intensive benchmarks like MMLU.
+
+                              Encoder LMB HellA PIQA ARC-E ARC-C WINO Open MMLU
+                              Mamba2 67.8 73.5 78.2 77.1 49.7 69.5 40.0 70.2
+                              Transformer 45.7 68.3 73.3 69.4 44.5 66.2 37.4 31.3
+
+formance across various benchmarks. This enhancement               The results are summarized in Table 4. While MBP achieves
+is particularly pronounced in reasoning tasks, which effec-        marginal gains on several benchmarks (e.g., +0.8% on
+tively aids in knowledge recovery, reducing the performance        MMLU), it suffers from a performance degradation on
+gap on demanding tasks such as MMLU by increasing the              GSM8K (Cobbe et al., 2021) (53.5% vs. 37.4%). This re-
+score from 52.52 to 54.64. These findings indicate that the        sult directly indicates that the MBP decoding mechanism is
+Stage 1 architecture offers a solid foundation that is fully       ineffective for long-horizon autoregressive generation. The
+compatible with advanced optimization techniques.                  reliance on an auxiliary head and similarity-based routing
+                                                                   struggles to maintain the coherence required for complex
+6. Ablation Study                                                  reasoning chains.
+
+6.1. Necessity of Embedding Alignment                              Consequently, we adopt JBP as the default strategy to ensure
+                                                                   the model’s capabilities.
+In Stage 1, our framework employs a sequential optimiza-
+tion strategy comprising three steps: embedding alignment,         6.3. Impact of Encoder Architecture
+distillation, and boundary learning. To assess the neces-
+sity of the initial embedding alignment step, we conduct an        A pivotal design choice in this framework is the selection
+ablation study using Llama-3.2 3B as the teacher model.            of Mamba2 as the encoder. To substantiate this decision, an
+                                                                   ablation study is conducted in which the Mamba2 block is
+Experimental Setup. We compare two configurations un-              substituted with a standard transformer of equivalent param-
+der a fixed compute budget of 20B bytes: (1) Distill (Se-          eter size. Both encoder variants are trained using the same
+quential): The model underwent 10B bytes of embedding              Step 1 (Embedding Alignment) protocol on Qwen-3 4B.
+alignment, followed by 10B bytes of distillation. (2) Distill
+w/o emb: The model skips the alignment step and under-             Performance Collapse of Attention. Table 5 shows signifi-
+goes 20B bytes of direct distillation. For both settings, the      cant differences in alignment quality. The Mamba2 encoder
+learning rates are consistently set to 1 × 10−3 for the en-        achieves high fidelity (70.2 MMLU), while the transformer
+coder and 2×10−5 for the main transformer. The evaluation          variant shows performance decline in knowledge-intensive
+results for multiple benchmarks are presented in Table 3.          tasks (31.3 MMLU). This disparity stems from byte se-
+                                                                   quences characteristics. Raw byte streams are longer than
+Analysis. The result reveals that omitting the embedding           token sequences, reducing attention mechanism’s ability to
+alignment results in catastrophic failure in knowledge trans-      capture semantic structures, while the State Space Model
+fer. The Distill w/o emb variant exhibits a drastic perfor-        (SSM) backbone of Mamba2 can effectively compresses
+mance decline, with the LMB score decreasing from 70.7             these signals into meaningful latent states.
+to 31.2.
+                                                                   7. Conclusion
+This collapse highlights a key challenge in token-to-byte dis-
+tillation: byte-level student model and token-trained teacher      In this paper, we propose a practical two-stage distillation
+model initially occupy different latent spaces. Without em-        framework that converts pretrained token-based LLMs into
+bedding alignment to bridge this gap, the student model’s          byte-level models while preserving most of their capabilities.
+transformer cannot interpret latent states during distilla-        Our method is effective across multiple model families, in-
+tion. Anchoring the student model’s embedding space to the         cluding Llama, Qwen, and OLMo, and achieves competitive
+teacher model’s enables effective transfer of capabilities.        performance using only 125B training bytes, substantially
+                                                                   lowering the cost of building scalable BLMs.
+6.2. Ablation Study on Decoding Strategy
+                                                                   8. Impact Statement
+We investigate the impact of the decoding strategy used
+in Stage 2. Specifically, we compare the JBP and MBP               This paper presents work whose goal is to advance the field
+strategies, as detailed in Section 4.1.2.                          of machine learning. There are many potential societal
+
+                                                                8
+Distilling Token-Trained Models into Byte-Level Models
+
+consequences of our work, none of which we feel must be             Hwang, S., Wang, B., and Gu, A. Dynamic chunking for
+specifically highlighted here.                                         end-to-end hierarchical sequence modeling, 2025. URL
+                                                                       https://arxiv.org/abs/2507.07955.
+References
+                                                                    Kasai, J., Peng, H., Zhang, Y., Yogatama, D., Ilharco, G.,
+Bisk, Y., Zellers, R., Bras, R. L., Gao, J., and Choi, Y.              Pappas, N., Mao, Y., Chen, W., and Smith, N. A. Fine-
+   Piqa: Reasoning about physical commonsense in natural               tuning pretrained transformers into rnns. arXiv preprint
+   language, 2019. URL https://arxiv.org/abs/                          arXiv:2103.13076, 2021.
+  1911.11641.
+                                                                    Katharopoulos, A., Vyas, A., Pappas, N., and Fleuret, F.
+Clark, P., Cowhey, I., Etzioni, O., Khot, T., Sabharwal,              Transformers are rnns: Fast autoregressive transformers
+  A., Schoenick, C., and Tafjord, O. Think you have                   with linear attention. In International conference on ma-
+   solved question answering? try arc, the ai2 reasoning               chine learning, pp. 5156–5165. PMLR, 2020.
+   challenge, 2018. URL https://arxiv.org/abs/
+  1803.05457.                                                       Lambert, N., Morrison, J., Pyatkin, V., Huang, S., Ivison,
+                                                                       H., Brahman, F., Miranda, L. J. V., Liu, A., Dziri, N., Lyu,
+Cobbe, K., Kosaraju, V., Bavarian, M., Chen, M., Jun, H.,              S., Gu, Y., Malik, S., Graf, V., Hwang, J. D., Yang, J.,
+   Kaiser, L., Plappert, M., Tworek, J., Hilton, J., Nakano,           Bras, R. L., Tafjord, O., Wilhelm, C., Soldaini, L., Smith,
+   R., et al. Training verifiers to solve math word problems.          N. A., Wang, Y., Dasigi, P., and Hajishirzi, H. Tu¨lu 3:
+   arXiv preprint arXiv:2110.14168, 2021.                              Pushing frontiers in open language model post-training.
+                                                                       2024.
+Dao, T. and Gu, A. Transformers are ssms: Generalized
+   models and efficient algorithms through structured state         Lu, K. and Lab, T. M. On-policy distillation. Thinking
+   space duality, 2024. URL https://arxiv.org/                        Machines Lab: Connectionism, 2025. doi: 10.64434/tml.
+   abs/2405.21060.                                                     20251026. https://thinkingmachines.ai/blog/on-policy-
+                                                                       distillation.
+Egli, E., Manica, M., and Born, J. Multiscale byte
+   language models–a hierarchical architecture for causal           Mihaylov, T., Clark, P., Khot, T., and Sabharwal, A. Can
+   million-length sequence modeling. arXiv preprint                    a suit of armor conduct electricity? a new dataset for
+   arXiv:2502.14553, 2025.                                             open book question answering, 2018. URL https://
+                                                                       arxiv.org/abs/1809.02789.
+Gao, L., Tow, J., Abbasi, B., Biderman, S., Black, S., DiPofi,
+  A., Foster, C., Golding, L., Hsu, J., Le Noac’h, A., Li,          Minixhofer, B., Murray, T., Limisiewicz, T., Korhonen, A.,
+   H., McDonell, K., Muennighoff, N., Ociepa, C., Phang,               Zettlemoyer, L., Smith, N. A., Ponti, E. M., Soldaini, L.,
+  J., Reynolds, L., Schoelkopf, H., Skowron, A., Sutawika,             and Hofmann, V. Bolmo: Byteifying the next generation
+   L., Tang, E., Thite, A., Wang, B., Wang, K., and Zou, A.            of language models, 2025a. URL https://arxiv.
+  The language model evaluation harness, 07 2024. URL                  org/abs/2512.15586.
+   https://zenodo.org/records/12608602.
+                                                                    Minixhofer, B., Vulic´, I., and Ponti, E. M. Universal
+Grattafiori, A., Dubey, A., Jauhri, A., et al. The llama 3             cross-tokenizer distillation via approximate likelihood
+   herd of models, 2024. URL https://arxiv.org/                        matching, 2025b. URL https://arxiv.org/abs/
+   abs/2407.21783.                                                     2503.20083.
+
+Hendrycks, D., Burns, C., Basart, S., Zou, A., Mazeika,             Nawrot, P., Tworkowski, S., Tyrolski, M., Kaiser, Ł., Wu, Y.,
+   M., Song, D., and Steinhardt, J. Measuring massive                  Szegedy, C., and Michalewski, H. Hierarchical transform-
+   multitask language understanding, 2021. URL https:                  ers are more efficient language models. In Findings of
+  //arxiv.org/abs/2009.03300.                                          the Association for Computational Linguistics: NAACL
+                                                                      2022, pp. 1559–1571, 2022.
+Hinton, G., Vinyals, O., and Dean, J. Distilling the
+   knowledge in a neural network, 2015. URL https:                  Nawrot, P., Chorowski, J., Lancucki, A., and Ponti, E. M.
+  //arxiv.org/abs/1503.02531.                                          Efficient transformers with dynamic token pooling. In
+                                                                      Proceedings of the 61st Annual Meeting of the Associ-
+Ho, N., Bae, S., Kim, T., Jo, H., Kim, Y., Schuster, T., Fisch,        ation for Computational Linguistics (Volume 1: Long
+  A., Thorne, J., and Yun, S.-Y. Block transformer: Global-           Papers), pp. 6403–6417. Association for Computational
+   to-local language modeling for fast inference. Advances             Linguistics, 2023a. doi: 10.18653/v1/2023.acl-long.
+   in Neural Information Processing Systems, 37:48740–                 353. URL http://dx.doi.org/10.18653/v1/
+  48783, 2024.                                                         2023.acl-long.353.
+
+                                                                 9
+Distilling Token-Trained Models into Byte-Level Models
+
+Nawrot, P., Chorowski, J., Lancucki, A., and Ponti, E. M.         Yang, A., Li, A., Yang, B., Zhang, B., Hui, B., Zheng,
+   Efficient transformers with dynamic token pooling. In             B., Yu, B., Gao, C., Huang, C., Lv, C., Zheng, C., Liu,
+  Proceedings of the 61st Annual Meeting of the Associ-              D., Zhou, F., Huang, F., Hu, F., Ge, H., Wei, H., Lin,
+   ation for Computational Linguistics (Volume 1: Long               H., Tang, J., Yang, J., Tu, J., Zhang, J., Yang, J., Yang,
+  Papers), pp. 6403–6417, 2023b.                                    J., Zhou, J., Zhou, J., Lin, J., Dang, K., Bao, K., Yang,
+                                                                     K., Yu, L., Deng, L., Li, M., Xue, M., Li, M., Zhang,
+OLMo, T., Walsh, P., Soldaini, L., Groeneveld, D., Lo, K.,           P., Wang, P., Zhu, Q., Men, R., Gao, R., Liu, S., Luo,
+  Arora, S., Bhagia, A., Gu, Y., Huang, S., Jordan, M.,              S., Li, T., Tang, T., Yin, W., Ren, X., Wang, X., Zhang,
+   et al. 2 olmo 2 furious. arXiv preprint arXiv:2501.00656,        X., Ren, X., Fan, Y., Su, Y., Zhang, Y., Zhang, Y., Wan,
+   2024.                                                            Y., Liu, Y., Wang, Z., Cui, Z., Zhang, Z., Zhou, Z., and
+                                                                     Qiu, Z. Qwen3 technical report, 2025. URL https:
+Olmo, T., Ettinger, A., Bertsch, A., Kuehl, B., Graham,             //arxiv.org/abs/2505.09388.
+   D., Heineman, D., Groeneveld, D., Brahman, F., Tim-
+   bers, F., Ivison, H., et al. Olmo 3. arXiv preprint            Yu, L., Simig, D., Flaherty, C., Aghajanyan, A., Zettlemoyer,
+   arXiv:2512.13961, 2025.                                           L., and Lewis, M. Megabyte: Predicting million-byte se-
+                                                                     quences with multiscale transformers. Advances in Neu-
+Pagnoni, A., Pasunuru, R., Rodriguez, P., Nguyen, J.,                ral Information Processing Systems, 36:78808–78823,
+   Muller, B., Li, M., Zhou, C., Yu, L., Weston, J., Zettle-         2023.
+   moyer, L., Ghosh, G., Lewis, M., Holtzman, A., and
+   Iyer, S. Byte latent transformer: Patches scale bet-           Zellers, R., Holtzman, A., Bisk, Y., Farhadi, A., and
+   ter than tokens, 2024. URL https://arxiv.org/                     Choi, Y. Hellaswag: Can a machine really finish your
+   abs/2412.09871.                                                   sentence?, 2019. URL https://arxiv.org/abs/
+                                                                    1905.07830.
+Patin˜o, C. M., Rasul, K., Galloue´dec, Q., Burtenshaw, B.,
+   Paniego, S., Srivastav, V., Frere, T., Beeching, E., Tun-
+   stall, L., von Werra, L., and Wolf, T. Unlocking on-policy
+   distillation for any model family, 2025.
+
+Penedo, G., Kydl´ıcˇek, H., allal, L. B., Lozhkov, A., Mitchell,
+   M., Raffel, C., Werra, L. V., and Wolf, T. The fineweb
+   datasets: Decanting the web for the finest text data at
+   scale. In The Thirty-eight Conference on Neural Informa-
+   tion Processing Systems Datasets and Benchmarks Track,
+   2024. URL https://openreview.net/forum?
+   id=n6SCkn2QaG.
+
+Sakaguchi, K., Bras, R. L., Bhagavatula, C., and Choi, Y.
+  Winogrande: An adversarial winograd schema challenge
+   at scale, 2019. URL https://arxiv.org/abs/
+  1907.10641.
+
+Slagle, K. Spacebyte: Towards deleting tokenization from
+   large language modeling. Advances in Neural Informa-
+   tion Processing Systems, 37:124925–124950, 2024.
+
+Vaswani, A., Shazeer, N., Parmar, N., Uszkoreit, J., Jones,
+   L., Gomez, A. N., Kaiser, Ł., and Polosukhin, I. At-
+   tention is all you need. Advances in neural information
+   processing systems, 30, 2017.
+
+Wang, J., Gangavarapu, T., Yan, J. N., and Rush, A. M.
+   Mambabyte: Token-free selective state space model,
+   2024a. URL https://arxiv.org/abs/2401.
+  13660.
+
+Wang, J., Paliotta, D., May, A., Rush, A., and Dao, T. The
+   mamba in the llama: Distilling and accelerating hybrid
+   models. Advances in Neural Information Processing
+  Systems, 37:62432–62457, 2024b.
+
+10
+                                             Distilling Token-Trained Models into Byte-Level Models
+
+A. In-depth Analysis of Byte-level Robustness and Boundary Learning
+
+In this section, we provide a comprehensive evaluation of the robustness of the distilled H-Net and investigate the behavioral
+patterns of its boundary predictor.
+
+A.1. Intrinsic Byte-level Resilience
+
+Traditional LLMs depend on subword tokenization, which is inherently vulnerable to surface-level disturbances; even slight
+character-level noise can significantly change token IDs, resulting in semantic collapse. In contrast, byte-level modeling
+processes raw sequences, theoretically providing greater granularity and robustness. While our distillation framework has
+been demonstrated to effectively maintain the teacher model’s semantic performance on standard benchmarks (as discussed
+in Section 5), it is crucial to assess whether the distilled H-Net genuinely inherits the distinctive resilience characteristics of
+byte-level architectures.
+
+Following the methodology proposed in BLT (Pagnoni et al., 2024), we assess our models using the HellaSwag benchmark,
+focusing on five types of character-level perturbations: AntSpeak, Drop, Random Case, Repeat, and Uppercase. Further
+more, we add a Robustness Score proposed by H-Net (Hwang et al., 2025) as a metric, which is calculated as follows:
+
+                                perturbed accuracy − 0.25
+robustness score = 100 · max(unperturbed accuracy − 0.25, 0)       (5)
+
+As shown in Table 6, our distilled Stage 1 models demonstrate a significant level of intrinsic resilience. For Llama-3.2
+3B, while the teacher model baseline performs well on clean text, the Stage1 model achieves higher accuracy on several
+noise types, such as AntSpeak (48.78 vs. 46.62) and Drop (52.30 vs. 52.03). This indicates that the distillation process
+does more than merely replicate the teacher model’s probability distribution; it enables the H-Net to utilize its byte-to-byte
+architecture to bypass the fragility of the subword boundaries. Interestingly, the Stage2 models exhibit a decrease in
+robustness compared to Stage1, particularly in benchmarks such as AntSpeak. This suggests that while further fine-tuning
+maintains the overall performance, it may introduce a degree of boundary fragility, making the model more sensitive to
+certain structural perturbations.
+
+Table 6. Robustness Evaluation on HellaSwag. We reported zero-shot accuracy across the five perturbation types. Robustness Score is
+the harmonic mean of clean and noisy performance (higher is better). Bold indicates the best performance within each model family.
+
+Metric / Model           Qwen-3 4B            Llama-3.2 3B
+
+                  Baseline Stage1 Stage2 Baseline Stage1 Stage2
+
+HellaSwag Original 73.64 72.47 69.70 73.76 72.90 71.20
+HellaSwag Noise Avg 58.22 56.25 48.86 54.10 53.29 51.40
+
+Robustness Score  68.29 65.83 53.38 59.68 59.06 57.14
+
+Breakdown by Perturbation Type
+
+AntSpeak          59.86         57.02  45.48  46.62  48.78  38.05
+Drop              52.94         55.03  46.42  52.03  52.30  48.71
+Random Case       59.27         54.55  48.89  53.76  51.77  49.61
+Repeat            50.27         50.36  42.44  49.05  48.74  43.17
+Uppercase         68.80         64.26  61.08  69.12  64.83  62.93
+
+A.2. Boundary Analysis and Optimization Strategies
+
+Despite the intrinsic resilience observed in the intermediate distillation stage, the integration of an explicit boundary predictor
+leads to a noticeable decline in the overall robustness score compared to the teacher model baseline. To investigate this
+performance gap, we conducted a qualitative analysis of the segmentation behavior of the model under various input
+conditions.
+
+Visualization of Boundary Bias. By visualizing the predicted boundaries (see Figure 3), we discovered that the model’s
+segmentation is heavily overfitted to a specific surface pattern: it consistently predicts boundaries at the character immediately
+preceding a whitespace. This Space Bias suggests that the boundary predictor prioritizes shallow lexical cues over deep
+semantic segmentation. While this heuristic works for clean text, it becomes liable in the presence of perturbations. For
+
+                                                                        11
+Distilling Token-Trained Models into Byte-Level Models
+
+instance, in AntSpeak, the proliferation of spaces forces the model to segment at every character, whereas in Drop, the
+removal of spaces leaves the model unable to identify logical segments, thereby disrupting the downstream transformer’s
+processing.
+
+Proposed Mitigation Strategies. To alleviate this bias and force the model to learn more robust semantic-oriented
+segmentation, we propose two strategies.
+
+1. Trim Data: We fine-tune the model on a modified dataset where all whitespaces are removed, forcing the model to rely
+   on character sequences alone to determine boundaries.
+
+2. Whitespace Penalty: We introduce a penalty term in the boundary loss function to discourage the model from
+   triggering boundaries at whitespace positions, thereby encouraging the exploration of alternative semantic anchor
+   points.
+
+Results Analysis. The results in Table 7 reveal a clear trade-off between clean-text accuracy and noise invariance. The
+Trim Data strategy successfully recovers most of the robustness lost during standard boundary learning, maintaining a
+stable robustness score of 59.39. Remarkably, the Whitespace Penalty achieves the lowest sensitivity to noise (∆ = 14.45),
+effectively creating a ”noise-invariant” boundary predictor. However, this stability comes at the cost of a significant drop in
+Original performance (58.50), indicating that while penalizing space boundaries enhances resilience, it may also prevent the
+model from identifying the standard linguistic boundaries necessary for clean-text reasoning. These findings highlight the
+challenge of balancing the structural adherence and robustness in byte-level LLMs.
+
+Table 7. Evaluation of boundary optimization strategies on Llama-3.2 3B. We compare our proposed Trim Data and Whitespace Penalty
+against the teacher model baseline and the standard boundary learning stage. Delta (∆) indicates the performance gap between original
+and noisy benchmarks.
+
+Metric / Model            Llama       Llama Distill    Llama    Llama Space
+                     (Teacher Model)     Stage 1     Trim Data     Penalty
+HellaSwag Original
+HellaSwag Noise Avg        73.76           72.90        72.57       58.50
+                           54.10           53.29        53.25       44.05
+Robustness Score
+Delta (∆)                  59.68           59.06        59.39       53.66
+                           19.66           19.61        19.32       14.45
+AntSpeak
+Drop                       46.62           48.78        48.76       39.26
+Random Case                52.94           52.30        54.03       44.19
+Repeat                     53.76           51.77        51.59       43.39
+Uppercase                  49.05           48.74        48.19       41.29
+                           69.12           64.83        63.70       52.10
+
+A.3. Finetuning on Perturbed Benchmarks: A Limit Study
+
+To further investigate the performance limits and adaptation capabilities of different architectures, we conducted a supervised
+fine-tuning (SFT) experiment. We compare the subword-level Llama (Token) against our distilled byte-level H-Net (Distill)
+by fine-tuning both on the perturbed HellaSwag training set.
+
+Experimental Setup. Both models are fine-tuned for 10 epochs with a learning rate of 2 × 10−5 and a weight decay of
+0.1. This setup aims to assess whether the subword model can ”learn” to be robust through data augmentation, and how the
+byte-level model compares in this intensive adaptation scenario. The results are presented in Table 8.
+
+Analysis. The experimental results highlight the fundamental differences in the adaptability of the two architectures.
+Notably, the byte-level Llama distill model exhibited a significantly higher adaptation ceiling than its subword counterpart.
+After fine-tuning, it achieved the highest overall Robustness Score (69.93) and consistently surpassed the teacher model
+across the averaged noise metrics. Critical divergence is evident in the AntSpeak task, which serves as a litmus test for
+tokenizer rigidity. While the subword model’s performance remains stagnant at 46.59, despite ten epochs of specific
+training—underscoring a ”hard bottleneck” imposed by fixed vocabulary constraints—our byte-level model successfully
+adapts to the character-spaced inputs, increasing from 49.05 to 56.07. Furthermore, the byte-level architecture demonstrates
+superior stability to catastrophic forgetting. Whereas the subword model experiences a decline in clean-text performance
+(dropping from 73.76 to 71.90) as it struggles to accommodate noisy patterns, the distilled model maintains its original
+
+                                                                        12
+Distilling Token-Trained Models into Byte-Level Models
+
+Table 8. Comparison of subword-level (Llama token) and byte-level (Llama distill) models after fine-tuning on perturbed HellaSwag.
+Origin denotes zero-shot performance without noise-specific tuning, while Finetune denotes performance after 10 epochs of training on
+noisy data.
+
+Metric                    Token   Origin                     Finetuned
+                                 Distill Dechunk   Token Distill Dechunk
+HellaSwag Original        73.76
+HellaSwag Noise Avg       54.10  73.50      71.38  71.90 73.58   70.90
+                                 55.30      47.47  57.23 58.97   56.67
+Robustness Score          59.68
+Delta (∆)                 19.66  62.40      48.46  68.72 69.93   69.00
+                                 18.26      23.91  14.67 14.61   14.23
+AntSpeak                  46.62
+Drop                      52.03  49.05      32.32  46.59  56.07  55.64
+Random Case               53.76  56.21      49.20  59.32  58.30  51.74
+Repeat                    49.05  53.41      48.06  57.61  56.40  60.70
+Uppercase                 69.12  50.71      44.35  58.55  56.38  50.57
+                                 66.79      63.44  64.10  67.68  64.71
+
+capabilities (73.58), suggesting that its granular representation space allows the integration of noisy features without
+overwriting the structural knowledge required for standard reasoning.
+
+B. Decoupled vs. Integrated Routing Module
+
+In the proposed H-Net design, the routing module is seamlessly integrated within the encoder to utilize hidden representations
+to predict the token boundaries. However, an intriguing alternative is to consider whether the routing logic can be separated
+from the main semantic encoder to operate as an independent component. To explore this, we developed a decoupled
+routing module comprising a 4-layer Mamba2 block with a hidden dimension of 512, followed by a linear layer and sigmoid
+activation head for direct binary boundary classification from raw byte sequences. This standalone router was trained using
+the same dataset and hyperparameters as in our Stage 1 distillation process.
+
+The experimental results, as outlined in Table 9, highlight a notable performance gap between the integrated and decoupled
+approaches. Most strikingly, the Lambda task score for the split routing module falls to 39.05, marking a significant decline
+from the 58.65 achieved by our integrated Stage 1 model. This downward trend is evident across all downstream benchmarks,
+including HellaSwag, PIQA, and ARC, where the decoupled model lagged consistently.
+
+The observed decline in performance suggests that token boundaries in natural language are not merely local morphological
+features that can be captured using a shallow, independent module. Rather, the detection of these boundaries is heavily
+dependent on high-level semantic and syntactic contexts that only a fully developed encoder can provide. When the routing
+module is compelled to operate in isolation, the system loses the benefit of ”feature sharing” between representation learning
+and structural segmentation. Consequently, even minor inaccuracies in the standalone router’s predictions can result in
+significant chunking errors, leading to the subsequent encoder receiving fragmented byte segments that are no longer aligned
+with the teacher model’s original semantic space. These findings support our architectural decision to integrate the routing
+mechanism within the hierarchical encoder, because the synergy between semantic understanding and boundary discovery is
+essential for maintaining the integrity of knowledge transfer in byte-level modeling.
+
+Table 9. Comparison of performance between the integrated routing module (Stage 1) and a decoupled (Split) routing module. The
+baseline is the teacher model, Llama 3.2 3B.
+
+Method              LMB   HellA  PIQA       ARC-E   ARC-C        WINO   Open
+
+Baseline (Teacher)  69.9   73.8   76.7        74.6    46.8        67.4  41.4
+Integrated          58.7   72.9   76.1        73.6    43.9        68.0  40.2
+Split Routing       39.1   68.2   75.3        70.4    39.9        62.8  36.4
+
+                                        13
+                      Distilling Token-Trained Models into Byte-Level Models
+
+C. Teacher Model Scale during Stage 1 Alignment
+
+In the first stage of our curriculum, we focus on aligning byte-level representations with the latent space of the teacher
+model. To determine whether the scale of the teacher model plays a decisive role in this process, we evaluated three distinct
+student-teacher configurations: Llama 3.2 1B distilled from a 3B teacher model and Qwen3 0.6B and 4B distilled from their
+4B and 8B versions, respectively. The objective was to observe whether the increased capacity of a larger teacher model
+translates into more robust representational guidance for byte-level student models.
+
+The comparative results summarized in Table 10 reveal that employing a significantly larger teacher model does not offer a
+distinct advantage; rather, it frequently results in a consistent decline in performance across all evaluation metrics. Within
+the Llama and Qwen families, the standard distillation setup, in which the teacher model is of a similar scale, consistently
+produces better outcomes than larger teacher model variants.
+
+Several factors may explain why larger teacher models do not necessarily enhance distillation outcomes in this context.
+Notably, contemporary small-scale models, such as Llama 3.2 and Qwen3, often result from the extensive distillation of
+much larger ”frontier” models. This suggests that their latent spaces are highly optimized and information-dense. When
+a student model is distilled from a slightly larger model within the same family, the potential for ”knowledge gain” is
+limited, while the risk of introducing subtle representational noise or latent misalignments increases. Such discrepancies can
+complicate student models’ learning of byte-to-token mapping, ultimately affecting the overall modeling quality. These
+findings support our architectural decision to prioritize scale consistency between student models and teacher models as it
+ensures a more seamless transfer of semantic knowledge during the critical alignment phase.
+
+Table 10. Comparison of performance across different student-teacher scale configurations. ”Baseline” refers to the original subword
+model and ”Distill (Teacher X)” indicates distillation from a larger teacher model.
+
+Student Model Method  LMB HellA PIQA ARC-E ARC-C WINO Open MMLU GSM8K
+
+          Baseline    62.2 63.8 74.2 65.3 36.0 60.0 36.6 31.0 5.3
+
+Llama 3.2 1B Stage1   60.1 63.1 75.2 66.4 35.8 60.7 35.6 30.5 -
+
+          Stage1 (Teacher 3B) 56.9 61.9 75.1 66.8 34.9 59.8 35.2 30.1 -
+
+          Baseline    69.1 73.6 77.8 78.9 51.3 70.4 40.6 73.0 84.2
+
+Qwen3 4B  Stage1      69.7 73.6 77.8 78.1 50.9 70.0 40.4 71.9 79.6
+
+          Stage1 (Teacher 8B) 67.1 72.0 77.9 80.0 54.8 68.8 40.4 71.4 77.4
+
+          Baseline    53.7 53.8 69.6 65.6 38.6 59.0 34.6 52.5 46.0
+
+Qwen3 0.6B Stage1     53.5 52.8 70.1 67.3 38.1 58.3 35.6 51.1 44.4
+
+          Stage1 (Teacher 4B) 50.1 51.3 69.6 69.0 37.7 58.4 33.6 50.6 43.9
+
+D. Detailed Comparison with Bolmo and Other Baselines
+
+In this section, we extend our evaluation to include Bolmo 1B alongside other baselines such as BLT 1B and Hnet XL.
+As shown in Table 11, Bolmo 1B demonstrates strong capabilities, achieving an average accuracy of 60.3% across the
+7 downstream tasks. When comparing our fully byte-level model (Ours Stage 2) against this baseline, we observe a
+performance gap, with our model attaining an average score of 58.1%. Specifically, Bolmo 1B outperforms our Stage 2
+model on reasoning-heavy benchmarks such as ARC (59.0% vs. 55.5%) and HellaSwag (67.0% vs. 62.5%). However, our
+distilled model remains competitive on knowledge-intensive tasks, slightly surpassing Bolmo on MMLU (37.6% vs. 37.2%).
+We also note that BLT 1B remains the strongest baseline in this evaluation suite with an average score of 62.8%. These
+results provide a comprehensive view of the current landscape, highlighting that while our distillation framework effectively
+constructs a functional byte-level model, there remains room for improvement to match the performance of models trained
+with different objectives or larger computational budgets.
+
+E. Training Hyperparameters
+
+Full architecture hyperparameters are shown in Table 12, and full training in Table 13.
+
+                      14
+                  Distilling Token-Trained Models into Byte-Level Models
+
+Table 11. Performance comparison on downstream tasks. We compare our proposed models (Stage 1 & Stage 2) with Bolmo 1B, Hnet XL
+variants, BLT 1B, and the sub-word reference. The best results among byte-level models are bolded.
+
+Task        Ours (Stage 1) Ours (Stage 2) Bolmo Hnet (1-stage) Hnet (2-stage) BLT OLMo 2
+
+Avg         60.3  58.1  60.3  57.6                                        59.2  62.8 61.9
+
+ARC         60.0  55.5  59.0  61.8                                        62.3  59.9 61.4
+
+MMLU        37.6  37.6  37.2  37.5                                        38.7  40.6 40.4
+
+CSQA        65.8  62.6  64.2  61.4                                        62.4  69.2 66.0
+
+HellaSwag   65.4  62.5  67.0  60.2                                        63.6  71.0 68.9
+
+WinoGrande  63.9  63.5  65.7  58.9                                        60.9  67.0 65.2
+
+SocialIQA   53.8  52.9  54.7  50.1                                        52.9  54.6 55.1
+
+PiQA        75.7  72.3  74.9  73.6                                        74.0  77.3 76.4
+
+                  Figure 3. Visualization of Learned Token Boundaries.
+                                               15
+Distilling Token-Trained Models into Byte-Level Models
+
+              Table 12. Student model architecture details.
+
+                      H-net 4B      H-Net 3B                 H-Net 1B
+
+Global Model
+
+                      Llama 3.2 3B  Qwen 3 4B                OLMo 2 1B
+
+Encoder                     1536          1536                     1536
+   Dimension          Mamba2 + FFN  Mamba2 + FFN             Mamba2 + FFN
+   Layer Type
+   Num. Layers                 4             4                        4
+   Mamba2
+      chunk size             256           256                      256
+      d conv                   4             4                        4
+      d state                128           128                      128
+      expand                   2             2                        2
+   FFN
+      Expansion Dim.        8192          8192                     8192
+      Nonlinearity        SwiGLU        SwiGLU                   SwiGLU
+      Layer norm         RMSNorm       RMSNorm                  RMSNorm
+
+Local Decoder               1536          1536                     1536
+   Dimension          Mamba2 + FFN  Mamba2 + FFN             Mamba2 + FFN
+   Layer Type
+   Num. Layers                 4             4                        4
+   Mamba2
+      chunk size             256           256                      256
+      d conv                   4             4                        4
+      d state                128           128                      128
+      expand                   2             2                        2
+   FFN
+      Expansion Dim.        8192          8192                     8192
+      Nonlinearity        SwiGLU        SwiGLU                   SwiGLU
+      Layer norm         RMSNorm       RMSNorm                  RMSNorm
+
+                                16
+                         Distilling Token-Trained Models into Byte-Level Models
+
+                                      Table 13. Training details.
+
+                                      Llama 3.2 3B                 Qwen 3 4B     OLMo 2 1B
+
+Stage 1                                         30B                 30B                    30B
+   Total Training Bytes                          256                 256                    256
+   Batch Size                                   8192                8192                   8192
+   Seq. Length. (Bytes)               Warmup + Cos Decay  Warmup + Cos Decay     Warmup + Cos Decay
+   LR Schedule
+   Step 1                             1e-3                         1e-3          1e-3
+         Peak LR
+         Warmup Ratio                 0.2                          0.2           0.2
+   Step 2
+         Peak LR                      2e-5                         2e-5          2e-5
+         Warmup Ratio
+   Step 3                             0.01                         0.01          0.01
+         Peak LR
+         Warmup Ratio                   1e-3                         1e-3          1e-3
+   Weight Decay                          0.1                          0.1           0.1
+   Optimizer                             0.1                          0.1           0.1
+   β1, β2                             AdamW                        AdamW
+   Max. Grad. Norm                    0.9, 0.95                    0.9, 0.95     0.9, 0.95
+                                         1.0                          1.0           1.0
+
+Stage 2                                         95B                 95B                    95B
+   Total Training Bytes                          256                 256
+   Batch Size                                   8192                8192                   8192
+   Seq. Length. (Bytes)               Warmup + Cos Decay  Warmup + Cos Decay     Warmup + Cos Decay
+   LR Schedule
+   Step 1                                       1e-3                1e-3                   1e-3
+         Peak LR (Decoder)                       0.1                 0.1                    0.1
+         Warmup Ratio
+   Step 2                                       4e-5                4e-5                   4e-5
+         Peak LR (Encoder + Decoder)            2e-5                2e-5                   2e-5
+         Peak LR (Main Transformer)             0.01                0.01                   0.01
+         Warmup Ratio                            0.1                 0.1                    0.1
+   Weight Decay                               AdamW               AdamW                  AdamW
+   Optimizer                                  0.9, 0.95           0.9, 0.95              0.9, 0.95
+   β1, β2                                        1.0                 1.0                    1.0
+   Max. Grad. Norm
+
+                                            17
+

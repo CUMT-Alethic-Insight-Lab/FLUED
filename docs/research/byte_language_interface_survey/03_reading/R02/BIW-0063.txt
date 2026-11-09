@@ -1,0 +1,556 @@
+                                       Learning to Generate Reviews and Discovering Sentiment
+
+                                       Alec Radford 1 Rafal Jozefowicz 1 Ilya Sutskever 1
+
+arXiv:1704.01444v2 [cs.LG] 6 Apr 2017                          Abstract                                it is now commonplace to reuse these representations on
+                                                                                                       a broad suite of related tasks - one of the most successful
+                                             We explore the properties of byte-level recur-            examples of transfer learning to date (Oquab et al., 2014).
+                                             rent language models. When given sufﬁcient
+                                             amounts of capacity, training data, and compute           There is also a long history of unsupervised representation
+                                             time, the representations learned by these models         learning (Olshausen & Field, 1997). Much of the early re-
+                                             include disentangled features corresponding to            search into modern deep learning was developed and val-
+                                             high-level concepts. Speciﬁcally, we ﬁnd a single         idated via this approach (Hinton & Salakhutdinov, 2006)
+                                             unit which performs sentiment analysis. These             (Huang et al., 2007) (Vincent et al., 2008) (Coates et al.,
+                                             representations, learned in an unsupervised man-          2010) (Le, 2013). Unsupervised learning is promising due
+                                             ner, achieve state of the art on the binary subset of     to its ability to scale beyond only the subsets and domains
+                                             the Stanford Sentiment Treebank. They are also            of data that can be cleaned and labeled given resource, pri-
+                                             very data efﬁcient. When using only a handful             vacy, or other constraints. This advantage is also its difﬁ-
+                                             of labeled examples, our approach matches the             culty. While supervised approaches have clear objectives
+                                             performance of strong baselines trained on full           that can be directly optimized, unsupervised approaches
+                                             datasets. We also demonstrate the sentiment unit          rely on proxy tasks such as reconstruction, density estima-
+                                             has a direct inﬂuence on the generative process           tion, or generation, which do not directly encourage useful
+                                             of the model. Simply ﬁxing its value to be pos-           representations for speciﬁc tasks. As a result, much work
+                                             itive or negative generates samples with the cor-         has gone into designing objectives, priors, and architectures
+                                             responding positive or negative sentiment.                meant to encourage the learning of useful representations.
+                                                                                                       We refer readers to Goodfellow et al. (2016) for a detailed
+                                       1. Introduction and Motivating Work                             review.
+
+                                       Representation learning (Bengio et al., 2013) plays a crit-     Despite these difﬁculties, there are notable applications of
+                                       ical role in many modern machine learning systems. Rep-         unsupervised learning. Pre-trained word vectors are a vi-
+                                       resentations map raw data to more useful forms and the          tal part of many modern NLP systems (Collobert et al.,
+                                       choice of representation is an important component of any       2011). These representations, learned by modeling word
+                                       application. Broadly speaking, there are two areas of re-       co-occurrences, increase the data efﬁciency and general-
+                                       search emphasizing different details of how to learn useful     ization capability of NLP systems (Pennington et al., 2014)
+                                       representations.                                                (Chen & Manning, 2014). Topic modelling can also dis-
+                                                                                                       cover factors within a corpus of text which align to human
+                                       The supervised training of high-capacity models on large        interpretable concepts such as art or education (Blei et al.,
+                                       labeled datasets is critical to the recent success of deep      2003).
+                                       learning techniques for a wide range of applications such
+                                       as image classiﬁcation (Krizhevsky et al., 2012), speech        How to learn representations of phrases, sentences, and
+                                       recognition (Hinton et al., 2012), and machine transla-         documents is an open area of research. Inspired by the
+                                       tion (Wu et al., 2016). Analysis of the task speciﬁc rep-       success of word vectors, Kiros et al. (2015) propose skip-
+                                       resentations learned by these models reveals many fasci-        thought vectors, a method of training a sentence encoder
+                                       nating properties (Zhou et al., 2014). Image classiﬁers         by predicting the preceding and following sentence. The
+                                       learn a broadly useful hierarchy of feature detectors re-       representation learned by this objective performs competi-
+                                       representing raw pixels as edges, textures, and objects         tively on a broad suite of evaluated tasks. More advanced
+                                       (Zeiler & Fergus, 2014). In the ﬁeld of computer vision,        training techniques such as layer normalization (Ba et al.,
+                                                                                                       2016) further improve results. However, skip-thought vec-
+                                          1OpenAI, San Francisco, California, USA. Correspondence to:  tors are still outperformed by supervised models which di-
+                                       Alec Radford <alec@openai.com>.                                 rectly optimize the desired performance metric on a spe-
+                                                                                                       ciﬁc dataset. This is the case for both text classiﬁcation
+Generating Reviews and Discovering Sentiment
+
+tasks, which measure whether a speciﬁc concept is well en-     tation to various degrees of out-of-domain data and tasks.
+coded in a representation, and more general semantic sim-
+ilarity tasks. This occurs even when the datasets are rela-    2. Dataset
+tively small by modern standards, often consisting of only
+a few thousand labeled examples.                               Much previous work on language modeling has evaluated
+                                                               on relatively small but competitive datasets such as Penn
+In contrast to learning a generic representation on one large  Treebank (Marcus et al., 1993) and Hutter Prize Wikipedia
+dataset and then evaluating on other tasks/datasets, Dai       (Hutter, 2006). As discussed in Jozefowicz et al. (2016)
+& Le (2015) proposed using similar unsupervised objec-         performance on these datasets is primarily dominated by
+tives such as sequence autoencoding and language model-        regularization. Since we are interested in high-quality sen-
+ing to ﬁrst pretrain a model on a dataset and then ﬁnetune     timent representations, we chose the Amazon product re-
+it for a given task. This approach outperformed training the   view dataset introduced in McAuley et al. (2015) as a train-
+same model from random initialization and achieved state       ing corpus. In de-duplicated form, this dataset contains
+of the art on several text classiﬁcation datasets. Combin-     over 82 million product reviews from May 1996 to July
+ing language modelling with topic modelling and ﬁtting a       2014 amounting to over 38 billion training bytes. Due to
+small supervised feature extractor on top has also achieved    the size of the dataset, we ﬁrst split it into 1000 shards con-
+strong results on in-domain document level sentiment anal-     taining equal numbers of reviews and set aside 1 shard for
+ysis (Dieng et al., 2016).                                     validation and 1 shard for test.
+
+Considering this, we hypothesize two effects may be com-       Figure 1. The mLSTM converges faster and achieves a better re-
+bining to result in the weaker performance of purely unsu-     sult within our time budget compared to a standard LSTM with
+pervised approaches. Skip-thought vectors were trained on      the same hidden state size
+a corpus of books. But some of the classiﬁcation tasks they
+are evaluated on, such as sentiment analysis of reviews of     3. Model and Training Details
+consumer goods, do not have much overlap with the text of
+novels. We propose this distributional issue, combined with    Many potential recurrent architectures and hyperparameter
+the limited capacity of current models, results in represen-   settings were considered in preliminary experiments on the
+tational underﬁtting. Current generic distributed sentence     dataset. Given the size of the dataset, searching the wide
+representations may be very lossy - good at capturing the      space of possible conﬁgurations is quite costly. To help
+gist, but poor with the precise semantic or syntactic details  alleviate this, we evaluated the generative performance of
+which are critical for applications.                           smaller candidate models after a single pass through the
+                                                               dataset. The model chosen for the large scale experiment is
+The experimental and evaluation protocols may be under-        a single layer multiplicative LSTM (Krause et al., 2016)
+estimating the quality of unsupervised representation learn-   with 4096 units. We observed multiplicative LSTMs to
+ing for sentences and documents due to certain seemingly       converge faster than normal LSTMs for the hyperparam-
+insigniﬁcant design decisions. Hill et al. (2016) also raises
+concern about current evaluation tasks in their recent work
+which provides a thorough survey of architectures and ob-
+jectives for learning unsupervised sentence representations
+- including the above mentioned skip-thoughts.
+
+In this work, we test whether this is the case. We focus
+in on the task of sentiment analysis and attempt to learn
+an unsupervised representation that accurately contains this
+concept. Mikolov et al. (2013) showed that word-level re-
+current language modelling supports the learning of useful
+word vectors and we are interested in pushing this line of
+work. As an approach, we consider the popular research
+benchmark of byte (character) level language modelling
+due to its further simplicity and generality. We are also in-
+terested in evaluating this approach as it is not immediately
+clear whether such a low-level training objective supports
+the learning of high-level representations. We train on a
+very large corpus picked to have a similar distribution as
+our task of interest. We also benchmark on a wider range
+of tasks to quantify the sensitivity of the learned represen-
+Generating Reviews and Discovering Sentiment
+
+eter settings that were explored both in terms of data and        Table 1. Small dataset classiﬁcation accuracies
+wall-clock time. The model was trained for a single epoch
+on mini-batches of 128 subsequences of length 256 for a           METHOD        MR CR SUBJ MPQA
+total of 1 million weight updates. States were initialized
+to zero at the beginning of each shard and persisted across       NBSVM [49]    79.4 81.8 93.2     86.3
+updates to simulate full-backpropagation and allow for the                                         87.9
+forward propagation of information outside of a given sub-        SKIPTHOUGHT [23] 77.3 81.8 92.6  89.3
+sequence. Adam (Kingma & Ba, 2014) was used to ac-                                                 86.9
+celerate learning with an initial 5e-4 learning rate that was     SKIPTHOUGHT(LN) 79.5 83.1 93.7   89.6
+decayed linearly to zero over the course of training. Weight                                       93.3
+normalization (Salimans & Kingma, 2016) was applied to            SDAE [12]     74.6 78.0 90.8     88.5
+the LSTM parameters. Data-parallelism was used across 4
+Pascal Titan X gpus to speed up training and increase effec-      CNN [21]      81.5 85.0 93.4
+tive memory size. Training took approximately one month.
+The model is compact, containing approximately as many            ADASENT [56]  83.1 86.3 95.5
+parameters as there are reviews in the training dataset. It
+also has a high ratio of compute to total parameters com-         BYTE MLSTM    86.9 91.4 94.6
+pared to other large scale language models due to operating
+at a byte level. The selected model reaches 1.12 bits per         4. Experimental Setup and Results
+byte.
+                                                                  Our model processes text as a sequence of UTF-8 encoded
+                                                                  bytes (Yergeau, 2003). For each byte, the model updates its
+                                                                  hidden state and predicts a probability distribution over the
+                                                                  next possible byte. The hidden state of the model serves
+                                                                  as an online summary of the sequence which encodes all
+                                                                  information the model has learned to preserve that is rele-
+                                                                  vant to predicting the future bytes of the sequence. We are
+                                                                  interested in understanding the properties of the learned en-
+                                                                  coding. The process of extracting a feature representation
+                                                                  is outlined as follows:
+
+                                                                  • Since newlines are used as review delimiters in the
+                                                                     training dataset, all newline characters are replaced
+                                                                     with spaces to avoid the model resetting state.
+
+                                                                  • Any leading whitespace is removed and replaced with
+                                                                     a newline+space to simulate a start token. Any trailing
+                                                                     whitespace is removed and replaced with a space to
+                                                                     simulate an end token. The text is encoded as a UTF-
+                                                                     8 byte sequence.
+
+                                                                  • Model states are initialized to zeros. The model pro-
+                                                                     cesses the sequence and the ﬁnal cell states of the mL-
+                                                                     STM are used as a feature representation. Tanh is ap-
+                                                                     plied to bound values between -1 and 1.
+
+Figure 2. Performance on the binary version of SST as a function  We follow the methodology established in Kiros et al.
+of labeled training examples. The solid lines indicate the aver-  (2015) by training a logistic regression classiﬁer on top of
+age of 100 runs while the sharded regions indicate the 10th and   our model’s representation on datasets for tasks including
+90th percentiles. Previous results on the dataset are plotted as  semantic relatedness, text classiﬁcation, and paraphrase de-
+dashed lines with the numbers indicating the amount of examples   tection. For the details on these comparison experiments,
+required for logistic regression on the byte mLSTM representa-    we refer the reader to their work. One exception is that we
+tion to match their performance. RNTN (Socher et al., 2013)       use an L1 penalty for text classiﬁcation results instead of
+CNN (Kim, 2014) DMN (Kumar et al., 2015) LSTM (Wieting            L2 as we found this performed better in the very low data
+et al., 2015) NSE (Munkhdalai & Yu, 2016) CT-LSTM (Looks          regime.
+et al., 2017)
+                                                                  4.1. Review Sentiment Analysis
+
+                                                                  Table 1 shows the results of our model on 4 standard text
+                                                                  classiﬁcation datasets. The performance of our model is
+                                                                  noticeably lopsided. On the MR (Pang & Lee, 2005) and
+        Generating Reviews and Discovering Sentiment
+
+CR (Hu & Liu, 2004) sentiment analysis datasets we im-         Figure 3. Histogram of cell activation values for the sentiment
+prove the state of the art by a signiﬁcant margin. The MR      unit on IMDB reviews.
+and CR datasets are sentences extracted from Rotten Toma-
+toes, a movie review website, and Amazon product reviews       sentations our model learned and how they achieve the ob-
+(which almost certainly overlaps with our training corpus).    served data efﬁciency. The beneﬁt of an L1 penalty in the
+This suggests that our model has learned a rich represen-      low data regime (see Figure 2) is a clue. L1 regulariza-
+tation of text from a similar domain. On the other two         tion is known to reduce sample complexity when there are
+datasets, SUBJ’s subjectivity/objectivity detection (Pang &    many irrelevant features (Ng, 2004). This is likely to be the
+Lee, 2004) and MPQA’s opinion polarity (Wiebe et al.,          case for our model since it is trained as a language model
+2005) our model has no noticeable advantage over other         and not as a supervised feature extractor. By inspecting the
+unsupervised representation learning approaches and is still   relative contributions of features on various datasets, we
+outperformed by a supervised approach.                         discovered a single unit within the mLSTM that directly
+                                                               corresponds to sentiment. In Figure 3 we show the his-
+To better quantify the learned representation, we also test    togram of the ﬁnal activations of this unit after processing
+on a wider set of sentiment analysis datasets with differ-     IMDB reviews (Maas et al., 2011) which shows a bimodal
+ent properties. The Stanford Sentiment Treebank (SST)          distribution with a clear separation between positive and
+(Socher et al., 2013) was created speciﬁcally to evaluate      negative reviews. In Figure 4 we visualize the activations
+more complex compositional models of language. It is de-       of this unit on 6 randomly selected reviews from a set of
+rived from the same base dataset as MR but was relabeled       100 high contrast reviews which shows it acts as an on-
+via Amazon Mechanical and includes dense labeling of the       line estimate of the local sentiment of the review. Fitting
+phrases of parse trees computed for all sentences. For the     a threshold to this single unit achieves a test accuracy of
+binary subtask, this amounts to 76961 total labels com-        92.30% which outperforms a strong supervised results on
+pared to the 6920 sentence level labels. As a demonstration    the dataset, the 91.87% of NB-SVM trigram (Mesnil et al.,
+of the capability of unsupervised representation learning to   2014), but is still below the semi-supervised state of the art
+simplify data collection and remove preprocessing steps,       of 94.09% (Miyato et al., 2016). Using the full 4096 unit
+our reported results ignore these dense labels and computed    representation achieves 92.88%. This is an improvement of
+parse trees, using only the raw text and sentence level la-    only 0.58% over the sentiment unit suggesting that almost
+bels.                                                          all information the model retains that is relevant to senti-
+                                                               ment analysis is represented in the very compact form of a
+The representation learned by our model achieves 91.8%         single scalar. Table 2 has a full list of results on the IMDB
+signiﬁcantly outperforming the state of the art of 90.2% by    dataset.
+a 30 model ensemble (Looks et al., 2017). As visualized
+in Figure 2, our model is very data efﬁcient. It matches       4.3. Capacity Ceiling
+the performance of baselines using as few as a dozen la-
+beled examples and outperforms all previous results with       Encouraged by these results, we were curious how well
+only a few hundred labeled examples. This is under 10%         the model’s representation scales to larger datasets. We
+of the total sentences in the dataset. Confusingly, despite a  try our approach on the binary version of the Yelp Dataset
+16% relative error reduction on the binary subtask, it does
+not reach the state of the art of 53.6% on the ﬁne-grained
+subtask, achieving 52.9%.
+
+4.2. Sentiment Unit
+
+        Table 2. IMDB sentiment classiﬁcation
+
+METHOD                                         ERROR
+
+FULLUNLABELEDBOW (MAAS ET AL., 2011)           11.11%
+NB-SVM TRIGRAM (MESNIL ET AL., 2014)           8.13%
+SENTIMENT UNIT (OURS)                          7.70%
+SA-LSTM (DAI & LE, 2015)                       7.24%
+BYTE MLSTM (OURS)                              7.12%
+TOPICRNN (DIENG ET AL., 2016)                  6.24%
+VIRTUAL ADV (MIYATO ET AL., 2016)              5.91%
+
+We conducted further analysis to understand what repre-
+Generating Reviews and Discovering Sentiment
+
+25 August 2003 League of Extraordinary Gentlemen: Sean Connery is one of    Figure 5. Performance on the binary version of the Yelp reviews
+the all time greats and I have been a fan of his since the 1950's. I went   dataset as a function of labeled training examples. The model’s
+to this movie because Sean Connery was the main actor. I had not read       performance plateaus after about ten labeled examples and only
+reviews or had any prior knowledge of the movie. The movie surprised me     slow improves with additional data.
+quite a bit. The scenery and sights were spectacular, but the plot was
+unreal to the point of being ridiculous. In my mind this was not one of             Table 3. Microsoft Paraphrase Corpus
+his better movies it could be the worst. Why he chose to be in this movie
+is a mystery. For me, going to this movie was a waste of my time. I will    METHOD                            ACC F1
+continue to go to his movies and add his movies to my video collection.
+But I can't see wasting money to put this movie in my collection            SKIPTHOUGHT (KIROS ET AL., 2015)  73.0        82.0
+                                                                            SDAE (HILL ET AL., 2016)          76.4        83.4
+I found this to be a charming adaptation, very lively and full of fun.      MTMETRICS [31]                    77.4        84.1
+With the exception of a couple of major errors, the cast is wonderful. I    BYTE MLSTM                        75.0        82.8
+have to echo some of the earlier comments -- Chynna Phillips is horribly
+miscast as a teenager. At 27, she's just too old (and, yes, it DOES show),
+and lacks the singing "chops" for Broadway-style music. Vanessa Williams
+is a decent-enough singer and, for a non-dancer, she's adequate. However,
+she is NOT Latina, and her character definitely is. She's also very
+STRIDENT throughout, which gets tiresome. The girls of Sweet Apple's
+Conrad Birdie fan club really sparkle -- with special kudos to Brigitta
+Dau and Chiara Zanni. I also enjoyed Tyne Daly's performance, though I'm
+not generally a fan of her work. Finally, the dancing Shriners are a riot,
+especially the dorky three in the bar. The movie is suitable for the whole
+family, and I highly recommend it.
+
+Judy Holliday struck gold in 1950 withe George Cukor's film version of
+"Born Yesterday," and from that point forward, her career consisted of
+trying to find material good enough to allow her to strike gold again. It
+never happened. In "It Should Happen to You" (I can't think of a blander
+title, by the way), Holliday does yet one more variation on the dumb
+blonde who's maybe not so dumb after all, but everything about this movie
+feels warmed over and half hearted. Even Jack Lemmon, in what I believe
+was his first film role, can't muster up enough energy to enliven this
+recycled comedy. The audience knows how the movie will end virtually from
+the beginning, so mostly it just sits around waiting for the film to catch
+up. Maybe if you're enamored of Holliday you'll enjoy this; otherwise I
+wouldn't bother. Grade: C
+
+Once in a while you get amazed over how BAD a film can be, and how in the
+world anybody could raise money to make this kind of crap. There is
+absolutely No talent included in this film - from a crappy script, to a
+crappy story to crappy acting. Amazing...
+
+Team Spirit is maybe made by the best intentions, but it misses the warmth
+of "All Stars" (1997) by Jean van de Velde. Most scenes are identic, just
+not that funny and not that well done. The actors repeat the same lines as
+in "All Stars" but without much feeling.
+
+God bless Randy Quaid...his leachorous Cousin Eddie in Vacation and
+Christmas Vacation hilariously stole the show. He even made the awful
+Vegas Vacation at least worth a look. I will say that he tries hard in
+this made for TV sequel, but that the script is so NON funny that the
+movie never really gets anywhere. Quaid and the rest of the returning
+Vacation vets (including the orginal Audrey, Dana Barron) are wasted here.
+Even European Vacation's Eric Idle cannot save the show in a brief
+cameo.... Pathetic and sad...actually painful to watch....Christmas
+Vacation 2 is the worst of the Vacation franchise.
+
+Figure 4. Visualizing the value of the sentiment cell as it processes       Table 4. SICK semantic relatedness subtask
+six randomly selected high contrast IMDB reviews. Red indicates
+negative sentiment while green indicates positive sentiment. Best           METHOD            r               ρ MSE
+seen in color.
+                                                                            SKIPTHOUGHT [23]  0.858  0.792          0.269
+Challenge in 2015 as introduced in Zhang et al. (2015).                     SKIPTHOUGHT(LN)   0.858  0.788          0.270
+This dataset contains 598,000 examples which is an or-                      TREE-LSTM [47]    0.868  0.808          0.253
+der of magnitude larger than any other datasets we tested                   BYTE MLSTM        0.792  0.725          0.390
+on. When visualizing performance as a function of number
+of training examples in Figure 5, we observe a ”capacity                    businesses, where details like hospitality, location, and at-
+ceiling” where the test accuracy of our approach only im-                   mosphere are important. But these ideas are not present in
+proves by a little over 1% across a four order of magnitude                 reviews of products. Additionally, there is a notable drop
+increase in training data. Using the full dataset, we achieve               in the relative performance of our approach transitioning
+95.22% test accuracy. This better than a BoW TFIDF base-                    from sentence to document datasets. This is likely due to
+line at 93.66% but slightly worse than the 95.64% of a lin-                 our model working on the byte level which leads to it fo-
+ear classiﬁer on top of the 500,000 most frequent n-grams                   cusing on the content of the last few sentences instead of
+up to length 5.                                                             the whole document. Finally, as the amount of labeled data
+                                                                            increases, the performance of the simple linear model we
+The observed capacity ceiling is an interesting phenomena                   train on top of our static representation will eventually satu-
+and stumbling point for scaling our unsupervised represen-                  rate. Complex models explicitly trained for a task can con-
+tations. We think a variety of factors are contributing to                  tinue to improve and eventually outperform our approach
+cause this. Since our model is trained only on Amazon                       with enough labeled data.
+reviews, it is does not appear to be sensitive to concepts
+speciﬁc to other domains. For instance, Yelp reviews are of                 With this context, the observed results make a lot of sense.
+                            Generating Reviews and Discovering Sentiment
+
+Sentiment ﬁxed to positive                                     Sentiment ﬁxed to negative
+
+Just what I was looking for. Nice ﬁtted pants, exactly The package received was blank and has no barcode. A
+matched seam to color contrast with other pants I own. waste of time and money.
+Highly recommended and also very happy!
+
+This product does what it is supposed to. I always keep Great little item. Hard to put on the crib without some
+
+three of these in my kitchen just in case ever I need a kind of embellishment. My guess is just like the screw
+
+replacement cord.                                              kind of attachment I had.
+
+Best hammock ever! Stays in place and holds it’s shape. They didn’t ﬁt either. Straight high sticks at the end. On
+Comfy (I love the deep neon pictures on it), and looks so par with other buds I have. Lesson learned to avoid.
+cute.
+
+Dixie is getting her Doolittle newsletter we’ll see another    great product but no seller. couldn’t ascertain a cause.
+new one coming out next year. Great stuff. And, here’s         Broken product. I am a proliﬁc consumer of this company
+the contents - information that we hardly know about or        all the time.
+forget.
+
+I love this weapons look . Like I said beautiful !!! I rec-    Like the cover, Fits good. . However, an annoying rear
+ommend it to all. Would suggest this to many roleplayers       piece like garbage should be out of this one. I bought this
+, And I stronge to get them for every one I know. A must       hoping it would help with a huge pull down my back &
+watch for any man who love Chess!                              the black just doesn’t stay. Scrap off everytime I use it....
+                                                               Very disappointed.
+
+Table 5. Random samples from the model generated when the value of sentiment hidden state is ﬁxed to either -1 or 1 for all steps. The
+sentiment unit has a strong inﬂuence on the model’s generative process.
+
+On a small sentence level dataset of a known domain (the       tense. We were curious whether a similar result could be
+movie reviews of Stanford Sentiment Treebank) our model        achieved using the sentiment unit. In Table 5 we show that
+sets a new state of the art. But on a large, document level    by simply setting the sentiment unit to be positive or neg-
+dataset of a different domain (the Yelp reviews) it is only    ative, the model generates corresponding positive or nega-
+competitive with standard baselines.                           tive reviews. While all sampled negative reviews contain
+                                                               sentences with negative sentiment, they sometimes contain
+4.4. Other Tasks                                               sentences with positive sentiment as well. This might be
+                                                               reﬂective of the bias of the training corpus which contains
+Besides classiﬁcation, we also evaluate on two other stan-     over 5x as many ﬁve star reviews as one star reviews. Nev-
+dard tasks: semantic relatedness and paraphrase detection.     ertheless, it is interesting to see that such a simple manipu-
+While our model performs competitively on Microsoft Re-        lation of the model’s representation has a noticeable effect
+search Paraphrase Corpus (Dolan et al., 2004) in Table 3,      on its behavior. The samples are also high quality for a byte
+it performs poorly on the SICK semantic relatedness task       level language model and often include valid sentences.
+(Marelli et al., 2014) in Table 4. It is likely that the form
+and content of the semantic relatedness task, which is built   5. Discussion and Future Work
+on top of descriptions of images and videos and contains
+sentences such as ”A sea turtle is hunting for ﬁsh” is ef-     It is an open question why our model recovers the con-
+fectively out-of-domain for our model which has only been      cept of sentiment in such a precise, disentangled, inter-
+trained on the text of product reviews.                        pretable, and manipulable way. It is possible that senti-
+                                                               ment as a conditioning feature has strong predictive capa-
+4.5. Generative Analysis                                       bility for language modelling. This is likely since senti-
+                                                               ment is such an important component of a review. Previous
+Although the focus of our analysis has been on the prop-       work analysing LSTM language models showed the exis-
+erties of our model’s representation, it is trained as a gen-  tence of interpretable units that indicate position within a
+erative model and we are also interested in its generative     line or presence inside a quotation (Karpathy et al., 2015).
+capabilities. Hu et al. (2017) and Dong et al. (2017) both     In many ways, the sentiment unit in this model is just a
+designed conditional generative models to disentangle the      scaled up example of the same phenomena. The update
+content of text from various attributes like sentiment or      equation of an LSTM could play a role. The element-wise
+Generating Reviews and Discovering Sentiment
+
+operation of its gates may encourage axis-aligned repre-            of Machine Learning Research, 12(Aug):2493–2537,
+sentations. Models such as word2vec have also been ob-              2011.
+served to have small subsets of dimensions strongly asso-
+ciated with speciﬁc tasks (Li et al., 2016).                     Dai, Andrew M and Le, Quoc V. Semi-supervised sequence
+                                                                    learning. In Advances in Neural Information Processing
+Our work highlights the sensitivity of learned representa-          Systems, pp. 3079–3087, 2015.
+tions to the data distribution they are trained on. The results
+make clear that it is unrealistic to expect a model trained      Dieng, Adji B, Wang, Chong, Gao, Jianfeng, and Pais-
+on a corpus of books, where the two most common gen-                ley, John. Topicrnn: A recurrent neural network
+res are Romance and Fantasy, to learn an encoding which             with long-range semantic dependency. arXiv preprint
+preserves the exact sentiment of a review. Likewise, it is          arXiv:1611.01702, 2016.
+unrealistic to expect a model trained on Amazon product
+reviews to represent the precise semantic content of a cap-      Dolan, Bill, Quirk, Chris, and Brockett, Chris. Unsuper-
+tion of an image or a video.                                        vised construction of large paraphrase corpora: Exploit-
+                                                                    ing massively parallel news sources. In Proceedings of
+There are several promising directions for future work              the 20th international conference on Computational Lin-
+highlighted by our results. The observed performance                guistics, pp. 350. Association for Computational Lin-
+plateau, even on relatively similar domains, suggests im-           guistics, 2004.
+proving the representation model both in terms of architec-
+ture and size. Since our model operates at the byte-level,       Dong, Li, Huang, Shaohan, Wei, Furu, Lapata, Mirella,
+hierarchical/multi-timescale extensions could improve the           Zhou, Ming, and Ke, Xu. Learning to generate prod-
+quality of representations for longer documents. The sen-           uct reviews from attributes. In Proceedings of the 15th
+sitivity of learned representations to their training domain        Conference of the European Chapter of the Association
+could be addressed by training on a wider mix of datasets           for Computational Linguistics, pp. 623–632. Associa-
+with better coverage of target tasks. Finally, our work             tion for Computational Linguistics, 2017.
+encourages further research into language modelling as it
+demonstrates that the standard language modelling objec-         Goodfellow, Ian, Bengio, Yoshua, and Courville, Aaron.
+tive with no modiﬁcations is sufﬁcient to learn high-quality        Deep learning. 2016.
+representations.
+                                                                 Hill, Felix, Cho, Kyunghyun, and Korhonen, Anna. Learn-
+References                                                          ing distributed representations of sentences from unla-
+                                                                    belled data. arXiv preprint arXiv:1602.03483, 2016.
+Ba, Jimmy Lei, Kiros, Jamie Ryan, and Hinton, Ge-
+   offrey E. Layer normalization. arXiv preprint                 Hinton, Geoffrey, Deng, Li, Yu, Dong, Dahl, George E,
+   arXiv:1607.06450, 2016.                                          Mohamed, Abdel-rahman, Jaitly, Navdeep, Senior, An-
+                                                                    drew, Vanhoucke, Vincent, Nguyen, Patrick, Sainath,
+Bengio, Yoshua, Courville, Aaron, and Vincent, Pascal.              Tara N, et al. Deep neural networks for acoustic mod-
+   Representation learning: A review and new perspectives.          eling in speech recognition: The shared views of four
+   IEEE transactions on pattern analysis and machine in-            research groups. IEEE Signal Processing Magazine, 29
+   telligence, 35(8):1798–1828, 2013.                               (6):82–97, 2012.
+
+Blei, David M, Ng, Andrew Y, and Jordan, Michael I. La-          Hinton, Geoffrey E and Salakhutdinov, Ruslan R. Reduc-
+   tent dirichlet allocation. Journal of machine Learning           ing the dimensionality of data with neural networks. sci-
+   research, 3(Jan):993–1022, 2003.                                 ence, 313(5786):504–507, 2006.
+
+Chen, Danqi and Manning, Christopher D. A fast and               Hu, Minqing and Liu, Bing. Mining and summarizing
+   accurate dependency parser using neural networks. In             customer reviews. In Proceedings of the tenth ACM
+   EMNLP, pp. 740–750, 2014.                                        SIGKDD international conference on Knowledge dis-
+                                                                    covery and data mining, pp. 168–177. ACM, 2004.
+Coates, Adam, Lee, Honglak, and Ng, Andrew Y. An
+   analysis of single-layer networks in unsupervised feature     Hu, Zhiting, Yang, Zichao, Liang, Xiaodan, Salakhutdinov,
+   learning. Ann Arbor, 1001(48109):2, 2010.                        Ruslan, and Xing, Eric P. Controllable text generation.
+                                                                    arXiv preprint arXiv:1703.00955, 2017.
+Collobert, Ronan, Weston, Jason, Bottou, Le´on, Karlen,
+   Michael, Kavukcuoglu, Koray, and Kuksa, Pavel. Natu-          Huang, Fu Jie, Boureau, Y-Lan, LeCun, Yann, et al. Un-
+   ral language processing (almost) from scratch. Journal           supervised learning of invariant feature hierarchies with
+                                                                    applications to object recognition. In Computer Vision
+                                                                    and Pattern Recognition, 2007. CVPR’07. IEEE Confer-
+                                                                    ence on, pp. 1–8. IEEE, 2007.
+Generating Reviews and Discovering Sentiment
+
+Hutter, Marcus. The human knowledge compression con-         Madnani, Nitin, Tetreault, Joel, and Chodorow, Martin. Re-
+   test. 2006. URL http://prize. hutter1. net, 2006.            examining machine translation metrics for paraphrase
+                                                                identiﬁcation. In Proceedings of the 2012 Conference of
+Jozefowicz, Rafal, Vinyals, Oriol, Schuster, Mike, Shazeer,     the North American Chapter of the Association for Com-
+   Noam, and Wu, Yonghui. Exploring the limits of               putational Linguistics: Human Language Technologies,
+   language modeling. arXiv preprint arXiv:1602.02410,          pp. 182–190. Association for Computational Linguistics,
+   2016.                                                        2012.
+
+Karpathy, Andrej, Johnson, Justin, and Fei-Fei, Li. Vi-      Marcus, Mitchell P, Marcinkiewicz, Mary Ann, and San-
+   sualizing and understanding recurrent networks. arXiv        torini, Beatrice. Building a large annotated corpus of
+   preprint arXiv:1506.02078, 2015.                             english: The penn treebank. Computational linguistics,
+                                                                19(2):313–330, 1993.
+Kim, Yoon. Convolutional neural networks for sentence
+   classiﬁcation. arXiv preprint arXiv:1408.5882, 2014.      Marelli, Marco, Bentivogli, Luisa, Baroni, Marco,
+                                                                Bernardi, Raffaella, Menini, Stefano, and Zamparelli,
+Kingma, Diederik and Ba, Jimmy. Adam: A                         Roberto. Semeval-2014 task 1: Evaluation of com-
+   method for stochastic optimization. arXiv preprint           positional distributional semantic models on full sen-
+   arXiv:1412.6980, 2014.                                       tences through semantic relatedness and textual entail-
+                                                                ment. SemEval-2014, 2014.
+Kiros, Ryan, Zhu, Yukun, Salakhutdinov, Ruslan R, Zemel,
+   Richard, Urtasun, Raquel, Torralba, Antonio, and Fidler,  McAuley, Julian, Pandey, Rahul, and Leskovec, Jure. Infer-
+   Sanja. Skip-thought vectors. In Advances in neural in-       ring networks of substitutable and complementary prod-
+   formation processing systems, pp. 3294–3302, 2015.           ucts. In Proceedings of the 21th ACM SIGKDD Inter-
+                                                                national Conference on Knowledge Discovery and Data
+Krause, Ben, Lu, Liang, Murray, Iain, and Renals, Steve.        Mining, pp. 785–794. ACM, 2015.
+   Multiplicative lstm for sequence modelling. arXiv
+   preprint arXiv:1609.07959, 2016.                          Mesnil, Gre´goire, Mikolov, Tomas, Ranzato,
+                                                                Marc’Aurelio, and Bengio, Yoshua. Ensemble of
+Krizhevsky, Alex, Sutskever, Ilya, and Hinton, Geoffrey E.      generative and discriminative techniques for sen-
+   Imagenet classiﬁcation with deep convolutional neural        timent analysis of movie reviews. arXiv preprint
+   networks. In Advances in neural information processing       arXiv:1412.5335, 2014.
+   systems, pp. 1097–1105, 2012.
+                                                             Mikolov, Tomas, Yih, Wen-tau, and Zweig, Geoffrey. Lin-
+Kumar, Ankit, Irsoy, Ozan, Su, Jonathan, Bradbury, James,       guistic regularities in continuous space word representa-
+   English, Robert, Pierce, Brian, Ondruska, Peter, Gulra-      tions. 2013.
+   jani, Ishaan, and Socher, Richard. Ask me anything: Dy-
+   namic memory networks for natural language process-       Miyato, Takeru, Dai, Andrew M, and Goodfellow, Ian. Ad-
+   ing. CoRR, abs/1506.07285, 2015.                             versarial training methods for semi-supervised text clas-
+                                                                siﬁcation. arXiv preprint arXiv:1605.07725, 2016.
+Le, Quoc V. Building high-level features using large scale
+   unsupervised learning. In Acoustics, Speech and Signal    Munkhdalai, Tsendsuren and Yu, Hong. Neural semantic
+   Processing (ICASSP), 2013 IEEE International Confer-         encoders. arXiv preprint arXiv:1607.04315, 2016.
+   ence on, pp. 8595–8598. IEEE, 2013.
+                                                             Ng, Andrew Y. Feature selection, l 1 vs. l 2 regularization,
+Li, Jiwei, Monroe, Will, and Jurafsky, Dan. Understanding       and rotational invariance. In Proceedings of the twenty-
+   neural networks through representation erasure. arXiv        ﬁrst international conference on Machine learning, pp.
+   preprint arXiv:1612.08220, 2016.                             78. ACM, 2004.
+
+Looks, Moshe, Herreshoff, Marcello, Hutchins, DeLesley,      Olshausen, Bruno A and Field, David J. Sparse coding with
+   and Norvig, Peter. Deep learning with dynamic compu-         an overcomplete basis set: A strategy employed by v1?
+   tation graphs. arXiv preprint arXiv:1702.02181, 2017.        Vision research, 37(23):3311–3325, 1997.
+
+Maas, Andrew L, Daly, Raymond E, Pham, Peter T, Huang,       Oquab, Maxime, Bottou, Leon, Laptev, Ivan, and Sivic,
+   Dan, Ng, Andrew Y, and Potts, Christopher. Learning          Josef. Learning and transferring mid-level image repre-
+   word vectors for sentiment analysis. In Proceedings of       sentations using convolutional neural networks. In Pro-
+   the 49th Annual Meeting of the Association for Com-          ceedings of the IEEE conference on computer vision and
+   putational Linguistics: Human Language Technologies-         pattern recognition, pp. 1717–1724, 2014.
+   Volume 1, pp. 142–150. Association for Computational
+   Linguistics, 2011.
+Generating Reviews and Discovering Sentiment
+
+Pang, Bo and Lee, Lillian. A sentimental education: Senti-        the gap between human and machine translation. arXiv
+   ment analysis using subjectivity summarization based on        preprint arXiv:1609.08144, 2016.
+   minimum cuts. In Proceedings of the 42nd annual meet-
+   ing on Association for Computational Linguistics, pp.       Yergeau, Francois. Utf-8, a transformation format of iso
+   271. Association for Computational Linguistics, 2004.          10646. 2003.
+
+Pang, Bo and Lee, Lillian. Seeing stars: Exploiting class      Zeiler, Matthew D and Fergus, Rob. Visualizing and under-
+   relationships for sentiment categorization with respect to     standing convolutional networks. In European confer-
+   rating scales. In Proceedings of the 43rd annual meeting       ence on computer vision, pp. 818–833. Springer, 2014.
+   on association for computational linguistics, pp. 115–
+   124. Association for Computational Linguistics, 2005.       Zhang, Xiang, Zhao, Junbo, and LeCun, Yann. Character-
+                                                                  level convolutional networks for text classiﬁcation. In
+Pennington, Jeffrey, Socher, Richard, and Manning,                Advances in neural information processing systems, pp.
+   Christopher D. Glove: Global vectors for word repre-           649–657, 2015.
+   sentation. In EMNLP, volume 14, pp. 1532–1543, 2014.
+                                                               Zhao, Han, Lu, Zhengdong, and Poupart, Pascal. Self-
+Salimans, Tim and Kingma, Diederik P. Weight normaliza-           adaptive hierarchical sentence model. arXiv preprint
+   tion: A simple reparameterization to accelerate training       arXiv:1504.05070, 2015.
+   of deep neural networks. In Advances in Neural Infor-
+   mation Processing Systems, pp. 901–901, 2016.               Zhou, Bolei, Khosla, Aditya, Lapedriza, Agata, Oliva,
+                                                                  Aude, and Torralba, Antonio. Object detectors emerge in
+Socher, Richard, Perelygin, Alex, Wu, Jean Y, Chuang,             deep scene cnns. arXiv preprint arXiv:1412.6856, 2014.
+   Jason, Manning, Christopher D, Ng, Andrew Y, Potts,
+   Christopher, et al. Recursive deep models for seman-
+   tic compositionality over a sentiment treebank. Citeseer,
+   2013.
+
+Tai, Kai Sheng, Socher, Richard, and Manning, Christo-
+   pher D. Improved semantic representations from tree-
+   structured long short-term memory networks. arXiv
+   preprint arXiv:1503.00075, 2015.
+
+Vincent, Pascal, Larochelle, Hugo, Bengio, Yoshua, and
+   Manzagol, Pierre-Antoine. Extracting and composing
+   robust features with denoising autoencoders. In Proceed-
+   ings of the 25th international conference on Machine
+   learning, pp. 1096–1103. ACM, 2008.
+
+Wang, Sida and Manning, Christopher D. Baselines and
+   bigrams: Simple, good sentiment and topic classiﬁca-
+   tion. In Proceedings of the 50th Annual Meeting of
+   the Association for Computational Linguistics: Short
+   Papers-Volume 2, pp. 90–94. Association for Computa-
+   tional Linguistics, 2012.
+
+Wiebe, Janyce, Wilson, Theresa, and Cardie, Claire. An-
+   notating expressions of opinions and emotions in lan-
+   guage. Language resources and evaluation, 39(2):165–
+   210, 2005.
+
+Wieting, John, Bansal, Mohit, Gimpel, Kevin, and Livescu,
+   Karen. Towards universal paraphrastic sentence embed-
+   dings. arXiv preprint arXiv:1511.08198, 2015.
+
+Wu, Yonghui, Schuster, Mike, Chen, Zhifeng, Le, Quoc V,
+   Norouzi, Mohammad, Macherey, Wolfgang, Krikun,
+   Maxim, Cao, Yuan, Gao, Qin, Macherey, Klaus, et al.
+   Google’s neural machine translation system: Bridging
+
