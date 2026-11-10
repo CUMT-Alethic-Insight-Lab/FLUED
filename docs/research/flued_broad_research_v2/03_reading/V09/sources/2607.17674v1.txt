@@ -1,0 +1,2205 @@
+                                        Uncovering Latent Reasoning Strategies
+                                                    in Language Models
+
+                                               Awni Altabaa             John Lafferty
+                                               Yale University          Yale University
+                                        awni.altabaa@yale.edu   john.lafferty@yale.edu
+
+arXiv:2607.17674v1 [cs.LG] 20 Jul 2026                                              Abstract
+
+                                                  A language model pθ(y|x) trained on reasoning tasks learns to solve problems
+                                                  via multiple distinct strategies, yet these strategies are implicit and entangled
+                                                  within the model’s response distribution. We study the problem of decomposing
+                                                   the response distribution of a given pretrained language model into a structured,
+                                                   strategy-conditioned representation. Specifically, we learn a latent-variable fac-
+                                                   torization pθ(y|x) ⇝ (rϕ(z|x), gϕ(y|x, z)), where a router r maps each input
+                                                   to a distribution over latent strategies z and a generator g produces the response
+                                                   conditioned on that strategy. A key challenge is that the generator, initialized from
+                                                   the base model, already represents pθ(y|x) without using z. Standard variational
+                                                   inference therefore gives the model no incentive to route information through z
+                                                   and can yield a severe form of posterior collapse. To address this, we propose
+                                                   a variational objective that measures fractional information gain relative to the
+                                                   base model’s response loss and concentrates reconstruction pressure on tokens
+                                                  with high base model surprisal, encouraging z to encode strategy-relevant response
+                                                  variation. We introduce a benchmark of multi-strategy algorithmic tasks and show
+                                                   that this objective recovers latent codes aligned with distinct reference strategies
+                                                  while preserving the base model’s response distribution.
+
+                                                   Code: github.com/Awni00/latent-strategies-in-lms
+
+                                        1 Introduction
+
+                                        Language models trained on reasoning tasks can solve the same problem using multiple distinct
+                                        strategies. For example, a model asked to prove a theorem may produce a proof by contradiction,
+                                        induction, or construction, while a model asked to solve a programming problem may formulate it
+                                        as dynamic programming, graph search, or a greedy algorithm. These strategies can recur across
+                                        many problems, but are represented only implicitly. The model’s response distribution pθ(y|x) is an
+                                        entangled mixture over distinct strategies, with no separate variable for identifying or controlling the
+                                        strategy used during generation.
+
+                                        We study how to uncover these strategies by decomposing the response distribution of a pretrained
+                                        language model into a structured, strategy-conditioned representation. Concretely, we seek a router-
+                                        generator factorization (rϕ(z|x), gϕ(y|x, z)) of the base model pθ(y|x), where a router maps each
+                                        input to a distribution over a latent strategy variable z, and a strategy-conditioned generator produces
+                                        responses given the input and the sampled strategy. The goal is to find a factorization that preserves
+                                        the observable response distribution, so that rϕ(z|x)gϕ(y|x, z)dz =: pϕ(y|x) ≈ pθ(y|x), while
+                                        making z informative and strategy-aligned: varying z should change which strategy the generator
+                                        uses, and the same latent value should carry the same strategy meaning across related inputs.
+
+                                        This problem is distinct from standard latent variable generative modeling [KW13; SLY15]. In
+                                        VAE-style methods, the latent variable model is trained from data, and the target distribution is not
+                                        already represented at initialization. Here, the pretrained generator already captures pθ(y|x) without
+                                        any latent variable, creating a pathological form of posterior collapse. A factorization that ignores
+
+                                        Preprint.
+               pθ(y | x)                                    misaligned latent z  strategy-aligned latent z
+
+      Induct on n. Assume (n − 2)2. . .                                          Proof by         Proof by
+    Base n = 2: 4 even. Suppose k2. . .                                          Induction     Contradiction
+
+                      Suppose n odd, n = 2k + 1. Then. . .
+We show: n odd ⇒ n2 odd. . .
+
+x: prove that if n is even, then n2 is even                    Output Space Y      Algebraic       Proof by
+                                       Output Space Y                            Manipulation  Contrapositive
+
+                                                                                                      Output Space Y
+
+Figure 1: Latent strategy structure in output space. A pretrained LM’s response distribution mixes
+strategies implicitly (left). A latent variable model initialized to match it leaves z unused (center).
+Training aligns z with reference strategies, disentangling them in latent space while preserving the
+base model’s response distribution (right).
+
+z–by reproducing the base model’s response distribution for every z–is available at initialization and is
+globally optimal for objectives that only fit the observable response distribution. Standard variational
+training, including the conditional ELBO, is therefore subject to this failure mode [Bow+16; He+19;
+Fu+19; HJ16]: it can preserve distributional fidelity while leaving z inert, because it does not require
+z to explain strategy-level variation.
+
+To address this problem, we propose a training objective that replaces marginal-fit pressure with
+model-directed reconstruction pressure. The fixed base model pθ serves as a reference for what is
+already predictable from x alone. The reconstruction term is normalized by the base model’s response
+loss and weighted at the token level by base model surprisal, concentrating pressure on positions
+where the base model leaves multiple continuations plausible, which tend to be the branch points
+where strategy choices are made. Together, these mechanisms encourage z to encode strategy-relevant
+response variation that is not already determined by x, rather than reconstructing what the base model
+already captures.
+
+The broader promise of this problem is to expose latent capabilities that large language models
+already possess but do not reliably express under default sampling. By recovering a strategy-
+aligned factorization, we can turn implicit strategy structure into an explicit object of analysis and
+intervention. This has applications across model interpretability [Koh+20; Hub+24], controllability
+[Kes+19; LL21], and exploration [Wan+23; Yao+23]. In particular, strategy-level interventions could
+support directed exploration across high-level solution strategies during reinforcement-learning post-
+training, beyond passive on-policy sampling from the base model’s response distribution [Yue+25;
+Tuy+25]. Such broader exploration could enable the discovery and improvement of previously
+under-sampled reasoning strategies and support their transfer or recombination across inputs. We
+leave these downstream applications to future work.
+
+We summarize the contributions of this paper as follows:
+
+1. Problem formulation. We formulate the problem of learning a router-generator factorization of a
+   pretrained language model and identify the core challenge that makes this setting different from
+   standard latent variable modeling.
+
+2. Methodology. We propose a variational objective with model-directed reconstruction pressure
+   that uses the base model to normalize reconstruction in base model reference units and to direct
+   token-level pressure toward positions of high base model residual surprisal, encouraging the latent
+   to encode strategy-relevant variation.
+
+3. Benchmark and empirical evaluation. We introduce a controlled benchmark of multi-strategy
+   algorithmic tasks with ground-truth strategy annotations, withheld during training and used only
+   for evaluation. We evaluate our method on both pretrained and randomly initialized language
+   models, characterizing recovery conditions, ablation effects, and failure modes.
+
+4. Theoretical analysis. We initiate a theoretical analysis of the strategy-structure recovery problem,
+   studying the conditions under which a useful factorization can be identified.
+
+                                                            2
+Our experiments show that strategy information is decodable from the base model’s hidden states
+before any factorization is trained, indicating that the target structure exists. Standard variational
+objectives nevertheless fail to expose this information through the latent variable. Model-directed
+reconstruction pressure recovers latents that are aligned with reference solution strategies and seman-
+tically consistent across inputs. As a result, the latent variable transfers the same strategy from one
+problem to another, while preserving the base model’s response distribution. This opens possibilities
+for intervening and more efficiently searching over solutions that are guided by high-level strategies.
+
+2 Problem Statement: Latent-Variable Factorization
+
+Let pθ(y|x) denote the response distribution of a pretrained base model, where x is the input and y
+is the response sequence. We consider reasoning tasks for which pθ(y|x) mixes multiple high-level
+strategies for producing valid responses. The goal of this paper is to expose such variation as an
+explicit latent variable while preserving the observable response distribution that the base model
+already represents. We formalize this goal as a latent-variable router-generator factorization of
+pθ(y|x): the router r(z|x) maps each input to a distribution over latent strategy values z, and the
+strategy-conditioned generator g(y|x, z) produces responses conditioned on both x and z.
+
+  Problem Statement: Latent-variable factorization of a pretrained model
+
+  Let pθ(y|x) be the fixed response distribution of a pretrained base model. A router-generator
+  factorization pθ(y|x) ⇝ pϕ = (rϕ, gϕ) introduces a latent variable z ∈ Z, a router rϕ(z|x), and
+  a strategy-conditioned generator gϕ(y|x, z), inducing
+
+                                    pϕ(y|x) = rϕ(z|x)gϕ(y|x, z) dµ(z).
+
+                                                                         Z
+
+  The goal is to select a factorization that preserves the observable response distribution, pϕ(y|x) ≈
+  pθ(y|x), while making z informative about y beyond x and strategy-aligned: variation in z should
+  expose high-level, reusable strategy variation in responses rather than arbitrary predictive surface
+  details.
+
+The objective cannot be merely to fit the latent marginal pϕ(y|x) to the base model distribution.
+For expressive router-generator classes, many factorizations can induce nearly the same distribution
+over y after integrating out z. One extreme ignores z, with gϕ(y|x, z) reproducing the base model
+distribution for all z. More generally, a marginal-preserving factorization may use z for input-
+specific partitions, surface form, or other predictive details rather than reusable strategy structure.
+The problem is therefore not ordinary latent-variable modeling of pθ(y|x), but selection among
+marginal-preserving factorizations for one whose latent variable is informative and strategy-aligned.
+
+The desired latent must first be informative: z should encode information about y beyond what is
+already determined by x. This is nontrivial for autoregressive language models, where the base model
+already defines a stochastic response distribution without an explicit latent; making z informative
+therefore requires it to encode structured variation across responses. However, informativeness
+alone is too weak: a latent can help predict y by encoding surface form, input-specific partitions,
+or arbitrary details. We seek an informative latent that is strategy-aligned, where a strategy is a
+high-level, reusable attribute of a response trace: the broad procedure used to generate a solution, not
+incidental wording, formatting, or token-level variation. A strategy-aligned factorization is one in
+which changing z changes the generator along this strategy-level axis, while marginalizing over z
+remains faithful to the base model.
+
+There are two distinct requirements: local strategy separation and stable cross-input latent semantics.
+Within-input strategy separation asks whether varying z changes the strategy used for a fixed input
+x. This rules out an inert latent, but not an input-local code whose interpretation changes across
+problems. The stronger requirement is cross-input semantic consistency: a latent value or region
+should retain its strategy meaning across related inputs. Only with this stability does z behave like a
+reusable strategy variable, rather than an input-specific response index.
+
+To measure whether a factorization succeeds, we use controlled experiments in which response traces
+are parseable and their reference strategy can be classified. These strategy labels are withheld during
+factorization training and used only to evaluate whether the learned latent achieves within-input
+
+                                                           3
+                sample z ∼ rϕ(z|x), project as E(z) training: z ∼ qξ(z|x, y) substituted at E(z)
+
+p(x2 | ·) · · · p(<lat> | ·)  rϕ(z | x) p(</lat> | ·) p(y1 | x, z)   p(y2 | ·) · · · p(EOS | ·)   qξ(z | x, y)
+
+     ···                                                                  ···                     µξ, log σξ2
+                                                                                                       hxy
+                                                  y attends to E(z)
+
+h1x  ···  hxtx                µϕ, log σϕ2  hlzat  h⟩lat              hy1  ···  htyy
+                                   h⟨lat
+
+                              Adapted Transformer backbone ϕ                                      Backbone ξ
+
+x1   · · · xtx                <lat>        E(z)   </lat>             y1   · · · yty               x1:tx , y1:ty
+
+                                                                                                                                                       Training-only posterior
+
+Figure 2: Autoregressive router-generator Transformer architecture. The adapted Transformer ϕ
+implements both the router rϕ(z|x), which reads the prompt and produces a latent distribution, and
+the strategy-conditioned generator gϕ(y|x, z), which attends to E(z) while generating the response.
+During variational training, qξ(z|x, y) infers z from the full input-response pair.
+
+strategy separation and cross-input semantic consistency. The next section develops a procedure for
+learning a router-generator factorization whose latent variable is informative and strategy-aligned.
+
+3 Learning Strategy-Aligned Latent-Variable Factorizations
+
+This section describes our methodology for learning a latent-variable router-generator factorization
+of a pretrained base model, with the goal of recovering an informative and strategy-aligned latent
+variable. We first describe the architecture and parameterization of the router-generator model,
+then identify the under-specification and latent collapse issues that arise when applying standard
+variational inference to this setting, and finally introduce a modified training objective that addresses
+these issues by using the base model to direct reconstruction pressure. Throughout, pθ(y|x) denotes
+the fixed pretrained base model whose response distribution we seek to factorize, ϕ denotes the
+adapted factorized router-generator model’s parameters, and ξ denotes the training-time posterior
+model parameters.
+
+3.1 A Transformer Architecture for Router-Generator Factorization
+
+We implement the latent-variable router-generator factorization by adapting a pretrained Transformer
+language model into the three roles shown in Figure 2. The router rϕ(z|x) reads the input and
+produces a distribution over latent strategy values. Sampling from the router corresponds to selecting
+a strategy for generating a response. The strategy-conditioned generator gϕ(y|x, z) generates the
+response autoregressively while conditioning on x and an embedding E(z) of the latent strategy. The
+training-time posterior qξ(z|x, y) reads the full input-response pair and produces a distribution over
+latent values, which is used to provide variational training signal.
+
+This parameterization requires only small architectural additions to the base model. Let h(ϕL)(x)
+denote the final-layer representation produced by the adapted Transformer after reading the input
+prefix x. The router adds two learned projection heads on top of this representation, producing the
+mean and log-variance of a diagonal Gaussian over the continuous latent:
+
+                          rϕ(z|x) = N Wµhϕ(L)(x), diag exp(Wσh(ϕL)(x)) .
+
+During autoregressive generation, a latent sample z is projected to an embedding Eϕ(z) and inserted
+as a pseudo-token at the embedding layer, so response tokens can attend to it while the generator pre-
+dicts y. The training-time posterior qξ(z|x, y) is implemented similarly to the router, parameterizing
+a Gaussian distribution over z from the final-layer input representation after reading (x, y).
+
+The router and generator are a single autoregressive model with shared parameters ϕ. The posterior is
+a separate model with parameters ξ, and is used only during variational training. Both models are
+initialized from the base parameters θ and trained as light adaptations using LoRA-style low-rank
+updates [Hu+22], together with the small Gaussian heads and latent embedding projection.
+
+                                                  4
+Because pθ(y|x) is already represented by the base model, lightweight adaptation lets the generator
+inherit the base model’s response distribution rather than relearn it. However, because the base gener-
+ator realizes the target response distribution, a factorization that ignores z is available at initialization,
+biasing optimization toward it when the objective only measures marginal fit. The training objective
+must therefore choose a factorization where z explains meaningful strategy variation.
+
+3.2 ELBO Under-Specification and Latent Collapse
+
+The standard negative conditional ELBO objective for this router-generator model is
+
+JcELBO(x, y; ϕ, ξ) = E [− log gϕ(y|x, z)] + KL(qξ(·|x, y) ∥ rϕ(·|x)) .                                                 (1)
+z∼qξ (·|x,y)
+
+Let pϕ(z|x, y) = rϕ(z|x)gϕ(y|x, z)/pϕ(y|x) denote the posterior induced by the router-generator
+factorization. This objective satisfies the identity
+
+JcELBO(x, y; ϕ, ξ) = − log pϕ(y|x) + KL(qξ(·|x, y) ∥ pϕ(·|x, y)) .                                                     (2)
+
+Thus the standard variational objective asks the induced marginal pϕ(y|x) =
+ Z rϕ(z|x)gϕ(y|x, z) dµ(z) to match the observed response distribution, and asks qξ to match the
+posterior of whichever factorization produced that marginal. It does not ask whether z explains
+variation in y beyond x, nor whether the resulting latent is strategy-aligned.
+
+This is an objective-level under-specification problem. If the generator class can represent the base
+model while ignoring z, then the factorization
+
+gϕ(y|x, z) = pθ(y|x) for all z, qξ(z|x, y) = rϕ(z|x)
+
+preserves the base model’s response distribution and                     1.00                       Distributional Fidelity
+attains the objective’s optimum. The latent variable
+is then inert even though pϕ(y|x) = pθ(y|x). In our        Metric value  0.75
+setting, with expressive generator classes built from
+pretrained language models, this z-ignoring factor-                      0.50                       Strategy Alignment
+ization is not only available, but also close to initial-
+ization, biasing optimization toward it. In particular,                  0.25
+the generator can implement gϕ(y|x, z) = pθ(y|x)
+for all z by simply learning to ignore z. This is a                      0.00                              KL / initial KL
+latent collapse driven by both the objective’s under-                            0.0
+specification and the proximity of the inert solution                                     0.2  0.4  0.6           0.8  1.0
+to initialization.
+                                                                                               Training progress
+3.3 Model-Directed Reconstruction for
+Informative, Strategy-Aligned Latents                      Figure 3: ELBO training can preserve fi-
+                                                           delity while leaving the latent unused. Dis-
+                                                           tributional fidelity rises, posterior-router KL
+                                                           collapses relative to initialization, and strat-
+                                                           egy alignment remains low.
+
+The ELBO failure above shows that marginal fidelity is not enough: a factorized model can preserve
+pθ(y|x) while leaving z unused. We address this selection problem with a model-directed reconstruc-
+tion term. The base model pθ is used to concentrate reconstruction pressure on response tokens where
+the base model is uncertain, so the latent is encouraged to explain variation in y that the base model
+
+does not already explain through x and the autoregressive prefix.
+
+The fixed base model is used first to define the response distribution being factorized. Training
+examples are drawn as
+
+                               x ∼ DX , y ∼ pθ(·|x), z ∼ qξ(·|x, y).
+
+Thus y is sampled from the base model, while z is inferred by the training-time posterior for that
+sampled input-response pair. No strategy annotations are available during training.
+
+The core methodological idea is to use the base model pθ to adaptively rescale the reconstruction loss
+and direct reconstruction pressure towards tokens where the base model is uncertain. We instantiate
+
+this idea with token-level base model surprisal. Define
+
+bθ,t(x, y) = − log pθ(yt|x, y<t),                          bθ(x, y)            =      1 Ty
+                                                                                              bθ,t(x, y),
+                                                                                      Ty
+                                                                                          t=1
+
+as the z-free base model surprisal. This score is computed by the latent-free base model. bθ,t(x, y)
+measures how much uncertainty remains about yt after conditioning on x and y<t, and therefore
+gives a local estimate of where z can explain variation beyond the z-free prefix model.
+
+                                   5
+                                                                                 bt
+
+x                                                                                    y1     y2  y3             y4  y5  y6
+
+       y1           y2           y3       y4           y5             y6         wt
+
+Figure 4: Token-level pθ surprisal weighting. The left panel shows a response path with branch
+points, where several next tokens remain plausible, and determined positions, where the next token
+
+is mostly fixed by x and earlier response tokens. The right panel shows z-free base model surprisal
+
+bθ,t(x, y) above each token and the corresponding token weight below it; higher-surprisal positions
+receive more reconstruction pressure in aθ,t(x, y).
+
+This token-level view matters because autoregressive responses quickly become partially self-
+predictable. After an early commitment, many later tokens may be determined by x and y<t,
+even if the commitment itself reflects a strategy choice. Our reconstruction term therefore replaces
+uniform token pressure with pθ-surprisal-directed pressure, assigning more weight to branch points
+and high-surprisal positions where the base model leaves multiple continuations plausible.
+
+The proposed objective is
+
+       Jθ(x, y; ϕ, ξ) = Rθ(x, y; ϕ, ξ) + β KL(qξ(·|x, y) ∥ rϕ(·|x)) ,
+
+                             1                    Ty                                                   
+                                                                                                        ,
+       Rθ(x, y; ϕ, ξ)     =  cθ        E                aθ,t(x, y)       − log gϕ(yt|x, z, y<t)                       (3)
+
+                                 z  ∼qξ (·|x,y)     t=1
+
+       aθ,t(x, y)         =  α   1   + (1 −      α) wθ(γ,t)(x, y),            cθ =          E           [bθ(x, y)] .
+                                 Ty                                                  x∼DX , y∼pθ (·|x)
+
+Quantities with a θ subscript reflect values that depend on the base model pθ. The global scale cθ
+expresses reconstruction in base model reference units, so the reconstruction term is normalized
+
+across different data distributions and remains comparable to the KL term even when the base model
+already has low z-free loss. The interpolation parameter α ∈ [0, 1] mixes uniform response-token
+pressure with surprisal-directed pressure. The token weights wθ(γ,t)(x, y) are defined in terms of the
+base model surprisal as follows:
+
+                    wθ(γ,t)(x, y) =       bθ,t(x,      y)γ         ,      wθ(γ,t)(x, y)  =  wθ(γ,t)(x,  y)  ,          (4)
+                                                       (x,                                  κ(θγ)(x,    y)
+                                          Ty     bθ,s       y  )γ
+                                          s=1
+
+where  κθ(γ)(x, y)  =      1         Ty   wθ(γ,s)(x,   y)  bθ,s(x,    y)  is  a  normalization  factor      that   preserves  the
+                       bθ (x,y)      s=1
+
+z-free base scale of the reconstruction term. The parameter γ ≥ 0 controls concentration of the
+
+token-level weighting. The reconstruction term Rθ is designed so that Ex,y [Rθ(x, y; ϕ, ξ)] = 1
+when gϕ(y|x, z, y<t) = pθ(yt|x, y<t), and thus can be interpreted as a (weighted) fraction of the
+base model response loss that remains after conditioning on the latent z. The objective therefore
+
+balances the KL penalty against the fraction of the base model’s response loss explained by z, giving
+
+reconstruction improvement a fractional information-gain interpretation rather than measuring it in
+
+absolute log-loss units.
+
+4 Experiments
+
+4.1 Benchmark and evaluation protocol
+
+We evaluate on a controlled multi-strategy algorithmic benchmark designed to make strategy align-
+ment measurable. The task structure is parseable, allowing generated solution traces to be validated
+and matched to compatible benchmark strategies. This enables ground-truth evaluation of whether
+a learned latent variable tracks strategy-level variation, a property that is not directly observable in
+open-ended language modeling.
+
+Each example consists of a problem instance x and a solution trace y. The benchmark covers six
+task families: list summation, sorting algorithms, grid pathfinding, linear equation solving, base
+
+                                                               6
+conversion, and multidigit addition. Solution traces instantiate task-specific procedures for reaching
+the same valid answer, such as different traversal orders, algebraic manipulation orders, or algorithms.
+Details of the benchmark design are provided in Appendix C.
+
+We use a two-stage experimental protocol. First, to construct a controlled factorization target with
+known reference strategies, we fit a language model to the benchmark distribution, producing a base
+model pθ(y|x) whose response distribution mixes multiple strategies. We then train a router-generator
+factorization on samples from this fixed response distribution,
+
+     (x, y) ∼ D for base model fitting, x ∼ DX , y ∼ pθ(·|x) for factorization training.
+
+We report two primary evaluation axes. Distributional Fidelity measures whether the factorized model
+preserves the observable base model behavior, in particular whether it continues to produce valid
+solution traces. Strategy Alignment measures whether the learned latent is aligned with the reference
+strategy structure, in particular whether it achieves cross-input semantic consistency in assigning the
+same latent value to the same strategy across different problems. For each method class, we report
+the best run over the swept KL-to-reconstruction weight β; sweep details are in Appendix E.
+
+4.2 Recovering Strategy-Aligned Latents
+
+Implicit strategy information. We first ask whether the base model already contains information
+about the reference strategy before any router-generator factorization is trained. For each task and
+token position, we train a lightweight linear probe on the base model’s hidden states to predict the
+reference strategy annotation.
+
+Figure 5 shows that strategy information is                                                       1.00
+
+broadly decodable across the algorithmic bench- Summation
+
+mark, especially at positions where strategy-          Addition                                   0.75
+                                                    Task
+                                                                                                                                                  Probe accuracy
+specific computation is expressed in the se- Base conv.
+
+quence. This provides evidence that the tar-                                                      0.50
+
+get strategy structure is represented in the base      Linear eqs.
+
+model’s hidden states, but it is not exposed as        Sorting                                    0.25
+
+a reusable latent variable that can be sampled,        Grid paths
+transferred, or compared across inputs.
+                                                                                                  0.00
+
+                                                                    0.0  0.2  0.4  0.6  0.8  1.0
+
+ELBO failure. The presence of implicit strat-                                                     Position
+egy information does not imply that a standard
+variational objective will identify it. The condi-  Figure 5: Strategy labels are decodable from
+tional ELBO is under-specified for this purpose:    base model hidden states. Rows are benchmark
+it rewards matching the observable response         tasks, columns are normalized token positions, and
+distribution, but does not require z to explain     color gives linear-probe accuracy for predicting
+strategy-level variation. Empirically, Figure 3     the ground-truth strategy from the base model’s
+                                                    hidden states.
+
+and Figure 6 show that ELBO-style baselines can preserve Distributional Fidelity while leaving the
+
+latent inert or strategy-unaligned.
+
+The proposed model-directed reconstruction objective changes which marginal-preserving factoriza-
+tion is learned. Figure 6 depicts the distributional fidelity and strategy alignment of factorizations
+of pretrained language models induced by different objectives. The model-directed reconstruc-
+tion objective and its variants recover strategy-aligned latents while preserving the base model’s
+response distribution, whereas ELBO-style baselines preserve the distribution but fail to recover
+strategy-aligned latents. The latent dynamics in Figure 7 provide complementary geometric evidence:
+posterior latents that begin as an overlapping cloud separate into task- and strategy-structured regions
+over training. In the multi-task setting, this organization is task-conditioned rather than a single
+global strategy codebook: the same latent regions can carry different strategy meanings for different
+task families. This latent multiplexing is visible in linear diagnostics, as strategies pooled across all
+tasks are not linearly separable from z alone, but become linearly separable when task identity is
+provided. Together, these results indicate that model-directed reconstruction pressure can expose the
+strategy structure that was implicit in the base model’s response distribution.
+
+Cross-input semantic consistency. A latent variable can separate strategies locally for each
+input while failing to give Z a stable strategy meaning across inputs. We therefore evaluate a
+stronger notion of Strategy Alignment with Analogical Consistency: sample a source input X, draw
+Z ∼ rϕ(·|X), reuse the same Z on a related target input X′, and check whether Y ∼ gϕ(·|X, Z) and
+
+                                                    7
+                                                   Qwen2.5 0.5B                                Qwen2.5 1.5B
+              1.0
+
+              0.8
+
+Metric value  0.6
+
+              0.4
+
+              0.2
+
+              0.0                                                                    global + token global token ELBO β-ELBO
+                        global + token global token ELBO β-ELBO                        token weighting scale inverse
+                           token weighting scale inverse
+
+                       Distributional Fidelity                   Strategy Alignment  Baseline  Ablation  task
+
+Figure 6: Method comparison on pretrained Qwen2.5 runs. For each objective variant and model
+size, bars show Distributional Fidelity and Strategy Alignment, with open points giving per-task
+values. Strategy Alignment denotes cross-input latent strategy alignment measured by Analogical
+Consistency. Hatching marks baselines and ablations.
+
+                   2%  6%  10%                                   20%                 50%                 100%
+
+                                                                                                               Base conv.
+
+                                                                                                               Grid paths
+
+                                                                                                               Linear eqs.
+
+                                                                                                               Summation
+
+                                                                                                               Addition
+
+                                                                                                               Sorting
+
+Figure 7: Posterior latent geometry over training. Each panel is a PCA projection of posterior
+mean latents at the indicated fraction of training. Points are colored by task and strategy; the initially
+overlapping cloud separates into task- and strategy-specific regions over training.
+
+Y ′ ∼ gϕ(·|X′, Z) use the same inferred strategy. In the main figures, including Figure 6, “Strategy
+Alignment” denotes this stronger cross-input metric, which we write as AnalogicalConsistency =
+Pr[strat(Y ) = strat(Y ′)]. High Strategy Alignment therefore means that Z carries the same strategy
+meaning across inputs; Figure 6 shows that our objective recovers this property.
+
+Ablation: inverse-surprisal reconstruction pressure. The proposed objective puts more re-
+construction pressure on high-surprisal tokens under pθ, where strategy-branching information is
+expected to concentrate. We test this hypothesis through an ablation in which the reconstruction loss
+is weighted by inverse surprisal, so that low-surprisal tokens receive more emphasis. This ablation
+weakens Strategy Alignment, supporting the view that the model-directed reconstruction helps by
+pressuring z to encode strategy-relevant response variation. Details are in Appendix E.
+
+4.3 How Model-Directed Reconstruction Pressure Drives Strategy Alignment
+
+The preceding results show that the proposed objective recovers strategy-aligned latents. We next ask
+which part of the training signal explains the alignment gains across proposed methods and variational
+baselines. If alignment comes from capturing high-surprisal response variation in z, runs with lower
+token-weighted reconstruction loss should have higher Strategy Alignment.
+
+Figure 8 supports this mechanism-level interpretation. The phase-space dynamics show that, when
+the objective is underspecified, the model can move toward high Distributional Fidelity without
+moving toward high Strategy Alignment. The scatter plot shows that token-weighted reconstruction
+loss tracks Strategy Alignment across all methods. This suggests strategy alignment improves when
+z is pressured to explain strategy-relevant residual surprisal under pθ.
+
+5 Toward a Theory of Strategy-Structure Recovery
+
+This section outlines a line of analysis that can provide theoretical insight into the methods introduced
+in the paper. The goal is to understand when the variational approach can identify a latent variable Z
+that aligns with a target strategy structure S⋆ implicit in the pretrained model. We provide a preview
+of the main results here; the full formal treatment is given in Appendix F.
+
+Consider finite sets X and Y, an input law µ, and a fixed pretrained response distribution p(y | x).
+For an encoder q(z | x, y), router r(z | x), and generator g(y | x, z), let Qq be the joint law obtained
+
+                                                                 8
+          ELBO    global scale     global + token                                                                    1.0
+
+1.0       β-ELBO  token weighting  token inverse                                                                     0.9
+
+Strategy-Alignment0.9                                                                                                0.8
+                                                                                                 Strategy-Alignment
+0.8                                                                                                                  0.7
+
+0.7                                                                                                                  0.6
+
+0.6                                                                                                                  0.5                                      ELBO baseline
+
+                                                                                                                                                              global scale
+
+0.5                                                                                                                  0.4                                      token weighting
+                                                                                                                                                              global + token
+
+0.4                                                                                                                                                                                               token inverse
+    0.60                                                                                                             0.3
+
+          0.65    0.70 0.75 0.80 0.85 0.90        0.95  1.00                                                              100         10−1       10−2         10−3
+                         Distributional Fidelity
+                                                                                                                               Token-Weighted Reconstruction
+
+Figure 8: Left: training trajectories in fidelity-alignment phase space for different objective variants.
+Right: token-weighted reconstruction loss versus Strategy Alignment at training endpoints; outlined
+points show method centroids and translucent points show individual runs.
+
+by sampling X ∼ µ, Y ∼ p(· | X), and Z ∼ q(· | X, Y ). We study, for β ∈ [0, 1) and λ ≥ 0, the
+population complexity-penalized variational objective
+
+  Lβ,λ(q, r, g) := EQq [− log g(Y | X, Z)] + β EX,Y KL(q(· | X, Y )∥r(· | X)) + λC(r, g), (5)
+
+where C(r, g) is a theoretical proxy for architecture, parameterization, and optimization biases that
+favor simple router-generator factorizations. The appendix shows the decomposition
+
+                  Lβ,λ(q, r, g) = H(Y | X) − (1 − β)Iq(Y ; Z | X)                                                                                                                                                (6)
+
+                                   + DecGap(q, g) + β PriorGap(q, r) + λC(r, g),
+
+where DecGap and PriorGap are the generator and router KL gaps. For a fixed encoder q, define
+
+                  Aβ,λ(q)  :=     inf    [DecGap(q,            g)    +  β                                            PriorGap(q,      r)  +  λC  (r,  g)]  ,                                                     (7)
+
+                               r∈R, g∈G
+
+We show that minimizing Lβ,λ is equivalent to maximizing the following profiled score
+
+                                   Jβp,rλof (q)   :=    Iq (Y  ;  Z  |  X)                                           −    Aβ,λ(q)  .                                                                             (8)
+                                                                                                                           1−β
+
+The first term Iq(Y ; Z | X) is the information pressure that encourages Z to capture information
+about Y beyond what is already predictable from X, while the second term Aβ,λ(q) is an effective
+approximation-complexity penalty that measures whether the induced distribution is close to the
+target while being simple, as measured by the complexity term C(r, g).
+
+Let S⋆ = f (X, Y ) be the targeted strategy, and let q⋆(z|x, y) = 1{z = S⋆}. Let d(q, S⋆) be a
+recovery discrepancy between q and S⋆. Our primary result gives sufficient conditions under which
+the complexity-penalized variational objective selects a latent factorization aligned with S⋆.
+
+Theoretical analysis of latent-variable disentanglement
+Given a discrepancy measure d(q, S⋆), define
+
+                           ∆βpr,λof (δ) = Jβp,rλof (q⋆) −                                                            sup       Jβp,rλof (q).                                                                     (9)
+
+                                                                  q∈Q: d(q,S⋆)≥δ
+
+If ∆βpr,λof (δ) > 0, then every population minimizer (q, r, g) ∈ arg minq,r,g Lβ,λ(q, r, g) satisfies
+d(q, S⋆) < δ. Moreover, if the empirical objective Lβ,λ,n satisfies, with probability at least 1 − η,
+
+                  sup          Lβ,λ,n(q, r, g) − Lβ,λ(q, r, g)                                                       ≤ (1 − β)∆pβr,λof (δ) ,
+                                                                                                                                 4
+                  q,r,g
+
+                                                               9
+then every empirical minimizer (qn, rn, gn) ∈ arg minq,r,g Lβ,λ,n(q, r, g) satisfies d(qn, S⋆) <
+δ. For finite Q, R, G with sub-Gaussian losses,
+
+            n=O                          log(|Q||R||G|) + log(1/η)
+                                            (1 − β)2(∆βpr,λof (δ))2
+
+is sufficient to ensure this condition.
+
+6 Conclusion
+
+This paper studies the problem of recovering explicit latent variable representations of reasoning
+strategies from pretrained language models. The central observation is that a pretrained model’s
+response distribution is an entangled mixture over high-level strategies, and that exposing this
+structure requires more than fitting a latent variable model to observable outputs using previously
+explored methods. In particular, because the base generator already realizes this response distribution,
+a factorization that ignores the latent variable is immediately available and is globally optimal under
+objectives that only measure marginal fit.
+
+We show that standard variational training can preserve the observable response distribution while
+leaving the latent variable unused. To address this, we propose a model-directed reconstruction
+objective that uses the base model itself as a reference. In our approach, reconstruction is normalized
+by the base model’s response loss and weighted by the uncertainty seen in the base model at the token
+level, allowing the loss to concentrate on positions where strategy choices are most consequential.
+On a controlled benchmark of multi-strategy algorithmic tasks, this objective recovers latent structure
+that is aligned with reference solution strategies and is semantically consistent across inputs.
+
+The benchmark design makes strategy recovery measurable, but it limits the scope of the conclusions.
+The benchmarks we introduce cover synthetic algorithmic tasks with ground-truth strategies; how
+well the methodology extends to open-ended reasoning tasks remains an open question. Moreover,
+the theoretical analysis is preliminary, and the connection between the oracle selection criterion and
+actual training dynamics is not yet formally characterized. Further discussion of related work, broader
+implications, and future directions appears in Appendix A.
+
+References
+
+[AMR09]   Elizabeth S. Allman, Catherine Matias, and John A. Rhodes. “Identifiability of Param-
+[Bao+19]  eters in Latent Structure Models with Many Observed Variables”. In: The Annals of
+[Bow+16]  Statistics (2009) (cited on pages 13, 14).
+[Bur+18]  Yu Bao, Hao Zhou, Shujian Huang, Lei Li, Lili Mou, Olga Vechtomova, Xin-yu Dai, and
+[Che+16]  Jiajun Chen. “Generating Sentences from Disentangled Syntactic and Semantic Spaces”.
+[Fu+19]   In: Proceedings of the 57th Annual Meeting of the Association for Computational
+[Gal+25]  Linguistics. 2019 (cited on pages 13, 14).
+          Samuel R. Bowman, Luke Vilnis, Oriol Vinyals, Andrew M. Dai, Rafal Jozefowicz, and
+          Samy Bengio. “Generating Sentences from a Continuous Space”. In: Proceedings of The
+          20th SIGNLL Conference on Computational Natural Language Learning. 2016 (cited
+          on pages 2, 13, 14).
+          Christopher P. Burgess, Irina Higgins, Arka Pal, Loic Matthey, Nick Watters, Guillaume
+          Desjardins, and Alexander Lerchner. “Understanding disentangling in β-VAE”. 2018.
+          arXiv: 1804.03599 [stat.ML] (cited on pages 13, 14).
+          Xi Chen, Yan Duan, Rein Houthooft, John Schulman, Ilya Sutskever, and Pieter Abbeel.
+          “InfoGAN: Interpretable Representation Learning by Information Maximizing Genera-
+          tive Adversarial Nets”. In: Advances in Neural Information Processing Systems. 2016
+          (cited on pages 13, 14).
+          Hao Fu, Chunyuan Li, Xiaodong Liu, Jianfeng Gao, Asli Celikyilmaz, and Lawrence
+          Carin. “Cyclical Annealing Schedule: A Simple Approach to Mitigating KL Vanishing”.
+          In: Proceedings of the 2019 Conference of the North American Chapter of the Association
+          for Computational Linguistics. 2019 (cited on pages 2, 14).
+          Andrey Galichin, Alexey Dontsov, Polina Druzhinina, Anton Razzhigaev, Oleg Y. Rogov,
+          Elena Tutubalina, and Ivan Oseledets. “I Have Covered All the Bases Here: Interpreting
+          Reasoning Features in Large Language Models via Sparse Autoencoders”. 2025. arXiv:
+          2503.18878 [cs.CL] (cited on pages 13, 14).
+
+                                         10
+[Gu+23]   Yuxuan Gu, Xiaocheng Feng, Sicheng Ma, Lingyuan Zhang, Heng Gong, Weihong
+          Zhong, and Bing Qin. “Controllable Text Generation via Probability Density Estimation
+[He+19]   in the Latent Space”. In: Proceedings of the 61st Annual Meeting of the Association for
+[Hig+17]  Computational Linguistics. 2023 (cited on page 14).
+          Junxian He, Daniel Spokoyny, Graham Neubig, and Taylor Berg-Kirkpatrick. “Lagging
+[HJ16]    Inference Networks and Posterior Collapse in Variational Autoencoders”. In: Interna-
+[HST19]   tional Conference on Learning Representations. 2019 (cited on pages 2, 14).
+          Irina Higgins, Loic Matthey, Arka Pal, Christopher P. Burgess, Xavier Glorot, Matthew
+[Hu+22]   Botvinick, Shakir Mohamed, and Alexander Lerchner. “beta-VAE: Learning Basic Visual
+[Hub+24]  Concepts with a Constrained Variational Framework”. In: International Conference on
+[JT99]    Learning Representations. 2017 (cited on pages 13, 14).
+[Kes+19]  Matthew D. Hoffman and Matthew J. Johnson. “ELBO Surgery: Yet Another Way to
+[Khe+20]  Carve up the Variational Evidence Lower Bound”. 2016 (cited on pages 2, 14).
+          Aapo Hyvärinen, Hiroaki Sasaki, and Richard E. Turner. “Nonlinear ICA Using Aux-
+[KM18]    iliary Variables and Generalized Contrastive Learning”. In: Proceedings of the 22nd
+[Koh+20]  International Conference on Artificial Intelligence and Statistics. 2019 (cited on pages 13,
+[Kon+25]  14).
+[KW13]    Edward J. Hu, Yelong Shen, Phillip Wallis, Zeyuan Allen-Zhu, Yuanzhi Li, Shean Wang,
+[Li+20]   Lu Wang, and Weizhu Chen. “LoRA: Low-Rank Adaptation of Large Language Models”.
+          In: International Conference on Learning Representations. 2022 (cited on page 4).
+[LL21]    Robert Huben, Hoagy Cunningham, Logan Riggs Smith, Aidan Ewart, and Lee Sharkey.
+          “Sparse Autoencoders Find Highly Interpretable Features in Language Models”. In:
+[MF21]    International Conference on Learning Representations. 2024 (cited on page 2).
+[PL21]    Wenxin Jiang and Martin A. Tanner. “Hierarchical Mixtures-of-Experts for Exponential
+          Family Regression Models: Approximation and Maximum Likelihood Estimation”. In:
+          The Annals of Statistics (1999) (cited on pages 13, 14).
+          Nitish Shirish Keskar, Bryan McCann, Lav R. Varshney, Caiming Xiong, and Richard
+          Socher. “CTRL: A Conditional Transformer Language Model for Controllable Genera-
+          tion”. 2019. arXiv: 1909.05858 [cs.CL] (cited on page 2).
+          Ilyes Khemakhem, Diederik P. Kingma, Ricardo Pio Monti, and Aapo Hyvärinen.
+          “Variational Autoencoders and Nonlinear ICA: A Unifying Framework”. In: Proceedings
+          of the 23rd International Conference on Artificial Intelligence and Statistics. 2020 (cited
+          on pages 13, 14).
+          Hyunjik Kim and Andriy Mnih. “Disentangling by Factorising”. In: Proceedings of the
+          35th International Conference on Machine Learning. 2018 (cited on pages 13, 14).
+          Pang Wei Koh, Thao Nguyen, Yew Siang Tang, Stephen Mussmann, Emma Pierson,
+          Been Kim, and Percy Liang. “Concept Bottleneck Models”. In: Proceedings of the 37th
+          International Conference on Machine Learning. 2020 (cited on page 2).
+          Deqian Kong et al. “Latent Thought Models with Variational Bayes Inference-Time Com-
+          putation”. In: Proceedings of the 42nd International Conference on Machine Learning.
+          2025 (cited on page 14).
+          Diederik P. Kingma and Max Welling. “Auto-Encoding Variational Bayes”. 2013. arXiv:
+          1312.6114 [stat.ML] (cited on pages 1, 13, 14).
+          Chunyuan Li, Xiang Gao, Yuan Li, Baolin Peng, Xiujun Li, Yizhe Zhang, and Jianfeng
+          Gao. “Optimus: Organizing Sentences via Pre-trained Modeling of a Latent Space”.
+          In: Proceedings of the 2020 Conference on Empirical Methods in Natural Language
+          Processing (EMNLP). Online: Association for Computational Linguistics, 2020 (cited
+          on pages 13, 14).
+          Xiang Lisa Li and Percy Liang. “Prefix-Tuning: Optimizing Continuous Prompts for
+          Generation”. In: Proceedings of the 59th Annual Meeting of the Association for Compu-
+          tational Linguistics and the 11th International Joint Conference on Natural Language
+          Processing. 2021 (cited on page 2).
+          Giangiacomo Mercatali and André Freitas. “Disentangling Generative Factors in Natural
+          Language with Discrete Variational Autoencoders”. In: Findings of the Association for
+          Computational Linguistics: EMNLP 2021. 2021 (cited on pages 13, 14).
+          Seongmin Park and Jihwa Lee. “Finetuning Pretrained Transformers into Variational
+          Autoencoders”. In: Proceedings of the Second Workshop on Insights from Negative
+          Results in NLP. 2021 (cited on pages 13, 14).
+
+          11
+[Qwe24]   Qwen Team. “Qwen2.5 Technical Report”. 2024. arXiv: 2412.15115 [cs.CL] (cited
+[Ser+17]  on page 20).
+          Iulian V. Serban, Alessandro Sordoni, Ryan Lowe, Laurent Charlin, Joelle Pineau, Aaron
+[Sha+17]  C. Courville, and Yoshua Bengio. “A Hierarchical Latent Variable Encoder-Decoder
+          Model for Generating Dialogues”. In: Proceedings of the AAAI Conference on Artificial
+[SLY15]   Intelligence. 2017 (cited on page 14).
+[Tan+24]  Noam Shazeer, Azalia Mirhoseini, Krzysztof Maziarz, Andy Davis, Quoc Le, Geoffrey
+[Tei63]   Hinton, and Jeff Dean. “Outrageously Large Neural Networks: The Sparsely-Gated
+[Tuy+25]  Mixture-of-Experts Layer”. In: International Conference on Learning Representations.
+[Vas+22]  2017 (cited on page 13).
+          Kihyuk Sohn, Honglak Lee, and Xinchen Yan. “Learning Structured Output Representa-
+[Wan+23]  tion using Deep Conditional Generative Models”. In: Advances in Neural Information
+          Processing Systems. 2015 (cited on pages 1, 13, 14).
+[Wu+26]   Zhen Tan, Lu Cheng, Song Wang, Bo Yuan, Jundong Li, and Huan Liu. “Interpreting
+[Yao+23]  Pretrained Language Models via Concept Bottlenecks”. In: Advances in Knowledge
+          Discovery and Data Mining. 2024 (cited on pages 13, 14).
+[YS68]    Henry Teicher. “Identifiability of Finite Mixtures”. In: The Annals of Mathematical
+[Yue+25]  Statistics (1963) (cited on pages 13, 14).
+          Jens Tuyls, Dylan J. Foster, Akshay Krishnamurthy, and Jordan T. Ash. “Representation-
+[Zha+24]  Based Exploration for Language Models: From Test-Time to Post-Training”. 2025.
+          arXiv: 2510.11686 [cs.LG] (cited on pages 2, 15).
+[ZSE19]   Jake Vasilakes, Chrysoula Zerva, Makoto Miwa, and Sophia Ananiadou. “Learning
+[ZZE17]   Disentangled Representations of Negation and Uncertainty”. In: Proceedings of the
+          60th Annual Meeting of the Association for Computational Linguistics. 2022 (cited on
+          pages 13, 14).
+          Xuezhi Wang, Jason Wei, Dale Schuurmans, Quoc V. Le, Ed H. Chi, Sharan Narang,
+          Aakanksha Chowdhery, and Denny Zhou. “Self-Consistency Improves Chain of Thought
+          Reasoning in Language Models”. In: International Conference on Learning Representa-
+          tions. 2023 (cited on page 2).
+          Fang Wu, Weihao Xuan, Ximing Lu, Mingjie Liu, Yi Dong, Zaid Harchaoui, and Yejin
+          Choi. “The Invisible Leash: Why RLVR May or May Not Escape Its Origin”. 2026.
+          arXiv: 2507.14843 [cs.LG] (cited on page 15).
+          Shunyu Yao, Dian Yu, Jeffrey Zhao, Izhak Shafran, Thomas L. Griffiths, Yuan Cao,
+          and Karthik Narasimhan. “Tree of Thoughts: Deliberate Problem Solving with Large
+          Language Models”. In: Advances in Neural Information Processing Systems. 2023 (cited
+          on page 2).
+          Sidney Yakowitz and John D. Spragins. “On the Identifiability of Finite Mixtures”. In:
+          The Annals of Mathematical Statistics (1968) (cited on pages 13, 14).
+          Yang Yue, Zhiqi Chen, Rui Lu, Andrew Zhao, Zhaokai Wang, Yang Yue, Shiji Song, and
+          Gao Huang. “Does Reinforcement Learning Really Incentivize Reasoning Capacity in
+          LLMs Beyond the Base Model?” 2025. arXiv: 2504.13837 [cs.AI] (cited on pages 2,
+          15).
+          Yingji Zhang, Marco Valentino, Danilo Carvalho, Ian Pratt-Hartmann, and Andre Freitas.
+          “Graph-Induced Syntactic-Semantic Spaces in Transformer-Based Variational AutoEn-
+          coders”. In: Findings of the Association for Computational Linguistics: NAACL 2024.
+          2024 (cited on pages 13, 14).
+          Shengjia Zhao, Jiaming Song, and Stefano Ermon. “InfoVAE: Balancing Learning and
+          Inference in Variational Autoencoders”. In: Proceedings of the AAAI Conference on
+          Artificial Intelligence. 2019 (cited on page 14).
+          Tiancheng Zhao, Ran Zhao, and Maxine Eskenazi. “Learning Discourse-level Diversity
+          for Neural Dialog Models using Conditional Variational Autoencoders”. In: Proceedings
+          of the 55th Annual Meeting of the Association for Computational Linguistics. 2017 (cited
+          on pages 13, 14).
+
+          12
+A Extended Discussion
+
+This paper studies the problem of recovering explicit latent variable representations of reasoning
+strategies from pretrained language models. The central observation is that a pretrained model’s
+response distribution is an entangled mixture over high-level strategies, and that exposing this
+structure requires more than fitting a latent variable model to observable outputs using previously
+explored methods. In particular, because the base generator already realizes this response distribution,
+a factorization that ignores the latent variable is immediately available and is globally optimal under
+objectives that only measure marginal fit.
+
+We show that standard variational training can preserve the observable response distribution while
+leaving the latent variable unused. To address this, we propose a model-directed reconstruction
+objective that uses the base model itself as a reference. In our approach, reconstruction is normalized
+by the base model’s response loss and weighted by the uncertainty seen in the base model at the token
+level, allowing the loss to concentrate on positions where strategy choices are most consequential.
+On a controlled benchmark of multi-strategy algorithmic tasks, this objective recovers latent structure
+that is well-aligned with reference solution strategies, while also being semantically consistent across
+inputs. In this way, the latent variable transfers the same strategy from one problem to another.
+
+A.1 Related Work
+
+There is a rich and extensive literature on latent variable methods for generative models of text. This
+work includes VAEs [KW13] and CVAEs [SLY15], text and sequence VAEs [Bow+16; ZZE17],
+and disentanglement-oriented variants such as the β-VAE [Hig+17; Bur+18], FactorVAE [KM18],
+and InfoGAN [Che+16], as well as pretrained-Transformer VAEs such as OPTIMUS [Li+20] and
+the Transformer VAE of Park and Lee [PL21]. Adjacent language-VAE work also uses structured
+latent spaces to separate syntax from semantics, represent discrete linguistic factors, and control
+semantic attributes such as negation or uncertainty [Bao+19; MF21; Vas+22; Zha+24]. The problem
+we study in this work is not directly addressed by this prior work. The key distinction is that these
+methods learn a latent variable model where the target distribution is not represented by the model at
+initialization. In our setting the base model already realizes pθ(y|x), and it would be inefficient, if
+not impossible, to retrain the model from scratch to expose the strategy.
+
+Mixture-of-experts language models also learn routing over specialized generators [Sha+17; JT99],
+but such models are optimized for capacity or efficiency, not for correspondence to an interpretable
+strategy variable, and training is typically carried out from scratch. Mechanistic interpretability
+methods, including sparse autoencoders [Gal+25] and concept-bottleneck approaches [Tan+24],
+extract or steer internal representations post-hoc; our goal is instead a generative factorization that
+supports sampling and intervention.
+
+While there is also a rich theory for latent variable methods, classical identifiability theory for
+mixture models [Tei63; YS68; AMR09] and nonlinear ICA [HST19; Khe+20] achieve uniqueness
+by restricting the component family or adding auxiliary observations. When using an expressive
+pretrained generator, classical identifiability conditions generally fail, and the central question
+becomes how to select a useful factorization among the many that preserve the marginal distribution.
+An extended discussion of related work with fuller citations is given in the supplementary material.
+
+A.2 Implications and Future Directions
+
+The ideas and methods presented here open up several directions for future work; here we briefly
+mention potential connections to interpretability, directed exploration, and safety. First, because
+a strategy-aligned factorization exposes the strategies implicit in a pretrained model’s response
+distribution and makes them comparable across related inputs, it can provide a higher-level and more
+interpretable description of model behavior than token-level analysis. Moreover, intervening on z
+at generation time can direct the model toward a specific strategy; shifting the router distribution
+rϕ(z | x) adjusts the relative weight of different strategies without retraining. This has the potential
+to provide a structured prior for exploring the strategy space, which could improve coverage in
+settings where the base model under-samples certain valid approaches. Finally, because strategy-level
+control offers a more interpretable abstraction for constraining or auditing generation compared with
+token-level steering, the methods introduced in this paper may support applications where certain
+reasoning paths need to be permitted or excluded, presenting possible benefits for safety.
+
+                                                          13
+The scope of our conclusions is limited in two respects. The benchmarks we introduce cover synthetic
+algorithmic tasks with ground-truth strategies; how well the methodology extends to open-ended
+reasoning tasks remains an open question. Moreover, the theoretical analysis is preliminary, and the
+connection between the oracle selection criterion and actual training dynamics is not yet formally
+characterized.
+
+B Extended Related Work
+
+Conditional latent-variable models and language VAEs. Latent-variable generative models
+provide the formal background for our router-generator factorization. The VAE and conditional
+VAE literature learns a latent-variable model from observed data, using an encoder or recognition
+model and an ELBO to train a generator with latent variation [KW13; SLY15]. Sequence and
+dialogue VAEs extend this idea to autoregressive generation, where the latent is intended to capture
+sentence-level, discourse-level, or response-level variation beyond the input context [Bow+16; Ser+17;
+ZZE17]. Pretrained language VAEs and latent-thought models scale related ideas with pretrained
+Transformer components, continuous sentence spaces, or inference-time latent optimization [Li+20;
+PL21; Kon+25]. Another line of language-VAE work explicitly structures the latent space around
+controllable or disentangled linguistic factors. Prior work separates syntax and semantics in sentence
+VAEs [Bao+19], extends syntactic-semantic separation to Transformer-based VAEs [Zha+24], uses
+discrete latent variables to capture natural-language generative factors [MF21], and disentangles
+semantic attributes such as negation and uncertainty from content [Vas+22]. Latent-space control
+methods further model control distributions directly in the VAE latent space [Gu+23]. Our setting
+differs in the learning target: rather than fitting a latent-variable generator to data, we start from a
+fixed or pretrained response distribution pθ(y|x) and learn a factorization rϕ(z|x)gϕ(y|x, z) dz
+whose latent variable exposes strategy-level variation already implicit in that distribution.
+
+Posterior collapse, latent usage, and disentanglement objectives. Autoregressive decoders can
+ignore latent variables, giving rise to posterior-collapse and KL-vanishing pathologies in sequence
+VAEs [Bow+16; He+19; Fu+19]. Several objective analyses separate the standard ELBO regularizer
+into latent information and aggregate-prior matching terms, motivating variants that preserve latent
+usage while keeping generation well regularized [HJ16; ZSE19]. Disentanglement-oriented objectives
+such as β-VAE, capacity-controlled β-VAE, FactorVAE, and InfoGAN also show that useful latent
+structure usually requires explicit inductive bias or information pressure, not merely the presence
+of a latent code [Hig+17; Bur+18; KM18; Che+16]. These works motivate our use of objective
+terms that pressure z to carry information. However, our desideratum is more specific than latent
+activity or visual-factor disentanglement: z should be informative about y beyond x, aligned with
+reference solution strategies, and semantically consistent across related inputs. The collapse issue is
+also sharper in our adaptation setting because the initialized generator already realizes the observable
+conditional behavior without consulting z.
+
+Identifiability, conditional mixtures, and routing. Classical finite-mixture theory studies when
+a marginal distribution uniquely determines its mixture components, often through restrictive com-
+ponent families, linear-independence conditions, or multi-view structure [Tei63; YS68; AMR09].
+Conditional mixture and mixture-of-experts models introduce input-dependent routing or gating, but
+their classical guarantees usually concern approximation, prediction, or consistency under structured
+expert families rather than recovery of a semantically named latent variable [JT99]. Identifiable latent-
+variable and nonlinear-ICA results restore stronger recovery guarantees by adding auxiliary variables
+or conditional-prior structure that breaks otherwise unavoidable symmetries [HST19; Khe+20]. These
+literatures clarify why latent-variable factorization is not identified by marginal fit alone. In our
+setting, the router and generator are expressive neural language models, so many factorizations can
+preserve pθ(y|x). The problem is therefore not only estimation of the observable conditional law, but
+selection of a useful factorization whose latent variable captures reusable strategy structure.
+
+Interpretability and reasoning features. A separate line of work exposes internal model structure
+through supervised concept bottlenecks or post-hoc feature decompositions. Concept-bottleneck
+methods for pretrained language models insert human-defined concept variables and train the model
+to predict through them, providing an explicit supervised interpretability interface [Tan+24]. Sparse-
+autoencoder analyses of reasoning models instead discover internal features associated with reasoning
+motifs and can steer model behavior by intervening on feature directions [Gal+25]. These approaches
+are closely related to our interpretability motivation because they aim to make latent reasoning
+structure visible and manipulable. The distinction is that we learn a generative router-generator
+
+                                                          14
+factorization of pθ(y|x), so the learned latent variable participates directly in generation rather than
+serving only as a supervised concept layer or a post-hoc activation feature.
+
+Exploration and RLVR motivation. Recent analyses of reinforcement learning with verifiable
+rewards suggest that on-policy post-training often sharpens solutions already accessible under the
+base model rather than broadly expanding the set of reachable reasoning strategies [Yue+25; Wu+26].
+Representation-based exploration methods respond to this limitation by adding novelty or diversity
+pressure in model representation space [Tuy+25]. This literature motivates strategy-level intervention
+as a possible future use of latent-variable factorization: a reusable strategy-aligned z could provide a
+higher-level handle for directed exploration than token-space sampling alone. We do not evaluate
+RLVR or downstream exploration in this paper; the connection is a motivation for why exposing
+abstract strategies in a pretrained model may be useful beyond the controlled benchmark.
+
+C Benchmark and Data Generation
+
+The controlled multi-strategy algorithmic benchmark provides problem instances, solution traces,
+and reference strategy labels in a setting where strategy alignment can be measured directly. Each
+task family is designed so that the same problem can be solved by multiple valid procedures. The
+procedures differ in the intermediate solution trace while preserving the same final answer. This gives
+an evaluation reference for asking whether a learned latent variable corresponds to strategy-level
+variation in generated reasoning traces.
+
+C.1 Task families
+
+Table 1 summarizes the benchmark tasks used in the paper. Within each task family, strategies are
+sampled uniformly from the listed strategy set. The table lists the sampled strategies, not every
+procedure that could in principle solve the task. The task families probe complementary forms of
+strategy variation: reduction order for summation, state-transition algorithms for sorting, move-order
+policies for grid paths, algebraic manipulation order for linear equations, conversion procedures for
+base conversion, and arithmetic decomposition for multidigit addition. In each case, the strategies
+alter the intermediate trace while preserving the same problem-answer relation.
+
+Table 1: Controlled multi-strategy algorithmic benchmark. Each task family admits multiple
+valid solution procedures for the same problem instance. The benchmark uses the listed sampled
+strategies as reference labels for evaluating strategy-aligned latent variables.
+
+Task family          Problem domain                                Sampled strategies
+
+List summation       Four integers from 0 to 9                     left-to-right; right-to-left; pairwise
+
+Sorting algorithms   Five integers from 0 to 9                     bubble sort; insertion sort; merge sort
+
+Grid pathfinding     Monotone shortest paths on a 6 × 6 right-first; down-first; alternating
+                     grid
+
+Linear equation solving Integer equations ax + b = c, with         subtract-then-divide;
+                                a = 2, . . . , 9 and integer-safe  divide-then-subtract; inverse-ops
+                                solutions and offsets in [−9, 9]
+
+Base conversion      Integer n = 1, . . . , 255, base in           repeated division; via binary;
+                     2, 4, 8, 16                                   decomposition
+
+Multidigit addition  Two three-digit nonnegative integers right-to-left carry; left-to-right partials;
+                                                                     rounding decomposition
+
+C.2 Data generation
+The benchmark data distribution samples a task family, a problem instance for that task, and a
+reference strategy for solving that instance:
+
+       T ∼ Unif(task families), X ∼ DT , S ∼ Unif(ST ), Y = TraceT (X, S).
+
+                                                          15
+Here DT is the task-specific input distribution and ST is the listed strategy set for task T . The
+rendering function TraceT produces a solution trace that follows strategy S and reaches the task’s
+correct final answer. The resulting example consists of a problem instance X, a solution trace Y , and
+
+a reference strategy label S that is used for evaluation but not training.
+
+C.3 Reference strategy identification
+
+The benchmark is designed to enable parsing solution trajectories generated by a model and identify-
+ing the reference strategy. Given a problem instance and a generated solution trace, the task parser
+checks whether the trace is a valid solution and identifies which benchmark strategy it expresses. This
+makes it possible to evaluate whether generated outputs preserve valid task behavior and whether a
+learned latent variable is aligned with the benchmark’s reference strategy structure. The reference
+labels are used as an evaluation target for the controlled benchmark.
+
+C.4 Representative examples
+
+To illustrate the benchmark, the examples below show a sample problem from each task with two
+sample solutions demonstrating two different strategies. Some traces are abbreviated with ellipses
+where the omitted steps continue the same procedure.
+
+List summation. For the problem instance “3, 7, 2, 8”, the benchmark can render traces such
+as:
+
+Strategy                Trace
+
+left-to-right           3+7=10 ; 10+2=12 ; 12+8=20
+pairwise                3+7=10 ; 2+8=10 ; 10+10=20
+
+Sorting algorithms. For the problem instance “[5,2,8,1,4]”, the benchmark can render traces
+such as:
+
+Strategy                Trace
+
+bubble sort             [2,5,8,1,4] ; [2,5,1,8,4] ; ... ; [1,2,4,5,8]
+merge sort              [2,5,8,1,4] ; [2,5,1,8,4] ; [1,2,5,8,4] ; [1,2,4,5,8]
+
+Grid pathfinding. For the problem instance “grid=6 ; start=(0,0) ; goal=(2,3)”, the
+benchmark can render traces such as:
+
+Strategy                Trace
+
+right-first             R:(0,1) ; R:(0,2) ; R:(0,3) ; D:(1,3) ; D:(2,3)
+alternating             R:(0,1) ; D:(1,1) ; R:(1,2) ; D:(2,2) ; R:(2,3)
+
+Linear equation solving. For the problem instance “3x+6=21”, the benchmark can render traces
+such as:
+
+Strategy                Trace
+
+subtract-then-divide    3x+6=21 ; 3x=15 ; x=5
+divide-then-subtract    3x+6=21 ; x+2=7 ; x=7-2 ; x=5
+
+Base conversion. For the problem instance “n=45, base=4”, the benchmark can render traces
+such as:
+
+Strategy                Trace
+repeated division
+decomposition           DIV:45/4=11,r:1 ; DIV:11/4=2,r:3 ; DIV:2/4=0,r:2 ;
+                        OUT:231
+                        TERM:2*4^2=32 ; TERM:3*4^1=12 ; TERM:1*4^0=1 ; OUT:231
+
+Multidigit addition. For the problem instance “348+274”, the benchmark can render traces such
+as:
+
+Strategy                Trace
+right-to-left carry
+left-to-right partials  d2:8+4+0=12->w2,c1 ; d1:4+7+1=12->w2,c1 ;
+                        d0:3+2+1=6->w6,c0 ; sum=622
+                        p100:300+200=500 ; p10:40+70=110 ; p1:8+4=12 ;
+                        sum=500+110+12=622
+
+                        16
+    Algorithm 1: Model-directed training of a router-generator factorization
+
+    Input: Input distribution DX ; frozen base model pθ; objective parameters β, α, γ.
+    Output: Router rϕ(z|x) and strategy-conditioned generator gϕ(y|x, z).
+
+1 Initialize ϕ from θ, adding router heads and a latent embedding projection
+
+2 Initialize ξ from θ, adding posterior heads
+
+3 Freeze pθ as both the response distribution to factorize and the reconstruction reference
+
+4 Estimate cθ = Ex∼DX, y∼pθ(·|x)[bθ(x, y)] using frozen-base samples
+5 for each optimization step do
+
+6 Sample a minibatch xi ∼ DX , for i = 1, . . . , B
+7 Sample responses yi ∼ pθ(·|xi)
+
+8 Compute frozen-base surprisals bθ,t(xi, yi) and weights aθ,t(xi, yi)
+9 Sample or reparameterize zi ∼ qξ(·|xi, yi)
+
+10  Form Jθ = B−1  B    Jθ  (xi,  yi  ;  ϕ,  ξ)
+                   i=1
+
+11 Update ϕ and ξ by a stochastic gradient step on Jθ, leaving θ fixed
+
+12 end
+
+    D Details of Training Methodology
+
+    Section 3 describes the objective-level motivation for model-directed reconstruction. This appendix
+
+    gives the corresponding training procedure and the implementation details needed to reproduce the
+
+    factorization objective. Throughout this section, pθ is a frozen base model, ϕ denotes the adapted
+    router-generator parameters, and ξ denotes the training-time posterior parameters. The training
+    distribution is generated by the frozen base model itself: inputs are drawn from DX and responses
+    are sampled from pθ(·|x).
+
+    D.1 Architecture Parameterization
+
+    The router and generator are implemented as two roles of one adapted autoregressive Transformer.
+    The router reads the input prefix and produces a Gaussian distribution over continuous latent values.
+    Let h(ϕL)(x) be the final-layer representation produced by the adapted Transformer after reading x.
+    The router distribution is
+
+                              rϕ(z|x) = N Wµhϕ(L)(x), diag exp(Wσh(ϕL)(x)) .
+
+    During autoregressive generation, a latent sample z is projected to an embedding Eϕ(z) and inserted
+    as a pseudo-token at the embedding layer. The generator then predicts each response token while
+    attending to x, the latent pseudo-token, and the previous response tokens.
+
+    The training-time posterior uses the same construction, but reads the full input-response sequence.
+    Let h(ξL)(x, y) be the final-layer representation after reading (x, y). The posterior distribution is
+
+                           qξ(z|x, y) = N Uµh(ξL)(x, y), diag exp(Uσhξ(L)(x, y)) .
+
+    The posterior is used only during training to provide variational signal. At generation time, latents
+    are sampled from the router.
+
+    Both adapted models are initialized from the frozen base model parameters θ. In the experiments, the
+    trainable parameters consist of LoRA-style low-rank updates to the Transformer backbone together
+    with the Gaussian heads and latent embedding projection. This keeps the factorization close to the
+    base model while allowing the router and generator to assign a nontrivial role to z.
+
+    D.2 Objective and Normalization Details
+
+    For a sampled response y = (y1, . . . , yTy ), define the frozen-base token surprisal and response-
+    average surprisal as
+
+        bθ,t(x, y) = − log pθ(yt|x, y<t),            bθ(x, y)  =  1 Ty
+                                                                          bθ,t(x, y).
+                                                                  Ty
+                                                                      t=1
+
+                                                 17
+The global reference scale is
+
+                                       cθ = Ex∼DX , y∼pθ(·|x) [bθ(x, y)] .
+The θ subscript marks dependence on the frozen base model.
+
+Token-level reconstruction weights are derived from the base model surprisals. For γ ≥ 0, define
+
+     wθ(γ,t)(x, y) =     bθ,t(x,     y)γ      ,     κθ(γ)(x, y) =      Ty     wθ(γ,s)(x,  y)bθ,s(x,  y)  ,
+                                     (x, y)γ                           s=1
+
+                      Ty       bθ,s                                           bθ(x, y)
+                      s=1
+
+and                      wθ(γ,t)(x,
+                         κ(θγ)(x,
+     wθ(γ,t)(x, y)    =              y)  ,       aθ,t(x, y)  =  α  1   +  (1  − α) wθ(γ,t)(x, y).
+                                     y)                            Ty
+
+The parameter α ∈ [0, 1] mixes uniform response-token pressure with token-level pθ-surprisal-
+
+directed pressure. The parameter γ controls how strongly the token weights concentrate on high-
+
+surprisal positions. The base model reference scores, token weights, and normalization constants
+
+defined above are treated as constants when updating ϕ and ξ.
+
+The resulting reconstruction term and training objective are
+
+                               1                  Ty                                            
+                                                         aθ,t(x, y) [− log gϕ(yt|x, z, y<t)] ,
+     Rθ(x, y; ϕ, ξ)      =     cθ       E        
+
+                                   z∼qξ (·|x,y)     t=1
+
+and
+                       Jθ(x, y; ϕ, ξ) = Rθ(x, y; ϕ, ξ) + β KL(qξ(·|x, y) ∥ rϕ(·|x)) .
+
+The normalization by κ(θγ) preserves the frozen-base response scale under token weighting:
+
+                                                       Ty
+
+                                           wθ(γ,t)(x, y) bθ,t(x, y) = bθ(x, y).
+
+                                                      t=1
+
+Since the uniform component also satisfies
+
+                                           Ty 1
+                                           t=1 Ty bθ,t(x, y) = bθ(x, y),
+
+the mixed weights satisfy
+
+                                                        Ty
+
+                                           aθ,t(x, y) bθ,t(x, y) = bθ(x, y).
+
+                                                       t=1
+
+Consequently, if the generator matches the frozen base model token distribution, so that
+gϕ(yt|x, z, y<t) = pθ(yt|x, y<t), then Rθ(x, y; ϕ, ξ) = bθ(x, y)/cθ. Taking expectation over
+x ∼ DX and y ∼ pθ(·|x) gives E[Rθ] = 1. Thus Rθ can be read as a base-normalized frac-
+tion of the frozen-base response loss that remains after conditioning on the latent.
+
+D.3 Inference And Evaluation Interface
+
+The posterior qξ(z|x, y) is a training-time object. It provides latent samples for reconstruction
+and a variational bridge between the generator and router, but it is not needed to sample from the
+learned factorization. At inference time, the model first samples z ∼ rϕ(·|x) and then generates y
+autoregressively from gϕ(·|x, z).
+
+Strategy annotations are not used in the optimization loop. They enter only after training, when we
+evaluate whether the learned latent is informative and strategy-aligned, separates strategies within
+each input, and assigns semantically consistent latent regions across inputs
+
+E Experimental Details
+
+E.1 Evaluation protocol and metrics
+
+We evaluate trained router-generator factorizations using the parseable structure of the benchmark
+described in Appendix C. Generated solution traces can be parsed and assigned to the benchmark’s
+reference strategy structure, enabling direct evaluation of whether the learned latent variable preserves
+task behavior and has stable strategy meaning across related inputs. Strategy labels are used only for
+evaluation.
+
+                                                    18
+Table 2: Objective variants used in the experimental figures. All model-directed variants train on
+samples x ∼ DX , y ∼ pθ(·|x) and keep pθ frozen as the reference model.
+
+Method label     Reconstruction term                      Role in comparison
+
+ELBO baseline    Standard token reconstruction, with-     Tests whether ordinary variational train-
+Global scale     out base-relative normalization          ing identifies strategy-aligned latents.
+Token weighting  Base-relative reconstruction with uni-   Tests the effect of putting reconstruction
+                 form token weights                       in frozen-base reference units.
+Global + token   Base-relative reconstruction with high-  Tests model-directed pressure toward re-
+                 surprisal token weights                  sponse regions where pθ has residual sur-
+Token inverse                                             prisal.
+                 Convex mixture of uniform base-          Combines global normalization with
+                 relative and high-surprisal token-       token-level model-directed pressure.
+                 weighted reconstruction
+                 Base-relative reconstruction with        Directional negative control emphasizing
+                 inverse-surprisal token weights          low-surprisal tokens.
+
+Distributional Fidelity. Distributional Fidelity measures whether samples from the factorized
+
+model preserve the base model response behavior at the level of valid benchmark solutions. Opera-
+tionally, we sample Z ∼ rϕ(·|X), generate Y ∼ gϕ(·|X, Z), parse the generated trace, and report
+the fraction of samples that remain strategy-compatible task solutions.
+
+Strategy Alignment. The main-paper Strategy Alignment metric is Analogical Consistency, as
+defined in Section 4.2. We sample a source input X, draw Z ∼ rϕ(·|X), generate Y ∼ gϕ(·|X, Z),
+reuse the same Z on a related target input X′, and generate Y ′ ∼ gϕ(·|X′, Z). The score is
+
+                          AnalogicalConsistency = Pr[strat(Y ) = strat(Y ′)] ,
+
+where X′ is sampled from the same task family as X. This tests whether the latent value carries the
+same strategy meaning across different inputs.
+
+Supporting diagnostics. Router Strategy Decodability is a linear-probe diagnostic measuring
+whether reference strategy information is linearly recoverable from router-sampled latents Z ∼
+rϕ(·|X). It is useful for diagnosing latent information, but it is weaker than Analogical Consistency
+because it does not test whether the same latent value has reusable cross-input meaning. For
+mechanism analysis, we also report base-relative reconstruction Rθ, token-weighted reconstruction,
+and the posterior-router prior KL term from the training objective.
+
+E.2 Objective variants and inverse-surprisal ablation
+
+Appendix D.2 gives the full model-directed objective. The experiments compare variants of
+
+                        J (x, y; ϕ, ξ) = R(x, y; ϕ, ξ) + β KL(qξ(·|x, y) ∥ rϕ(·|x)) ,
+
+where the variants differ in the reconstruction term R. The standard ELBO uses the unnormalized
+autoregressive reconstruction loss, while the proposed variants use the frozen base model pθ to
+normalize and direct reconstruction pressure.
+
+For uniform base-relative reconstruction, the token weights are aθ,t = 1/Ty. For surprisal-
+proportionate token weighting, aθ,t is the concentration-corrected token weight defined from the
+frozen-base surprisal bθ,t(x, y) in Appendix D.2. The global+token variants use convex mixtures
+of the uniform base-relative term and the high-surprisal token-weighted term. Table 2 maps the
+paper-facing method labels to the objective components used in the figures.
+
+Inverse-surprisal ablation. The inverse-surprisal ablation tests whether the direction of token-level
+pressure matters. Let ˜bθ,t(x, y) = max{bθ,t(x, y), ϵ}, and define inverse-surprisal weights
+
+                             vθ,t(x, y) =  ˜bθ,t(x,    y)−1      .
+                                                       (x, y)−1
+                                           Ty   ˜bθ,s
+                                           s=1
+
+As with the high-surprisal token-weighted term, we use a per-example scale correction so that the
+z-free base model reconstruction remains on the same base-relative scale:
+
+              vθ,t(x, y)  =  vθ,t(x, y) ,  ηθ(x, y) =     Ty   vθ,s  (x,  y  )bθ,s  (x,  y)  .
+                             ηθ(x, y)                     s=1
+
+                                                                 bθ(x, y)
+
+                                           19
+Replacing aθ,t by vθ,t emphasizes tokens already well predicted by pθ, while preserving the same
+z-free reconstruction scale in expectation. The ablation therefore tests the mechanism-level hypothesis
+that alignment gains come from pressure on high-surprisal, strategy-relevant response regions rather
+than from nonuniform token weighting alone.
+
+E.3 Training settings and hyperparameter sweeps
+
+The default experimental setting is multi-task factorization: each run trains one router-generator
+model jointly across all six benchmark task families. This setting better matches the heterogeneous
+training regime of language models, where a single model must represent many task distributions.
+Additional single-task runs are used for diagnostic sweeps and mechanism plots where per-task
+variation is useful.
+
+We construct the benchmark base models from two initializations: pretrained Qwen2.5 checkpoints
+and random weights. In both settings, we first fit the model to the benchmark task distribution;
+we then freeze and factorize the resulting base model pθ. The randomly initialized diagnostic grid
+contains 504 complete LoRA adaptation runs: six single-task settings plus the multi-task setting,
+twelve reconstruction-family settings including ablations, three KL weights β ∈ {1, 0.1, 0.01}, and
+two schedules for β (constant and linear warmup over training). The pretrained method-comparison
+runs factorize Qwen2.5 0.5B and 1.5B base models [Qwe24] in the multi-task setting with con-
+tinuous latent dimension 64. We use the Hugging Face checkpoints Qwen/Qwen2.5-0.5B and
+Qwen/Qwen2.5-1.5B, whose model cards list the Apache 2.0 license.
+
+E.4 Additional diagnostics
+
+The main text focuses on the headline pretrained method comparison and compact mechanism
+diagnostics. Here we include additional views that support the same claims: latent geometry over
+training, role of KL weights, metric associations, and phase-space training dynamics.
+
+F A Theory of Variational Approaches to the Strategy-Structure Recovery
+    Problem
+
+This appendix gives the formal treatment behind the preview theorem in the main text. The main
+result studies the population ELBO over independently parameterized expressive encoder, router, and
+generator classes.
+
+F.1 Setup and the Strategy Structure Recovery Problem
+Let X and Y be finite sets (e.g., space of token sequences). Let µ be a fixed input law on X , and let
+p(y | x) be a fixed conditional law on Y. All expectations, entropies, and mutual informations are
+computed under
+
+                                           X ∼ µ, Y ∼ p(· | X),
+
+unless stated otherwise. Because all sample spaces are finite, measurability is automatic; the only
+analytic issues are support, finite-value, and minimizer-attainment issues, stated explicitly below.
+
+Fix a latent cardinality K, and write Z = [K]. Let Q, R, G be classes of encoders q(z | x, y), routers
+r(z | x), and generators g(y | x, z), respectively. For q ∈ Q, define the joint law
+
+                                    Qq(x, y, z) = µ(x)p(y | x)q(z | x, y).
+
+Under Qq, define the encoder-induced router
+
+q(z | x) := p(y | x)q(z | x, y),
+
+                      y
+
+and the encoder-induced branch conditional, whenever q(z | x) > 0, by
+
+pq (y  |  x, z)  :=  p(y  | x)q(z | x, y)
+                           q(z | x) .
+
+The conditional pq(y | x, z) may be defined arbitrarily on zero-mass branches; all KL and expectation
+terms below weight such branches by q(z | x). Let Iq(Y ; Z | X) denote conditional mutual
+information under Qq.
+
+                     20
+2%             6%  10%                  20%  50%  100%
+
+                                                                   Base conv.
+                                                                        repeated-division
+                                                                        via-binary
+                                                                        decomposition
+
+                                                                   Grid paths
+                                                                        right-first
+                                                                        down-first
+                                                                        alternating
+
+                                                                   Linear eqs.
+                                                                        subtract-then-divide
+                                                                        divide-then-subtract
+                                                                        inverse-ops
+
+                                                                   Summation
+                                                                        left-to-right
+                                                                        right-to-left
+                                                                        pairwise
+
+                                                                   Addition
+                                                                        right-to-left-carry
+                                                                        left-to-right-partials
+                                                                        rounding-decomposition
+
+                                                                                                                                                                                                                                        Sorting
+
+                                                                                                                                                                                                                                                                 bubble-sort
+                                                                                                                                                                                                                                                                 selection-sort
+                                                                                                                                                                                                                                                                 insertion-sort
+                                                                                                                                                                                                                                                                 merge-sort
+                                                                                                                                                                                                                                                                 heap-sort
+
+Figure 9: Task-faceted posterior latent dynamics. Each row shows one benchmark task for the
+selected multi-task token-weighting run, and columns show checkpoints over training. Points are
+posterior mean latents projected with task-local PCA and colored by reference strategy. The view
+complements Figure 7 by showing that strategy organization emerges within each task family.
+
+Let S⋆ = σ(X, Y ) ∈ [K] denote the reference strategy. This hard-strategy assumption says that,
+once the completed trace is observed, the strategy is recognizable as an attribute of (X, Y ). Let q⋆ be
+the hard reference encoder
+
+                                        q⋆(z | x, y) := 1{z = σ(x, y)}.
+
+We assume q⋆ ∈ Q when stating recovery theorems.
+
+Because latent labels are arbitrary, recovery can only be defined up to relabeling. The next definition
+separates relabelings that may vary with the input from a single label system shared across inputs.
+
+Definition 1: Weak and strong recovery
+
+An encoder q ∈ Q weakly recovers S⋆ if, for µ-almost every x, there exists a permutation πx of
+
+[K] such that  Z = πx(S⋆)
+
+                           Qq-almost surely conditional on X = x.
+
+It strongly recovers S⋆ if there exists one global permutation π of [K] such that Z = π(S⋆)
+
+Qq-almost surely. Null labels are ignored; any bijection between positive-probability labels may
+be extended arbitrarily to a permutation of [K].
+
+We measure approximate recovery by the corresponding variation-of-information distances under
+Qq :
+
+                               dw(q, S⋆) := Hq(Z | X, S⋆) + Hq(S⋆ | X, Z),
+
+and
+                                   ds(q, S⋆) := Hq(Z | S⋆) + Hq(S⋆ | Z).
+
+                                        21
+                                      ELBO baseline       global scale   token weighting                                                          global + token  token inverse
+
+                                                       Constant β                                                                                 Linear β warmup
+                    1.0
+
+Fidelity-Alignment  0.8
+
+                    0.6
+
+                    0.4
+
+                    0.2
+
+                    0.0                              0.1                                                        0.01                           1                  0.1                                                                 0.01
+                              1
+
+                                                     β                                                                                                            β
+
+Figure 10: Method success across β settings. Plots show the product of Distributional Fidelity and
+Strategy Alignment across different KL weights β for the multi-task randomly initialized diagnostic
+grid. Standard ELBO-style baselines remain weak in fidelity-alignment across β, while model-
+directed objectives succeed robustly once β is small enough to enable informative latents.
+
+                    1.0                                                                                                                   1.0
+
+                    0.9                                                                                                                   0.9
+
+Strategy-Alignment  0.8                                                                                               Strategy-Alignment  0.8
+
+                    0.7                                                                                                                   0.7
+
+                    0.6                                                                                                                   0.6
+
+                    0.5                                            ELBO baseline                                                          0.5                          ELBO baseline
+
+                                                                   global scale                                                                                        global scale
+
+                    0.4                                            token weighting                                                        0.4                          token weighting
+                                                                   global + token                                                                                      global + token
+
+                                                                                                 token inverse                                                                                                         token inverse
+
+                    0.3                                                                                                                   0.3
+
+                                 101  100            10−1          10−2  10−3                                                                     0.92 0.94 0.96 0.98 1.00 1.02
+
+                                 Base-Normalized Reconstruction                                                                                   Distributional Fidelity
+
+Figure 11: Endpoint metric associations in single-task diagnostic runs. Left: base-relative
+reconstruction versus Strategy Alignment. There is a general positive association between recon-
+struction measured in base model units and strategy alignment; however, unlike the token-weighted
+reconstruction shown in the main text, the association is weaker for the pure token-weighted variant.
+This is likely caused by too little reconstruction pressure on non high-surprisal tokens, which causes
+some loss on these tokens. This motivates setting α > 0 in the global+token variant to preserve
+some uniform reconstruction pressure. Right: Distributional Fidelity versus Strategy Alignment.
+Larger outlined points show method centroids and smaller translucent points show individual runs;
+these diagnostics illustrate that it is possible to have high distributional fidelity without strategy
+alignment. In general distributional fidelity is easy, especially because the factorization is initialized
+near the pretrained model’s response distribution, but strategy alignment is harder and requires the
+right objective design.
+
+The weak distance conditions on X, so it compares strategy semantics separately within each input.
+The strong distance does not condition on X, so it also penalizes input-dependent relabeling. The
+following lemma verifies that these distances are exactly the right zero-error notions for the two
+definitions.
+
+                                                                                                                22
+                                  β-ELBO  global scale  token weighting       global + token  token inverse
+
+                             Baseline reconstruction Token-weighted reconstruction Distributional Fidelity               Prior KL
+
+                       1.00       θ = 1        1.00    θ = 1                1.00                           1.00
+
+Qwen2.5 0.5B           0.95                     0.95                          0.95                           0.95
+   Strategy-Alignment
+                       0.90                     0.90                          0.90                           0.90
+
+                       0.85                     0.85                          0.85                           0.85
+
+                       0.80                     0.80                          0.80                           0.80
+
+                       0.75                     0.75                          0.75                           0.75
+
+                             101  100     10−1          100     10−1                0.8       0.9       1.0        10−1 101 103 105
+
+Qwen2.5 1.5B           1.00       θ = 1        1.00    θ = 1                1.00                           1.00
+   Strategy-Alignment  0.95                     0.95                          0.95                           0.95
+                       0.90                     0.90                          0.90                           0.90
+                       0.85                     0.85                          0.85                           0.85
+                       0.80                     0.80                          0.80                           0.80
+                       0.75                     0.75                          0.75                           0.75
+
+                             101  100 10−1              100     10−1                0.8       0.9       1.0        10−1  101       103
+
+                             Baseline recon.                    Token recon.                  Fidelity                   Prior KL
+
+Figure 12: Phase-space training dynamics of pretrained Qwen model factorization. Phase-
+space dynamics diagrams of Qwen2.5 0.5B and 1.5B multi-task runs are shown across base-relative
+reconstruction, token-weighted reconstruction, Distributional Fidelity, and Prior KL, each plotted
+against Strategy Alignment. Trajectories show how each method moves through these diagnostic
+phase spaces over training, from initialization to the final checkpoint.
+
+  Lemma 1: Recovery distances
+
+  For every q ∈ Q:
+         1. dw(q, S⋆) = 0 if and only if q weakly recovers S⋆.
+         2. ds(q, S⋆) = 0 if and only if q strongly recovers S⋆.
+         3. dw(q, S⋆) ≤ ds(q, S⋆).
+
+Proof. For the weak statement, dw(q, S⋆) = 0 holds if and only if
+                                Hq(Z | X, S⋆) = 0, Hq(S⋆ | X, Z) = 0.
+
+Thus, for µ-almost every x, Z is a deterministic function of S⋆ under Qq(· | X = x), and S⋆ is a
+deterministic function of Z under the same conditional law. The two variables therefore induce the
+same partition of positive-probability labels at that input, up to a bijection between the labels that
+occur. Since both label spaces are subsets of [K], the bijection extends to a permutation πx. This is
+weak recovery. The converse is immediate because Z = πx(S⋆) makes the two conditional entropies
+vanish.
+The strong statement is the same argument without conditioning on X. The condition ds(q, S⋆) = 0
+is equivalent to Z and S⋆ determining each other as global random variables under Qq, which is
+strong recovery up to null labels.
+
+Finally, conditioning reduces entropy:
+                   Hq(Z | X, S⋆) ≤ Hq(Z | S⋆), Hq(S⋆ | X, Z) ≤ Hq(S⋆ | Z).
+
+Adding these inequalities gives dw(q, S⋆) ≤ ds(q, S⋆).
+
+Thus any strong recovery guarantee also implies weak recovery, but not conversely. This distinction
+becomes important when different inputs can reuse the same latent labels with different meanings.
+
+                                                          23
+F.2 ELBO Decomposition with Router-Generator Complexity
+
+We study the population complexity-penalized beta-ELBO, with β ≥ 0 and λ ≥ 0,
+
+     Lβ,λ(q, r, g) := EQq [− log g(Y | X, Z)] + β EX,Y KL(q(· | X, Y )∥r(· | X)) + λC(r, g).
+
+The functional C(r, g) ∈ [0, ∞] is a theoretical proxy for architecture, parameterization, and opti-
+mization biases that favor simple router-generator factorizations. We assume it is invariant under
+global relabeling of latent states. All KL terms use the usual extended-real convention.
+
+Define            DecGap(q, g) := EX,Z KL(pq(· | X, Z)∥g(· | X, Z)),
+and                   PriorGap(q, r) := EX KL(q(· | X)∥r(· | X)).
+
+The following lemma decomposes the variational objective into four terms: the irreducible conditional
+entropy H(Y | X), an information term involving Iq(Y ; Z | X), the router and decoder KL gaps,
+and the complexity penalty C(r, g). This form makes clear how the objective trades off information
+
+in the latent variable against the fit and complexity of the router-generator factorization.
+
+Lemma 2: ELBO information-complexity decomposition
+
+For every (q, r, g),
+                  Lβ,λ(q, r, g) = H(Y | X) + (β − 1)Iq(Y ; Z | X)
+                                     + DecGap(q, g) + β PriorGap(q, r) + λC(r, g).
+
+Proof. First decompose the reconstruction term. Under Qq,
+
+                  E[− log g(Y | X, Z)] = EX,Z pq(y | X, Z)(− log g(y | X, Z)).
+
+                                                                                  y
+
+For each (x, z), cross-entropy equals entropy plus KL:
+
+           pq(y | x, z)(− log g(y | x, z)) = H(pq(· | x, z)) + KL(pq(· | x, z)∥g(· | x, z)).
+
+        y
+
+Averaging gives
+                         E[− log g(Y | X, Z)] = Hq(Y | X, Z) + DecGap(q, g).
+
+Because the (X, Y ) marginal of Qq is µ(x)p(y | x),
+
+                                   Hq(Y | X) = H(Y | X).
+
+Thus                  Hq(Y | X, Z) = H(Y | X) − Iq(Y ; Z | X),
+and     E[− log g(Y | X, Z)] = H(Y | X) − Iq(Y ; Z | X) + DecGap(q, g).
+
+Next decompose the KL-to-prior term:
+
+                        KL(q(·  |  X,  Y  )∥r(·  |  X ))  =       log  q(Z |  X, Y  )   .
+                                                                        r(Z   | X)
+                  EX,Y                                       EQq
+
+Insert q(Z | X):
+
+                  log   q(Z | X, Y )   = log     q(Z | X, Y )  +       q(Z | X)
+                                                                  log                .
+                        r(Z | X)                    q(Z | X)           r(Z    |  X)
+
+The first expectation is Iq(Y ; Z | X), and the second is PriorGap(q, r). Therefore
+                   EX,Y KL(q(· | X, Y )∥r(· | X)) = Iq(Y ; Z | X) + PriorGap(q, r).
+
+Combining the reconstruction decomposition, the KL decomposition, and the complexity term gives
+the identity.
+
+The coefficient of Iq(Y ; Z | X) is β − 1. Therefore the objective is information-seeking only when
+β < 1. At β = 1, selection can still occur through the profiled cost below, but the ELBO no longer
+rewards conditional information after the variational gaps have been profiled out. For β > 1, the
+objective penalizes information in Z.
+
+                                                    24
+F.3 Profiled Router-Generator Objective
+For a fixed encoder q, define the profiled router-generator cost
+
+Aβ,λ(q)           :=     inf      [DecGap(q,     g)  +     β  PriorGap(q,     r)   +  λC (r,  g)]  ∈  [0,  ∞].
+
+                      r∈R, g∈G
+
+Also define the profiled population loss
+
+                                  Lβ,λ(q)  :=       inf          Lβ,λ(q,  r,  g).
+
+                                                 r∈R, g∈G
+
+Profiling asks how good an encoder can look after choosing the best available router and generator
+for it. The next proposition rewrites that profiled loss as an encoder-only score.
+
+Proposition 1: Profiled ELBO score
+
+For every q ∈ Q,
+
+                  Lβ,λ(q) = H(Y | X) − (1 − β)Iq(Y ; Z | X) + Aβ,λ(q).
+
+If β < 1, define      Jβp,rλof (q)        :=     Iq (Y  ;  Z  |  X)  −  Aβ,λ(q)    ,
+Then                                                                     1−β
+
+                      Lβ,λ(q) = H(Y | X) − (1 − β)Jβp,rλof (q).
+
+Proof. Take the infimum over r ∈ R and g ∈ G in Lemma 2. The terms H(Y | X) and Iq(Y ; Z | X)
+do not depend on r or g, and the remaining infimum is exactly Aβ,λ(q). The final identity is a
+rearrangement when β < 1.
+
+Thus the full expressive ELBO selects encoders by an information-minus-profiled approximation-
+complexity score. The quantity Aβ,λ(q), which involves the router-generator complexity C(r, g),
+measures whether the encoder-induced routing law and branch conditionals can be approximated
+
+with low profiled cost by a simple router-generator pair.
+
+F.4 Metric Recovery Margins
+Fix a notion of recovery ρ ∈ {w, s} and δ > 0. Define the bad encoder set
+
+                                  Bρ(δ) := {q ∈ Q : dρ(q, S⋆) ≥ δ}.
+
+For β < 1 and Aβ,λ(q⋆) < ∞, define the profiled metric recovery margin
+
+                      ∆βρ,,pλrof (δ) := Jβp,rλof (q⋆) − sup Jβp,rλof (q),
+
+                                                                     q ∈Bρ (δ )
+
+with the convention that the supremum of an empty set is −∞. Equivalently,
+
+                  ∆ρβ,,pλrof (δ)  =    inf       I⋆  −  I (q)    +  Aβ,λ(q) − Aβ,λ(q⋆)        ,
+                                                                            1−β
+                                     q ∈Bρ (δ )
+
+where I(q) := Iq(Y ; Z | X) and I⋆ := Iq⋆ (Y ; Z | X).
+
+The following theorem states the population strategy-structure recovery criterion. When the profiled
+margin at level δ is positive, every population ELBO minimizer must recover the reference strategy
+up to recovery distance δ.
+
+                                                        25
+Theorem 1: Population strategy-structure recovery for the expressive ELBO
+Assume β < 1, q⋆ ∈ Q, Aβ,λ(q⋆) < ∞, and ∆βρ,,pλrof (δ) > 0. If a profiled minimizer exists and
+
+                                             q ∈ arg min Lβ,λ(q),
+
+                                                                           q∈Q
+
+then
+                                                 dρ(q, S⋆) < δ.
+
+Consequently, if a full ELBO minimizer exists and
+                                  (q, r, g) ∈ arg min Lβ,λ(q, r, g),
+
+                                                                    q∈Q, r∈R, g∈G
+
+then dρ(q, S⋆) < δ.
+
+Proof. By Proposition 1, minimizing Lβ,λ is equivalent to maximizing Jβp,rλof when β < 1. Hence
+any profiled population minimizer q satisfies
+
+                                              Jβp,rλof (q) ≥ Jβp,rλof (q⋆).
+If dρ(q, S⋆) ≥ δ, then q ∈ Bρ(δ), so
+
+                  Jβp,rλof (q) ≤ sup Jβp,rλof (q) = Jβp,rλof (q⋆) − ∆βρ,,pλrof (δ) < Jβp,rλof (q⋆),
+
+                                               q ∈Bρ (δ )
+
+contradicting optimality. Therefore dρ(q, S⋆) < δ.
+For the final claim, let (q, r, g) be a full ELBO minimizer and let
+
+V  :=   q∈Q,  inf   g∈G  Lβ,λ(q,  r,  g)  =  Lβ,λ(q,                    r,  g).
+
+              r∈R,
+
+For every q, V ≤ Lβ,λ(q), so V ≤ infq Lβ,λ(q). Conversely,
+
+   inf  Lβ,λ(q)  ≤  Lβ,λ(q)  ≤    Lβ,λ(q,                   r,  g)  =   V.
+
+    q
+
+Thus q minimizes the profiled loss over Q, and the first part applies.
+
+This theorem reduces population recovery to a score-separation condition. It states that semantic
+recovery of the reference strategy is controlled by the profiled-score gap ∆βρ,,pλrof (δ): if this gap is
+positive, then optimizing the complexity-penalized variational objective selects only encoders inside
+
+the desired δ-recovery neighborhood.
+
+  Remark 1: Sufficient conditions for minimizer existence
+
+  The above theorem is conditional on minimizers existing. One sufficient route, in these finite
+  ambient spaces, is that Q, R, G are compact subsets of the relevant probability simplexes and
+  C is lower semicontinuous, with support restrictions or closure conventions that make the KL
+  terms lower semicontinuous and avoid undefined ∞ − ∞ expressions. The substantive content of
+  this theorem is the identification of the profiled score that must separate the target encoder from
+  misaligned encoders.
+
+The margin definition is sometimes hard to check directly because it ranges over all bad encoders.
+The following corollary gives a more interpretable sufficient condition in terms of an information
+advantage and a profiled-cost advantage. It says that if encoders that fail to recover the strategy don’t
+have much more conditional information than the target, and they pay a large enough profiled cost
+penalty, then the selected encoder will recover the strategy.
+
+                         26
+Corollary 1: A sufficient information-complexity separation condition
+
+Assume the hypotheses of Theorem 1 except for the positivity of the margin. Suppose there exist
+γI ∈ R and γA > 0 such that, for every q ∈ Bρ(δ),
+
+                                   Iq(Y ; Z | X) − Iq⋆ (Y ; Z | X) ≤ γI ,
+
+and                                               Aβ,λ(q) − Aβ,λ(q⋆) ≥ γA.
+If γA > (1 − β)γI , then
+                                                                 γA
+                                           ∆βρ,,pλrof (δ)  ≥    1−β    −   γI  >  0.
+
+Proof. For every bad q,
+
+Jβp,rλof (q⋆)  −  Jβp,rλof (q)  =  Iq⋆ (Y  ;Z  |  X)  −  Iq (Y  ;Z  |  X)  +  Aβ,λ(q) − Aβ,λ(q⋆)  ≥  −γI  +  1  γA  .
+                                                                                      1−β                       −β
+
+Taking the infimum over Bρ(δ) proves the claim.
+
+This corollary makes the tradeoff explicit: a bad encoder may have more conditional information, but
+only up to γI . The target still wins if the bad encoder pays a large enough additional router-generator
+cost.
+
+We now return to the distinction between weak and strong recovery. Strong recovery requires more
+than recovering the correct partition separately for each input; it also requires label alignment across
+inputs. The next proposition shows that input-dependent relabelings can preserve weak recovery and
+conditional information exactly, while still preventing strong recovery unless the profiled cost favors
+a globally consistent label system.
+
+Proposition 2: Input-dependent relabelings and strong recovery
+
+For a family of permutations π = {πx : x ∈ X }, define the hard encoder
+                                   qπ(z | x, y) := 1{z = πx(σ(x, y))}.
+
+Assume β < 1. If qπ ∈ Q, then dw(qπ, S⋆) = 0 and
+                                     Iqπ (Y ; Z | X) = Iq⋆ (Y ; Z | X).
+
+If no single global permutation agrees with πx on the positive-probability support of S⋆ | X = x
+for µ-almost every x, then ds(qπ, S⋆) > 0. In that case, q⋆ beats this input-dependent relabeling
+in the profiled score if and only if
+
+                                            Aβ,λ(qπ) > Aβ,λ(q⋆).
+
+Consequently, strong recovery requires a positive profiled-cost gap against such non-globally
+aligned relabelings; if some such qπ has Aβ,λ(qπ) = Aβ,λ(q⋆), then the strong margin cannot be
+positive for every δ ≤ ds(qπ, S⋆).
+
+Proof. Conditional on X = x, the map S⋆ → πx(S⋆) is a bijection on labels, so weak recovery
+holds and
+
+                     Iqπ (Y ; Z | X) = Hqπ (Z | X) = H(S⋆ | X) = Iq⋆ (Y ; Z | X).
+
+If no global permutation agrees with the family {πx} on the positive supports, then qπ does not
+strongly recover S⋆; by Lemma 1, ds(qπ, S⋆) > 0. Since the conditional information terms are equal,
+the profiled-score comparison between q⋆ and qπ is determined exactly by the profiled costs. If the
+profiled costs tie, the two scores tie, so no positive strong margin can separate q⋆ from qπ at any scale
+including qπ in the bad set.
+
+This shows why strong recovery requires more than predictive information. The model class or
+complexity proxy must also prefer a globally aligned label system over equally informative local
+relabelings.
+
+                                                                27
+The recovery theorem above gives approximate recovery at a chosen radius with respect to the
+corresponding recovery distance. When the candidate class has a positive distance gap around the
+target equivalence class, that approximate statement upgrades to exact recovery.
+
+Corollary 2: Exact recovery from metric recovery
+
+Let ∼ρ denote weak equivalence when ρ = w and strong equivalence when ρ = s. Suppose
+
+mρ  :=   inf       dρ(q,  S⋆)                     >  0.
+
+        q ̸∼ρ q ⋆
+
+If Theorem 1 holds for some δ ≤ mρ, then every population ELBO minimizer exactly recovers
+S⋆ in the corresponding weak or strong sense.
+
+Proof. The theorem gives dρ(q, S⋆) < δ ≤ mρ. By definition of mρ, every non-recovering encoder
+has distance at least mρ. Therefore q ∼ρ q⋆.
+
+The separation assumption mρ > 0 is natural for finite or otherwise discrete encoder classes.
+
+  Example 1: Positive margin from semantic branch sharing
+
+  Suppose the target strategy yields branch conditionals that can be represented by shared low-
+  complexity generator templates, while every encoder at recovery scale δ either has at most γI
+  more conditional information or requires at least γA additional profiled router-generator cost.
+  If γA > (1 − β)γI , Corollary 1 gives a positive recovery margin. This is the intended regime:
+  semantic strategies win not merely because they are informative, but because their factorization is
+  cheaper to realize.
+
+Example 2: Failure from a superficial high-information attribute
+
+If λ = 0 and R, G are expressive enough that Aβ,λ(q) = 0 for all candidate deterministic
+encoders, then the profiled score is just Iq(Y ; Z | X). A length bucket, formatting marker, or
+balanced nuisance partition with larger conditional information than S⋆ will beat the semantic
+strategy. The theorem then correctly predicts non-recovery.
+
+  Example 3: Failure of strong recovery under free local relabeling
+
+  If the available router-generator class and complexity proxy are invariant not only to global
+  relabeling but also to input-dependent relabeling, then the encoders qπ in Proposition 2 can tie q⋆
+  in profiled score. Weak recovery may still hold, but the strong margin cannot be positive unless
+  the objective assigns positive cost to such local label misalignment.
+
+F.5 Marginal Fidelity and the Small-Complexity Limit
+For a router-generator pair, define the marginal conditional law
+
+                                    mr,g(y | x) := r(z | x)g(y | x, z).
+
+                                                                                 z
+
+The next proposition connects the profiled variational gaps to the observable marginal fit of this
+router-generator pair. It clarifies how much fidelity can be lost when the profiled optimizer trades
+exact factorization for lower complexity.
+
+        28
+Proposition 3: Variational gaps control marginal fidelity
+For every (q, r, g),
+
+                 EX KL(p(· | X)∥mr,g(· | X)) ≤ PriorGap(q, r) + DecGap(q, g).
+
+Proof. Fix x ∈ X . Define two joint distributions on Y × Z:
+
+                  Px(y, z) := p(y | x)q(z | x, y), Mx(y, z) := r(z | x)g(y | x, z).
+The distribution Px is the joint law over (Y, Z) induced by first sampling Y ∼ p(· | x) and then
+Z ∼ q(· | x, Y ). By Bayes’ rule, it can also be written as
+
+                           Px(y, z) = q(z | x)pq(y | x, z),
+
+with the usual convention that zero-mass branches do not affect the KL terms.
+
+Now compare the Y -marginals of these two joint distributions. For Px,
+
+                      Px(y, z) = p(y | x)q(z | x, y) = p(y | x).
+
+                   z                      z
+
+For Mx,
+
+                   Mx(y, z) = r(z | x)g(y | x, z) = mr,g(y | x).
+
+              z                        z
+
+Thus p(· | x) and mr,g(· | x) are obtained from Px and Mx, respectively, by applying the same
+projection map (y, z) → y.
+
+By data processing for KL divergence, marginalizing out Z cannot increase KL. Therefore
+
+                      KL(p(· | x)∥mr,g(· | x)) ≤ KL(Px∥Mx).
+
+It remains to expand the joint KL on the right. Using the factorizations Px(y, z) = q(z | x)pq(y | x, z)
+and Mx(y, z) = r(z | x)g(y | x, z),
+
+KL(Px∥Mx)  =       q(z  |  x)pq (y  |  x, z) log    q(z | x)pq(y | x, z)
+                                                    r(z | x)g(y | x, z)
+              z,y
+
+           =       q(z  |  x)  log  q(z   |  x)  +      q(z | x)     pq (y  |  x,  z)  log  pq(y | x, z)
+                                    r(z   |  x)                                             g(y | x, z)
+              z                                      z            y
+
+           = KL(q(· | x)∥r(· | x)) + EZ∼q(·|x)KL(pq(· | x, Z)∥g(· | x, Z)).
+
+Combining the previous two displays gives, for each fixed x,
+
+KL(p(· | x)∥mr,g(· | x)) ≤ KL(q(· | x)∥r(· | x)) + EZ∼q(·|x)KL(pq(· | x, Z)∥g(· | x, Z)).
+
+Finally, average both sides over X ∼ µ. The two terms on the right become PriorGap(q, r) and
+DecGap(q, g), respectively, which proves
+
+         EX KL(p(· | X)∥mr,g(· | X)) ≤ PriorGap(q, r) + DecGap(q, g).
+
+This proposition makes the fidelity tradeoff explicit. For finite λ, the profiled optimizer can prefer a
+simpler (r, g) with nonzero variational gaps, and therefore need not exactly factorize p(y | x). The
+
+next result records the high-fidelity limit.
+
+                                                 29
+Proposition 4: Small-λ fidelity for a fixed encoder
+Fix q ∈ Q and β > 0. Suppose the exact induced pair
+
+                         rq(z | x) := q(z | x), gq(y | x, z) := pq(y | x, z)
+belongs to R × G, and C(rq, gq) < ∞. If (rλ, gλ) minimizes Aβ,λ(q), for each λ > 0, then
+
+                            DecGap(q, gλ) → 0, PriorGap(q, rλ) → 0
+as λ ↓ 0. Consequently,
+
+                                  EX KL(p(· | X)∥mrλ,gλ (· | X)) → 0.
+
+Proof. Fix q ∈ Q. By assumption, the exact induced router-generator pair
+
+                           rq(z | x) := q(z | x),  gq(y | x, z) := pq(y | x, z)
+belongs to R × G and has finite complexity.
+
+For q’s induced router-generator pair (rq, gq), the prior gap and decoder gap are both zero. Since
+(rλ, gλ) minimizes Aβ,λ(q), its objective value is no larger than the value achieved by the exact
+induced pair. Therefore
+
+DecGap(q, gλ) + β PriorGap(q, rλ) + λC(rλ, gλ)
+      ≤ DecGap(q, gq) + β PriorGap(q, rq) + λC(rq, gq) = λC(rq, gq).
+
+All three terms on the left are nonnegative. Hence
+
+                   DecGap(q, gλ) ≤ λC(rq, gq),
+
+and, since β > 0,
+
+                   PriorGap(q, rλ)                     ≤  λC(rq, gq) .
+                                                               β
+
+Because C(rq, gq) < ∞, both upper bounds go to zero as λ ↓ 0. Thus
+
+                   DecGap(q, gλ) → 0, PriorGap(q, rλ) → 0.
+
+Finally, Proposition 3 gives
+                EX KL(p(· | X)∥mrλ,gλ (· | X)) ≤ PriorGap(q, rλ) + DecGap(q, gλ).
+
+The right-hand side tends to zero, so the marginal KL also tends to zero.
+
+The limit λ ↓ 0 restores high-fidelity factorization under exact realizability. It also weakens the
+selection role of complexity: the profiled encoder score approaches maximum conditional information,
+which can favor superficial high-information partitions unless complexity still breaks the relevant
+near-ties.
+
+F.6 Empirical Recovery
+The population theorem gives a profiled-score margin ∆βρ,,pλrof (δ). Empirical recovery only requires
+one additional ingredient: the empirical profiled ELBO must approximate the population profiled
+ELBO at a scale smaller than the same margin measured in loss units. Since
+
+                                  Lβ,λ(q) = H(Y | X) − (1 − β)Jβp,rλof (q),
+
+the loss separation corresponding to ∆βρ,,pλrof (δ) is (1 − β)∆βρ,,pλrof (δ). Equivalently, for every bad
+encoder q ∈ Bρ(δ),
+
+                  Lβ,λ(q) − Lβ,λ(q⋆) = Aβ,λ(q) − Aβ,λ(q⋆)
+                                               − (1 − β){Iq(Y ; Z | X) − Iq⋆ (Y ; Z | X)}.
+
+Thus empirical recovery is possible when finite samples preserve this information-complexity loss
+gap.
+
+                                                   30
+Let (Xi, Yi)in=1 be i.i.d. samples from µ(x)p(y | x). We use the analytic expectation over z ∼ q(· |
+Xi, Yi) and define
+
+                          1    n                                                              q(z |  Xi, Yi)
+                          n                                                                     r(z  | Xi)
+Lβ,λ,n(q, r, g)      :=                   q(z | Xi, Yi)  −  log  g(Yi  |  Xi, z)   +  β  log
+
+                             i=1  z
+
+                             + λC(r, g),
+
+with the usual extended-real conventions for the logarithmic terms. The empirical profiled loss is
+
+                                  Lβ,λ,n(q)  :=     inf     Lβ,λ,n(q,     r,  g).
+
+                                                 r∈R, g∈G
+
+Theorem 2: Empirical recovery for the profiled ELBO
+Assume β < 1, q⋆ ∈ Q, Lβ,λ(q⋆) < ∞, and
+
+                                                ∆βρ,,pλrof (δ) > 0.
+Suppose an empirical profiled minimizer exists,
+
+                                          qn ∈ arg min Lβ,λ,n(q),
+
+                                                       q∈Q
+
+and the empirical profiled objective satisfies a uniform convergence bound:
+
+                          sup  Lβ,λ,n(q) − Lβ,λ(q)          < (1 − β)∆ρβ,,pλrof (δ) .
+                                                                         2
+                          q∈Q
+
+Then every empirical profiled minimizer recovers S⋆ at scale δ:
+
+                                             dρ(qn, S⋆) < δ.
+
+Proof. Let
+
+                                  εn := sup Lβ,λ,n(q) − Lβ,λ(q) .
+
+                                             q∈Q
+
+By empirical optimality,               Lβ,λ,n(qn) ≤ Lβ,λ,n(q⋆).
+Therefore                    Lβ,λ(qn) ≤ Lβ,λ,n(qn) + εn
+
+                                             ≤ Lβ,λ,n(q⋆) + εn
+                                             ≤ Lβ,λ(q⋆) + 2εn
+                                             < Lβ,λ(q⋆) + (1 − β)∆βρ,,pλrof (δ).
+If dρ(qn, S⋆) ≥ δ, then qn ∈ Bρ(δ). Since
+
+                             Lβ,λ(q) = H(Y | X) − (1 − β)Jβp,rλof (q),
+
+the definition of ∆βρ,,pλrof (δ) implies
+
+                             Lβ,λ(qn) ≥ Lβ,λ(q⋆) + (1 − β)∆βρ,,pλrof (δ),
+
+a contradiction. Hence dρ(qn, S⋆) < δ.
+
+This theorem is deterministic conditional on uniform convergence. The remaining question is how
+
+large n must be for
+
+                          sup     Lβ,λ,n(q) − Lβ,λ(q)       < (1 − β)∆βρ,,pλrof (δ)
+                                                                         2
+                          q∈Q
+
+                                                 31
+to hold with high probability. This is a statistical question about the profiled log-loss class.
+
+In what follows, we give two concrete sufficient conditions for this uniform convergence. The first
+corollary assumes a finite encoder class and a fixed concentration bound for each encoder. The second
+derives a concrete condition under which such concentration holds by assuming a support floor for
+the decoder and router probabilities such that the log losses are bounded.
+
+Corollary 3: Finite-class sample complexity
+
+Suppose |Q| = N < ∞ and for every fixed q ∈ Q, the empirical profiled loss Lβ,λ,n(q) satisfies
+
+                   P  Lβ,λ,n(q) − Lβ,λ(q) ≥ t ≤ 2 exp                       −      nt2  .
+                                                                                   2σ2
+
+If                                                   8σ2
+                                                 β)2(∆βρ,,pλrof (δ))2
+                        n  ≥              (1  −                        log  2N  ,
+                                                                             η
+
+then with probability at least 1 − η, every empirical profiled-ELBO minimizer satisfies
+dρ(qn, S⋆) < δ.
+
+Proof. For each fixed q ∈ Q, apply the assumed concentration inequality. A union bound over the N
+
+encoders gives
+
+                P  sup Lβ,λ,n(q) − Lβ,λ(q) ≥ t       ≤ 2N exp                      −  nt2  .
+                                                                                      2σ2
+                   q∈Q
+
+Set
+                                             t = (1 − β)∆βρ,,pλrof (δ) .
+                                                             2
+
+The displayed lower bound on n makes the right-hand side at most η. On the complementary event,
+
+                   sup  Lβ,λ,n(q) − Lβ,λ(q)          < (1 − β)∆βρ,,pλrof (δ) .
+                                                                  2
+                   q∈Q
+
+The empirical recovery theorem then implies dρ(qn, S⋆) < δ for every empirical profiled-ELBO
+minimizer.
+
+Finite Q alone does not make the preceding concentration automatic. The log terms
+
+                        − log g(y | x, z),               q(z | x, y)
+                                                     log r(z | x)
+
+can be unbounded or infinite when g(y | x, z) or r(z | x) is near zero. A simple sufficient condition
+is to assume finite Q, R, G, finite C(r, g), and a support floor τ ∈ (0, 1] such that
+
+                        r(z | x) ≥ τ, g(y | x, z) ≥ τ
+
+for all admissible r, g and all x, y, z.
+
+This is stated in the following corollary.
+
+                                                 32
+Corollary 4: Finite classes with bounded log loss
+
+Suppose Q, R, G are finite, C(r, g) < ∞ for all (r, g) ∈ R × G, and there is τ ∈ (0, 1] such that
+
+                                        r(z | x) ≥ τ, g(y | x, z) ≥ τ
+
+for all r ∈ R, g ∈ G, and all x, y, z. If
+
+                                 n   ≥   2(1 + β)2 log2(1/τ )                 log  2|Q||R||G|
+                                        (1 − β)2(∆βρ,,pλrof (δ))2                               ,
+
+                                                                                        η
+
+then with probability at least 1 − η, every empirical profiled-ELBO minimizer satisfies
+dρ(qn, S⋆) < δ.
+
+Proof. For a fixed triple (q, r, g), the data-dependent part of the single-sample loss is
+
+                                 q(z | x, y)  −     log  g(y     |  x,  z)  +  β   log  q(z |   x, y)   .
+                                                                                         r(z    | x)
+                        z
+
+The support floor gives − log g(y | x, z) ≤ log(1/τ ), and
+
+                   q(z       |  x,  y) log   q(z |  x, y)    =   KL(q(·       |  x,  y)∥r(·  |  x))  ≤  log  1
+                                              r(z   | x)                                                       .
+                z
+                                                                                                             τ
+
+Thus the data-dependent part is bounded between 0 and (1 + β) log(1/τ ). The complexity term
+λC(r, g) is deterministic and cancels in empirical-population deviations.
+
+Hoeffding’s inequality and a union bound over Q × R × G imply
+
+P  sup Lβ,λ,n(q, r, g) − Lβ,λ(q, r, g) ≥ t                          ≤ 2|Q||R||G| exp            −  (1  +     2nt2    (1/τ  )  .
+                                                                                                           β)2 log2
+   q,r,g
+
+Set
+                                             t = (1 − β)∆βρ,,pλrof (δ) .
+                                                             2
+
+The displayed lower bound on n makes the right-hand side at most η.
+
+On the complementary event, profiling cannot increase the deviation: for every q,
+
+           inf  Lβ,λ,n  (q,  r,  g)  −  inf  Lβ,λ   (q,  r,  g)     ≤ sup     Lβ,λ,n(q, r, g) − Lβ,λ(q, r, g)        .
+
+           r,g                          r,g                              r,g
+
+Therefore                                                               < (1 − β)∆βρ,,pλrof (δ) .
+                                                                                     2
+                             sup     Lβ,λ,n(q) − Lβ,λ(q)
+
+                             q∈Q
+
+The empirical recovery theorem then gives dρ(qn, S⋆) < δ for every empirical profiled-ELBO
+minimizer.
+
+Support floors are only one transparent sufficient condition. Other standard routes are to clip predictive
+probabilities, assume direct concentration of the profiled losses, prove a high-probability envelope
+or sub-exponential tail bound for the relevant log losses, or use entropy, bracketing, or Rademacher
+control for the likelihood class. The recovery argument itself only needs uniform accuracy at scale
+(1 − β)∆βρ,,pλrof (δ); support or tail assumptions are one way to obtain that event.
+
+                                                                 33
+

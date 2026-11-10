@@ -1,0 +1,891 @@
+                                        Dual DeltaNet: Value-Side Memory Reorganization for Linear Attention
+
+                                        Yixiao Qian 1 Yaxin Zhang 2 Song Chen 3 * Jiaxu Liu 4 Shengze Cai 1 * Chao Xu 1 *
+
+arXiv:2610.38578v1 [cs.LG] 28 Oct 2026                          Abstract                                    ever, full attention incurs quadratic computation in sequence
+                                                                                                            length during training, while autoregressive inference main-
+                                              Linear attention and state space models (SSMs)                tains a token-level KV cache that grows linearly with the
+                                              offer efficient alternatives to softmax attention by          context length. Modern recurrent sequence models, includ-
+                                              maintaining a fixed-size recurrent state, but this            ing state space models (SSMs) and linear attention, offer
+                                              design requires careful management to preserve                efficient alternatives by processing sequences through re-
+                                              useful historical associations and limit interfer-            current state updates and compressing the history into a
+                                              ence. The delta rule helps reduce interference                fixed-size state (Gu & Dao, 2023; Dao & Gu, 2024; Qian
+                                              through correction of the value associated with               et al., 2026a; Katharopoulos et al., 2020). This recurrent
+                                              each key, but it does not explicitly account for              formulation enables linear-time sequence processing and
+                                              how related value features are distributed across             fixed-size inference memory, and recent work has shown
+                                              the state. We observe that a state S ∈ Rdk×dv can             that such models can achieve language-modeling perfor-
+                                              be viewed as a bank of dk addresses storing dv-               mance competitive with Transformers (Yang et al., 2025;
+                                              dimensional values. While a key-side read S⊤k                 Zhang et al., 2025; Lahoti et al., 2026). This compression,
+                                              retrieves the value associated with k, a value-side           however, introduces a fundamental challenge: the recurrent
+                                              read Se aggregates addresses whose stored value               fixed-size state must continuously accommodate new infor-
+                                              features match the selector e. Based on this obser-           mation while preserving useful historical associations and
+                                              vation, we propose Dual DeltaNet (DDN), which                 avoiding interference among them. Prior studies on asso-
+                                              extends Kimi Delta Attention (KDA) with a two-                ciative recall, copying, and long-context retrieval suggest
+                                              sided delta rule. The key-side delta rule reads               that recurrent models can be less effective at retrieving pre-
+                                              with the current key to correct its associated value,         cise information than softmax attention in certain settings.
+                                              while the complementary value-side delta rule                 (Arora et al., 2024a; Jelassi et al., 2024; Waleffe et al., 2024).
+                                              reads with selected features of the current value to          Therefore, effectively utilizing the recurrent fixed-size state
+                                              reorganize the addresses it occupies. We derive a             while maintaining reliable associative memory remains a
+                                              chunkwise parallel training algorithm and a rank-             central challenge.
+                                              2 recurrence that increases arithmetic intensity
+                                              during inference. Compared with KDA, GDN-2,                   Prior work has sought to improve recurrent-state utilization
+                                              and Mamba-3, DDN achieves the strongest over-                 along several complementary directions. The Mamba fam-
+                                              all performance across language modeling, zero-               ily improves the underlying state-space dynamics: Mamba
+                                              shot downstream tasks, and retrieval, while incur-            introduces input-dependent selective propagation and for-
+                                              ring modest training and inference overhead rela-             getting, Mamba-2 develops state space duality and a more
+                                              tive to KDA. Code: https://github.com/                        efficient structured recurrence, and Mamba-3 combines a
+                                              ReichtumQian/DualDeltaNet                                     more expressive discretization with complex-valued states
+                                                                                                            and multi-input multi-output updates (Gu & Dao, 2023; Dao
+                                        1. Introduction                                                     & Gu, 2024; Lahoti et al., 2026). In parallel, the DeltaNet
+                                                                                                            family improves the associative update itself. DeltaNet uses
+                                        Transformers have become the dominant backbone of mod-              the delta rule to correct the value associated with the current
+                                        ern large language models (Vaswani et al., 2017). How-              key (Schlag et al., 2021), and a subsequent parallel formula-
+                                                                                                            tion enables efficient training over sequence length (Yang
+                                            1College of Control Science and Engineering, Zhejiang Uni-      et al., 2024). Gated DeltaNet (GDN) adds an adaptive for-
+                                        versity 2Polytechnic Institute, Zhejiang University 3Department     getting gate, Kimi Delta Attention (KDA) extends decay
+                                        of Mathematics, National University of Singapore 4School            to individual key channels, and Gated DeltaNet-2 (GDN-2)
+                                        of Science, Huzhou Normal University. Correspondence                further decouples erasure from writing (Yang et al., 2025;
+                                        to: Song Chen <song.chen@nus.edu.sg>, Shengze Cai                   Zhang et al., 2025; Hatamizadeh et al., 2026). Precondi-
+                                        <shengze cai@zju.edu.cn>, Chao Xu <cxu@zju.edu.cn>.                 tioned GDN (PGDN) and Kalman Delta Networks (KDNs)
+
+                                        Preprint.
+
+                                                                                                         1
+                                                     Dual DeltaNet
+
+further refine residual writes using curvature and uncertainty      Specifically, DDN constructs a selector et by applying a
+information, respectively (Tumma et al., 2026; Bui et al.,          sigmoid channel gate to the normalized value direction vˆt.
+2026). Another line organizes memory into explicit slots            The value-side read Stet aggregates stored address direc-
+with separately maintained key and value states. Gated Slot
+Attention (GSA) uses input-dependent routing and adaptive           tions weighted by their alignment with the selected value
+forgetting to update these slots, Raven sparsifies this routing
+so that each token modifies only a selected subset of slots,        features. For each outer-product write kjvj⊤, the value-side
+and GSA2 implements two-sided correction through sepa-
+rate key–slot and slot–value recurrences, using Gated Oja           read gives (kjv⊤j )et = (vj⊤et)kj, weighting its write ad-
+Rule-2 and Gated Delta Rule-2, respectively (Zhang et al.,
+2024; Afzal et al., 2026; Li et al., 2026). These approaches        dress by the selected value features. The value-side delta
+improve recurrent memory through richer dynamics, asso-
+ciative correction, or explicit slot routing.                       rule  moves  the  aggregated  address  toward  (v  ⊤  et  )kt  ,  the
+                                                                                                                       t
+Linear attention constructs an associative state St ∈
+Rdk×dv by accumulating an outer-product update ktvt⊤                corresponding address of the current key–value association,
+from each token, where kt ∈ Rdk and vt ∈ Rdv . Viewed
+row-wise, this state St forms a bank of dk addresses, each          as illustrated in Figure 1(b). This correction reorganizes
+carrying a dv-dimensional value representation. In this view,
+kt serves two roles: it is the semantic key matched by sub-         value-conditioned address occupancy within the state, po-
+sequent queries, and it acts as the write-address vector in
+the outer-product update ktvt⊤, determining how vt is dis-          tentially reducing redundant storage and interference. Our
+tributed across the address bank. For vanilla linear attention
+with S0 = 0, these two roles appear in the state construction       contributions are summarized as follows:
+and readout:
+                                                                    • We introduce Dual DeltaNet (DDN), which applies
+                t              (write address),                       a key-side delta rule to correct the value associated
+                               (semantic matching).                   with the current key and a complementary value-side
+   St = kj vj⊤                                                        delta rule to reorganize value content across addresses
+                                                                      within the same associative state.
+             j=1
+                                                                    • We develop efficient training and inference algorithms
+             t                                                        for DDN. For training, we extend KDA’s chunkwise
+                                                                      parallel formulation using two-sided compact WY fac-
+S  ⊤  qt  =       vj (k⊤j qt)                                         torizations. For inference, we express the recurrence
+   t                                                                  in a rank-2 factorized form that increases theoretical
+                                                                      arithmetic intensity during memory-bound decoding.
+             j=1                                                      Our experiments show modest training and inference
+                                                                      overhead relative to KDA, with efficiency competitive
+Existing delta rules use the key-side read St⊤−1kt to cor-            with GDN-2 and Mamba-3 MIMO.
+rect the value associated with the current key, but do not
+explicitly examine how related value features are distributed       • We compare DDN with KDA, GDN-2, and Mamba-3
+across different addresses. Building on DART’s observa-               on language-model pretraining, zero-shot downstream
+tion that value-side reads from recurrent states can decode           tasks, real-world retrieval tasks, and synthetic NIAH
+token-conditioned keys (Qian et al., 2026b), we exploit this          tasks. DDN achieves the strongest overall performance
+complementary operation to guide associative memory up-               across the 130M, 340M, and 1B scales, with the most
+dates. While linear attention is designed for key-to-value            pronounced gains on the needle-in-a-haystack bench-
+retrieval and a value-side read does not generally invert this        mark.
+mapping to recover semantic keys, this read can reveal how
+selected value features are represented across the recurrent        2. Background
+state’s addresses. Specifically, given a value-side selector
+et ∈ Rdv , the response St−1et ∈ Rdk aggregates the ad-             Linear Attention. Linear attention admits a recurrence
+dress directions associated with the selected value features,       that accumulates key–value information through outer-
+as illustrated in Figure 1(a). The resulting state-dependent        product updates (Katharopoulos et al., 2020). Let qt, kt ∈
+address vector can guide the reorganization of related value        Rdk and vt ∈ Rdv . The recurrent state St ∈ Rdk×dv and
+content within the associative memory.                              its readout are
+
+Motivated by this observation, we propose Dual DeltaNet                   St = St−1 + ktv⊤t ,              ot  =   S  ⊤  qt.          (1)
+(DDN), which extends KDA with complementary key-side                                                                  t
+and value-side delta rules. While the key-side delta rule
+corrects the value associated with the current key kt, the          For S0 = 0, expanding the recurrence gives
+value-side delta rule adjusts the addresses of value features.
+                                                                                      t
+
+                                                                                      ot = vj kj⊤qt ,                                 (2)
+
+                                                                                      j=1
+
+                                                                    so linear attention combines the values vj using the key–
+                                                                    query inner products k⊤j qt as weights.
+
+                                                                 2
+                                                     Dual DeltaNet
+
+                      (a) Value-side read                                              (b) Value-side delta rule
+
+                                                                    target: address 5      read: addresses 1 and 3     address residual
+                                                                      (v⊤ t et)kt
+                   St                 et             Stet                              −                            =  −     −        +
+                                                                               St
+        1                       ×                                                                 S t et                  ′  ct
+        2                                                                                                                 t
+        3                            selector                                                                          S
+        4
+        5                                       addresses
+                                                 1 and 3
+                value features
+
+                                                                    before: addresses 1 and 3                       after: address 5
+
+Figure 1. Illustration of the value-side read and delta rule. (a) The selector et extracts the address response Stet of selected value features,
+which occupy addresses 1 and 3 in this example. (b) Comparing this response with the target (vt⊤et)kt produces a negative correction at
+
+addresses 1 and 3 and a positive correction at address 5, reorganizing the selected features toward the target address.
+
+Delta Rule. DeltaNet replaces the additive write with a             correction is written at the same key with strength βt. Equiv-
+key-side correction (Schlag et al., 2021),                          alently, the update can be expressed as erasure followed by
+                                                                    writing:
+St = St−1 + βtkt vt − S⊤t−1kt ⊤
+                                                                    StKDA = I − βtktkt⊤ S¯ t−1 + βtktv⊤t .
+   = I − βtktkt⊤ St−1 + βtktv⊤t .                          (3)                                                                                   (6)
+
+The residual vt − S⊤t−1kt measures the difference between           The left factor removes a fraction βt of the value associated
+the incoming value and the value currently associated with          with kt before the new value is written. Denote this factor
+kt, while βt ∈ (0, 1) controls the strength of this correction.     by At = I − βtktkt⊤.
+
+Several subsequent models extend DeltaNet with more flex-           Dual DeltaNet. Let vˆt = vt/∥vt∥2 denote the normal-
+ible forgetting and update mechanisms. Gated DeltaNet               ized value direction. To select which value features guide the
+adds adaptive forgetting to the delta rule (Yang et al., 2025).     correction, define the channel gate mt = sigmoid(sm t ) ∈
+Kimi Delta Attention (KDA) further generalizes forgetting           (0, 1)dv , where the logit vector stm ∈ Rdv is predicted from
+to channel-wise decay (Zhang et al., 2025):                         the current input. Define the normalized selector and its
+
+                                                                    target scale as
+
+St = I − βtktk⊤t DtSt−1 + βtktvt⊤.                         (4)                                      mt ⊙ vˆt ,         τt = v⊤t et.
+                                                                                                  ∥mt ⊙ vˆt∥2
+                                                                                       et      =                                                 (7)
+
+where Dt = Diag(αt) and αt ∈ (0, 1)dk allows the value              Let γt = sigmoid(sγt ) be a scalar gate whose logit stγ is
+content stored at each address to decay at a different rate.        predicted from the current input. The complementary value-
+Gated DeltaNet-2 further separates channel-wise decay, era-
+sure, and writing (Hatamizadeh et al., 2026).                       side delta rule then applies
+
+3. Methodology                                                      St                 =   S   KDA  +     γt  τtkt − SKt DAet            vˆ⊤t .  (8)
+                                                                                               t
+DDN maintains a matrix state St ∈ Rdk×dv . The query qt
+and key kt are L2-normalized in key space before the re-            The channel gate selects the value features used by StKDAet
+current update. Let βt ∈ (0, 1) be the KDA update strength          to identify matching addresses. The residual guides the
+and let Dt = Diag(αt) with αt ∈ (0, 1)dk . The retained             correction of the resulting address vector toward τtkt, with
+state after decay is S¯ t−1 = DtSt−1.                               strength controlled by γt. Equivalently, the update can be
+                                                                    written as:
+
+Key-side delta rule. KDA updates the state through a                                       St = StKDABt + γtτtktvˆ⊤t
+value residual:
+                                                                                                  = AtS¯ t−1Bt + ηtktvˆ⊤t ,                      (9)
+
+S  KDA  =  S¯ t−1  +  βtkt      vt − S¯ ⊤t−1kt  ⊤          (5)      where Bt = I −γtetvˆ⊤t . Since vt = ∥vt∥2vˆt, the effective
+   t                                                                write strength is
+                                                  .
+
+This form adjusts the incoming value vt by subtracting                                    ηt = βt∥vt∥2 + γt(1 − βt)τt.                           (10)
+the value already associated with kt in S¯ t−1. The resulting
+
+                                                                 3
+                                                                             Dual DeltaNet
+
+Rank-2 factorized form. Autoregressive decoding with                                    Block design. DDN follows KDA’s block design, as il-
+linear attention is often memory-bound because each to-                                 lustrated in Figure 2. The query, key, and value branches
+ken reads and writes the recurrent state while performing                               each apply a linear projection, a short causal convolution,
+relatively little computation. Mamba-3’s MIMO formula-                                  and a SiLU activation, with additional ℓ2 normalization for
+tion improves model expressivity by increasing computa-                                 queries and keys. The gates βt, mt, and γt are produced by
+tion while keeping recurrent-state memory traffic largely                               linear projections of the current input followed by sigmoid
+unchanged (Lahoti et al., 2026). This increases arithmetic                              activations. The decay branch follows KDA’s parameteriza-
+intensity (FLOPs per input/output byte) and improves hard-                              tion for αt, and its nonlinear transformations are omitted
+ware utilization during decoding. Motivated by this prin-                               from the figure for clarity and detailed in Appendix B.
+ciple, DDN expresses its two rank-one corrections as a
+rank-2 update in Algorithm 1. Both state-dependent reads                                                                                  Output
+are computed from the decayed state S¯ t−1, and the resulting
+correction directions are packed on chip into Kt ∈ Rdk×2                                                                    Linear
+and Vt ∈ R2×dv . Table 1 compares the input/output traffic,
+FLOPs, and arithmetic intensity of KDA and DDN. Both                                                                        Norm                       Linear
+methods load one dk × dv state and write it back once
+per token, while DDN increases the leading-order compu-                                                                   Dual DeltaNet
+tation from 7dkdv to 11dkdv with only O(dv) additional
+input. Its arithmetic intensity consequently increases from                                        q, k                   vα                  β, m, γ
+approximately 1.75 to 2.75 FLOPs/byte when state traffic
+dominates.                                                                                               L2 L2
+                                                                                                        ConCvonv
+Algorithm 1 Rank-2 factorized form                                                                    LinLeianrear  Conv
+
+Input: St−1, Dt, kt, vt, et, qt, βt, and γt                                                                         Linear        Lin.        Lin. ×3
+Output: Updated state St and output ot
+ 1: Preparation: Compute S¯ t−1, vˆt, and τt.                                                                                              Input
+ 2: Read both sides: ℓt ← S¯ t⊤−1kt, rt ← S¯ t−1et.
+ 3: Form residual directions.                                                           Figure 2. DDN block design. Query, key, and value branches apply
+                                                                                        linear projections, short causal convolutions, and SiLU activations,
+                       v˜t ← vt − ℓt,                                                   with ℓ2 normalization applied to queries and keys. The control
+                                                                                        branches produce the channel-wise decay αt and the sigmoid-
+                           k˜t ← (τt − βtv˜⊤t et)kt − rt.                               gated quantities βt, mt, and γt.
+
+4: Pack rank-2 factors.
+
+                   Kt ← kt k˜t ,         Vt ←          βtv˜⊤t  .
+                                                       γtvˆt⊤
+
+5: Update state: St ← S¯ t−1 + KtVt.
+6: Read output: ot ← d−k 1/2St⊤qt.
+
+                                                                                        4. Chunkwise Computation
+
+Table 1. Arithmetic intensity for (a) KDA and (b) DDN, measured                         Chunk notation. For chunks of length C, indexed by n =
+in FLOPs/byte for 2-byte inputs and outputs. The batch and head                         0, 1, . . ., write xi[n] = xnC+i for position i ∈ {1, . . . , C}.
+dimensions cancel out. DDN’s higher arithmetic intensity can                            The incoming and outgoing states are
+improve hardware utilization during memory-bound phases such
+as autoregressive decoding.                                                                        S[n] := S0[n] = SnC ,                S[n+1] = SC[n]. (11)
+
+Input              Output         FLOPs                Arithmetic intensity             Chunk matrices carry the same subscript [n].
+
+St−1 : (dk, dv)    St : (dk, dv)  7dkdv + O(dk + dv)      7dkdv + O(dk + dv) ≈ 1.75     Equivalent decay-free recurrence. Define the cumula-
+αt, kt, qt : (dk)    ot : (dv)                         2(2dkdv + 3dk + 2dv + 1)         tive diagonal decay as
+
+    vt : (dv)
+     βt : (1)
+
+                           (a) KDA (2-byte data).                                                  π[in] = αi[n] ⊙ αi[n−]1 ⊙ · · · ⊙ α1[n],
+
+Input              Output         FLOPs                Arithmetic intensity                        Π[in] = Diag(πi[n]),                                (12)
+
+St−1 : (dk, dv)    St : (dk, dv)  11dkdv + O(dk + dv)    11dkdv + O(dk + dv) ≈ 2.75     with Π0[n] = I.                        i        (Πi[n])−1Si[n], k¯[in]
+αt, kt, qt : (dk)    ot : (dv)                         2(2dkdv + 3dk + 3dv + 2)
+                                                                                                                    Set S[n]      =                             =
+  vt, et : (dv)
+   βt, γt : (1)                                                                         (Π[in])−1ki[n], and u¯ i[n] = β[in]Π[in]k[in]. Substituting
+
+                           (b) DDN (2-byte data).                                       S  i−1  =  Πi[n−]1S  i−1    into  Equation      (9),  left-multiplying  by
+                                                                                           [n]               [n]
+
+                                                                                     4
+                                                                                         Dual DeltaNet
+
+(Π[in])−1, and using D[in]Πi[n−]1 = Πi[n] gives                                                    Define the diagonal write-strength matrix
+
+          i  =        A¯ i[n]     i−1  B[in]    +   η[in] k¯ i[n] (vˆ i[n] )⊤ ,          (13)                      N [n] = Diag(η[1n], . . . , η[Cn]).                       (21)
+
+       S[n]                    S[n]
+
+where the normalized left-side erasure is                                                          Substituting into Equation (15) yields
+
+A¯ i[n] = (Πi[n])−1Ai[n]Πi[n] = I − k¯i[n](u¯ i[n])⊤. (14)                                                 C   =  (I  −   H[n]U¯ [n])S[n](I    −      E ⊤[n] Γ[n] Z [n] )
+
+                                                                                                        S[n]
+
+The  right-side  transition        from    Equation             (9)     is  B   i     =  I  −                     + H [n]N [n]Z[n],                                          (22)
+                                                                                [n]
+
+γ[in]ei[n](vˆi[n])⊤.  The      initial  normalized          state       is     0     =   S[n].     Using Z[n]      =      M  ⊤      Vˆ       from     Equation        (19),  the
+                                                                                                                             R,[n]
+                                                                            S[n]                                                        [n]
+
+Compact WY representation. Unrolling separates the                                                 right-side erasure term factors as E[⊤n]Γ[n]Z[n] =
+transformed initial state from the propagated writes:
+                                                                                                   M R,[n]Γ[n]E[n] ⊤ Vˆ [n]. Define the right-transition factor
+
+                                                C                                                  and state-dependent quantities
+
+   C                                                 η[in]hi[n](zi[n])⊤,                 (15)           F R,[n] = M R,[n]Γ[n]E[n],
+
+S[n] = P L,[n]S[n]P R,[n] +
+
+                                                i=1                                                       R[n] = S[n]P R,[n] = S[n] − S[n]F ⊤R,[n]Vˆ [n],
+
+where P L,[n] = A¯ [Cn] · · · A¯ [1n], P R,[n] = B[1n] · · · BC[n], and                                   Ψ[n] = N [n]Z[n] − U¯ [n]R[n].                                     (23)
+
+                 hi[n] = (A¯ [Cn] · · · A¯ [in+]1)k¯i[n],                                          Substituting Equation (23) into Equation (22) gives
+
+          (z[in])⊤ = (vˆi[n])⊤(B[in+]1 · · · B[Cn]).                                     (16)                C
+
+Empty products are identities.                                                                            S[n]  =  (I  −     H [n]U¯ [n])R[n]  +      H [n]N [n]Z[n]
+
+Stack h[in] as columns of H[n], and (zi[n])⊤, (k¯[in])⊤,                                                        = R[n] + H [n]Ψ[n].                                          (24)
+(u¯ i[n])⊤, (ei[n])⊤, and (vˆi[n])⊤ as rows of Z[n], K¯ [n], U¯ [n],
+E[n], and Vˆ [n], respectively. The compact WY representa-                                         Restoring the cumulative decay gives the boundary recur-
+tion of the left and right transition products (Lemma A.1,
+                                                                                                   rence
+Appendix A) gives
+                                                                                                                S[n+1] = ΠC[n] R[n] + H [n]Ψ[n] .                            (25)
+
+                                                                                                   Causal readout. Define the decay-scaled queries by
+
+                      H [n] (I  +       T  L,[n])    =      K¯  ⊤    ,                                (Qπ,[n])j,: = (qjπ,[n])⊤ = d−k 1/2(πj[n] ⊙ q[jn])⊤. (26)
+                                                                [n]                                For the prefix ending at position j, Equation (15) gives
+
+                 (I + T R,[n])⊤Z[n] = Vˆ [n],                                            (17)
+
+where
+
+          T L,[n]        =     tril(U¯     [n]  K¯  ⊤    ,  −1),                                      (o[jn])⊤ = dk−1/2(qj[n])⊤S[jn]
+                                                    [n]
+
+          T R,[n]        =     tril(Γ[n]E[n]Vˆ              ⊤                                                   = (qπj ,[n])⊤Sj[n]
+
+                                                            [n], −1),
+
+                 Γ[n] = Diag(γ[1n], . . . , γ[Cn]).                                      (18)                   =  (qπj ,[n])⊤P     (Lj,)[n] S [n] P  (j)
+                                                                                                                                                      R,[n]
+
+Writing M L,[n] = (I + T L,[n])−1 and M R,[n] = (I +                                                                      j
+T R,[n])−1, the solutions are
+                                                                                                                   +         η[in]((qjπ,[n])⊤h[(nj)],i)(z[(nj)],i)⊤,         (27)
+
+                                                                                                                       i=1
+
+H [n]  =  K¯  ⊤       M  L,[n]  ,          Z [n]     =      M   ⊤           Vˆ  [n].     (19)      where the transition products and propagated directions fol-
+              [n]                                               R,[n]                              low Equations (15)–(16) with endpoint C replaced by j.
+                                                                                                   Denote the row-stacked first and second terms of the last
+State transition. Applying the product identity in                                                 expression by Oinit,[n] and Owrite,[n], respectively. Sub-
+Lemma A.1 to both transition products gives                                                        stituting the left-side WY identities from Equations (20)
+                                                                                                   and (19) and stacking the causal reads gives
+                               C
+
+     P L,[n] = I − hi[n](u¯ i[n])⊤ = I − H[n]U¯ [n],
+
+                         i=1                                                                       (q1π,[n])⊤  P  (1)    
+                                                                                                                   L,[n]
+                         C
+                                                                                                          ...
+     P R,[n] = I −             γ[in]ei[n](z[in])⊤                                                                          =  Qπ,[n]  −    tril(Qπ,[n]     K¯  ⊤    )M  L,[n]U¯ [n].
+                                                                                                                                                               [n]
+
+                                                                                                                         
+
+                         i=1                                                                       (qCπ,[n])⊤   P  (C)
+                                                                                                                   L,[n]
+          = I − E[⊤n]Γ[n]Z[n].                                                           (20)
+                                                                                                                                                                             (28)
+
+                                                                                                5
+                                                                 Dual DeltaNet
+
+Define                                                                    Algorithm 2 DDN chunkwise computation
+
+           GL,[n]   =  tril(Qπ,[n]K¯  ⊤    )M         ,                   Input: Incoming state S[n]; per-token q[in], k[in], β[in], γ[in], v[in],
+                                      [n]
+                                               L,[n]                      vˆ[in], ei[n], τ[in], and α[in] for i = 1, . . . , C
+
+           Qeff,[n] = Qπ,[n] − GL,[n]U¯ [n],                     (29)     Output: O[n] and S[n+1]
+
+        Obase,[n] = Qeff,[n]S[n].                                         1: Normalize decay.  Compute   π  i    and            Π[Cn]  using  Equa-
+                                                                                                            [n]
+
+                                                                          tion (12). Set η[in] = β[in]∥v[in]∥2 + γ[in](1 − β[in])τ[in].
+
+Substituting the right-side WY form into the initial-state                2: Triangular solution.           Stack ((Πi[n])−1k[in])⊤,
+and new-write terms and retaining causal coefficients yields
+                                                                          β[in](Πi[n]ki[n])⊤, (e[in])⊤, and (vˆ[in])⊤ as rows of K¯ [n],
+
+Oinit,[n]  =  Obase,[n]  −  tril(Obase,[n]F    ⊤      )Vˆ  [n],  (30)     U¯ [n], E[n], and Vˆ [n], and set N [n] = Diag(η[1n], . . . , η[Cn])
+                                               R,[n]
+                                                                          and Γ[n] = Diag(γ[1n], . . . , γ[Cn]). Compute M L,[n], M R,[n],
+Owrite,[n] = tril(GL,[n]N [n]M R⊤,[n])Vˆ [n].
+                                                                 (31)     H[n], and Z[n] using Equations (18)–(19). Form Qπ,[n]
+
+                                                                          using Equation (26) and compute GL,[n] using Equation (29).
+
+Adding these contributions and defining                                   3: State-independent factors.
+
+                                                                                            F R,[n] ← M R,[n]Γ[n]E[n],
+
+           Φ[n]  =  GL,[n]  N  [n]M  ⊤      ,                                   Qeff,[n] ← Qπ,[n] − GL,[n]U¯ [n],
+                                     R,[n]
+
+        GR,[n] = tril    Φ[n]  −  Obase,[n]F   ⊤                 (32)                       Φ[n] ← GL,[n]N [n]M R⊤,[n].
+                                               R,[n]
+
+                                                                          4: State update.
+
+gives                                                                           R[n] ← S[n] − S[n]F R⊤,[n]Vˆ [n],
+
+O[n] = Oinit,[n] + Owrite,[n]                                                               Ψ[n] ← N [n]Z[n] − U¯ [n]R[n],
+
+        = Obase,[n] + tril  Φ[n]  −  Obase,[n]F  ⊤         Vˆ [n]               S[n+1] ← Π[Cn](R[n] + H [n]Ψ[n]).
+                                                 R,[n]
+                                                                          5: Causal readout.
+
+        = Obase,[n] + GR,[n]Vˆ [n].                              (33)                         Obase,[n] ← Qeff,[n]S[n],
+
+Here row j of O[n] is (oj[n])⊤. The operator tril retains the                   GR,[n] ← tril      Φ[n]  −  O base,[n] F        ⊤      ,
+lower-triangular part, including the diagonal, and sets all                                                                     R,[n]
+entries above the diagonal to zero. Algorithm 2 summarizes
+the computation, and Appendix B gives the implementation                        O[n] ← Obase,[n] + GR,[n]Vˆ [n].
+details.
+                                                                          seven downstream tasks from LAMBADA through Open-
+5. Experiments                                                            BookQA. In language modeling, DDN achieves lower per-
+                                                                          plexity than KDA on all three measures at every scale
+Setup. We compare DDN against KDA, GDN-2, and                             and ranks among the leading models in most comparisons.
+Mamba-3 to evaluate its effectiveness among recent recur-                 These results suggest that the value-side delta rule improves
+rent models. For Mamba-3, we evaluate both SISO and                       language modeling. On zero-shot downstream tasks, DDN
+rank-4 MIMO variants. The 130M, 340M, and 1B models                       achieves the highest average downstream accuracy among
+are trained on approximately 5B, 15B, and 50B FineWeb-                    all evaluated baselines at each scale.
+Edu tokens, respectively. Within each scale, we match total
+parameter counts by adjusting model and MLP widths to                     Synthetic NIAH tasks. Table 3 evaluates four needle vari-
+compensate for differences in recurrent parameters. Follow-               ants from RULER (Hsieh et al., 2024) at context lengths
+ing the Mamba-3 and GDN-2 setups (Lahoti et al., 2026;                    from 1,024 to 4,096. DDN achieves the highest average
+Hatamizadeh et al., 2026), we preserve the multi-value atten-             score at all three model scales. At 1B, it achieves the highest
+tion (MVA) head structure of Mamba-3, resulting in more                   accuracy across all NIAH-Single settings, with particularly
+heads than the linear-attention baselines. This shape ad-                 pronounced gains on NIAH-Single-2 at 4,096 tokens and
+justment keeps the effective state size per layer nheaddkdv               NIAH-Single-3. These results suggest that the state man-
+identical across all baselines at each model scale. All runs              agement provided by the value-side delta rule substantially
+use AdamW, gradient clipping at 1.0, cosine learning-rate                 improves associative recall.
+decay, and a context length of 2,048. Further architecture,
+optimization, and evaluation details are provided in Ap-                  Real-world retrieval tasks. Table 4 reports six recall-
+pendix C.                                                                 intensive real-world tasks from Just Read Twice (Arora
+                                                                          et al., 2024c), with inputs truncated to a maximum of 2,048
+Language modeling and zero-shot downstream tasks.                         tokens. DDN outperforms KDA in average accuracy at all
+Table 2 reports FineWeb-Edu training perplexity, WikiText-                three scales, achieving the highest average at 130M and
+2 and LAMBADA perplexity, and zero-shot accuracy on the                   340M. At 1B, it ranks second with 31.20%, slightly below
+                                                                          GDN-2 at 31.80%. GDN-2 shows a particularly large ad-
+
+                                                                       6
+                                    Dual DeltaNet
+
+Table 2. Results on language modeling and zero-shot downstream tasks at the 130M, 340M, and 1B scales after approximately 5B, 15B,
+and 50B FineWeb-Edu training tokens, respectively. All accuracy values are percentages. Bold and underlined values denote the best and
+second-best distinct scores within each model-size group in each column, respectively.
+
+Model          FW-Edu WT2 LAMB. LAMB. PIQA HellaS. WinoGr. ARC-E ARC-C OBQA Avg.
+              train ppl ↓ ppl ↓ ppl ↓ acc ↑ acc ↑ accn ↑ acc ↑ acc ↑ acc ↑ acc ↑ acc ↑
+
+Mamba-3 SISO  15.10  44.58   68.20  130M models; 5B tokens   50.91  50.46  20.39  18.80     37.43
+Mamba-3 MIMO  14.93  43.89   73.03   26.37 63.11 31.97       52.64  51.01  20.73  19.60     37.75
+GDN-2         15.22  42.79   67.88   25.97 62.08 32.22       51.70  50.93  20.14  19.20     37.60
+KDA           14.79  42.53   69.91   26.41 62.51 32.28       52.09  49.66  20.14  19.00     37.38
+DDN (ours)    14.78  42.36   60.93   25.69 62.95 32.14       52.41  51.22  20.39  19.60     38.03
+                                     27.75 62.35 32.49
+Mamba-3 SISO  10.97  28.68   29.62  340M models; 15B tokens  49.96  59.18  25.60  22.60     42.67
+Mamba-3 MIMO  10.81  27.63   28.33   34.93 66.00 40.46       50.67  59.09  24.92  23.60     43.00
+GDN-2         11.19  29.40   29.18   34.83 66.76 41.12       52.25  56.06  23.21  20.20     41.87
+KDA           10.93  28.13   29.09   36.35 65.51 39.48       51.38  57.53  24.23  21.60     42.40
+DDN (ours)    10.88  27.43   28.41   35.92 65.83 40.31       51.46  58.33  27.30  24.40     43.44
+                                     35.92 66.32 40.34
+Mamba-3 SISO  8.29   19.38   14.81   1B models; 50B tokens   54.93  67.00  32.42  29.40     50.18
+Mamba-3 MIMO  8.20   19.10   15.14   43.22 71.27 53.00       56.20  68.01  32.42  28.40     50.48
+GDN-2         8.63   19.30   14.44   42.75 71.60 53.96       56.59  67.17  30.97  28.60     50.26
+KDA           8.23   19.07   13.86   45.62 71.00 51.84       56.12  66.67  33.28  28.20     50.37
+DDN (ours)    8.22   19.00   13.56   44.29 71.22 52.84       54.46  67.59  32.85  29.80     50.59
+                                     44.98 71.65 52.77
+
+Table 3. RULER-style needle retrieval accuracy in percent at the 130M, 340M, and 1B scales after approximately 5B, 15B, and 50B
+training tokens, with 500 examples per task. Bold and underlined values denote the best and second-best distinct scores within each
+model-size group in each column.
+
+              NIAH-Single-1         NIAH-Single-2  NIAH-Single-3           NIAH-MultiKey-1
+
+Model         1024 2048 4096 1024 2048 4096 1024 2048 4096 1024 2048 4096 Avg.
+
+                                    130M models; 5B tokens
+
+Mamba-3 SISO 22.2 6.4 3.4 66.2 18.6 10.0 0.0 0.0 0.0 9.0 10.4 9.2 12.95
+
+Mamba-3 MIMO 41.6 14.4 5.2 41.0 9.6 3.6 0.0 0.0 0.0 9.6 10.0 4.8 11.65
+
+GDN-2         68.8 29.6 14.2 82.8 34.0 28.4 1.8 0.2 0.2 23.8 22.0 16.8 26.88
+
+KDA           99.0 96.8 52.8 93.0 33.6 21.0 0.4 0.2 0.0 25.4 21.4 13.6 38.10
+
+DDN (ours)    99.2 97.4 82.8 84.6 36.0 17.2 5.4 2.4 0.2 22.6 21.0 18.0 40.57
+
+                                    340M models; 15B tokens
+
+Mamba-3 SISO 86.2 36.6 19.8 98.2 86.0 32.0 7.0 3.6 2.0 16.0 16.6 16.2 35.02
+
+Mamba-3 MIMO 94.0 66.2 28.0 96.4 90.0 35.6 17.0 8.4 2.2 21.6 21.4 17.6 41.53
+
+GDN-2         99.8 96.6 65.2 100.0 98.4 48.8 2.0 4.0 2.2 22.6 22.4 20.8 48.57
+
+KDA           100.0 98.8 64.2 99.2 95.6 40.6 27.8 13.6 2.0 27.4 25.4 19.8 51.20
+
+DDN (ours)    100.0 100.0 100.0 98.4 67.2 14.4 58.0 37.2 7.0 23.6 23.2 17.4 53.87
+
+                                    1B models; 50B tokens
+
+Mamba-3 SISO 98.6 75.4 16.6 97.2 50.2 24.8 68.4 28.8 11.0 48.8 35.0 12.2 47.25
+
+Mamba-3 MIMO 99.8 83.0 43.2 100.0 97.4 56.4 83.4 50.8 7.0 53.2 35.4 19.2 60.73
+
+GDN-2         100.0 100.0 99.8 99.8 95.4 56.6 94.2 78.2 29.4 30.6 25.8 23.0 69.40
+
+KDA           100.0 97.6 96.4 92.8 100.0 54.2 59.4 67.2 19.0 34.4 30.2 20.0 64.27
+
+DDN (ours)    100.0 100.0 100.0 100.0 100.0 80.8 97.0 83.6 36.0 37.6 32.2 27.0 74.52
+
+                                    7
+                                             Dual DeltaNet
+
+                                                                                              (a) Training Throughput
+
+Table 4. Real-world retrieval at the 130M, 340M, and 1B scales        K tokens/s  55
+after approximately 5B, 15B, and 50B training tokens. Bold and                    50
+underlined values denote the best and second-best distinct scores                 45
+within each model-size group in each column.                                      40
+
+Model         SWDE SQuAD FDA TQA NQ DROP Avg.
+
+Mamba-3 SISO    130M models; 5B tokens       11.60 12.81                          35
+Mamba-3 MIMO   5.85 18.97 0.82 35.13 4.47    13.51 12.98
+GDN-2          6.57 16.89 1.36 34.83 4.72    16.77 15.53                          30          2K × 16  4K × 8           8K × 4
+KDA           10.35 21.35 2.09 37.03 5.61    16.68 15.18                            1K × 32
+DDN (ours)     8.82 20.07 1.91 37.92 5.70    16.53 16.18
+              10.62 21.95 2.63 39.40 5.96                                                    (b) Peak Allocated Memory
+Mamba-3 SISO    340M models; 15B tokens      19.26 20.56
+Mamba-3 MIMO  14.40 27.71 3.27 50.24 8.46    19.50 21.45                          80
+GDN-2         15.84 29.89 2.72 51.72 9.00    17.97 21.54
+KDA           17.10 30.80 3.63 50.42 9.34    17.54 21.31              GB          70
+DDN (ours)    16.83 30.23 3.81 49.82 9.60    21.56 23.22
+              18.45 29.89 8.71 51.13 9.57                                         1K × 32     2K × 16  4K × 8           8K × 4
+Mamba-3 SISO                                 23.19 27.63
+Mamba-3 MIMO      1B models; 50B tokens      22.14 29.45                          Mamba3 SISO Mamba3 MIMO GDN2 KDA DDN
+GDN-2         27.18 35.29 6.08 58.83 15.24   22.23 31.80
+KDA           31.86 36.03 11.16 60.19 15.33  25.11 30.90
+DDN (ours)    31.95 39.21 17.42 62.97 17.01  24.72 31.20
+              35.46 37.80 10.62 61.08 15.30
+              32.58 37.06 12.89 62.50 17.45
+
+vantage on FDA at this scale, scoring 17.42% compared                 Figure 3. Training throughput and peak allocated memory of 1B
+with 12.89% for DDN and 10.62% for KDA. These task-                   models on an NVIDIA H200. The horizontal axis denotes se-
+dependent gains suggest that GDN-2 and DDN may improve                quence length × batch size. All baselines retain their default
+different aspects of recall.                                          recomputation settings.
+
+Training and inference efficiency. Figure 3 compares                  Table 5. Prefill and prefill + decode latency in seconds for 1B
+end-to-end BF16 training throughput and peak allocated                models on an NVIDIA H200 with batch size 64. Generation length
+memory of 1B models on an NVIDIA H200. All baselines                  equals input length. Bold and underlined values denote the lowest
+retain the default recomputation settings of their original           and second-lowest distinct latencies in each column within each
+implementations. DDN’s throughput is modestly lower than              group, respectively.
+KDA’s and GDN-2’s, and higher than Mamba-3 MIMO’s.
+Mamba-3 SISO saves recurrent states and other forward                             Model       1024 2048 4096 8192
+intermediates for backward, favoring higher throughput at
+the cost of greater memory usage. DDN’s peak allocated                                        Prefill
+memory is slightly higher than KDA’s and comparable to
+GDN-2’s. Both DDN and Mamba-3 MIMO show reduced                                   Mamba-3 SISO 0.34 0.68 1.35 2.69
+throughput at 8K × 4. A possible reason is that the current
+implementations provide limited parallelism at small batch                        Mamba-3 MIMO 0.40 0.81 1.64 3.35
+sizes, as discussed in Appendix B. For inference, Table 5
+reports prefill and prefill-plus-decode latency for the 1B                        GDN-2       0.40 0.80 1.58 3.16
+models on an NVIDIA H200 with batch size 64. The gen-
+eration length equals the input length. GDN-2, DDN, and                           KDA         0.35 0.70 1.39 2.81
+Mamba-3 MIMO have higher prefill and prefill-plus-decode
+latencies than Mamba-3 SISO and KDA. DDN’s latencies                              DDN (ours)  0.39 0.79 1.57 3.15
+are close to those of GDN-2 and Mamba-3 MIMO.
+                                                                                              Prefill + Decode
+
+                                                                                  Mamba-3 SISO 3.65 7.31 14.66 27.44
+
+                                                                                  Mamba-3 MIMO 4.16 8.34 16.70 33.46
+
+                                                                                  GDN-2       4.13 8.26 16.53 33.11
+
+                                                                                  KDA         3.65 7.31 14.66 29.34
+
+                                                                                  DDN (ours)  4.18 8.35 16.68 33.37
+
+Ablation study. To isolate the role of the learned channel            over KDA, supporting the effectiveness of the value-side
+gate, we train 130M and 340M DDN variants with et = vˆt               delta rule. The gated variant achieves stronger overall per-
+for approximately 5B and 15B tokens, respectively. Table 6            formance, suggesting that selecting relevant value features
+summarizes the results. At both scales, the gated and un-             benefits value-side address reorganization.
+gated DDN variants improve retrieval and NIAH accuracy
+
+                                                                   8
+                                                       Dual DeltaNet
+
+Table 6. Ablation results for 130M and 340M models trained on          twice: closing the recall gap for recurrent language mod-
+                                                                       els. arXiv preprint arXiv:2407.05483, 2024c.
+approximately 5B and 15B FineWeb-Edu tokens, respectively.
+                                                                    Bisk, Y., Zellers, R., Le Bras, R., Gao, J., and Choi, Y.
+Downstream, Retrieval, and NIAH report average accuracy in             PIQA: Reasoning about physical commonsense in natural
+                                                                       language. In Proceedings of the AAAI conference on
+percent. Bold and underlined values denote the best and second-        artificial intelligence, volume 34, pp. 7432–7439, 2020.
+
+best scores at each scale.                                          Bui, N., Huang, T., and Ying, R. Kalman delta networks:
+                                                                       Uncertainty-aware associative memory. arXiv preprint
+Model                       Downstream Retrieval NIAH                  arXiv:2609.07816, 2026.
+
+       130M models; 5B tokens                                       Clark, P., Cowhey, I., Etzioni, O., Khot, T., Sabharwal, A.,
+                                                                       Schoenick, C., and Tafjord, O. Think you have solved
+KDA                         37.38  15.18  38.10                        question answering? try ARC, the AI2 reasoning chal-
+                                          39.45                        lenge. arXiv preprint arXiv:1803.05457, 2018.
+DDN (et = vˆt)              37.41  15.87  40.57
+DDN                         38.03  16.18                            Dao, T. and Gu, A. Transformers are SSMs: Generalized
+                                                                       models and efficient algorithms through structured state
+       340M models; 15B tokens                                         space duality. arXiv preprint arXiv:2405.21060, 2024.
+
+KDA                         42.40  21.30  51.20                     Dua, D., Wang, Y., Dasigi, P., Stanovsky, G., Singh, S., and
+                                          52.42                        Gardner, M. DROP: A reading comprehension bench-
+DDN (et = vˆt)              42.16  23.48  53.87                        mark requiring discrete reasoning over paragraphs. In
+DDN                         43.44  23.22                              Proceedings of the 2019 Conference of the North Amer-
+                                                                       ican Chapter of the Association for Computational Lin-
+6. Conclusion                                                          guistics: Human Language Technologies, Volume 1 (Long
+                                                                       and Short Papers), pp. 2368–2378, 2019.
+We presented Dual DeltaNet (DDN), which extends KDA
+with complementary key-side and value-side delta rules.             Gao, L., Tow, J., Biderman, S., Black, S., DiPofi, A., Foster,
+The key-side update corrects the value associated with the             C., Golding, L., Hsu, J., McDonell, K., Muennighoff,
+current key, while the value-side update utilizes selected             N., et al. A framework for few-shot language model
+value features to reorganize related content across addresses.         evaluation. Zenodo, 2021.
+A chunkwise parallel formulation and a rank-2 recurrent
+form support efficient training and inference with modest           Gu, A. and Dao, T. Mamba: Linear-time sequence
+overhead relative to KDA. Experiments across the 130M,                 modeling with selective state spaces. arXiv preprint
+340M, and 1B scales show improvements over KDA in lan-                 arXiv:2312.00752, 2023.
+guage modeling, zero-shot downstream tasks, and retrieval,
+with particularly pronounced gains on the RULER needle-in-          Hao, Q., Cai, R., Pang, Y., and Zhang, L. From one tree to
+a-haystack benchmark. These results suggest that key-side              a forest: a unified solution for structured web data extrac-
+associative correction and value-side address reorganization           tion. In Proceedings of the 34th international ACM SIGIR
+can jointly improve the management of fixed-size recurrent             conference on Research and development in Information
+memory.                                                               Retrieval, pp. 775–784, 2011.
+
+References                                                          Hatamizadeh, A., Choi, Y., and Kautz, J. Gated deltanet-2:
+                                                                       Decoupling erase and write in linear attention. arXiv
+Afzal, A., Bick, A., Xing, E. P., Cevher, V., and Gu, A.               preprint arXiv:2605.22791, 2026.
+   Raven: High-recall sequence modeling with sparse mem-
+   ory routing. arXiv preprint arXiv:2607.25357, 2026.              Hsieh, C.-P., Sun, S., Kriman, S., Acharya, S., Rekesh, D.,
+                                                                      Jia, F., Zhang, Y., and Ginsburg, B. RULER: What’s the
+Arora, S., Eyuboglu, S., Timalsina, A., Johnson, I., Poli,             real context size of your long-context language models?
+   M., Zou, J., Rudra, A., and Re´, C. Zoology: Measuring              arXiv preprint arXiv:2404.06654, 2024.
+   and improving recall in efficient language models. In
+   International Conference on Learning Representations,            Jelassi, S., Brandfonbrener, D., Kakade, S. M., and
+   2024a.                                                              Malach, E. Repeat after me: Transformers are bet-
+                                                                       ter than state space models at copying. arXiv preprint
+Arora, S., Eyuboglu, S., Zhang, M., Timalsina, A., Alberti,            arXiv:2402.01032, 2024.
+   S., Zinsley, D., Zou, J., Rudra, A., and Re´, C. Sim-
+   ple linear attention language models balance the recall-
+   throughput tradeoff. arXiv preprint arXiv:2402.18668,
+   2024b.
+
+Arora, S., Timalsina, A., Singhal, A., Spector, B., Eyuboglu,
+   S., Zhao, X., Rao, A., Rudra, A., and Re´, C. Just read
+
+                                                                 9
+Dual DeltaNet
+
+Joshi, M., Choi, E., Weld, D. S., and Zettlemoyer, L. Trivi-            Methods in Natural Language Processing, pp. 2383–
+   aQA: A large scale distantly supervised challenge dataset             2392, 2016.
+   for reading comprehension. In Proceedings of the 55th
+  Annual Meeting of the Association for Computational                 Sakaguchi, K., Le Bras, R., Bhagavatula, C., and Choi, Y.
+  Linguistics (Volume 1: Long Papers), pp. 1601–1611,                   WinoGrande: An adversarial winograd schema challenge
+   2017.                                                                 at scale. Communications of the ACM, 64(9):99–106,
+                                                                         2021.
+Katharopoulos, A., Vyas, A., Pappas, N., and Fleuret, F.
+  Transformers are RNNs: Fast autoregressive transform-               Schlag, I., Irie, K., and Schmidhuber, J. Linear transform-
+   ers with linear attention. In International conference on             ers are secretly fast weight programmers. In Interna-
+   machine learning, pp. 5156–5165. PMLR, 2020.                          tional Conference on Machine Learning, pp. 9355–9366.
+                                                                         PMLR, 2021.
+Kwiatkowski, T., Palomaki, J., Redfield, O., Collins, M.,
+   Parikh, A., Alberti, C., Epstein, D., Polosukhin, I., Devlin,      Tumma, N., Loo, N., and Rus, D. Preconditioned DeltaNet:
+  J., Lee, K., et al. Natural questions: a benchmark for ques-           Curvature-aware sequence modeling for linear recur-
+   tion answering research. Transactions of the Association              rences. arXiv preprint arXiv:2604.21100, 2026.
+   for Computational Linguistics, 7:452–466, 2019.
+                                                                      Vaswani, A., Shazeer, N., Parmar, N., Uszkoreit, J., Jones,
+Lahoti, A., Li, K. Y., Chen, B., Wang, C., Bick, A., Kolter,             L., Gomez, A. N., Kaiser, Ł., and Polosukhin, I. At-
+  J. Z., Dao, T., and Gu, A. Mamba-3: Improved sequence                  tention is all you need. Advances in neural information
+   modeling using state space principles. arXiv preprint                 processing systems, 30, 2017.
+   arXiv:2603.15569, 2026.
+                                                                      Waleffe, R., Byeon, W., Riach, D., Norick, B., Kor-
+Li, R., Ding, S., Zhang, W., Tang, D., Zeng, Z., Zeng, Q.,               thikanti, V., Dao, T., Gu, A., Hatamizadeh, A., Singh,
+   Chen, M., Hu, J., and Liang, Y. Gated slot attention-                 S., Narayanan, D., et al. An empirical study of Mamba-
+   2: Two-sided associative memory correction in linear                  based language models. arXiv preprint arXiv:2406.07887,
+   attention. arXiv preprint arXiv:2610.02816, 2026.                     2024.
+
+Merity, S., Xiong, C., Bradbury, J., and Socher, R.                   Wang, L., Cheng, Y., Shi, Y., Tang, Z., Mo, Z., Xie, W.,
+   Pointer sentinel mixture models. arXiv preprint                       Ma, L., Xia, Y., Xue, J., Yang, F., and Yang, Z. TileLang:
+   arXiv:1609.07843, 2016.                                              A composable tiled programming model for AI systems.
+                                                                         arXiv preprint arXiv:2504.17577, 2025.
+Mihaylov, T., Clark, P., Khot, T., and Sabharwal, A. Can a
+   suit of armor conduct electricity? a new dataset for open          Yang, S. and Zhang, Y. FLA: A triton-based library for
+   book question answering. In Proceedings of the 2018                   hardware-efficient implementations of linear attention
+   conference on empirical methods in natural language                   mechanism. https://github.com/fla-org/
+   processing, pp. 2381–2391, 2018.                                      flash-linear-attention, January 2024.
+
+Paperno, D., Kruszewski, G., Lazaridou, A., Pham, N.-Q.,              Yang, S., Wang, B., Zhang, Y., Shen, Y., and Kim, Y. Par-
+   Bernardi, R., Pezzelle, S., Baroni, M., Boleda, G., and               allelizing linear transformers with the delta rule over se-
+   Ferna´ndez, R. The LAMBADA dataset: Word predic-                      quence length. Advances in neural information process-
+   tion requiring a broad discourse context. In Proceed-                 ing systems, 37:115491–115522, 2024.
+   ings of the 54th annual meeting of the association for
+   computational linguistics (volume 1: Long papers), pp.             Yang, S., Kautz, J., and Hatamizadeh, A. Gated delta net-
+  1525–1534, 2016.                                                      works: Improving Mamba2 with delta rule. In Interna-
+                                                                         tional Conference on Learning Representations, 2025.
+Qian, Y., Chen, S., Liu, J., Cai, S., and Xu, C. DSSMs: State
+   space models with explicit memory via delay differential           Zellers, R., Holtzman, A., Bisk, Y., Farhadi, A., and Choi, Y.
+   equations. arXiv preprint arXiv:2607.10244, 2026a.                    HellaSwag: Can a machine really finish your sentence? In
+                                                                        Proceedings of the 57th annual meeting of the association
+Qian, Y., Chen, S., Wang, P., Liu, J., Cai, S., and Xu, C.               for computational linguistics, pp. 4791–4800, 2019.
+   DART: Decoded attention over recurrent states for effi-
+   cient long-context sequence modeling. arXiv preprint               Zhang, Y., Yang, S., Zhu, R., Zhang, Y., Cui, L., Wang, Y.,
+   arXiv:2608.02032, 2026b.                                             Wang, B., Shi, F., Wang, B., Bi, W., Zhou, P., and Fu,
+                                                                         G. Gated slot attention for efficient linear-time sequence
+Rajpurkar, P., Zhang, J., Lopyrev, K., and Liang, P. SQuAD:              modeling. In Advances in Neural Information Processing
+  100,000+ questions for machine comprehension of text.                 Systems, volume 37, 2024.
+   In Proceedings of the 2016 Conference on Empirical
+
+                                                                  10
+                                                 Dual DeltaNet
+
+Zhang, Y., Lin, Z., Yao, X., Hu, J., Meng, F., Liu, C.,            Decay parameterization. The diagonal decay is imple-
+   Men, X., Yang, S., Li, Z., et al. Kimi linear: An ex-           mented as Dt = Diag(αt) with
+   pressive, efficient attention architecture. arXiv preprint
+   arXiv:2510.26692, 2025.                                              αt = exp(gt), gt = − exp(adecay) ⊙ ∆t, (38)
+
+                                                                   where
+
+A. Compact WY Representation                                                    ∆t = softplus(W ∆xt + b∆).      (39)
+
+Lemma A.1 (Compact WY form of rank-one transitions).               Here adecay is a learned per-head parameter and ∆t is a
+Let ui, wi ∈ Rd and Qi = I − uiwi⊤ for i = 1, . . . , m.           positive input-dependent step size. This parameterization
+Set U = [u1, . . . , um], W = [w1, . . . , wm], and                keeps gt < 0 and therefore αt ∈ (0, 1).
+
+     T = tril(W ⊤U , −1), M = (I + T )−1. (34)                     State transition implementation. State transition ker-
+                                                                   nels for KDA and GDN-2 exploit the independence of state
+Thus Tij = wi⊤uj for j < i, and Tij = 0 otherwise.                 columns through value tiling, assigning a separate program
+The inverse exists for arbitrary ui, wi, since I + T is            to each sequence, attention head, and value tile. This in-
+unit lower triangular. Define the propagated columns               creases parallelism beyond one program per sequence and
+                                                                   head. DDN’s value-side read couples these columns through
+f i = Qm · · · Qi+1ui and F = [f 1, . . . , f m], with empty       a reduction over dv, so value tiles cannot be processed inde-
+products equal to I. Then                                          pendently under the same scheme. Distributing them across
+                                                                   programs would require cross-program reductions and syn-
+F (I + T ) = U , F = U M .                          (35)           chronization. We therefore assign one program to each
+                                                                   sequence and attention head, with chunks processed sequen-
+The transition product admits the compact representation           tially within each program. We implement this strategy in
+      Qm · · · Q1 = I − F W ⊤ = I − U M W ⊤. (36)                  TileLang (Wang et al., 2025), keeping the full state resident
+                                                                   in shared memory. This strategy avoids cross-program re-
+Proof. The cancellation can be seen by expanding the suc-          ductions, but limits the number of independently scheduled
+cessive differences:                                               programs to the batch size times the number of heads. At
+                                                                   small batch sizes, the resulting parallelism may be insuffi-
+Qm · · · Qi+1 − I = (Qm · · · Qi+1 − Qm · · · Qi+2)                cient to fully utilize the GPU, contributing to the throughput
+                         + (Qm · · · Qi+2 − Qm · · · Qi+3)         decrease at 8K × 4 in Figure 3. The released Mamba-3
+                         + · · · + (Qm − I).                       MIMO implementation similarly processes chunks sequen-
+                                                                   tially within one program per sequence and head (Lahoti
+Thus, for 0 ≤ i ≤ m, with an empty sum when i = m,                 et al., 2026).
+
+                     m
+
+Qm · · · Qi+1 = I +         Qm · · · Qj − Qm · · · Qj+1
+
+                     j=i+1                                         Precision and recomputation. Most matrix operands and
+
+                     m                                             the carried recurrent state are stored in BF16, with FP32 ac-
+
+=I+                     (Qm · · · Qj+1)(Qj − I)                    cumulation for matrix products. Normalization, cumulative
+
+                     j=i+1                                         log-decay calculations, and triangular-solve intermediates
+
+                     m                                             are computed in FP32. During training, we retain q, k, and
+
+=I−                     (Qm · · · Qj+1uj )wj⊤                      vˆ, together with the inverse L2 norms computed during nor-
+
+                     j=i+1                                         malization. The triangular inverses M L,[n] and M R,[n] and
+
+                     m                                                                                          tril(Qπ,[n]K¯  ⊤
+                                                                                                                               [n]
+=I−                         f j w⊤j ,               (37)           the  causal  query–key  interaction  matrix                      )
+
+                     j=i+1                                         are also cached. Other state-transition and readout interme-
+
+                                                                   diates are recomputed during backward to reduce activation
+
+where the third line uses Qj − I = −ujwj⊤, and the last            memory.
+uses the definition of f j. For i ≥ 1, multiplying by ui
+yields f i = ui − j>i f j(wj⊤ui). These are the column             C. Experimental Details
+equations of F (I + T ) = U , giving F = U M . Taking
+                                                                   Architecture and parameter matching. Table 7 summa-
+i = 0 in Equation (37) gives the product identity.                 rizes the model configurations. KDA, GDN-2, and DDN
+                                                                   use 128-dimensional keys and values. Mamba-3 retains its
+B. Implementation Details                                          multi-value structure with expansion factor 2, one shared
+                                                                   state group, and state and head dimensions of 64. Conse-
+All implementations are built on the Flash Linear Attention        quently, every model at a given scale has the same effective
+(FLA) library (Yang & Zhang, 2024).
+
+                                                               11
+                                    Dual DeltaNet
+
+state size nheaddkdv. Model and MLP widths are adjusted                     Language modeling. FineWeb-Edu training perplexity is
+within each scale to compensate for differences in recurrent                the exponential of the mean logged loss over the final 500
+parameters. In DDN, the decay and selector-gate logits are                  steps, sampled every 10 steps. We report word-level perplex-
+generated by separate low-rank projections with bottleneck                  ity on WikiText-2 (Merity et al., 2016) and both perplexity
+width dv, following KDA’s decay-gate parameterization.                      and final-word prediction accuracy on the OpenAI version
+We initialize all entries of mt to 0.5 and γt to 0.05, giving               of LAMBADA (Paperno et al., 2016).
+et = vˆt at initialization.
+                                                                            Zero-shot downstream tasks. The seven tasks cover con-
+Table 7. Architecture configurations. For the linear-attention mod-         textual word prediction, commonsense reasoning, corefer-
+els, dk and dv are the key and value dimensions. For Mamba-3,               ence resolution, and science question answering. We re-
+they denote the state and head dimensions, respectively.                    port raw accuracy for LAMBADA (Paperno et al., 2016),
+                                                                            PIQA (Bisk et al., 2020), WinoGrande (Sakaguchi et al.,
+Model         Depth Heads dk dv dmodel dMLP State size                      2021), ARC-Easy and ARC-Challenge (Clark et al., 2018),
+                                                                            and OpenBookQA (Mihaylov et al., 2018), and length-
+                    130M scale                                              normalized accuracy for HellaSwag (Zellers et al., 2019).
+
+Mamba-3 SISO    12 24 64 64 768 2,208 98,304                                Real-world retrieval tasks. We evaluate six recall-
+                                                                            intensive tasks following prior work (Arora et al.,
+Mamba-3 MIMO 12 24 64 64 768 2,064 98,304                                   2024b;c): SWDE (Hao et al., 2011), SQuAD Comple-
+                                                                            tion (Rajpurkar et al., 2016), FDA (Arora et al., 2024b),
+GDN-2           12  6 128 128 768 2,112 98,304                              TriviaQA Cloze (Joshi et al., 2017), Natural Questions
+                                                                            Cloze (Kwiatkowski et al., 2019), and DROP Cloze (Dua
+KDA             12  6 128 128 816 2,336 98,304                              et al., 2019). Inputs are limited to 2,048 tokens. We report
+                                                                            contains accuracy, counting a response as correct when it
+DDN (ours)      12  6 128 128 800 2,320 98,304                              contains any accepted answer string.
+
+                    340M scale                                              Synthetic NIAH tasks. The four RULER variants (Hsieh
+                                                                            et al., 2024) test word-to-number retrieval in repeated text
+Mamba-3 SISO    24 32 64 64 1,024 2,048 131,072                             (Single-1) or essays (Single-2), word-to-UUID retrieval in
+                                                                            essays (Single-3), and retrieval among four word-to-number
+Mamba-3 MIMO 24 32 64 64 1,024 1,920 131,072                                associations in essays (MultiKey-1). Each variant has 500
+                                                                            examples at each context length of 1,024, 2,048, and 4,096
+GDN-2           24  8 128 128 904 2,560 131,072                             tokens.
+
+KDA             24  8 128 128 992 2,816 131,072
+
+DDN (ours)      24  8 128 128 976 2,800 131,072
+
+                    1B scale
+
+Mamba-3 SISO    24 56 64 64 1,792 3,584 229,376
+
+Mamba-3 MIMO 24 56 64 64 1,792 3,456 229,376
+
+GDN-2           24 14 128 128 1,616 4,352 229,376
+
+KDA             24 14 128 128 1,760 4,864 229,376
+
+DDN (ours)      24 14 128 128 1,744 4,848 229,376
+
+Optimization. All models are trained on FineWeb-Edu
+with a batch of 256 sequences and a sequence length of
+2,048. All models share the same LLaMA tokenizer with
+a vocabulary of 32,000 tokens for training and evaluation.
+We utilize AdamW with β1 = 0.9, β2 = 0.95, ϵ = 10−8,
+weight decay 0.01, and gradient clipping at 1.0. The learning
+rate follows a cosine schedule that decays to 10% of its peak
+value. Table 8 summarizes the training steps, peak learning
+rates, and warmup steps for all model scales.
+
+Table 8. Training steps, peak learning rates, and warmup steps of
+pretraining.
+
+Scale               130M 340M   1B
+
+Training steps      9,500 30,000 95,000
+
+Peak learning rate 6 × 10−4 4 × 10−4 4 × 10−4
+
+Warmup steps        512         1,024 1,024
+
+Evaluation protocol. All downstream and retrieval
+evaluations are zero-shot and are conducted with
+lm-evaluation-harness (Gao et al., 2021). Re-
+sponses are generated via greedy decoding, with a max-
+imum of 48 new tokens for real-world retrieval and 128 for
+NIAH.
+
+                                                                        12
+

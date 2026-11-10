@@ -1,0 +1,691 @@
+                                       SPARE: Fast Linear Attention Decoding with Compact Recurrent States
+
+                                                Ke Wan                Zaiyi Zheng                        Chen Chen
+                                        University of Virginia   University of Virginia            University of Virginia
+                                       tbn5pj@virginia.edu      sjc4fq@virginia.edu               zrh6du@virginia.edu
+
+arXiv:2611.07552v1 [cs.CL] 5 Nov 2026                        Abstract                             operations primarily involve matrix-vector multi-
+                                                                                                  plications (GEMV) and rank-one updates, which
+                                            Linear attention reduces the quadratic                require relatively little computation compared to
+                                            sequence-length complexity of softmax atten-          the amount of data transferred (Yin et al., 2014;
+                                            tion by maintaining fixed-size recurrent states.      Williams et al., 2009). Consequently, recurrent-
+                                            However, these states scale quadratically with        state memory traffic can become a dominant effi-
+                                            the representation dimension and require re-          ciency bottleneck during decoding, particularly at
+                                            peated data transfers during decoding, creating       high concurrency.
+                                            a substantial GPU memory bottleneck. Recent
+                                            studies have revealed significant low-rank               Reducing recurrent-state memory traffic there-
+                                            redundancy in recurrent states, suggesting            fore presents a promising opportunity to acceler-
+                                            opportunities for more efficient representations.     ate linear attention decoding. Prior studies have
+                                            We introduce SPARE (State Projection for              identified substantial low-rank structure in recur-
+                                            Accelerated Recurrent Execution), a training-         rent states (Nazari and Rusch, 2026), with effective
+                                            free method that exploits this redundancy             ranks varying considerably across layers and heads
+                                            through fixed low-dimensional subspaces,              (Sun et al., 2026), which is illustrated in Figure 1a.
+                                            heterogeneous rank allocation, and lightweight        A natural approach is to reduce state dimensions
+                                            write compensation. By performing recurrent           through structured pruning of key and query chan-
+                                            reads and updates directly on compact states,         nels (Nazari and Rusch, 2026). However, low-rank
+                                            SPARE reduces memory traffic without online           structure does not necessarily imply that important
+                                            decomposition or dense-state reconstruction.          information is concentrated in a small subset of the
+                                            SPARE achieves 2.55× full-model decoding              original representation dimensions. Consequently,
+                                            speedup, 7.49× lower recurrent-kernel DRAM            aggressive pruning may discard information essen-
+                                            traffic, and 3.31× lower peak GPU memory,             tial to the model’s associative memory. Projection
+                                            while preserving better associative-retrieval         onto a low-dimensional subspace avoids this re-
+                                            accuracy than structured pruning at matched           striction, but allocating the same rank to every head
+                                            memory budgets.                                       may overlook their heterogeneous memory require-
+                                                                                                  ments. Thus, exploiting recurrent-state redundancy
+                                       1 Introduction                                             requires careful consideration of both the represen-
+                                                                                                  tation subspace and the allocation of limited state
+                                       Linear attention (Katharopoulos et al., 2020; Yang         capacity.
+                                       et al., 2023) has emerged as an efficient alternative
+                                       to conventional softmax attention (Vaswani et al.,            A further challenge arises from the dynamic na-
+                                       2017) for long-sequence modeling. By reformulat-           ture of recurrent memory. Unlike static matrix com-
+                                       ing attention computation as recurrent state updates       pression, a compressed recurrent state must support
+                                       (Dao and Gu, 2024), linear attention summarizes            successive associative reads and writes, rather than
+                                       historical information into fixed-size states without      merely approximate a single state matrix. Project-
+                                       maintaining a growing key-value cache. However,            ing keys can alter their geometry and reduce their
+                                       eliminating the dependence on sequence length              norms, potentially changing the effectiveness of
+                                       does not eliminate the cost of recurrent memory            subsequent memory updates. This raises a funda-
+                                       itself. At each decoding step, linear attention must       mental question: can we exploit the heterogeneous
+                                       repeatedly read and update a potentially large recur-      low-rank structure of recurrent states to reduce de-
+                                       rent state matrix, requiring substantial data trans-       coding costs while preserving their functional ca-
+                                       fers between GPU high-bandwidth memory (HBM)
+                                       and computing units (Gupta et al., 2026). These
+
+                                                                                               1
+                        Natural text      Median = 6.5              Fixed basis P
+
+Number of heads  100
+                  75
+                  50
+                  25
+                    0
+
+                        Associative retrieval Median = 3.25
+
+                 100
+
+                 75
+
+                 50
+
+                 25
+
+                 0   0  20            40  60    80
+
+                            Effective rank r95                  Ct  Ct + 1         Ct + 2
+
+                 (a) Heterogeneous effective ranks              (b) Recurrent updates in a fixed subspace
+
+Figure 1: Motivation and intuition of SPARE. (a) Heterogeneous low-rank recurrent states. The histograms
+
+show the distributions of effective ranks across 192 attention heads on natural text (top) and associative retrieval
+(bottom). For each head, we report the median r95 across sampled recurrent states, where r95 denotes the minimum
+rank retaining 95% of the state’s squared singular-value energy. Despite the original state dimension of 256 × 256,
+effective ranks are typically much smaller and vary substantially across heads. (b) Recurrent updates in a fixed
+subspace. SPARE represents the recurrent state as St ≈ CtP ⊤, where the projection basis P remains fixed while
+the compact coefficient matrix Ct evolves across decoding steps. This allows recurrent reads and updates to operate
+directly on compact states of size dv × r, rather than the original dv × dk matrices, without reconstructing the dense
+state.
+
+pabilities? In particular, can recurrent reads and              et al., 2025), examining both model quality un-
+updates be performed directly in a compact low-                 der recurrent-state compression and actual GPU
+dimensional subspace without excessive informa-                 decoding efficiency. Our results demonstrate sub-
+tion loss?                                                      stantial reductions in recurrent-state memory traffic
+                                                                and full-model decoding latency, together with bet-
+   To address these challenges, we introduce                    ter retrieval performance than structured pruning
+SPARE (State Projection for Accelerated Recurrent               under matched memory budgets. These benefits in-
+Execution), a training-free method for accelerating             volve a task-dependent quality–efficiency trade-off
+linear attention decoding with compact recurrent                rather than lossless compression. In summary, our
+states. Instead of discarding selected representation           contributions are:
+dimensions, as shown in Figure 1b, SPARE main-
+tains recurrent states in fixed low-dimensional key                • We characterize the heterogeneous low-rank
+subspaces, where memory reads and updates can                         structure of linear attention’s recurrent states
+be performed directly. To accommodate heteroge-                       and highlight the limitations of coordinate
+neous memory requirements, SPARE allocates dif-                       pruning and uniform capacity allocation for
+ferent rank budgets across layers and heads based                     compressing associative memory.
+on their recurrent-state spectral characteristics. A
+lightweight write-compensation mechanism further                   • We propose SPARE, a training-free framework
+mitigates the loss of memory-writing effectiveness                    that combines fixed low-dimensional state rep-
+caused by key projection. Finally, a packed GPU                       resentations, heterogeneous rank allocation,
+implementation enables efficient recurrent compu-                     and lightweight write compensation to enable
+tation on the compressed states without online ma-                    efficient recurrent reads and updates.
+trix decomposition or dense-state reconstruction.
+                                                                   • We demonstrate 2.55× full-model decod-
+   We evaluate SPARE on Gated DeltaNet (Yang                          ing speedup, 7.49× lower recurrent-kernel
+
+                                                             2
+DRAM traffic, and 3.31× lower peak GPU                     3 SPARE: Compact Recurrent States
+memory, while achieving substantially better
+retrieval accuracy than structured pruning at              3.1 Fixed Low-Rank Representation
+matched memory budgets.
+                                                           Motivated by the low-rank structure of recurrent
+2 Background and Motivation
+                                                           memory, SPARE compresses the key dimension
+2.1 Gated Linear Attention
+                                                           while preserving the full value dimension. For
+We consider Gated DeltaNet (Yang et al., 2025), a
+representative architecture of gated linear attention.     clarity, we omit layer and head indices and consider
+For each attention head, historical information is         a fixed orthonormal basis P ∈ Rdk×r, where r ≪
+maintained in a recurrent state St ∈ Rdv×dk , where        dk and P ⊤P = Ir. Instead of maintaining the
+dk and dv denote the key and value dimensions,             original recurrent state St, SPARE represents it
+respectively. At each token position t, the key kt ∈       using a compact coefficient matrix Ct ∈ Rdv×r:
+Rdk , query qt ∈ Rdk , and value vt ∈ Rdv are used
+to update and read the recurrent state:                    St ≈ St = CtP ⊤.                       (3)
+
+                                                           By projecting keys and queries into the fixed sub-
+                                                           space,
+
+    St = αtSt−1 + βt (vt − αtSt−1kt) k⊤t , (1)             kt = P ⊤kt,       qt = P ⊤qt,          (4)
+    ot = Stqt,
+                                                           the recurrent output can be computed directly as
+where αt ∈ (0, 1) controls state decay and βt ∈
+(0, 1) determines the strength of the memory up-                        ot = Ctqt,                (5)
+date. The term St−1kt represents the previously
+stored value associated with the current key. Un-          without reconstructing the original dense state.
+like conventional attention, the recurrent state has a     This representation reduces the recurrent-state stor-
+fixed size of O(dkdv) independent of the sequence          age from O(dvdk) to O(dvr) while allowing the
+length, but must be accessed and updated at every          value-side representation to evolve with the input.
+decoding step.                                             The fixed basis and rank are determined separately
+                                                           for each head, as described in the following subsec-
+                                                           tion.
+
+2.2 Recurrent-State Redundancy                             3.2 Heterogeneous Rank Allocation
+
+Although the recurrent state St contains dvdk ele-         Since recurrent states exhibit different degrees of re-
+ments, its effective dimensionality can be substan-        dundancy across layers and heads, SPARE assigns
+tially smaller. Let σt,1 ≥ · · · ≥ σt,m denote its         heterogeneous rank budgets using offline calibra-
+singular values, where m = min(dv, dk). We de-             tion. For each layer ℓ and head h, we estimate the
+fine the effective rank required to retain a fraction      normalized spectral contribution of the j-th singu-
+η ∈ (0, 1) of the state’s spectral energy as               lar direction as
+
+                  r    σt2,i                                            Ecal σj2(St(ℓ,h))
+                  i=1                                      wℓ,h,j =                          ,    (6)
+rη(St) = min r :              ≥  η  .  (2)                            Ecal
+                  m    σt2,i                                                 ∥St(ℓ,h)∥F2
+                  i=1
+
+Prior studies have observed substantial low-rank           where σj(St(ℓ,h)) denotes the j-th largest singular
+structure in recurrent states (Nazari and Rusch,           value of the recurrent state. Given a total rank
+2026), with effective ranks varying considerably           budget R, we greedily allocate additional dimen-
+across layers and heads (Sun et al., 2026). This           sions to heads with the largest remaining spectral
+suggests that allocating the same state capacity to        contributions, subject to predefined rank bounds
+every head may be inefficient. However, a low ef-          and ℓ,h rℓ,h = R. We then construct a fixed
+fective rank does not guarantee that the informative       key subspace for each head using principal compo-
+subspace aligns with the original representation           nent analysis (PCA) on normalized calibration keys.
+dimensions or remains fixed over time. Exploit-            Specifically, we compute the uncentered second-
+ing this redundancy therefore requires a compact           moment matrix
+representation that supports efficient recurrent com-
+putation while preserving functionally important                     1  N           ki(ℓ,h)  ⊤    (7)
+information.                                               Σℓ,h = N
+                                                                           k(iℓ,h)             ,
+
+                                                                        i=1
+
+                                                        3
+where the calibration keys are collected after the        the compact read operation in Eq. (5), SPARE per-
+original convolution and key normalization. The           forms recurrent computation without reconstruct-
+projection basis P ℓ,h consists of the leading rℓ,h       ing the dense state or maintaining the projection
+eigenvectors of Σℓ,h and remains fixed throughout         basis online.
+inference. This offline procedure adapts the state
+capacity to individual heads without introducing          3.4 Theoretical Properties
+additional decomposition costs during decoding.
+                                                          The write-compensation mechanism admits a sim-
+   The choice of key PCA is motivated by the struc-       ple interpretation in terms of effective memory-
+ture of the Gated Delta Rule. Starting from a zero        writing strength. Multiplying Eq. (9) by the pro-
+initial state, each recurrent update adds a rank-one      jected key kt gives
+term whose right factor is the current key, imply-
+ing that the row space of St lies within the span         Ctkt = (1 − βtγtρt)αtCt−1kt  (10)
+of historical keys. Consequently, principal compo-
+nents of calibration keys provide a natural and inex-     + βtγtρtvt.
+pensive approximation to the directions supporting
+recurrent memory. However, the dominant singu-            Without compensation, the effective write strength
+lar directions of the recurrent state also depend on      is reduced from βt to βtρt. When neither the nu-
+values, gating, and interactions among historical         merical floor nor the compensation cap is active,
+updates, and need not coincide with those of the          γtρt = 1, restoring the original write strength along
+key covariance. We therefore use the state spec-          the projected key direction. Furthermore, SPARE
+trum to estimate the relative capacity requirements       preserves the original recurrent dynamics exactly
+of different heads, while employing key PCA to            when the keys remain within the fixed subspace, as
+construct their fixed projection bases. This separa-      established by the following theorem.
+tion provides a practical approximation rather than
+an optimality guarantee.                                  Theorem 1 (Exactness under Subspace Invariance).
+                                                          Let P be a fixed orthonormal basis, and suppose
+3.3 Compact Recurrent Updates                             S0 = C0P ⊤. If kt ∈ span(P ) and ∥kt∥2 = 1
+                                                          for every t, with ϵ ≤ 1 and γmax ≥ 1, then the
+With the fixed projection basis P , SPARE performs        original and compact recurrent updates satisfy
+recurrent updates directly on the compact coeffi-
+cient matrix Ct. The original old-value prediction        St = CtP ⊤,  ot = ot         (11)
+is approximated by Ct−1kt, allowing the Gated
+Delta Rule to operate in the reduced-dimensional          for all t, under identical input and gating se-
+space. However, projecting the key generally re-          quences.
+duces its norm, which can weaken the effective
+strength of memory writes. To mitigate this effect,          The theorem establishes that SPARE introduces
+SPARE introduces a bounded write-compensation             no approximation error when the fixed subspace
+factor:                                                   fully captures the key directions. In practice, the
+                                                          subspace is approximate, and write compensa-
+ρt = ∥kt∥22,                                              tion mitigates the resulting loss of effective write
+                                                          strength without guaranteeing exact recovery. The
+              1               (8)                         complete proof is provided in Appendix A.1.
+γt = min max(ρt, ϵ) , γmax ,
+                                                          3.5 Efficient Decoding
+where ϵ ensures numerical stability and γmax limits
+excessive amplification. The compact recurrent            To translate state compression into decoding ac-
+state is then updated as                                  celeration, SPARE packs the head-specific coeffi-
+                                                          cient matrices into a contiguous GPU buffer with-
+Ct = αtCt−1                                               out padding them to a uniform rank. Each head
+                                         ⊤ (9)            accesses its compact state through fixed offsets, en-
+                                                          abling recurrent reads and updates directly on the
+       + βtγt vt − αtCt−1kt kt .                          compressed representation. For a head with rank
+                                                          rℓ,h, the recurrent-state read/write volume scales
+This compensated update mitigates the loss of write       from O(dvdk) to O(dvrℓ,h), yielding a nominal
+strength caused by key projection while preserv-          reduction factor of dk/rℓ,h before projection and
+ing the original value dimension. Together with
+
+                                                       4
+auxiliary overheads. We implement these oper-             with varying sensitivity across tasks. Overall, these
+ations using GPU kernels and maintain address-            results highlight the advantages of compact recur-
+stable states to support CUDA Graph execution             rent subspaces for preserving associative retrieval
+across decoding steps. The fixed projection bases         performance, while revealing the task-dependent
+are shared across requests, while the original convo-     limitations of state compression.
+lution states are preserved. Further implementation
+details are provided in Appendix B.                       4.3 Quality under State Compression
+
+4 Experiments                                             Figure 2 examines the trade-off between model
+                                                          quality and measured peak GPU memory across
+4.1 Experimental Setup                                    language modeling, associative retrieval, and down-
+                                                          stream tasks. At comparable memory footprints,
+Model. We evaluate SPARE on a pretrained 1.3B-            SPARE generally achieves better quality retention
+parameter pure Gated DeltaNet (GDN) (Yang et al.,         than DRRQR, with particularly pronounced advan-
+2025), comprising 24 layers with eight heads per          tages in associative retrieval. As the compression
+layer and dk = dv = 256. Model weights use                budget increases, SPARE progressively reduces lan-
+BF16, while recurrent states are maintained in            guage modeling NLL, while retrieval and down-
+FP32. All compression configurations are training-        stream performance exhibit diminishing returns.
+free and use offline calibration.                         Although DRRQR-K128 achieves slightly better
+                                                          quality on some metrics than SPARE-H96, it re-
+Baselines. We compare SPARE against the orig-             quires substantially more GPU memory. Over-
+inal uncompressed model (Dense), structured               all, these results demonstrate that compact recur-
+key/query channel pruning (DRRQR) (Nazari and             rent subspaces provide a favorable quality–memory
+Rusch, 2026), and fixed-subspace compression              trade-off across different compression budgets.
+with uniform head ranks (Uniform). Comparisons
+use matched recurrent-state memory budgets with-          4.4 Decoding Efficiency
+out recovery fine-tuning.
+                                                          Figure 3 evaluates the decoding efficiency of SPARE
+Evaluation Tasks. We evaluate language mod-               across different batch sizes, reporting full-model
+eling using next-token NLL on WikiText-103 and            decoding speedup, recurrent-kernel DRAM traf-
+associative memory using 512 four-choice retrieval        fic reduction, and peak GPU memory reduction
+prompts. For downstream evaluation, we report             relative to Dense. As batch size increases, the de-
+results on three in-context retrieval tasks: SQuAD        coding benefits of compact recurrent states become
+Completion, TriviaQA, and DROP.                           more pronounced. At batch size 512, SPARE-H32
+                                                          achieves a 2.55× full-model decoding speedup,
+System Evaluation. We benchmark on NVIDIA                 while reducing recurrent-kernel DRAM traffic by
+RTX A6000 GPUs (48 GB), measuring full-model              7.49× and peak GPU memory by 3.31×. The
+decoding latency, recurrent-kernel DRAM traffic,          higher-capacity SPARE-H64 retains a 1.78× decod-
+and peak GPU memory. All decoding comparisons             ing speedup and a 2.53× reduction in peak GPU
+use stateful CUDA Graph execution with matched            memory at the same batch size. The gap between
+workloads and same-device baselines.                      recurrent-kernel traffic reduction and full-model
+                                                          speedup reflects the remaining costs of projection
+4.2 Task-dependent Performance                            and other model operations. Overall, these results
+                                                          demonstrate that performing recurrent reads and
+Table 1 compares SPARE with DRRQR at matched              updates directly in compact subspaces translates
+recurrent-state budgets of 6 and 12 MiB across lan-       substantial memory savings into practical decoding
+guage modeling, associative retrieval, and down-          acceleration.
+stream tasks. At both budgets, SPARE achieves
+lower language modeling NLL and substantially             4.5 Ablation Studies and Analysis
+higher associative retrieval accuracy, reaching
+60.35% compared with 33.20% for DRRQR at                  Heterogeneous Rank Allocation. We compare
+12 MiB. SPARE also achieves higher average ac-            heterogeneous and uniform rank allocations under
+curacy across the three downstream tasks, although        identical state budgets. As shown in Figure 4(a) and
+DRRQR-K64 slightly outperforms SPARE-H64 on               Table 2, heterogeneous allocation improves associa-
+TriviaQA. Nevertheless, both compressed meth-             tive retrieval accuracy by 14.26–23.24 percentage
+ods exhibit quality degradation relative to Dense,
+
+                                                       5
+Table 1: Task-dependent performance under recurrent-state compression. We compare SPARE with DRRQR at
+matched recurrent-state budgets of 6 and 12 MiB, using the uncompressed Dense model as a reference. Language
+modeling is evaluated using next-token NLL on WikiText-103 (lower is better). Associative retrieval accuracy is
+measured over 512 synthetic four-choice prompts (higher is better). Downstream results report accuracy (%) on
+SQuAD Completion, TriviaQA, and DROP, with Avg. denoting their unweighted mean. State denotes persistent
+recurrent-state storage per request, excluding model weights and other runtime memory. Bold values indicate the
+better result within each matched-budget comparison.
+
+                            Language Modeling Associative Retrieval                                                                              Downstream Tasks
+
+Method         State (MiB)       NLL ↓                 Acc. (%) ↑    SQuAD TriviaQA DROP Avg.
+
+Dense          48                2.290                 70.51              36.92                                                                     64.28  21.85   41.02
+
+DRRQR-K32      6                 3.068                 23.44              9.91                                                                      32.29  8.15    16.78
+                                 2.817                 56.84              28.62                                                                     37.68  12.75   26.35
+SPARE-H32      6
+                                 2.653                 33.20              21.90                                                                     50.12  15.09   29.04
+DRRQR-K64      12                2.534                 60.35              30.74                                                                     48.40  18.11   32.42
+
+SPARE-H64      12
+
+                                           SPARE                   DRRQR
+
+       (a) Language modeling          (b) Associative retrieval                                                                              (c) Selected downstream tasks
+
+                                 60                                                                                                          40
+3.0Next-token NLL
+                                                             Retrieval accuracy (%)                                                          35
+
+2.8                                                                                                                       Mean accuracy (%)5030
+
+                                 40                                                                                                          25
+
+2.6                                                                                                                                          20
+
+                                 30
+
+2.4                              20                                                                                                          15
+
+       9   12  15           18          9  12          15     18                                                                                 9  12     15      18
+
+          Peak GPU memory (GiB)            Peak GPU memory (GiB)                                                                                    Peak GPU memory (GiB)
+
+Figure 2: Quality–memory trade-off of recurrent-state compression. We compare SPARE with DRRQR structured
+pruning across different compression budgets. (a) Next-token NLL on WikiText-103 (lower is better). (b) Associative
+retrieval accuracy over 512 four-choice prompts (higher is better). (c) Mean accuracy across three selected
+downstream tasks: SQuAD Completion, TriviaQA, and DROP (higher is better). Peak GPU memory is measured
+during full-model inference with batch size 512, a prefill length of 128 tokens, and 64 decoding steps. Across these
+evaluations, SPARE provides a favorable quality–memory trade-off, particularly under aggressive compression.
+
+points across the evaluated budgets. However, uni-     and SPARE-H64, respectively.
+form allocation achieves slightly lower language
+modeling NLL at smaller budgets, indicating that       5 Related Work
+the benefits of heterogeneous allocation are task
+dependent.                                             5.1 Linear Attention and Efficient Inference
+
+Subspace Construction. Figure 4(b) compares            Linear attention replaces the growing key-value
+Key-, State-, and Value-based projection subspaces     cache of conventional attention with fixed-size re-
+under matched calibration and rank budgets. Key        current states, enabling efficient autoregressive in-
+PCA yields the highest associative retrieval accu-     ference (Katharopoulos et al., 2020). Subsequent
+racy among the evaluated subspaces, while Value        architectures improve the expressiveness of recur-
+PCA performs worst under the matched budget.           rent memory through gating and delta-rule updates,
+These results highlight the importance of subspace     including Gated Linear Attention (Yang et al.,
+construction for preserving associative memory.        2023), Gated DeltaNet (Yang et al., 2025), Kimi
+                                                       Delta Attention (Team et al., 2025), and Gated
+Write Compensation. Figure 4(c) shows that             DeltaNet-2 (Hatamizadeh et al., 2026). Mean-
+write compensation improves retrieval accuracy by      while, hardware-efficient implementations such as
+7.62 and 11.13 percentage points for SPARE-H32         FlashLinearAttention (Yang et al., 2023) and Light-
+                                                       ning Attention-2 (Qin et al., 2024) accelerate lin-
+
+                                                    6
+                                          SPARE-H32               SPARE-H64
+
+(a) Full-model decode speedup            (b) Recurrent-kernel DRAM           (c) Peak GPU memory reduction
+
+  3                                    10
+
+  2
+
+  1
+Speedup over Dense (×)                 8                                                                                                       3
+                                                          DRAM reduction (×)
+                                       6                                                                                                       2
+                                                                                                                         Memory reduction (×)
+                                       4
+                                                                                                              1
+
+                                       2
+
+0              128         512         0                    128   512                                                                          0              128         512
+           32                                     32                                                                                                      32
+
+               Batch size                             Batch size                                                                                              Batch size
+
+Figure 3: Decoding efficiency and memory savings of SPARE. We evaluate SPARE-H32 and SPARE-H64 against the
+Dense Gated DeltaNet baseline across batch sizes of 32, 128, and 512. (a) Full-model decoding speedup relative
+to Dense. (b) Reduction in recurrent-kernel DRAM traffic, measured using hardware counters and normalized by
+the corresponding Dense kernels. (c) Reduction in peak GPU memory, computed as the ratio of Dense to SPARE
+peak memory usage during full-model inference. Experiments are conducted on NVIDIA RTX A6000 GPUs using
+stateful CUDA Graph decoding. The results demonstrate that compact recurrent states reduce memory traffic and
+GPU memory requirements while accelerating full-model decoding.
+
+Table 2: Effect of heterogeneous rank allocation. Uni-         Rusch (2026) propose structured pruning of key
+form SPARE and SPARE are compared under identical              and query channels, including a rank-revealing
+recurrent-state budgets. NLL is measured on WikiText-          QR-based approach to state reduction. Similarly,
+103 (lower is better), and retrieval accuracy is evaluated     Sun et al. (2026) investigate heterogeneous state-
+on 512 four-choice prompts (higher is better). Bold            rank dynamics and introduce rank- and norm-aware
+values indicate the better result at each matched budget.      pruning. Another direction reduces recurrent-
+                                                               state storage through quantization. For example,
+Method         State (MiB) NLL ↓ Acc. (%) ↑                    LeapQuant (Pan et al., 2026) combines window-
+                                                               based quantization with outlier compensation to
+Uniform32           6           2.798  33.59                   mitigate quantization errors during recurrent infer-
+                                2.817  56.84                   ence. Unlike coordinate pruning, SPARE repre-
+SPARE-H32           6                                          sents recurrent memory in fixed low-dimensional
+                                2.658  40.63                   key subspaces without restricting it to selected orig-
+Uniform48           9           2.680  58.40                   inal representation dimensions. Rather than reduc-
+                                                               ing numerical precision, SPARE exploits hetero-
+SPARE-H48           9           2.574  46.09                   geneous low-rank structure to enable direct recur-
+                                2.534  60.35                   rent reads and updates on compact states, with
+Uniform64           12                                         lightweight compensation for reduced memory-
+                                                               writing strength.
+SPARE-H64           12
+                                                               6 Conclusion
+ear attention through tiled and parallel computa-
+tion. Other approaches explore specialized hard-               We presented SPARE, a training-free framework for
+ware that keeps recurrent states on-chip to reduce             accelerating linear attention decoding through com-
+memory transfers (Gupta et al., 2026). While these             pact recurrent states. By combining heterogeneous
+advances improve model architectures or execution              rank allocation, fixed key-based subspaces, and
+efficiency, recurrent-state memory access remains              lightweight write compensation, SPARE enables re-
+a substantial cost during GPU decoding. SPARE                  current reads and updates directly in a reduced rep-
+addresses this bottleneck by reducing the amount               resentation without online decomposition or dense-
+of recurrent-state data transferred through compact            state reconstruction. On a 1.3B Gated DeltaNet
+state representations.                                         model, SPARE achieves 2.55× full-model decoding
+                                                               speedup, 7.49× lower recurrent-kernel DRAM traf-
+5.2 Recurrent-State Compression                                fic, and 3.31× lower peak GPU memory at batch
+
+Recent studies have identified substantial low-rank
+redundancy in linear attention’s recurrent states,
+with effective ranks varying considerably across
+attention heads (Nazari and Rusch, 2026; Sun et al.,
+2026). To exploit this redundancy, Nazari and
+
+                                                            7
+                             SPARE                        Uniform SPARE
+
+    (a) Rank allocation          (b) Subspace construction                                                                                                  (c) Write compensation
+
+Retrieval accuracy (%)70     60                                                                                                                         70  Compensation OFF  Compensation ON
+                                                                Retrieval accuracy (%)
+60                                                                                                                              Retrieval accuracy (%)5060
+
+                             40                                                                                                                         50
+
+50                                                                                                                                                      40
+
+                             30                                                                                                                         30
+
+40                           20
+
+30                                                                                                                                                      20
+
+                             10                                                                                                                         10
+
+20          9            12  0                            State  Value                                                                                  0                     SPARE-H64
+         6                            Key                                                                                                                        SPARE-H32
+
+            State (MiB)
+
+Figure 4: Ablation studies of the key design choices in SPARE. All panels report associative retrieval accuracy
+on 512 four-choice prompts, with 256 prompts each at retrieval depths of 64 and 128. (a) Heterogeneous rank
+allocation. We compare SPARE with Uniform SPARE at matched recurrent-state budgets of 6, 9, and 12 MiB. Both
+methods use the same Key-PCA basis construction and write-compensation mechanism, differing only in how ranks
+are distributed across layers and heads. Heterogeneous allocation consistently achieves higher retrieval accuracy.
+(b) Subspace construction. We compare Key-based, State-based, and Value-based PCA projections under a fixed
+12 MiB state budget, matched calibration data, and identical per-head rank allocations. Key and State PCA use
+right-side projections, whereas Value PCA uses a left-side projection. Key-side write compensation is disabled
+for this comparison and is not applicable to the Value-side formulation. Key PCA achieves the highest retrieval
+accuracy among the evaluated subspaces. (c) Write compensation. We compare SPARE-H32 and SPARE-H64 with
+and without projected-Key write compensation, holding their respective rank allocations and projection bases
+fixed. Enabling compensation improves retrieval accuracy at both compression budgets. All state budgets refer to
+persistent recurrent-state storage per request rather than peak GPU memory.
+
+size 512. It also preserves associative retrieval ac-     References
+curacy more effectively than structured coordinate
+pruning at matched state budgets, although com-           Tri Dao and Albert Gu. 2024. Transformers are
+pression introduces task-dependent quality degra-            ssms: Generalized models and efficient algorithms
+dation. These results demonstrate the potential of           through structured state space duality. arXiv preprint
+compact recurrent computation for efficient linear           arXiv:2405.21060.
+attention inference.
+                                                          Neelesh Gupta, Peter Wang, Rajgopal Kannan, and Vik-
+                                                             tor K Prasanna. 2026. A persistent-state dataflow
+                                                             accelerator for memory-bound linear attention de-
+                                                             code on fpga. arXiv preprint arXiv:2603.05931.
+
+                                                          Ali Hatamizadeh, Yejin Choi, and Jan Kautz. 2026.
+                                                             Gated deltanet-2: Decoupling erase and write in lin-
+                                                             ear attention. arXiv preprint arXiv:2605.22791.
+
+                                                          Angelos Katharopoulos, Apoorv Vyas, Nikolaos Pap-
+                                                             pas, and François Fleuret. 2020. Transformers are
+                                                             rnns: Fast autoregressive transformers with linear
+                                                             attention. In International conference on machine
+                                                             learning, pages 5156–5165. PMLR.
+
+                                                          Philipp Nazari and T Konstantin Rusch. 2026. The key
+                                                             to state reduction in linear attention: A rank-based
+                                                             perspective. arXiv preprint arXiv:2602.04852.
+
+                                                          Yi Pan, Haocheng Xi, Kan Zhu, Xingyang Li, Yibo Wu,
+                                                             Mayank Mishra, Hongtao Zhang, William X Zheng,
+                                                             Baris Kasikci, Song Han, et al. 2026. Leapquant:
+                                                             Efficient linear attention with accurate recurrent state
+                                                             quantization. arXiv preprint arXiv:2609.38166.
+
+                                                          Zhen Qin, Weigao Sun, Dong Li, Xuyang Shen, Weix-
+                                                             uan Sun, and Yiran Zhong. 2024. Lightning attention-
+                                                             2: A free lunch for handling unlimited sequence
+                                                             lengths in large language models. arXiv preprint
+                                                             arXiv:2401.04658.
+
+                                                       8
+Ao Sun, Hongtao Zhang, Heng Zhou, Yixuan Ma, Yiran            A Additional Derivations
+   Qin, Tongrui Su, Yan Liu, Zhanyu Ma, Jun Xu, Jiu-
+   chong Gao, et al. 2026. State rank dynamics in linear      A.1 Proof of Theorem 1
+   attention llms. arXiv preprint arXiv:2602.02195.
+                                                              We prove the result by induction on t. The initial
+Kimi Team, Yu Zhang, Zongyu Lin, Xingcheng Yao,               condition S0 = C0P ⊤ holds by assumption. Sup-
+   Jiaxi Hu, Fanqing Meng, Chengyin Liu, Xin Men,             pose St−1 = Ct−1P ⊤. Since kt ∈ span(P ) and
+   Songlin Yang, Zhiyuan Li, et al. 2025. Kimi linear:        P ⊤P = Ir, we have
+   An expressive, efficient attention architecture. arXiv
+   preprint arXiv:2510.26692.                                       kt = P kt, St−1kt = Ct−1kt. (12)
+
+Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob              Furthermore, ∥kt∥2 = 1 implies ρt = ∥kt∥22 = 1,
+   Uszkoreit, Llion Jones, Aidan N Gomez, Łukasz              and hence γt = 1. Substituting these identities into
+   Kaiser, and Illia Polosukhin. 2017. Attention is all       the original Gated Delta Rule yields
+   you need. Advances in neural information processing
+   systems, 30.
+
+Samuel Williams, Andrew Waterman, and David Pat-              St = αtCt−1P ⊤
+   terson. 2009. Roofline: an insightful visual perfor-
+   mance model for multicore architectures. Communi-                     + βt  vt − αtCt−1kt         ⊤  P  ⊤         (13)
+   cations of the ACM, 52(4):65–76.
+                                                                                                   kt
+Songlin Yang, Jan Kautz, and Ali Hatamizadeh. 2025.
+   Gated delta networks: Improving mamba2 with delta          = CtP ⊤.
+   rule. In International Conference on Learning Rep-
+   resentations, volume 2025, pages 29687–29707.              Therefore, the recurrent states are identical under
+                                                              the compact representation. The corresponding
+Songlin Yang, Bailin Wang, Yikang Shen, Rameswar              outputs satisfy
+   Panda, and Yoon Kim. 2023. Gated linear attention
+   transformers with hardware-efficient training. arXiv       ot = Stqt = CtP ⊤qt = Ctqt = ot. (14)
+   preprint arXiv:2312.06635.
+                                                              Thus, both the recurrent-state identity and output
+Jian Yin, Hui Yu, Weizhi Xu, Yuxuan Wang, Zhu Tian,           equivalence hold for all t.
+   Yingping Zhang, and Bochuan Chen. 2014. Highly
+   parallel gemv with register blocking method on gpu         B GPU Implementation Details
+   architecture. Journal of Visual Communication and
+   Image Representation, 25(7):1566–1573.                     B.1 Packed Heterogeneous State Layout
+
+                                                              SPARE employs a packed memory layout to
+
+                                                              support heterogeneous rank allocations without
+
+                                                              padding individual heads to a uniform dimension.
+
+                                                              For a model with L layers and H heads per layer,
+
+                                                              let rℓ,h denote the rank assigned to head h in layer ℓ,
+
+                                                              and let R =      L    H    rℓ,h  be  the  total  rank  bud-
+                                                                               ℓ=1  h=1
+
+                                                              get. The compact coefficient matrices are stored
+
+                                                              in a contiguous tensor Ctpack ∈ RB×R×dv , where
+
+                                                              B denotes the batch size. Each head occupies a
+
+                                                              contiguous region containing the transpose of its co-
+
+                                                              efficient matrix, with its starting offset determined
+
+                                                              by the cumulative ranks of preceding heads. These
+
+                                                              offsets remain fixed throughout inference, allowing
+
+                                                              GPU kernels to access individual recurrent states
+
+                                                              without constructing padded intermediate tensors.
+
+                                                              The corresponding projection bases are stored sep-
+
+                                                              arately and shared across requests. For b bytes per
+
+                                                              state element, the recurrent-state memory require-
+
+                                                              ments are
+
+                                                                           Mdense = BLHdvdkb,                        (15)
+
+                                                                           MSPARE = BRdvb.
+
+                                                           9
+In our 24-layer Gated DeltaNet with eight heads            advanced consistently with the dependent decod-
+per layer and dk = dv = 256, a total rank bud-             ing steps. We validate graph execution against
+get of R = 6144 reduces FP32 recurrent-state               eager inference using identical initial states and
+storage from 48 MiB to 6 MiB per request. The              token sequences, checking recurrent coefficients,
+original short-convolution states are preserved and        convolution states, and output logits. For suffi-
+accounted for separately from the compressed re-           ciently large packed tensors, 64-bit pointer offsets
+current states.                                            are used to avoid integer overflow in GPU mem-
+                                                           ory addressing. These measures enable repeated
+B.2 Efficient Recurrent Decoding                           state-dependent graph execution without retaining
+                                                           the original dense recurrent state.
+We implement SPARE’s compact recurrent com-
+putation using Triton GPU kernels operating di-            B.4 Parallel Prefill Compatibility
+rectly on the packed coefficient matrices. At each
+decoding step, the normalized key and query are            Although SPARE primarily targets decoding, its
+projected onto their corresponding fixed subspaces,
+following Eq. (4). The kernels then compute the            compact recurrence is algebraically compatible
+old-value prediction Ct−1kt, apply the compen-
+sated update in Eq. (9), and obtain the recurrent          with the parallel Gated Delta Rule used during pre-
+output using Eq. (5). The coefficient matrices are
+updated in place, avoiding additional persistent           fill. To see this, define the transformed key and
+state copies and dense-state reconstruction. The
+implementation preserves the original key normal-          value vectors as
+ization, query scaling, decay factors, and update
+gates of Gated DeltaNet, while maintaining FP32                              kt′  =  √         (16)
+arithmetic for recurrent states. Unlike methods                              vt′  =    γtkt,
+that explicitly reconstruct a full dv × dk matrix,
+SPARE performs its state-dependent reads and up-                                     √
+dates on dv × r coefficients. Consequently, the                                        γtvt.
+recurrent-state access cost scales with the allocated
+rank rather than the original key dimension, al-           Substituting these variables into the standard Gated
+though key and query projections introduce addi-           Delta Rule gives
+tional computation. This trade-off is particularly
+favorable at high batch sizes, where recurrent-state       Ct = αtCt−1                         (17)
+memory traffic becomes a substantial fraction of
+decoding time.                                             + βt v′t − αtCt−1k′t (kt′ )⊤,
+
+B.3 CUDA Graph Execution                                   which is algebraically equivalent to Eq. (9). The
+                                                           query remains qt and is not rescaled by the write-
+To reduce kernel-launch overhead during autore-            compensation factor. This formulation allows
+gressive decoding, SPARE supports stateful CUDA            SPARE to reuse existing chunkwise parallel Gated
+Graph execution. A key requirement is that recur-          Delta Rule operators with reduced key dimensions.
+rent states must remain at fixed memory addresses          For heterogeneous ranks, heads with identical ranks
+across successive decoding steps. Our implemen-            are grouped for parallel computation, and their up-
+tation maintains address-stable packed coefficient         dated coefficients are written back into the original
+buffers and updates their contents in place, while         packed state buffer. The implementation preserves
+preserving the original convolution caches. Input          the original normalization and gating semantics
+token IDs are copied into fixed GPU buffers before         rather than applying additional normalization after
+each graph replay, allowing successive decoding            projection. In practice, grouped parallel prefill can
+steps to process different tokens without changing         introduce extra workspace, shape-specialization
+the captured execution graph. Since graph cap-             overhead, and numerical differences due to floating-
+ture and warmup can modify recurrent states, the           point operation ordering. We therefore retain a vali-
+implementation restores the corresponding prefill          dated sequential prefill path and use parallel execu-
+states into the captured buffers before measured           tion only for supported configurations that satisfy
+execution. Host-side cache bookkeeping is also             the numerical correctness checks. As a result, com-
+                                                           patibility with parallel prefill does not imply that
+                                                           SPARE universally accelerates the prefill stage.
+
+                                                           B.5 Memory and Performance Accounting
+
+                                                           The compact recurrent-state size in Eq. (15) mea-
+                                                           sures only the persistent coefficient storage and
+                                                           does not represent the complete GPU memory foot-
+                                                           print. Actual inference memory additionally in-
+                                                           cludes model parameters, shared projection bases,
+
+                                                       10
+convolution caches, temporary workspaces, inter-
+mediate activations, and CUDA Graph allocations.
+We distinguish recurrent-state storage from the
+measured peak allocated and reserved GPU mem-
+ory throughout our experiments. Similarly, reduced
+state capacity does not by itself establish a pro-
+portional reduction in physical GPU memory traf-
+fic. We therefore measure recurrent-kernel DRAM
+reads and writes using hardware profiling coun-
+ters and evaluate decoding latency using complete-
+model execution. The reported decoding measure-
+ments include all model layers and maintain re-
+current and convolution states across dependent
+token steps. All reported speedups are obtained
+from synchronized fixed-batch workloads with ap-
+propriate same-device Dense baselines and do not
+imply improvements in continuous-batching serv-
+ing throughput.
+
+                                                             11
+

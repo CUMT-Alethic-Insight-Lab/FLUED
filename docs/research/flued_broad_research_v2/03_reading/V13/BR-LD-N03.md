@@ -1,0 +1,19 @@
+# BR-LD-N03 — Critical Learning Periods in Deep Networks
+
+**Status: FULL.** Achille, Rovere and Soatto, arXiv [1711.08856v3](https://arxiv.org/pdf/1711.08856v3), 2019-02-25; the PDF identifies the work as published at ICLR 2019. [Local PDF](sources/BR-LD-N03.pdf), [text](sources/BR-LD-N03.txt); pp. 1–14 including A–C read, and [p. 2](sources/N03_p2.png) inspected visually because its text is superimposed. SHA-256 `0657f55b7f08ac9e351c9ef50c85edbd6e99a8bb84cba582d8e983a4cb64220c`. Directions E.04, E.17–E.21.
+
+## Problem and one-sentence solution
+
+Can a temporary early training deficit leave persistent task-specific impairment even after the original data are restored? Borrow the biological deprivation-and-recovery paradigm and a Fisher-information sensitivity proxy: vary the time and character of corrupted training, then measure final classifier accuracy and layerwise changes. This is a diagnostic protocol, not a repair algorithm.
+
+The supervised objective is image class cross-entropy; CIFAR-10 images are blurred by downsampling 32×32 to 8×8 and upsampling, then normal images are restored. A variable-onset 40-epoch blur window measures sensitivity; an initial-deprivation experiment follows restoration with 160 normal epochs (§2 p.3). Fig. 1 p.2 visually confirms onset sensitivity and impairment; do not inherit garbled overlay text that instead refers to 300 epochs. The reference/control gets the same number of normal examples, but deprivation adds training exposure and changes history. Class targets and full image are available during classification; no sequential query or content-addressed retained state is tested.
+
+## Results, controls, and limits
+
+- Blur removed after roughly the first 40–60 epochs yields substantial residual test-error increase, up to threefold in the plotted setting; a 40-epoch deficit centered near epoch 30 is more damaging than later windows. The observation is conditional on tested convergence and finite training; Fig. 1's verbal 'regardless of how much' cannot be established as an infinite-horizon theorem.
+- Vertical flips and class-label permutations recover to near baseline after correction; uninformative fixed random-noise images have milder residual effects than blur (Fig. 2). This is the strongest counterexample to 'any early deviation locks learning forever'. Increasing depth changes the profile. ResNet-18/CIFAR-10, fully connected MNIST, fixed learning rate, Adam and varying weight decay also exhibit differing profiles (Fig. 3); a constant rate rules out annealing as the sole explanation, not all optimizer-history causes. Appendix A: fixed rate .001 for CNN/depth controls, batch 128; five-layer MNIST .005. A longer 400-epoch plot is not a proof of unlimited recovery.
+- Fisher trace peaks near sensitivity and later falls; a layerwise noise-based estimate suggests early blur biases the upper layers, whereas early restoration permits some redistribution (Figs. 4–5). Appendix A.2 estimates model-prediction Fisher by Monte Carlo, or optimizes a diagonal noise covariance as a more robust surrogate. This local proxy is not measured mutual information, proof of structural capacity loss, or a demonstrated unique causal mechanism. The authors themselves entertain geometry as hypothesis and note sharpness may be an epiphenomenon (§4).
+
+## Independent non-retrieval use
+
+On a target host, compare same-initialization histories with temporary corruption of a particular training signal, an equally timed label/output permutation and a no-information control; after restoration compare equal clean exposure and multiple constant-rate recovery horizons. Separate probe, native output, and causal content swaps. If late impairment disappears with appropriate learning rate/recovery or follows all perturbations equally, weaken a specific early-formation hypothesis. No architecture winner follows from vision classifiers.

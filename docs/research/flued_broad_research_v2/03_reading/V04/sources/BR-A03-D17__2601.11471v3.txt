@@ -1,0 +1,1877 @@
+                                       Low-Rank Key Value Attention
+
+                                       James O’Neill† 1 Robert Clancy 1 Mariia Matskevichus 1 Fergal Reid 1
+
+arXiv:2601.11471v3 [cs.LG] 7 Apr 2026                          Abstract                                     the model’s parameter memory (5 GB in bfloat16), consum-
+                                                                                                            ing more memory than the model itself. This forces prac-
+                                             The key-value (KV) cache is a primary memory                   titioners into an impossible trilemma: use smaller batches
+                                             bottleneck in Transformers. We propose Low-                    (sacrificing throughput), shorter contexts (limiting capa-
+                                             Rank Key-Value (LRKV) attention, which re-                     bility), or frequent cache eviction (adding latency)—each
+                                             duces KV cache memory by exploiting redun-                     option directly degrading production utility. Reducing KV
+                                             dancy across attention heads, while being com-                 cache size thus directly translates to 2× longer contexts or
+                                             pute efficient. Each layer uses a shared full-                 2× larger batches at fixed memory budgets.
+                                             rank KV projection augmented with low-rank,
+                                             head-specific residuals, providing a continuous                A range of approaches have been proposed to alleviate the
+                                             trade-off between complete sharing and full in-                growing KV cache cost. Multi-Query Attention (Shazeer,
+                                             dependence. After pretraining models of size                   2019, MQA) and Grouped-Query Attention (Ainslie et al.,
+                                             128M to 6.3B parameters, LRKV consistently                     2023, GQA) reduce memory and latency by sharing key-
+                                             achieves the lowest test loss among standard                   value (KV) projections across heads or groups of heads,
+                                             MHA, MQA/GQA, and MLA while using only                         and are now standard in large-scale models such as PaLM
+                                             45-53% of MHA’s KV cache. LRKV reaches                         and LLaMA (Touvron et al., 2023; 2024). However, ag-
+                                             equivalent baseline quality 18-25% faster (mea-                gressive KV sharing introduces a fundamental trade-off:
+                                             sured in training steps). After supervised midtrain-           while memory is reduced, head-level representational diver-
+                                             ing, LRKV achieves the highest downstream task                 sity is constrained, even though distinct attention heads are
+                                             performance across ARC-Easy, ARC-Challenge,                    known to encode complementary syntactic and semantic
+                                             MMLU, GSM8K, and HumanEval benchmarks.                         patterns (Clark et al., 2019; Michel et al., 2019).
+
+                                       1. Introduction                                                      At the same time, empirical studies and recent spectral anal-
+                                                                                                            yses show that attention heads are not fully independent:
+                                       Transformers are the dominant architecture for large-scale           head-specific KV projections are highly correlated and oc-
+                                       sequence modeling in language, vision, and multimodal do-            cupy overlapping subspaces, indicating substantial redun-
+                                       mains (Vaswani et al., 2017; OpenAI, 2023), but as their size,       dancy (Yunis et al., 2024). Crucially, this redundancy is
+                                       sequence length, and context window grow, so does, rapidly,          structured rather than uniform—small, head-specific varia-
+                                       their computational and memory costs. KV-caching, which              tions remain important for capturing nuanced dependencies.
+                                       stores the attention key and value representations, is a pri-        This raises a natural question: can KV memory be reduced
+                                       mary contributor to this overhead, as it spans every attention       by exploiting redundancy across heads, without collapsing
+                                       layer, and scales linearly with sequence length and count of         the specialization that makes multi-head attention effective?
+                                       heads. The cumulative KV footprint of modern models with
+                                       tens of billion parameters can exceed the parameter mem-             Beyond KV sharing, efficiency research has pursued com-
+                                       ory itself, especially for long-context inference (Dao et al.,       plementary directions such as sparse or kernelized atten-
+                                       2024; Child et al., 2019). To illustrate the scale of this chal-     tion (Wang et al., 2020; Beltagy et al., 2020; Child et al.,
+                                       lenge, consider a 2.5B parameter model (18 layers, 18 heads,         2019), architectural optimizations (Dao et al., 2024), and
+                                       dh=128) serving 8K-token contexts: the KV cache alone                latent compression methods including Multi-Latent Atten-
+                                       requires 2×18×18×128×8192×2 bytes = 648 MB per re-                   tion (Liu et al., 2024, MLA). However, none of these ap-
+                                       quest. At batch size 4, KV cache memory (2.6 GB) exceeds             proaches explicitly resolve the duplication of per-head key
+                                                                                                            and value representations that dominates the KV memory
+                                           1 AI Group, Intercom                                             footprint in large models.
+                                       124 St Stephen’s Green, Dublin 2, D02 C628, Ireland . Correspon-
+                                       dence to: James O’Neill <james.oneill@intercom.io>.                  In this work, we propose Low-Rank Key-Value Atten-
+                                                                                                            tion (LRKV), a simple modification of multi-head atten-
+                                       Preprint. April 9, 2026.                                             tion that exploits structured redundancy across heads while
+                                                                                                            preserving head specialization. Each Transformer layer
+
+                                                                                                         1
+Low-Rank Key Value Attention
+
+Figure 1. Comparison of attention mechanisms. Standard MHA: Uses H independent projections per head, requiring high cache cost
+(2LHdh). MQA/GQA: Shares projections across all heads, reducing cache but losing head-specific detail. LRKV (Ours): Combines
+shared full-rank parameters with head-specific low-rank residuals (UhBhT , rank r ≪ dh), achieving low cache cost 2L(dh + Hr) while
+preserving head diversity.
+
+maintains a shared, full-rank key and value projection that        head-level expressivity. MQA (Shazeer, 2019) uses a sin-
+serves as a global basis, while each head learns a compact,        gle shared KV projection for all heads, achieving maximal
+trainable low-rank residual that captures head-specific de-        cache reduction but constraining diversity. GQA (Ainslie
+viations. The shared component encodes global relational           et al., 2023) groups heads to share KV projections within
+structure, and the residuals restore the localized diversity       groups, interpolating between MQA and full MHA. While
+otherwise lost under aggressive KV sharing. This factoriza-        both methods reduce memory, they fundamentally limit the
+tion substantially reduces KV memory while retaining the           representational capacity available to each head. LRKV pre-
+expressivity of multi-head attention.                              serves shared projection efficiency while restoring diversity
+                                                                   through structured low-rank head residuals, achieving better
+LRKV differs fundamentally from prior KV-efficient de-             quality at comparable cache sizes.
+signs in where compression is applied. Unlike LoRA (Hu
+et al., 2022), which introduces low-rank structure post hoc        Latent Compression Approaches. MLA (Liu et al., 2024)
+during fine-tuning, LRKV learns head-specific low-rank             takes a complementary approach: rather than sharing across
+residuals jointly during pretraining. Unlike factorized QKV        heads, it compresses across the token dimension by project-
+methods that reduce rank along the token or hidden di-             ing inputs into a low-dimensional latent space (dc ≪ d)
+mension (Wang et al., 2020; Saxena et al., 2024; Chang             before caching. While effective for extreme compression,
+et al., 2025), LRKV preserves full token resolution and com-       this bottleneck constrains all heads to operate through the
+presses only across attention heads. We now discuss the            same latent representation and requires T-dependent recon-
+main contributions of this paper.                                  struction overhead during generation (see Appendix F).
+                                                                   LRKV instead preserves full token-level resolution and com-
+Contributions.(1) LRKV reduces KV cache by 45-53%                  presses along the head dimension via additive factorization
+while achieving lowest test loss across 128M-6.3B mod-             (Wh = Wshared + UhB⊤h ), avoiding latent bottlenecks
+els, reaching baseline performance 18-25% faster in train-         while maintaining per-head specialization. These represent
+ing steps. (2) LRKV achieves highest downstream perfor-            orthogonal design choices: MLA optimizes for minimal
+mance across ARC, MMLU, GSM8K, demonstrating better                cache size via aggressive token compression, while LRKV
+pretraining translates to improved capabilities. (3) Gauge-        balances memory efficiency with head-level expressivity.
+invariant analysis shows LRKV effectively uses low-rank
+structure by preserving 93.5% head diversity vs 94% MHA.1          Low-Rank Parameterization. LoRA (Hu et al., 2022)
+                                                                   introduces low-rank updates for parameter-efficient fine-
+2. Related Work                                                    tuning, intervening on the optimization pathway rather than
+                                                                   the cached representations. LRKV applies the low-rank prin-
+KV-Sharing Mechanisms. MQA and GQA reduce KV                       ciple directly to KV projections during pretraining, shaping
+cache by sharing projections across heads, but sacrifice           the structure of cached features from the start. Recent work
+                                                                   explores low-rank QKV factorizations (Xie et al., 2023;
+    1Code and trained models will be released upon acceptance.     Khalaf et al., 2025; Lv et al., 2024) to reduce parameters or
+
+                                                                2
+                           Low-Rank Key Value Attention
+
+computation; LRKV differs by preserving a full-rank shared           Low-Rank KV Attention. We parameterize each head’s
+base (capturing global structure) while using low-rank resid-        key/value projection as a shared dense (unconstrained) base
+uals only for head-specific deviations. Concurrent work              plus a head-specific low-rank residual, while keeping the
+on factorized KV mechanisms (MFA/MFA-KR (Hu et al.,                  resulting projection shape d × dh:
+2025), TPA (Zhang et al., 2025)) explores related structured
+compression ideas.                                                   WhK = WsKhared + UhK BhK ⊤,                                             (2)
+
+Unlike joint-head low-rank decompositions such as J-                 WhV = WsVhared + UVh BVh ⊤,                                             (3)
+LRD/Palu, which compress projections post hoc, LRKV is
+a pretraining-time architectural reparameterization that pre-        where WsKh,aVred ∈ Rd×dh are dense projection matrices with
+serves a full-rank shared base while learning head-specific          no rank constraint, UKh ,V ∈ Rd×r, BhK,V ∈ Rdh×r, and
+low-rank residuals. This enables exact associative decoding          r ≪ dh. The effective keys and values are Kh = XWhK
+and reduces KV cache without post-hoc approximation.                 and Vh = XWhV . When r = 0, LRKV reduces to com-
+                                                                     plete KV sharing (MQA-style) within a layer; increasing r
+Complementary Efficiency Methods. LRKV is orthogo-
+nal to other efficiency techniques: sparse/kernelized atten-         interpolates continuously toward standard MHA.
+tion (Child et al., 2019; Beltagy et al., 2020; Wang et al.,
+2020) reduce computational complexity but not KV cache               Training and initialization. All parameters in Equation 3
+size; architectural optimizations like FlashAttention (Dao
+et al., 2024) improve throughput through better memory               are optimized jointly during pretraining. Gradients from
+access patterns; quantization and pruning reduce precision
+or parameters. For head diversity analysis, we extend prior          the shared and residual paths are additive, allowing the
+metrics (Michel et al., 2019; Kornblith et al., 2019; Wang
+& Wang, 2025) using gauge-invariant bilinear forms with              model to learn how much per-head variation is required.
+centered Gram matrix analysis (see Appendix A).
+                                                                     We initialize WsKh,aVred using standard Kaiming initializa-
+                                                                     tion for attention projections. The per-head factors UhK,V
+                                                                     1an/√d Br Khsu,VchatrheaitniintiiatliiazlerdestoidsumalasllUrahnBdohm⊤
+                                                                                                                                             values scaled by
+                                                                                                                                             have magnitude
+
+                                                                     ≈ 0.1 × ∥Wshared∥F , ensuring the model starts close to
+
+3. Methodology                                                       the shared baseline and gradually learns head specialization.
+
+Transformers represent each token in a sequence through              During training, we materialize full Kh and Vh matrices be-
+queries, keys, and values that interact via scaled dot-product
+attention. For an input matrix X ∈ RL×d, the h-th attention          fore attention computation for simplicity; the factored form
+head computes Qh = XWhQ, Kh = XWhK , and Vh =
+XWhV , where WhQ,K,V ∈ Rd×dh and dh = d/H for H                      is used only during inference to realize memory savings.
+heads. The head output is
+                                                                     This is an exact reparameterization, so the factorized and
+
+                                                                     unfactorized forms are mathematically equivalent. We apply
+
+                                                                     low-rank factorization only to key and value projections, as
+
+                                                                     these are cached during inference; query projections remain
+
+                                                                     independent per head at full rank.
+
+Oh = softmax  Q√hKh⊤  Vh,  (1)                                       LRKV caching scheme. During decoding, the bottleneck
+                  dh                                                 is storing Kh, Vh ∈ RL×dh for every head. LRKV instead
+
+                                                                     caches shared features once per layer,
+
+and outputs from all heads are concatenated and projected            Kshared = XWsKhared, Vshared = XWsVhared ∈ RL×dh ,
+to form the layer output.
+                                                                     and compact per-head latents
+KV caching. During autoregressive decoding, the KV cache
+stores Kh and Vh for all previous tokens and heads, incur-           RKh = XUhK , RVh = XUhV ∈ RL×r.
+ring per-layer memory Mstandard = 2LHdh = 2Ld. Equiva-
+lently, per token the cache stores 2Hdh floating-point values        The full per-head features implied by Equation 3 are
+(keys and values across H heads). Over N layers in bfloat16
+precision, this is 2N · (2LHdh) bytes of KV storage.                 Kh = Kshared + RKh BKh ⊤,                                               (4)
+
+Motivation. Empirical studies show attention heads within            Vh = Vshared + RVh BhV ⊤.                                               (5)
+a layer are often correlated (Clark et al., 2019; Michel et al.,
+2019), suggesting that per-head key/value features contain           Importantly, the matrices BhK,V are model parameters and
+substantial redundancy. Existing KV-sharing methods such             are not cached per token.
+as MQA and GQA reduce cache size by sharing K/V across
+heads, but can reduce head diversity and modeling capacity.          Attention computation without explicit reconstruction.
+Our goal is to reduce redundant KV storage while preserving          Naively materializing Kh, Vh for all cached tokens would
+head-specific flexibility.                                           cost O(Lrdh) memory and compute. Instead, we exploit
+
+                                                                  3
+                                            Low-Rank Key Value Attention
+
+associativity to compute attention exactly without forming        Memory bandwidth. Modern inference is often bandwidth-
+                                                                  bound rather than compute-bound (Dao et al., 2024). Per
+full per-head KV tensors. For a decoding step with query          decoding step, standard MHA reads 2H cached tensors (Kh
+qh ∈ Rdh ,                                                        and Vh for each head). LRKV reads two shared tensors plus
+                                                                  2H per-head latent tensors. Since the shared tensors (L×dh)
+qhK⊤h = qhK⊤shared + (qhBKh ) (RKh )⊤,              (6)           are reused across heads and the per-head latents (L × r) are
+                                                                  substantially smaller (r ≪ dh), the total bytes transferred is
+and for attention weights ah ∈ R1×L,                              2L(dh + Hr) for LRKV versus 2LHdh for standard MHA,
+                                                                  matching the cache-size reduction and directly translating
+ahVh = ahVshared + (ahRVh ) BhV ⊤.                  (7)           memory savings into reduced bandwidth pressure.
+
+Equations 6 and 7 compute the exact attention logits and          Parameter complexity. Standard per-layer K/V parameters
+outputs implied by Equation 4–Equation 5, but avoid explicit      scale as PMHA,KV = 2Hddh. LRKV uses a shared base plus
+reconstruction of Kh, Vh. This form can be implemented            low-rank factors:
+inside fused attention kernels. See Table 4 for a detailed
+mathematical comparison to existing mechanisms.
+
+                                                                  PLRKV = 2ddh + 2Hr(d + dh) ,                              (10)
+
+Compatibility with Positional Embeddings. Positional                               shared (K,V ) per-head low-rank factors
+embeddings, such as RoPE, are applied after projection and
+distribute linearly over the LRKV decomposition:                  which may be lower or higher than standard depending on
+                                                                  (H, r, dh). In practice, we choose r to prioritize KV-cache
+    RoPE(Kh) = RoPE(Kshared) + RoPE(Rh)Bh⊤.                       reduction with minimal quality impact; in our experiments,
+                                                                  LRKV remains competitive or superior even when the total
+Both components are rotated once at caching time, as in stan-     K/V parameter count is below that of standard MHA.
+dard KV caching, and reused during decoding. This intro-
+duces no additional memory or sequence-length-dependent           Rank as a control for diversity. The residual rank r
+computation. In contrast to latent-attention approaches such      controls a continuous spectrum between fully shared KVs
+as MLA, which require partial RoPE to preserve projection         (MQA-style, r = 0) and fully independent per-head projec-
+absorption, LRKV supports full-dimension RoPE without             tions (standard MHA, large r). The shared base WsKh,aVred
+modification.                                                     captures globally useful features, while low-rank residu-
+                                                                  als enable head specialization within a constrained budget.
+KV cache memory complexity (during decoding). Stan-               Empirically, we find r ≈ 0.36-0.43 × dh provides a criti-
+dard attention stores per-head keys and values:                   cal threshold: LRKV achieves 93.5% PCA-based effective
+                                                                  rank versus 94.0% for standard MHA at 2.5B scale (subsec-
+Mstandard = 2LHdh.                                                tion 4.3), preserving nearly all head diversity while achiev-
+                                                                  ing substantial cache reduction. See Appendix B for detailed
+LRKV stores shared features plus per-head latents:                discussion of spectral structure and low-rank factorization.
+
+MLRKV = 2Ldh + 2LHr                                               4. Experiments
+
+                  shared (K,V ) per-head latents                  We evaluate LRKV through large-scale pretraining exper-
+                                                                  iments across four model sizes (128M, 1.2B, 2.5B, 6.3B
+       = 2L(dh + Hr).                               (8)           parameters), comparing against standard MHA and state-
+                                                                  of-the-art KV-efficient baselines. We measure pretraining
+Thus the memory ratio is                                          loss, training efficiency, downstream task performance, and
+                                                                  provide detailed analysis of why LRKV preserves modeling
+MLRKV      = dh + Hr =                1  +  r       (9)           quality despite substantial cache reduction.
+                                              .
+Mstandard                 H dh  H dh                              Experimental setup. We pretrain decoder-only Transform-
+                                                                  ers at four scales (128M, 1.2B, 2.5B, 6.3B) on FineWeb-
+Per token, LRKV stores 2dh + 2Hr values versus 2Hdh               Edu (Penedo et al., 2024) for 100B tokens (128M) and 50B
+for standard attention.                                           tokens (others), comparing LRKV against Standard MHA,
+                                                                  GQA, MQA, and MLA. Models use 2048-token context,
+Compute overhead during decoding (FLOPs). Per decod-              Muon+AdamW optimizers (Sardana & Havens, 2024), and
+ing step, standard attention has dominant per-head computa-       are pretrained on 8×H200 GPUs in bfloat16. After pretrain-
+tional cost O(Ldh) from query–key dot products and value          ing, we perform supervised midtraining on 568K examples
+aggregation. Using the distributed forms in Equation 6 and        from SmolTalk (Allal et al., 2024), MMLU (Hendrycks
+Equation 7, LRKV adds an extra ∆FLOPs = O(Lr + rdh)
+per head per decoding step. For long contexts (L ≫ 1), the
+dominant additional term scales as O(Lr), yielding a rela-
+tive overhead of approximately r/dh compared to standard
+attention.
+
+                                                               4
+                                                        Low-Rank Key Value Attention
+
+Table 1. Pretraining performance across model scales. LRKV achieves competitive test loss across all model scales (128M, 1.2B, 2.5B,
+6.3B) while maintaining efficient KV cache usage.
+
+                Arch.                          KV Cache %                              128M            1.2B                                                                                2.5B           6.3B
+
+Model           KV Heads 128M 1.2B 2.5B 6.3B CE ↓ BPB ↓ CE ↓ BPB ↓ CE ↓ BPB ↓ CE ↓ BPB ↓
+
+Standard MHA 6/12/18/32 100 100 100 100 2.903 0.878 2.530 0.765 2.389 0.723 2.319 0.701
+
+GQA             3/4/6/2              50 33 33 6 2.918 0.883 2.536 0.767 2.397 0.725 2.354 0.712
+
+MQA                 1                17          8      6       3 2.929 0.886 2.573 0.778 2.408 0.729 2.304 0.697
+
+MLA                 –                8.3 8.3 8.3 12.5 2.901 0.876 2.564 0.775 2.392 0.724 2.377 0.719
+
+LRKV                –                53 48 48 45 2.893 0.872 2.509 0.758 2.376 0.719 2.288 0.692
+
+KV Heads show values for 128M/1.2B/2.5B/6.3B scales. KV Cache % indicates memory relative to Standard MHA baseline (see Ap-
+pendix G for profiling details). Test metrics on held-out FineWeb-Edu (100B tokens for 128M, 50B for 1.2B/2.5B/6.3B).
+
+        (a) 128M Parameters                             (b) 1B Parameters                          (c) 2.5B Parameters                                                                           (d) 6.3B Parameters
+        Training Compute (ExaFLOPs)              Training Compute (ExaFLOPs)                    Training Compute (ExaFLOPs)                                                                   Training Compute (ExaFLOPs)
+3.15 0 10 20 30 40 50 60 70              2.90 0  50 100 150 200 250
+                                                                                       2.65 0 100 200 300 400 500 600 700                                                             2.8 0 250 500 750 1000 1250 1500 1750
+                    Standard MHA
+3.10                LRKV                 2.85                                          2.60
+Test Cross-Entropy Loss                                                                                                                                                               2.7
+                                                    Test Cross-Entropy LossMQA2.80
+                                                                                                        Test Cross-Entropy LossGQA
+3.05                                                                                                                                                         Test Cross-Entropy LossMLA2.752.552.6
+
+3.00                                     2.70                                          2.50                                                                                           2.5
+
+2.95                                     2.65                                          2.45
+
+                                         2.60                                                                                                                                         2.4
+
+2.90                                     2.55                                          2.40                                                                                           2.3
+
+2.85 0  20  40  60        80 100         2.50 0     10  20  30             40   50     2.35 0  10  20  30    40            50                                                              0  10  20  30  40                 50
+        Training Tokens (Billions)                  Training Tokens (Billions)                 Training Tokens (Billions)                                                                        Training Tokens (Billions)
+
+Figure 2. Cross-scale pretraining curves with dual-axis compute metrics. Test cross-entropy loss across four model scales (128M,
+1.2B, 2.5B, 6.3B) plotted against training tokens (bottom x-axis) and cumulative training compute in ExaFLOPs (top x-axis). LRKV
+demonstrates competitive performance across all scales, achieving the lowest test loss at 128M and 2.5B scales. Final results in Table 1.
+
+et al., 2021), and GSM8K (Cobbe et al., 2021), then evalu-                             consistent advantages across three orders of magnitude in
+ate on ARC-Easy, ARC-Challenge, MMLU, GSM8K, and                                       model size. The top x-axis shows cumulative training com-
+HumanEval. LRKV uses 45-53% of Standard MHA’s KV                                       pute (ExaFLOPs), accounting for mechanism-specific per-
+cache (see Appendix D for details).                                                    token costs (MQA -6%, GQA -3.2%, MLA -3.7%, LRKV
+                                                                                       +0.8% at 2.5B scale).2 When normalized by total com-
+4.1. Pretraining Results                                                               pute rather than token count, LRKV maintains its perfor-
+                                                                                       mance advantage: at every ExaFLOP milestone, LRKV
+Final pretraining performance. Table 1 shows LRKV                                      achieves lower test loss than all baselines. At 2.5B scale,
+achieves competitive test loss across all scales (128M, 1.2B,                          LRKV reaches equivalent baseline performance 18–30%
+2.5B, 6.3B), with the best performance at 128M and 2.5B                                faster (23.6% average across all methods), while no baseline
+scales. At 6.3B scale, LRKV reaches 2.288 CE (0.692 BPB),                              reaches LRKV’s final performance even after exhausting the
+outperforming MHA (2.319 CE), MQA (2.304 CE), GQA                                      full compute budget. This establishes LRKV as dominant
+(2.354 CE), and MLA (2.377 CE). At 1.2B scale, LRKV                                    in both sample efficiency and final quality. At the largest
+achieves 2.509 CE (0.758 BPB) with only 48% of MHA’s                                   6.3B scale, the performance gap widens: LRKV achieves
+cache—outperforming all baselines while using half the                                 2.288 CE versus Standard MHA’s 2.319 CE (1.3% improve-
+memory. At 2.5B, LRKV achieves 0.719 BPB with only                                     ment), demonstrating that LRKV’s architectural advantages
+48.4% of MHA’s cache—a strictly better accuracy-memory                                 strengthen rather than diminish with scale.
+tradeoff. Cache efficiency improves at larger scales (52.6%
+→ 48% → 48.4% → 45.1%), making LRKV increasingly                                       Training efficiency analysis. Beyond superior converged
+attractive for large models.                                                           performance, LRKV demonstrates remarkable sample effi-
+                                                                                       ciency at 2.5B scale (Figure 3). LRKV reaches each base-
+Cross-scale training efficiency and compute normaliza-                                 line’s final validation performance 18-30% faster, averaging
+tion. Figure 2 presents test performance across all four                               23.6% training compute savings across all baselines while
+model scales, measured in cross-entropy loss with dual-axis
+compute metrics (training tokens and cumulative FLOPs).                                    2The reported per-token costs reflect inference FLOPs. During
+                                                                                       training, LRKV materializes full K/V matrices (as do all methods),
+LRKV demonstrates competitive performance across scales,                               so training cost per step is comparable to MHA. The 18-25%
+achieving the lowest test loss at 128M and 2.5B scales while                           “training compute savings” refer to sample efficiency (fewer steps
+remaining highly competitive at 1.2B and 6.3B, showing                                 to reach target loss), not per-step speedup.
+
+                                                                                    5
+                                                                                Low-Rank Key Value Attention
+
+Table 2. Downstream task performance after midtraining (128M, 2.5B, and 6.3B scales). LRKV achieves the highest combined
+accuracy across all three scales (18.9%, 37.9%, 40.2%) on five diverse benchmarks, demonstrating that superior pretraining performance
+translates to stronger downstream capabilities. Combined score (Comb.) is the average across all five benchmarks. HE = HumanEval.
+
+                                 128M                                                                                                   2.5B                                                       6.3B
+
+Model  ARC-E ARC-C MMLU GSM8K HE Comb. ARC-E ARC-C MMLU GSM8K HE Comb. ARC-E ARC-C MMLU GSM8K HE Comb.
+
+Standard MHA 26.4  26.0          27.2                     1.0 8.8 17.9 66.6               47.1                                          39.3          10.2 13.4 35.3      72.7      53.6      42.7       10.6 14.6 38.8
+
+GQA    28.0        25.4          25.7                     0.5 4.6 16.8 65.4               49.6                                          40.5          10.0 13.4 35.8      69.0      48.2      40.9       9.9 13.4 36.3
+
+MQA    28.0        27.1          27.8                     1.3 2.4 17.3 65.2               47.3                                          40.2          10.3 3.7 33.3       67.2      47.0      40.5       8.2  4.3 33.4
+
+MLA    27.3        27.8          26.3                     1.1 7.7 18.0 67.5               51.5                                          41.9          10.8 12.8 36.9      69.4      51.3      40.9       9.5 13.4 36.9
+
+LRKV   26.7        30.2          28.4                     0.3         9.1 18.9      70.7  53.8                                          42.2          11.3 11.7 37.9      75.0      58.0      44.5       11.5 12.8 40.2
+
+0.730 (a) Memory vs Performance                                (b) Training Efficiency Advantage                                                                      Training Compute (ExaFLOPs)
+Final Validation BPB (lower is better)                          29.7%         finLalRpKeVrfroeramcahnecseea1c8h-3b0a%seflainstee'sr           3.00 20      40         60        80            100        120        140
+                                                        (tTorarienaicnhg bCaosemlipnuteepSerafviorngmsa(nc%e))3024.5%
+0.728                                                     25   21.4%                                                                                                                                          Standard MHA
+                                                                                         Test Cross-Entropy Loss
+0.726                                                     20                              18.7%                                               2.95                                                            LRKV
+                                                                                                                                                                                                              MLA
+0.724                                                     15                                                                                                                                                  GQA
+
+0.722              m(LBRoeKdsVet rpaetrefomrmemanorcye),  10                                                                                  2.90                                                            MQA
+0.720
+0.718                                                     5
+
+                                                          0                                                                                   2.85
+
+       0 20 40 60 80 100                                       0 20 40 60 80 100                                                              2.80
+          KV Cache Size (% of Standard MHA)                       KV Cache Size (% of Standard MHA)
+
+       MQA         MLA           GQA                      LRKV        Standard MHA
+
+                                                                                                                                              2.75
+
+Figure 3. LRKV achieves superior training efficiency alongside                                                                                2.70
+best performance (2.5B scale). (a) Memory vs Performance:
+Test BPB versus KV cache percentage for all methods. LRKV                                                                                     2.65 5   10      15     20        25        30        35   40        45       50
+achieves optimal trade-off with lowest BPB at 48.4% cache usage                                                                                                       Training Tokens (Billions)
+(2.5B scale). (b) Training Efficiency Advantage: LRKV reaches
+each baseline’s final test loss, quantifying training compute savings.                                                                  Figure 4. Long context pretraining for 512M parameter models.
+LRKV reaches all baselines’ performance earlier.                                                                                        Test cross-entropy loss curves for models trained with 8192-token
+                                                                                                                                        sequence length on 50B tokens (153.6 ExaFLOPs). LRKV outper-
+                                                                                                                                        forms Standard MHA by 2.7% while using 48.2% cache.
+
+achieving better final performance. Critically, this reveals                                                                            Scale-consistent superiority across task categories.
+an asymmetric advantage: LRKV reaches any baseline’s                                                                                    LRKV achieves the highest combined accuracy at all three
+performance target early in training, but no baseline reaches                                                                           scales: 18.9% (128M), 37.9% (2.5B), and 40.2% (6.3B),
+LRKV’s final performance (0.719 BPB) even after the full                                                                                demonstrating consistent advantages across three orders of
+50B token budget.                                                                                                                       magnitude in model size. At 2.5B scale, LRKV outperforms
+                                                                                                                                        Standard MHA (35.3%), GQA (35.8%), MQA (33.3%), and
+Long Context Pretraining. We extend evaluation to 8192                                                                                  MLA (36.9%), with particularly strong gains on knowledge-
+token sequences using 512M parameter models trained for                                                                                 intensive and reasoning tasks: ARC-Easy (+4.1pp over
+50B tokens (153.6 ExaFLOPs). Figure 4 shows that LRKV                                                                                   MHA), ARC-Challenge (+6.7pp), MMLU (+2.9pp), and
+achieves 2.67 test loss, outperforming MHA (2.74) by 2.7%                                                                               GSM8K (+1.1pp). At 6.3B scale, LRKV achieves 40.2%
+while using only 48.2% of its KV cache. LRKV also sur-                                                                                  combined versus MHA’s 38.8%, with the largest improve-
+passes GQA (2.70, -1.3%), MLA (2.71, -0.9%), and MQA                                                                                    ments on reasoning benchmarks (ARC-Challenge: 58.0%
+(2.73, -0.4%). Notably, all KV-efficient methods outperform                                                                             vs 53.6%, MMLU: 44.5% vs 42.7%). One exception is
+Standard MHA at long context, suggesting compression                                                                                    HumanEval at 6.3B scale, where MHA is slightly better,
+provides implicit regularization benefits, though LRKV’s                                                                                possibly suggesting code generation may be more sensitive
+architectural advantages remain pronounced. These results                                                                               to head specialization.
+validate LRKV’s effectiveness at extended sequence lengths.
+                                                                                                                                        Notably, MQA shows catastrophic degradation on code
+4.2. Downstream Task Performance                                                                                                        generation (HumanEval: 2.4% at 128M, 3.7% at 2.5B, 4.3%
+                                                                                                                                        at 6.3B versus 13.4%, 11.7-13.4%, and 12.8-14.6% for other
+To evaluate whether LRKV’s pretraining advantages trans-                                                                                methods), confirming that complete KV sharing particularly
+late to practical capabilities, we perform supervised                                                                                   harms structured generation tasks requiring precise long-
+midtraining on a diverse instruction-following dataset                                                                                  range dependencies. LRKV avoids this pathology through
+(568K examples from SmolTalk (Allal et al., 2024),                                                                                      per-head residuals that preserve specialization.
+MMLU (Hendrycks et al., 2021), and GSM8K (Cobbe et al.,
+2021)) and evaluate on five standard benchmarks. Table 2                                                                                Pretraining quality predicts downstream performance.
+shows final downstream performance across three scales                                                                                  The strong correlation between pretraining BPB and down-
+(128M, 2.5B, 6.3B).
+
+                                                                                                                                     6
+                                                                   Low-Rank Key Value Attention
+
+       2.95 d=128                            (a)                   LRKV                              3.15 (b)                                                                                          LRKV Rank
+       2.94                                                        MLA                                                                                                                                      r=8
+                                               G(3QgAroups)        Standard MHA                      3.10                                                                                                   r=16
+                         d=192                                     GQA (3 groups)                                                                                                                           r=32
+                                                                   MQA                               3.05                                                                                                   r=64
+       2.93 MQA                                                                                                                                                                                             r=128
+       2.92
+Final Test CE Loss
+                                                       Test Cross-Entropy Loss2.91r=8d=384           3.00
+
+       2.90                    r=16                                Standard MHA
+                                        r=32
+
+       2.89                                                  r=64                                    2.95
+
+       2.88                                                                                          2.90         2T0raining40Tokens6(0Billions80) 100
+                                                                                                            0
+       2.87 K20V Cache40Size (% o60f Standa8r0d MHA)100
+
+Figure 5. LRKV rank ablation with performance-memory tradeoff analysis (128M, 100B tokens). (a) Final test cross-entropy loss
+versus KV cache size (relative to Standard MHA) for LRKV rank ablations (r ∈ {8, 16, 32, 64, 128}), MLA latent dimension ablations
+(d ∈ {128, 192, 384}), and baselines (Standard MHA, GQA with 3 groups, MQA). LRKV dominates the performance-memory tradeoff
+space. (b) LRKV training dynamics across ranks, showing consistent convergence and monotonic improvement with increasing rank.
+
+0      Standard MHA             1.00 0        LRKV (r=64)          1.00 0          GQA               1.00 0       MQA               1.00 0                                                             MLA               1.00
+
+2                               0.75 2                             0.75 2                            0.75 2                         0.75 2                                                                               0.75
+
+4                               0.50 4                             0.50 4                            0.50 4                         0.50 4                                                                               0.50
+
+6                               0.25 6                             0.25 6                            0.25 6                         0.25 6
+Head Index                                                                                                                                                                                                               0.25
+                                             Head Index
+                                                                                          Head Index
+                                                                                                                                       Head Index
+                                                                                                                                                                                    Head Index
+8                               0.00 8                             0.00 8                            0.00 8                         0.00 8                                                                               0.00
+
+10                              0.25 10                            0.25 10                           0.25 10                        0.25 10                                                                              0.25
+
+12                              0.50 12                            0.50 12                           0.50 12                        0.50 12                                                                              0.50
+
+14                              0.75  14                           0.75  14                          0.75  14                       0.75                                                        14                       0.75
+16                              1.00  16                           1.00  16                          1.00  16                       1.00                                                        16                       1.00
+
+    0        5Head In1d0ex 15             0   5Head In1d0ex 15               0     5Head In1d0ex 15            0  5Head In1d0ex 15                                                                  0  5Head In1d0ex 15
+
+Figure 6. Gauge-invariant head similarity matrices (2.5B scale). Heatmaps show pairwise similarities sij =
+
+tr((WiK )⊤WjK (WjQ)⊤WiQ) normalized by Frobenius norms for all 18 heads. Red indicates high similarity, blue indicates inde-
+pendence. LRKV exhibits similarity structure nearly identical to Standard MHA with predominantly dark off-diagonal regions.
+
+stream accuracy (R²=0.786 at 2.5B scale, see Appendix E)                                heads exhibit substantial redundancy (Michel et al., 2019;
+confirms that architectural improvements generalizing                                   Clark et al., 2019), heads also specialize for distinct syn-
+across pretraining data translate directly to task-specific                             tactic and semantic patterns (Zhang et al., 2023), imply-
+capabilities. LRKV’s 2.6 percentage point downstream ad-                                ing that complete KV sharing (MQA) may degrade quality.
+vantage over Standard MHA at 2.5B scale (37.9% vs 35.3%)                                LRKV addresses this tension through additive factorization:
+stems directly from its superior pretraining performance                                Wh = Wshared + UhBh⊤, which separates a full-rank
+(0.719 vs 0.723 BPB). This validates that LRKV’s low-                                   shared basis from compact per-head residuals. We now
+rank factorization provides fundamental capacity gains that                             examine three questions: (1) whether appropriate rank se-
+manifest across both language modeling and downstream                                   lection is critical for quality, (2) whether LRKV preserves
+evaluation, rather than overfitting to pretraining objectives.                          architectural head diversity, and (3) whether the learned
+                                                                                        factorization approaches mathematical optimality.
+4.3. Why Low-Rank Key-Value Attention Works
+                                                                                        Analysis setup. For a given Transformer layer, we analyze
+This subsection provides an empirical analysis explain-                                 head-specific projection matrices {WhQ, WhK , WhV }Hh=1
+ing why LRKV preserves or exceeds the modeling qual-                                    through their gauge-invariant bilinear forms on the final
+ity of standard attention despite substantially reducing KV-                            pretrained checkpoint. Our novelty is not the bilinear form
+cache memory. LRKV’s design is motivated by a practi-                                   itself, but its use for quantifying head diversity and the
+cal constraint: standard MHA duplicates K/V representa-                                 query-compensation effect under KV sharing. For LRKV,
+tions across H heads, causing memory cost to scale linearly                             we quantify geometric separation using cosine similarity
+with head count. While prior analyses suggest attention                                 between shared and residual projections, and measure sub-
+
+                                                                                   7
+                             Low-Rank Key Value Attention
+
+         128M Scale                                                                          2.5B Scale
+
+6                                                                            17.5
+
+5                                                                            15.0
+                                                                             12.5
+Effective Rank4                                                              10.0
+                                                             Effective Rank   7.5
+3        Standard MHA                                                         5.0
+                                                                              2.5
+         LRKV (r=16)
+         LRKV (r=64)
+2        MQA
+         MLA
+         GQA
+1        Fully redundant
+
+   0  2  4 Layer6         8  10                                                    0  5  10  15Layer20   25  30  35
+
+Figure 7. LRKV preserves head diversity across scales. Gauge-invariant effective rank shows LRKV with sufficient rank matches
+Standard MHA at 128M, while at 2.5B LRKV achieves 98.3% vs 98.9% for MHA using 48.4% of KV cache.
+
+space overlap via principal-angle-based metrics. To assess                   (r ≥ 64) outperforms MHA (0.875 BPB at 128M, 0.719
+head diversity, we use gauge-invariant similarity metrics                    at 2.5B vs 0.878 and 0.723), demonstrating that representa-
+based on attention bilinear forms Ah = WhQ(WhK )⊤,                           tional capacity is the limiting factor. In our experiments, we
+which are invariant to per-head rotations. We extend this                    find that r ≈ 0.36-0.43×dh provides the necessary capacity
+analysis using PCA in bilinear form space by centering                       for LRKV to exceed standard attention performance and
+the Gram matrix G (where Gij = ⟨Ai, Aj⟩F ) via the                           MQA, GQA and MLA baselines (see Appendix G for scale-
+kernel PCA transformation (Smola & Scho¨lkopf, 1998):                        specific rank values). This empirical regularity across scales
+Gcentered = G − Grow − Gcol + Gmean. This removes the                        suggests that this rank range aligns with the intrinsic rank
+mean bilinear form and reveals the intrinsic dimensionality                  of attention projections while optimizing the performance-
+of head specialization. To assess optimality, we compare                     memory tradeoff (see Appendix B for spectral analysis).
+LRKV’s learned decomposition to the mathematically op-
+timal rank-r truncated SVD of standard MHA projections,                      LRKV preserves functional head diversity. Figure 6 con-
+computed post-hoc.                                                           firms LRKV exhibits nearly identical similarity patterns to
+                                                                             Standard MHA. Quantitatively, we measure head diversity
+Rank selection determines capacity and performance.                          using gauge-invariant metrics based on attention bilinear
+We first examine how residual rank r affects model-                          forms Ah = WhQ(WhK )⊤, computing effective rank via
+ing quality through a systematic ablation study. Fig-                        eigenvalue entropy ( Appendix B). LRKV (r=64) achieves
+ure 5(b) shows training curves for LRKV with ranks r ∈                       98.3% effective rank at 2.5B scale versus 98.9% for Stan-
+{8, 16, 32, 64, 128} on 128M parameter models with 100B                      dard MHA—a negligible 0.6pp difference (Figure 7). In
+tokens, demonstrating monotonic improvement as rank in-                      contrast, MQA achieves only 86.2% and GQA 95.4%.
+creases: r = 128 achieves the best performance (CE=2.877,
+BPB=4.156), while r = 8 shows the worst (CE=2.908,                           Interpreting uncentered vs. PCA-based effective rank.
+BPB=4.201). The performance gap of approximately 1.06%                       The distinction between uncentered (98.3%) and PCA-based
+confirms that residual rank is a critical capacity control. Fig-             (93.5%) effective rank reveals LRKV’s factorization struc-
+ure 5(a) contextualizes this ablation by plotting final perfor-              ture. Uncentered analysis measures total variance including
+mance against KV cache size for all evaluated methods, re-                   the shared mean direction—the global structure captured
+vealing that LRKV achieves superior performance-memory                       by Wshared. PCA-based analysis centers the Gram matrix,
+tradeoffs across the rank spectrum compared to MLA latent                    isolating variance around this mean and measuring true
+dimension ablations and baselines. When comparing LRKV                       head independence. The modest 4.8pp gap indicates LRKV
+and MLA across full sweeps of r and dc, respectively, we                     achieves diversity primarily through genuine per-head spe-
+see that LRKV dominates the memory-performance frontier                      cialization rather than merely perturbing a dominant shared
+even against MLA settings with larger latent dimensions.                     structure. For comparison, MQA shows dramatic improve-
+                                                                             ment from uncentered (86.2%) to centered (91.0%)—a com-
+The constrained r = 16 configuration underperforms stan-                     pensation effect where forced KV sharing creates a strong
+dard MHA (0.881 vs 0.878 BPB at 128M), lacking capacity                      mean direction, but heads recover diversity by aggressively
+to capture head-specific variation. In contrast, sufficient rank             diversifying query projections around this baseline (see sub-
+
+                                                                  8
+                                 Low-Rank Key Value Attention
+
+            (a) 128M                                                                                                              (b) 2.5B
+
+         Standard MHA                                                                                     1400     Standard MHA
+         LRKV (total)                                                                                     1200     LRKV (total)
+         LRKV (shared)                                                                                    1000     LRKV (shared)
+         LRKV (residual)                                                                                           LRKV (residual)
+3000Frobenius norm (Keys)
+2500                                                                               Frobenius norm (Keys)  800
+2000
+1500                                                                                                      600
+1000
+                                 LRKV/Standard: 4.2×                                                      400             LRKV/Standard: 5.1×
+ 500                                                                                                      200
+
+      0  2  4             6      8  10                                                                          0  5 10 15 20 25 30 35
+
+                          Layer                                                                                    Layer
+
+Figure 8. Magnitude scaling in LRKV is absorbed by post-projection normalization. Frobenius norms of key projections comparing
+standard MHA with LRKV’s shared, residual, and total (shared + residual) components for (a) 128M and (b) 2.5B models. LRKV
+projections operate in a higher-magnitude regime than standard MHA, with both shared and residual components individually exceeding
+standard MHA magnitudes.
+
+section C.4 for detailed analysis).                                 than one dominating.
+
+PCA-based analysis reveals compensation mechanisms.                 5. Discussion
+Applying PCA in bilinear form space ( subsection C.4),
+LRKV achieves 93.5% PCA-based effective rank at 2.5B                The empirical analyses collectively reveal why LRKV
+versus 94.0% for Standard MHA—within 0.5% despite rank-             achieves superior performance despite KV cache reduction:
+64 factorization. Remarkably, PCA reveals a compensation
+effect in MQA: its centered effective rank (91.0%) increases        (1) Appropriate rank selection is critical. The range
+versus uncentered (86.2%), opposite to other architectures.         r ≈ 0.36-0.43×dh (46-55 for dh = 128) provides sufficient
+This indicates MQA heads compensate for forced KV shar-             degrees of freedom for per-head specialization while con-
+ing by diversifying query projections more aggressively.            straining the factorization to exploit structured redundancy.
+                                                                    Below this threshold (e.g., r = 16, 0.881 BPB), capacity be-
+Magnitude scaling and post-projection normalization.                comes limiting; above it (r ≥ 64, 0.875 BPB), performance
+Figure 8 reveals LRKV projections operate in a higher-              exceeds MHA, confirming that representational capacity
+magnitude regime than standard MHA (3.1–6.7×), with                 (not geometric properties) determines quality.
+both shared and residual components exceeding MHA
+norms. This arises naturally from the additive structure,           (2) LRKV preserves architectural head diversity. PCA-
+allowing independent growth during optimization. Cru-               based analysis shows LRKV achieves 93.5% effective
+cially, this scaling does not affect attention patterns because     rank versus 94.0% for standard MHA at 2.5B scale (Fig-
+RMSNorm is applied after projection, making attention               ure 7)—within 0.5% despite rank-64 factorization and
+effectively use cosine similarity.                                  48.4% cache size. This near-perfect preservation validates
+                                                                    that low-rank residuals provide sufficient capacity for heads
+Why magnitude scaling doesn’t degrade quality. The                  to occupy independent dimensions in bilinear form space.
+higher-magnitude regime emerges from unconstrained opti-            The consistency across all 36 layers demonstrates depth-
+mization of the additive factorization: gradients can indepen-      invariant factorization quality.
+dently scale Wshared and residuals UhB⊤h without affecting
+their sum’s direction. RMSNorm applied after projection             (3) Compensation mechanisms explain baseline behavior.
+normalizes representations before attention computation,            The PCA-based methodology reveals phenomena invisible
+making the attention mechanism operate on directional in-           to prior metrics: MQA’s 4.8pp improvement from uncen-
+formation (cosine similarity) rather than absolute magni-           tered to centered effective rank quantifies query compensa-
+tudes. This architectural property ensures that magnitude           tion - heads recover diversity by specializing queries around
+scaling affects only the internal parameterization, not the         forced shared KVs. This explains why MQA remains vi-
+functional behavior. The magnitude difference serves as a           able despite complete KV sharing, and positions LRKV’s
+diagnostic: it indicates that optimization successfully allo-       approach (preserving KV and query diversity) as superior.
+cated capacity between shared and residual pathways, with
+both contributing substantively to the final projection rather      (4) Emergent properties validate factorization quality.
+
+                                                                 9
+Low-Rank Key Value Attention
+
+Geometric properties like moderate shared-residual orthog-            low-rank projection. In The Thirteenth International
+onality (cosine similarity 0.2-0.4) and magnitude scaling            Conference on Learning Representations, 2025.
+(4-5× MHA) emerge as consequences of effective optimiza-
+tion, not design constraints. These indicators confirm that        Chari, V., Qin, G., and Van Durme, B. Kv-distill: Nearly
+end-to-end training discovers factorizations that efficiently         lossless learnable context compression for llms. arXiv
+allocate capacity between global structure (shared base) and          preprint arXiv:2503.10337, 2025.
+local specialization (residuals).
+                                                                   Chen, B., Zhang, F., Nguyen, A., Zan, D., Lin, Z., Lou, J.-
+These properties collectively enable LRKV to achieve strong           G., and Chen, W. Codet: Code generation with generated
+pretraining performance (0.692 BPB at 6.3B) and down-                 tests. arXiv preprint arXiv:2207.10397, 2022.
+stream accuracy (40.2% combined at 6.3B) while reducing
+KV cache to 45-53% of standard attention. The analyses             Child, R., Gray, S., Radford, A., and Sutskever, I. Generat-
+confirm LRKV exploits structured redundancy without sac-              ing long sequences with sparse transformers. In ICML,
+rificing the head specialization that makes MHA effective.            2019.
+
+6. Conclusion                                                      Choromanski, K., Likhosherstov, V., et al. Rethinking atten-
+                                                                      tion with performers. In ICLR, 2021.
+We introduced Low-Rank Key-Value attention, which de-
+composes key/value projections into a shared dense com-            Clark, K., Khandelwal, U., Levy, O., and Manning, C. D.
+ponent and compact per-head low-rank residuals. LRKV                 What does bert look at? an analysis of bert’s attention. In
+achieves (1) 45-53% KV cache reduction while attaining               Proceedings of the 58th Annual Meeting of the Associa-
+the best pretraining loss (0.692 BPB at 6.3B) and 18-25%              tion for Computational Linguistics (ACL), pp. 276––286,
+training compute savings; (2) the highest downstream per-             2019.
+formance across 5 benchmarks for varying model sizes; and
+(3) near-complete preservation of head diversity give suf-         Clark, P., Cowhey, I., Etzioni, O., Khot, T., Sabharwal, A.,
+ficiently lower rank (93.5% vs. 94% for standard MHA),                Schoenick, C., and Tafjord, O. Think you have solved
+confirming that LRKV exploits structured redundancy with-             question answering? try arc, the ai2 reasoning challenge.
+out sacrificing specialization. Our gauge-invariant analy-            arXiv preprint arXiv:1803.05457, 2018.
+sis and rank ablations show that residual rank r ≈ 0.36-
+0.43 × dh provides a critical threshold for preserving head        Cobbe, K., Kosaraju, V., Bavarian, M., Chen, M., Jun, H.,
+specialization while enabling substantial KV cache reduc-             Kaiser, L., Plappert, M., Tworek, J., Hilton, J., Nakano,
+tion, positioning LRKV as a practical drop-in replacement             R., Hesse, C., and Schulman, J. Training verifiers to solve
+for standard attention under memory constraints.                      math word problems. arXiv preprint arXiv:2110.14168,
+                                                                      2021.
+References
+                                                                   Dao, T., Fu, D. Y., Ermon, S., Rudra, A., and Re, C.
+Ainslie, J., Ontan˜o´n, S., Saxena, V., et al. Gqa: Training          Flashattention-3: Fast and memory-efficient exact atten-
+   generalized multi-query transformer models from multi-             tion with io-awareness. In Advances in Neural Informa-
+   head checkpoints. In arXiv:2305.13245, 2023.                       tion Processing Systems (NeurIPS), 2024.
+
+Allal, L. B., Lozhkov, A., von Werra, L., and Wolf, T.             Fang, R. and Xu, Y. Addressing spectral bias of deep neural
+   Smoltalk: A conversational dataset for instruction tuning.         networks by multi-grade deep learning. In Advances in
+   arXiv preprint arXiv:2408.00833, 2024.                            Neural Information Processing Systems (NeurIPS) 2024,
+                                                                      pp. –, 2024.
+Beltagy, I., Peters, M. E., and Cohan, A. Longformer: The
+   long-document transformer. arXiv:2004.05150, 2020.              Ge, S. et al. Longnet: Scaling transformers to 1,000,000
+                                                                      tokens. arXiv:2307.02486, 2023.
+Bhojanapalli, S., Chakrabarti, A., Veit, A., Lukasik, M.,
+   Jain, H., Liu, F., Chang, Y.-W., and Kumar, S. Leveraging       Hendrycks, D., Burns, C., Basart, S., Zou, A., Mazeika, M.,
+   redundancy in attention with reuse transformers. arXiv             Song, D., and Steinhardt, J. Measuring massive multitask
+   preprint arXiv:2110.06821, 2021.                                   language understanding. Proceedings of the International
+                                                                     Conference on Learning Representations (ICLR), 2021.
+Chang, C.-C., Lin, W.-C., Lin, C.-Y., Chen, C.-Y., Hu, Y.-
+   F., Wang, P.-S., Huang, N.-C., Ceze, L., Abdelfattah,           Hoffmann, J., Borgeaud, S., Mensch, A., Buchatskaya, E.,
+   M. S., and Wu, K.-C. Palu: Kv-cache compression with               Cai, T., Rutherford, E., Casas, D. d. L., Hendricks, L. A.,
+                                                                     Welbl, J., Clark, A., et al. Training compute-optimal
+                                                                      large language models. arXiv preprint arXiv:2203.15556,
+                                                                      2022.
+
+                                                               10
+Low-Rank Key Value Attention
+
+Hu, E. J., Shen, Y., Wallis, P., Allen-Zhu, Z., Li, Y., Wang,           deep learning dynamics and interpretability. In Advances
+   S., Wang, L., Chen, W., et al. Lora: Low-rank adaptation             in Neural Information Processing Systems, volume 30,
+   of large language models. ICLR, 1(2):3, 2022.                        2017.
+
+Hu, J., Li, H., Zhang, Y., Wang, Z., Zhou, S., Zhang, X.,            Rahaman, N., Baratin, A., Arpit, D., Draxler, F., Lin, M.,
+   Shum, H.-Y., and Jiang, D. Multi-matrix factorization                Hamprecht, F., Bengio, Y., and Courville, A. On the spec-
+   attention. arXiv preprint arXiv:2412.19255, 2025.                    tral bias of neural networks. In International conference
+                                                                        on machine learning, pp. 5301–5310. PMLR, 2019.
+Katharopoulos, A., Vyas, A., Pappas, N., and Fleuret, F.
+  Transformers are rnns: Fast autoregressive transformers            Sardana, N. and Havens, Z. Muon: An optimizer for hidden
+  with linear attention. In ICML, 2020.                                 layers. https://github.com/KellerJordan/
+                                                                        modded-nanogpt, 2024. Accessed: 2024-12-22.
+Khalaf, M., Shamshoum, Y., Hodos, N., Sieradzki, Y., and
+   Schuster, A. Qkv projections require a fraction of their          Saxena, U., Saha, G., Choudhary, S., and Roy, K. Eigen
+   memory. arXiv preprint arXiv:2506.02939, 2025.                       attention: Attention in low-rank space for kv cache com-
+                                                                        pression. arXiv preprint arXiv:2408.05646, 2024.
+Kornblith, S., Norouzi, M., Lee, H., and Hinton, G. Similar-
+   ity of neural network representations revisited. In Interna-      Scho¨lkopf, B., Smola, A., and Mu¨ller, K.-R. Nonlinear
+   tional Conference on Machine Learning, pp. 3519–3529.                component analysis as a kernel eigenvalue problem. In
+   PMLR, 2019.                                                         Neural computation, volume 10, pp. 1299–1319, 1998.
+
+Li, Y., Huang, Y., Yang, B., Venkitesh, B., Locatelli, A., Ye,       Shazeer, N. Fast transformer decoding: One write-head is
+   H., Cai, T., Lewis, P., and Chen, D. Snapkv: Llm knows               all you need. In arXiv:1911.02150, 2019.
+  what you are looking for before generation. Advances
+   in Neural Information Processing Systems, 37:22947–               Smola, A. J. and Scho¨lkopf, B. On a kernel-based method
+   22970, 2024.                                                         for pattern recognition, regression, approximation, and
+                                                                        operator inversion. Algorithmica, 22(1):211–231, 1998.
+Liu, A., Feng, B., Wang, B., Wang, B., Liu, B., Zhao, C.,
+   Dengr, C., Ruan, C., Dai, D., Guo, D., et al. Deepseek-v2:        Sun, Z., Liu, J., Dong, L., Wang, S., Huang, S., Chen, X.,
+  A strong, economical, and efficient mixture-of-experts                Zhou, Y., Wang, X.-L., and Zhang, F. Retnet: Retentive
+   language model. arXiv preprint arXiv:2405.04434, 2024.               network for efficient sequence modeling. In Advances in
+                                                                       Neural Information Processing Systems (NeurIPS), 2024.
+Lv, X., Ding, N., Zhang, K., Hua, E., Cui, G., and Zhou,
+   B. Scalable efficient training of large language models           Touvron, H., Martin, L., Stone, K., Albert, P., and et al.
+  with low-dimensional projected attention. arXiv preprint              Llama 2: Open foundation and fine-tuned chat models.
+   arXiv:2411.02063, 2024.                                              arXiv preprint arXiv:2307.09288, 2023.
+
+Michel, P., Levy, O., and Neubig, G. Are Sixteen Heads Re-           Touvron, H., Martin, L., Lavril, T., Albert, P., and et al. The
+   ally Better than One? In Advances in Neural Information              llama 3 herd of models. Meta AI Technical Report, 2024.
+  Processing Systems (NeurIPS), 2019.
+                                                                     Vaswani, A., Shazeer, N., Parmar, N., Uszkoreit, J., Jones,
+OpenAI. GPT-4. https://openai.com/research/                             L., Gomez, A. N., Kaiser, Ł., and Polosukhin, I. Attention
+   gpt-4, 2023. Accessed: 2025-10-02.                                   is All You Need. In Advances in Neural Information
+                                                                       Processing Systems, 2017.
+Penedo, G., Kydl´ıcˇek, H., Lozhkov, A., Mitchell, M., Raffel,
+   C. A., Von Werra, L., Wolf, T., et al. The fineweb datasets:      Voita, E., Talbot, D., Moiseev, F., Sennrich, R., and Titov, I.
+   Decanting the web for the finest text data at scale. Ad-            Analyzing multi-head self-attention: Specialized heads
+   vances in Neural Information Processing Systems, 37:                 do the heavy lifting, the rest can be pruned. arXiv preprint
+   30811–30849, 2024.                                                   arXiv:1905.09418, 2019.
+
+Peng, Y., Wang, Y., Fang, Z., Zhu, L., Deng, Y., and Duan, Y.        Wang, H. and Wang, K. Complete characterization of gauge
+   Revisiting lora: A smarter low-rank approach for efficient           symmetries in transformer architectures. In NeurIPS
+   model adaptation. In 2025 5th International Conference              2025 Workshop on Symmetry and Geometry in Neural
+   on Artificial Intelligence and Industrial Technology Ap-            Representations, 2025.
+   plications (AIITA), pp. 1248–1252. IEEE, 2025.
+                                                                     Wang, S., Zaheer, M., Katiyar, N., Salakhutdinov, R., and
+Raghu, M., Gilmer, J., Yosinski, J., and Sohl-Dickstein, J.            Ahmed, A. Linformer: Self-attention with linear com-
+   Svcca: Singular vector canonical correlation analysis for            plexity. In NeurIPS, 2020.
+
+                                                                 11
+                                                             Low-Rank Key Value Attention
+Xie, Y. et al. Gptq: Accurate post-training quantization for
+
+   generative pretrained transformers. arXiv:2303.09035,
+   2023.
+Yao, D., Shen, B., Lin, Z., Liu, W., Luan, J., Wang, B., and
+  Wang, W. Tailorkv: A hybrid framework for long-context
+   inference via tailored kv cache optimization. arXiv
+   preprint arXiv:2505.19586, 2025.
+Yunis, D., Patel, K. K., Wheeler, S., Savarese, P., Vardi, G.,
+   Livescu, K., Maire, M., and Walter, M. R. Approaching
+   deep learning through the spectral dynamics of weights.
+   arXiv preprint arXiv:2408.11804, 2024.
+Zhang, X., Ghosh, A., Liu, G., and Wang, R. Improving gen-
+   eralization of complex models under unbounded loss us-
+   ing pac-bayes bounds. arXiv preprint arXiv:2305.19243,
+   2023.
+Zhang, Y., Liu, Y., Yuan, H., Qin, Z., Yuan, Y., Gu, Q., and
+  Yao, A. C. Tensor product attention is all you need. In
+  ICML 2025 Workshop ES-FoMo-III (OpenReview), 2025.
+   OpenReview publication.
+
+                                                                        12
+                                                             Low-Rank Key Value Attention
+
+A. Related Work (Full Version)
+
+The memory footprint of the key-value (KV) cache has become a central bottleneck in deploying large autoregressive
+Transformers. While early work improved the computational efficiency of attention via sparsity, kernelization, or low-rank
+approximations of the attention matrix (Child et al., 2019; Beltagy et al., 2020; Wang et al., 2020; Katharopoulos et al.,
+2020; Choromanski et al., 2021), these methods do not reduce KV-cache size and therefore provide limited benefit for
+decoding-heavy LLMs where memory, rather than compute, dominates inference cost.
+
+Sharing K/V Projections. A widely adopted strategy for reducing KV memory is to share key and value projections
+across attention heads. Multi-Query Attention (MQA) (Shazeer, 2019) uses a single shared set of K/V projections, and
+Grouped-Query Attention (GQA) (Ainslie et al., 2023) extends this by sharing within small head groups. These approaches
+achieve substantial memory savings but sacrifice head-level expressivity. Analyses of pretrained models (Clark et al., 2019;
+Michel et al., 2019) consistently show that attention heads specialize for different syntactic or semantic functions; collapsing
+their projections can therefore degrade modeling quality. LRKV is motivated by this tension: we preserve the efficiency of
+shared projections while reintroducing diversity through low-rank head-specific residuals.
+
+Low-Rank Parameterization of Attention Weights. Our formulation is related to low-rank reparameterization techniques
+such as LoRA (Hu et al., 2022), which add low-rank updates to weight matrices for parameter-efficient fine-tuning. Follow-
+up work extends this idea to training-time regularization or improved factorization schemes (Peng et al., 2025). However,
+these methods intervene on the optimization pathway, not on the structure of stored activations. LRKV applies the same
+low-rank principle directly to attention projections, introducing low-rank representational deviations that shape the K/V
+features encoded in the cache.
+
+Recent work has also explored low-rank or factored Q/K/V projections to improve parameter efficiency or computational
+throughput (Xie et al., 2023; Khalaf et al., 2025). The concurrent work of Lv et al. (2024) investigates low-rank param-
+eterizations of attention projections more broadly. These methods typically replace full-rank projections with low-rank
+ones to reduce computation. LRKV differs conceptually: we preserve a full-rank shared projection and add only low-rank
+head-specific residuals, enabling memory reduction while maintaining full-rank representational capacity.
+
+KV-Cache Compression and Long-Context Modeling. A complementary body of research aims to compress or restructure
+the KV cache itself. Approaches include clustering or distilling K/V states (Chari et al., 2025), exact hybrid and compressed
+buffers (Yao et al., 2025; Li et al., 2024), token selection or pooling (Ge et al., 2023), and architectural changes that
+replace attention with recurrent or state-space alternatives (Sun et al., 2024). Unlike these activation-level methods, LRKV
+reduces the amount of information that must be stored by changing how each head generates its K/V features. Our hybrid
+long-context cache builds on this: exact short-range KVs are retained, while long-range information is reconstructed
+efficiently via low-rank residuals.
+
+Comparison to Multi-Latent Attention. Multi-Latent Attention (MLA) (Liu et al., 2024) reduces KV cache memory by
+compressing token representations into a shared low-dimensional latent space before caching. During attention, interaction
+with the cache therefore requires projecting queries and/or values through this latent bottleneck. This achieves strong memory
+compression but constrains all heads to operate through the same latent representation, limiting per-head expressivity and
+restricting positional encoding choices (e.g., requiring partial RoPE).
+
+LRKV addresses a different source of redundancy. Rather than compressing information across tokens, LRKV preserves
+full token-level resolution and reduces redundancy across heads by factorizing each head’s KV projection into a shared
+full-rank base plus low-rank head-specific residuals. This additive structure retains the original feature dimensionality,
+supports arbitrary positional encodings, and preserves head specialization while substantially reducing KV memory. As a
+result, LRKV and MLA represent complementary approaches: MLA compresses token space via a shared latent bottleneck,
+whereas LRKV compresses head space via structured sharing.
+
+Factorized or Shared KV Mechanisms. Concurrent work explores structured KV-cache reduction via factorized repre-
+sentations (e.g., MFA/MFA-KR; TPA (Hu et al., 2025; Zhang et al., 2025)) explores structured compression across heads.
+LRKV provides a principled middle ground between fully shared (MQA/GQA) and fully independent projections: the
+full-rank shared base captures global structure, while low-rank residuals preserve head-level variability. This structured
+additive decomposition is key for achieving memory savings without collapsing representational diversity.
+
+Analyzing attention head diversity. Prior work has measured head redundancy using attention pattern similarity (Michel
+et al., 2019; Voita et al., 2019), activation-based metrics such as CKA (Kornblith et al., 2019), or SVCCA (Raghu et al.,
+
+                                                                        13
+                                                             Low-Rank Key Value Attention
+
+2017). Recent work explicitly characterizes gauge symmetries in attention parameterizations (Wang & Wang, 2025),
+recognizing that per-head rotations preserve attention function. However, these approaches either compare raw weights (not
+gauge-invariant) or analyze activation space rather than the functional operators WQ(WK)⊤ that determine attention. We
+introduce a principled method combining gauge-invariant bilinear forms with centered Gram matrix analysis (kernel PCA)
+to measure intrinsic head diversity independent of parameterization choices.
+
+B. Shared Subspaces, Spectral Bias, and Information Structure
+
+Prior empirical analyses of pretrained Transformers have shown that attention heads exhibit substantial redundancy and
+occupy overlapping subspaces (Michel et al., 2019; Clark et al., 2019; Bhojanapalli et al., 2021; Rahaman et al., 2019). To
+assess this structure in a gauge-invariant manner, we analyze attention bilinear forms Ah = WhQ(WhK )⊤ and measure head
+diversity via PCA on their centered Gram matrix (subsection 4.3). We find that LRKV achieves 93.5% effective rank versus
+94.0% for standard MHA at 2.5B scale, confirming that heads occupy nearly independent dimensions in bilinear form space
+despite using shared key-value bases. This validates that the functional behavior of attention projections lies near a shared
+low-dimensional manifold, with LRKV’s additive structure explicitly parameterizing this geometry. Importantly, while
+heads remain functionally diverse, the individual weight matrices WhK exhibit low intrinsic rank—they concentrate energy
+in a small number of dominant singular directions.
+
+Such spectral concentration is consistent with the spectral bias of neural networks (Rahaman et al., 2019; Fang & Xu, 2024),
+whereby gradient-based optimization preferentially amplifies smooth, high-variance modes before fitting higher-frequency
+residual structure. As a result, attention projections tend to concentrate energy in a small set of globally shared directions.
+LRKV makes this implicit organization explicit: the shared projections WsKh,aVred capture dominant spectral components,
+while per-head low-rank residuals model localized refinements aligned with lower-variance directions. Each head therefore
+operates within an affine subspace centered on WsKh,aVred, with a tangent space spanned by a compact set of learned low-rank
+factors.
+
+Residual rank as a control knob for diversity. In LRKV, the residual rank r controls a continuous spectrum between
+fully shared keys/values and fully independent per-head projections. At a high level, the shared base WsKh,aVred serves as a
+common coordinate system capturing features that are broadly useful across heads, while the low-rank residuals provide a
+budgeted mechanism for head specialization. When r is small, heads are strongly coupled through the shared representation;
+as r grows, the model can allocate additional degrees of freedom to capture head-specific patterns. This view motivates
+treating r as an architectural hyperparameter with a clear interpretation: it directly controls the efficiency-diversity trade-off
+in the KV cache and per-head specialization. Empirically, we find that r ≈ 0.36-0.43 × dh provides the critical threshold:
+LRKV achieves 93.5% PCA-based effective rank versus 94.0% for standard MHA at 2.5B scale (subsection 4.3), confirming
+that moderate rank suffices to preserve nearly all head diversity while achieving substantial cache reduction.
+
+Decomposition geometry and (non-)orthogonality. The decomposition Wh = Wshared + UhB⊤h is not identifiable:
+for any ∆, we can shift Wshared ← Wshared + ∆ and UhB⊤h ← UhB⊤h − ∆ without changing Wh. In unconstrained
+Euclidean parameter space there is therefore no a priori reason to expect strict orthogonality between the shared and residual
+terms. Instead, we use overlap (e.g., cosine similarity or subspace angles) as a diagnostic: low overlap indicates that the
+residual contributes directions not already captured by the shared component, reducing redundant parameterization. In
+practice, any tendency toward reduced overlap is an emergent outcome of end-to-end training and the model’s incentives to
+allocate capacity efficiently, rather than an explicit constraint or training objective.
+
+Connection to low-rank approximation. LRKV can also be interpreted as learning a structured low-rank approximation
+of the family of per-head projections. In classical matrix approximation, the optimal rank-r representation is given by
+truncated SVD with respect to a chosen error metric. LRKV differs in two important ways: (i) it learns the shared and
+residual factors jointly with the rest of the network under the task loss, and (ii) the residual factors are head-specific, enabling
+specialization without requiring each head to store full-rank keys/values. This perspective suggests that end-to-end training
+can discover factorizations that are close to classical optima while remaining aligned with the functional requirements of
+attention.
+
+Scaling, normalization, and stability. Because LRKV is additive, the norms of the shared and residual components
+can evolve independently during training. However, attention depends primarily on directional structure and relative
+
+                                                                        14
+                                                             Low-Rank Key Value Attention
+
+alignment, and common transformer normalization (e.g., RMSNorm) reduces sensitivity to absolute scale. From this
+perspective, changes in parameter magnitudes are best interpreted as a redistribution of representational capacity between
+shared and residual pathways rather than as a direct indicator of instability. This motivates analyzing LRKV through
+geometry (alignment, overlap) and function (loss/perplexity), rather than through norms alone.
+
+C. Principled Head Diversity Analysis via PCA in Bilinear Form Space
+
+This section presents our gauge-invariant PCA-based methodology for analyzing attention head diversity and provides
+comprehensive results across model scales. To our knowledge, this is the first work to combine (i) gauge-invariant bilinear
+form comparison, (ii) centered Gram matrix analysis (kernel PCA), and (iii) variance-explained interpretation for measuring
+head independence in transformers.
+
+C.1. Methodology: PCA in the Space of Bilinear Forms
+Gauge invariance motivation. Comparing attention heads via raw weight matrices WhK or WhQ is not meaningful
+because attention is invariant to coupled per-head rotations: for any orthogonal Rh, the transformations WhQ ← WhQRh
+and WhK ← WhK Rh leave attention outputs unchanged. The gauge-invariant object is the bilinear form Ah = WhQ(WhK )⊤,
+which determines attention logits.
+
+Inner product on bilinear forms. We define similarity between heads i and j using the Frobenius inner product on their
+
+bilinear forms:
+
+                        ⟨Ai, Aj ⟩F = tr(Ai⊤Aj ) = tr((WiK )⊤WjK (WjQ)⊤WiQ).                              (11)
+
+Normalized by individual norms, this yields a similarity score sij ∈ [−1, 1] forming the Gram matrix G.
+
+Centering for proper PCA. The key methodological contribution is recognizing that the Gram matrix G can be centered
+without materializing the mean bilinear form:
+
+                                            1                       1        1               G[k, ℓ].
+                 Gcentered[i, j] = G[i, j] − H     G[i, k] −              G[k, j] + H2                   (12)
+                                                               H
+                                                k                      k                k,ℓ
+
+This is the kernel PCA centering trick (Scho¨lkopf et al., 1998), enabling PCA in the abstract space of bilinear forms using
+only their inner products.
+
+Interpretation as variance decomposition. The eigenvalues {λi} of Gcentered represent variance explained by each
+principal component in bilinear form space. We compute:
+
+• Variance explained: vi = λi/ j λj (fraction of total variance in i-th PC)
+
+• Cumulative variance:  k    vj  (variance  captured  by  first  k  PCs)
+                        j=1
+
+• Effective rank (PCA-based): exp(− i vi log vi) via Shannon entropy
+
+High effective rank indicates heads occupy many independent dimensions (low sharing); low effective rank indicates
+clustering in few PCs (high sharing).
+
+Comparison to uncentered analysis. Prior work typically uses uncentered Gram matrices, whose eigenvalues include
+both the ”mean direction” (shared structure) and variance around the mean. The centered analysis isolates the latter, revealing
+head independence independent of shared baselines. This distinction is critical: MQA’s complete KV sharing creates a
+dominant mean direction (lowering uncentered effective rank) but heads compensate via query specialization (maintaining
+centered effective rank). The PCA-based metric reveals this compensation effect.
+
+                                                                        15
+                                    Low-Rank Key Value Attention
+
+Table 3. PCA-based effective rank comparison. Centered Gram matrix analysis reveals LRKV preserves head diversity within 1% of
+Standard MHA at both scales, while MQA shows surprising resilience through query compensation.
+
+                                    128M (6 heads)                2.5B (18 heads)
+
+                   Model            Uncentered PCA-based Uncentered PCA-based
+
+                   Standard MHA     95.4%   82.4%     98.9%            94.0%
+                   LRKV (r=64)      96.2%   83.0%     98.3%            93.5%
+                   GQA              90.5%*  79.6%*    95.4%            91.7%
+                   LRKV (r=16)      88.8%   81.5%
+                   MQA              72.6%   78.4%        –                –
+                   MLA              83.9%   78.5%     86.2%            91.0%
+                                                      92.7%            91.6%
+
+*GQA at 128M estimated from 2.5B patterns. PCA-based percentages are relative to maximum possible effective rank (number of heads).
+Note MQA’s 4.8pp improvement from uncentered to PCA-based at 2.5B scale, revealing query compensation.
+
+                             Head Diversity via Effective Rank (128M)
+
+                6
+
+                5
+
+Effective Rank  4
+
+                3
+
+                                                                       Standard MHA
+                                                                       LRKV (r=16)
+                                                                       LRKV (r=64)
+                2                                                      MQA
+
+                                                                       MLA
+                                                                       GQA
+                1                                                      Fully redundant
+
+                   0             2          4 Layer6              8    10
+
+Figure 9. Head diversity at 128M scale (PCA-based analysis). Effective rank computed from centered Gram matrices shows consistent
+patterns: LRKV (r=64) achieves 83.0% effective rank versus 82.4% for Standard MHA, demonstrating that sufficient residual capacity
+(r ≈ 0.36-0.43 × dh in deployed models) preserves head specialization. LRKV (r=16) achieves 81.5%, while MQA shows 78.4%.
+The PCA-based metric reveals that even aggressive compression methods maintain substantial head diversity through compensation
+mechanisms.
+
+C.2. Complete Results Across Scales
+C.3. Effective Rank at 128M Scale
+At 128M scale with 6 attention heads, LRKV (r=64) achieves effective rank (83.0%) nearly matching Standard MHA
+(82.4%), demonstrating that the low-rank factorization does not inherently degrade head diversity when rank is appropriately
+chosen. The moderately constrained LRKV (r=16) configuration shows only slightly reduced diversity (81.5%), while MQA
+maintains 78.4% effective rank despite complete KV sharing—revealing the query compensation effect at smaller scale.
+
+C.4. PCA Eigenvalue Spectra
+The eigenvalue spectra provide an alternative view of head diversity, complementing the aggregate effective rank metric. The
+PCA-based effective rank summarizes the entire spectrum via entropy, while these plots show the full eigenvalue distribution.
+Key observations:
+
+   • LRKV matches Standard MHA spectra: At 2.5B scale (Figure 10), LRKV’s eigenvalue curves closely track Standard
+      MHA across early, middle, and late layers. This indicates not just similar effective rank, but nearly identical head
+
+                                                                        16
+                                                        Low-Rank Key Value Attention
+
+                                                   PCA Eigenvalue Spectra in Bilinear Form Space (2.5B)
+
+           Early Layer (L=0)  Standard MHA 2.5                          Middle Layer (L=18)                                                                            Late Layer (L=35)
+                              LRKV (r=64)
+7                             GQA                                                            Standard MHA                                                                                 Standard MHA
+                                                                                             LRKV (r=64)                                         1.4                                      LRKV (r=64)
+                                                                                             GQA                                                                                          GQA
+6Variance (PCA Eigenvalue)    MQA                  2.0                                       MQA                                                                                          MQA
+                                                          Variance (PCA Eigenvalue)MLA       MLA                                                 1.2                                      MLA
+                                                                                                                      Variance (PCA Eigenvalue)
+5                                                  1.5                                                                                           1.0
+
+4                                                                                                                                                0.8
+
+3                                                  1.0                                                                                           0.6
+
+2                                                  0.5                                                                                           0.4
+
+1                                                                                                                                                0.2
+
+0                                                  0.0                                                                                           0.0
+
+        2.5 5.0 7.5PC In10d.e0x 12.5 15.0 17.5             2.5 5.0 7.5PC In10d.e0x 12.5 15.0 17.5                                                        2.5 5.0 7.5PC In10d.e0x 12.5 15.0 17.5
+
+Figure 10. PCA eigenvalue spectra reveal variance structure in bilinear form space (2.5B). Eigenvalues of centered Gram matrices at
+early, middle, and late layers show how variance is distributed across principal components. LRKV’s spectra closely match Standard
+MHA across all depth regimes, with similar leading eigenvalues and comparable tail decay, indicating nearly identical head correlation
+structure. MQA shows slightly elevated later eigenvalues, consistent with query compensation: while the first few PCs capture shared KV
+structure, remaining PCs capture query-driven diversity. Early layers show slightly higher leading eigenvalues across methods, suggesting
+a stronger shared component (greater alignment in bilinear form space) in lower layers; deeper layers exhibit more uniform spectra,
+consistent with variance being spread across more modes.
+
+                                                PCA Eigenvalue Spectra in Bilinear Form Space (128M)
+
+           Early Layer (L=0)                                             Middle Layer (L=6)                                                                            Late Layer (L=11)
+
+1.2                           Standard MHA         1.0                                                                                           1.2
+                              LRKV (r=16)
+                              LRKV (r=64)
+1.0                           MQA                                                                                                                1.0
+Variance (PCA Eigenvalue)     MLA                  0.8
+                                                           Variance (PCA Eigenvalue)
+0.8                                                                                                                   Variance (PCA Eigenvalue)GQA0.8
+
+                                                   0.6
+
+0.6                                                                                                                                              0.6
+
+0.4                                                0.4                                                                                           0.4
+
+                                                           Standard MHA                                                                                  Standard MHA
+                                                           LRKV (r=16)                                                                                   LRKV (r=16)
+                                                   0.2     LRKV (r=64)                                                                                   LRKV (r=64)
+0.2                                                        MQA                                                                                   0.2     MQA
+
+                                                           MLA                                                                                           MLA
+0.0                                                0.0     GQA                                                                                   0.0     GQA
+
+     1  2  3PC Index4         5                 6       1       2        3PC Index4          5            6                                           1       2        3PC Index4         5    6
+
+Figure 11. PCA eigenvalue spectra at 128M scale. With 6 heads, the eigenvalue structure is more pronounced. LRKV (r=64) tracks
+Standard MHA closely across all layers, while LRKV (r=16) shows similar patterns with slightly elevated leading eigenvalues in later
+layers. MQA exhibits comparable spectra to other methods, with its eigenvalue distribution revealing that query compensation maintains
+diversity despite complete KV sharing. The consistency of spectra shapes across architectures suggests fundamental constraints on head
+organization.
+
+      correlation structure in the space of bilinear forms.
+
+   • MQA’s compensation appears in eigenvalue distribution: MQA shows slightly elevated later eigenvalues compared
+      to its uncentered analysis would suggest, consistent with query compensation. While early PCs capture the shared KV
+      structure (mean direction), later PCs reveal query-driven diversity that maintains head specialization.
+
+   • Depth-dependent patterns: Early layers show slightly higher leading eigenvalues across all methods, suggesting that
+      heads capture more structured relationships (greater specialization) for low-level features. Middle and late layers show
+      more uniform spectra, consistent with increasingly abstract representations where heads become more similar.
+
+   • Scale consistency: The 128M results (Figure 11) mirror the 2.5B patterns despite different head counts (6 vs 18),
+      confirming that LRKV’s preservation of head diversity and MQA’s compensation mechanism are scale-invariant
+      phenomena.
+
+C.5. Cumulative Variance Explained
+
+The cumulative variance plots directly answer the question: ”How many principal components capture most of the head
+diversity?” This provides an intuitive measure of intrinsic dimensionality that complements the entropy-based effective rank.
+
+                                                                        17
+                                                         Low-Rank Key Value Attention
+
+                                                    Cumulative Variance Explained by PCs (2.5B)
+
+                   Early Layer (L=0)                          Middle Layer (L=18)                                                                              Late Layer (L=35)
+
+1.0                                                 1.0                                                                                              1.0
+
+Cumulative Variance Explained0.8                    0.8                                                                                              0.8
+                                                           Cumulative Variance Explained
+                                                                                                                      Cumulative Variance Explained0.60.60.6
+
+0.4                                   Standard MHA  0.4                            Standard MHA                                                      0.4                          Standard MHA
+
+                                      LRKV (r=64)                                  LRKV (r=64)                                                                                    LRKV (r=64)
+                                      GQA                                          GQA                                                                                            GQA
+0.2                                   MQA           0.2                            MQA                                                               0.2                          MQA
+
+                                      MLA                                          MLA                                                                                            MLA
+                                      90% variance                                 90% variance                                                                                   90% variance
+0.0                                                 0.0                                                                                              0.0
+       2.5 5.0 N7.u5mber10o.0f PCs12.5 15.0 17.5           2.5 5.0 N7.u5mber10o.0f PCs12.5 15.0 17.5                                                        2.5 5.0 N7.u5mber10o.0f PCs12.5 15.0 17.5
+
+Figure 12. Cumulative variance explained quantifies dimensionality of head diversity (2.5B). Plots show how many principal
+components are needed to capture X% of total variance in bilinear form space at early, middle, and late layers. Standard MHA and
+LRKV require ∼16-17 PCs for 90% variance (out of 18 total heads), demonstrating heads occupy nearly all available dimensions with
+minimal redundancy. GQA requires ∼15-16 PCs, showing modest clustering from group-based sharing. MQA and MLA require ∼14-15
+PCs, indicating moderate concentration in fewer dimensions but still substantial spread. The 90% threshold (dashed line) serves as a
+practical measure of intrinsic dimensionality. All methods show relatively linear cumulative variance curves, indicating no single PC
+dominates—even MQA maintains distributed variance.
+
+                                                    Cumulative Variance Explained by PCs (128M)
+
+                   Early Layer (L=0)                          Middle Layer (L=6)                                                                               Late Layer (L=11)
+
+1.0                                                 1.0                                                                                              1.0
+
+Cumulative Variance Explained0.8                    0.8                                                                                              0.8
+                                                           Cumulative Variance Explained
+                                                                                                                      Cumulative Variance Explained0.60.60.6
+
+0.4                                   Standard MHA 0.4                             Standard MHA 0.4                                                                               Standard MHA
+0.2                                   LRKV (r=16)                                  LRKV (r=16)                                                                                    LRKV (r=16)
+0.0 1                                 LRKV (r=64)                                  LRKV (r=64)                                                                                    LRKV (r=64)
+                                      MQA                                          MQA                                                                                            MQA
+                                      MLA           0.2                            MLA                                                               0.2                          MLA
+                                                                                                                                                                                  GQA
+                                      GQA                                          GQA                                                                                            90% variance
+                                      90% variance                                 90% variance
+                                                    0.0 1                                                                                            0.0 1
+       2  Nu3mber of P4Cs             5    6               2  Nu3mber of P4Cs      5    6                                                                   2  Nu3mber of P4Cs    5    6
+
+Figure 13. Cumulative variance explained at 128M scale. With 6 heads, the variance structure is more visible. Standard MHA and
+LRKV (r=64) require ∼5 PCs for 90% variance, demonstrating that heads remain largely independent. LRKV (r=16) shows similar
+patterns despite constrained rank. MQA requires ∼4-5 PCs, confirming that query compensation maintains distributed variance even with
+complete KV sharing. The steeper curves at 128M compared to 2.5B suggest slightly more variance concentration at smaller scale.
+
+Key findings:
+
+   • LRKV preserves full dimensionality: At both scales, LRKV requires nearly all available PCs to capture 90% variance,
+      matching Standard MHA. This confirms that low-rank residuals provide sufficient degrees of freedom for heads to
+      occupy independent dimensions in bilinear form space.
+
+   • No dominant principal component: The relatively linear cumulative variance curves indicate that no single PC
+      captures disproportionate variance. Even the first PC accounts for only 15-20% of total variance, confirming that heads
+      do not collapse to a single dominant direction.
+
+   • MQA’s distributed compensation: Despite complete KV sharing, MQA’s cumulative variance curve shows substantial
+      spread across PCs rather than concentration in the first few components. This quantifies the compensation effect: heads
+      diversify their queries across many dimensions rather than collapsing to a low-dimensional subspace.
+
+   • Scale-dependent behavior: The gap between methods narrows from 128M to 2.5B scale. At 128M, methods are more
+      separated in the cumulative variance plot; at 2.5B, curves converge more closely, suggesting larger models develop
+      more sophisticated compensation mechanisms.
+
+                                                                        18
+                               Low-Rank Key Value Attention
+
+                           Effective Rank Comparison (2.5B)
+
+18          Original (Uncentered Gram Matrix)                                                      PCA-based (Centered Gram Matrix)
+16
+14                                                                                  17
+12
+10                                                                                  16
+ 8
+ 6Effective Rank                                                                    15
+                                                              Effective Rank (PCA)
+      0                                                                             14
+
+                                                                                    13
+
+                                                                                    12
+
+                                               Standard MHA                         11                                               Standard MHA
+                                               LRKV (r=64)                                                                           LRKV (r=64)
+                                               GQA                                  10                                               GQA
+                                               MQA                                                                                   MQA
+                                               MLA                                  9                                                MLA
+
+         5  10  15Layer20  25                  30   35                                  0  5  10  15Layer20  25                      30  35
+
+Figure 14. Comparing uncentered vs PCA-based effective rank reveals compensation mechanisms (2.5B). Layer-by-layer comparison
+shows consistent patterns across all 36 layers. Left panel (uncentered): Standard MHA and LRKV maintain high effective rank (17-18),
+while MQA shows substantial degradation (15-16), suggesting significant diversity loss from complete sharing. Right panel (PCA-
+based): After centering, all methods converge to narrower range (16-17), with MQA showing dramatic improvement. This reveals the
+compensation effect: MQA’s shared KV structure creates a strong mean direction (visible in uncentered analysis), but heads compensate
+by diversifying queries around this mean (revealed by centering). LRKV consistently tracks Standard MHA in both metrics, confirming
+true head independence. GQA and MLA show intermediate behavior with modest gaps between uncentered and centered metrics.
+
+C.6. Comparison: Uncentered vs PCA-based Effective Rank
+The side-by-side comparison of uncentered versus PCA-based effective rank reveals why centering is essential for under-
+standing head diversity:
+
+The MQA compensation effect (quantified). At 2.5B scale, MQA improves from 86.2% (uncentered) to 91.0% (PCA-
+based)—a 4.8 percentage point gain. This quantifies how much diversity MQA recovers through query specialization
+after accounting for its shared KV baseline. Without centering, we would conclude MQA loses 12.7pp of diversity versus
+Standard MHA (98.9% → 86.2%); with centering, the loss is only 3.0pp (94.0% → 91.0%), revealing MQA is much less
+constrained than raw metrics suggest.
+
+LRKV’s consistency across metrics. LRKV shows minimal gap between uncentered (98.3%) and PCA-based (93.5%)
+effective rank—a 4.8pp difference similar to Standard MHA’s 4.9pp gap. This indicates LRKV achieves diversity through
+genuinely independent head specialization rather than compensation around a shared baseline. The low-rank residuals
+provide real degrees of freedom, not just perturbations of a dominant mean structure.
+
+Scale-dependent centering effects. The gaps between uncentered and PCA-based metrics are larger at 128M scale (LRKV:
+13.2pp gap) than at 2.5B (4.8pp gap). This suggests smaller models rely more on shared structure with local compensation,
+while larger models develop more truly independent head specializations. The PCA-based metric, by removing the mean
+direction, reveals this scale-dependent transition.
+
+C.7. Eigenvalue Spectra of Uncentered Similarity Matrices
+For completeness, we also show the eigenvalue spectra of uncentered head similarity matrices, which have been used in
+prior work for head diversity analysis.
+
+C.8. Head Similarity Heatmaps
+The heatmaps provide direct visualization of head relationships in the uncentered similarity space, complementing the
+PCA-based aggregate metrics. Key observations:
+
+   • LRKV preserves correlation structure: At both scales, LRKV’s similarity matrices closely match Standard MHA’s
+
+                                                                        19
+                                                       Low-Rank Key Value Attention
+
+                                                  Effective Rank Comparison (128M)
+
+6.0      Original (Uncentered Gram Matrix)                                                         PCA-based (Centered Gram Matrix)
+5.5
+5.0                                                                                 5.0
+4.5
+4.0Effective Rank                                                                   4.8
+3.5                                                           Effective Rank (PCA)
+3.0                                                                                 4.6
+2.5
+2.0                                                                                 4.4
+
+      0                     Standard MHA                                                    Standard MHA
+                            LRKV (r=16)                                                     LRKV (r=16)
+                            LRKV (r=64)                                             4.2     LRKV (r=64)
+                            MQA
+                            MLA                                                             MQA
+                            GQA                                                             MLA
+                                                                                    4.0     GQA
+
+         2  4 Layer6                              8    10                                0       2                                     4 Layer6  8                  10
+
+Figure 15. Effective rank comparison at 128M scale. Similar patterns emerge with 6 heads: uncentered metric shows larger separation
+between methods, while PCA-based metric reveals closer clustering. MQA’s improvement from uncentered (4.36/6 = 72.6%) to PCA-
+based (4.70/6 = 78.4%) demonstrates compensation effect at smaller scale. The larger percentage gaps at 128M versus 2.5B suggest
+smaller models rely more heavily on shared structure with compensation, while larger models develop more independent specialization.
+
+                                                  Eigenvalue Spectra of Head Similarity Matrices (2.5B)
+
+         Early Layer (L=0)                                 Middle Layer (L=18)                                                                   Late Layer (L=35)
+
+                            Standard MHA 3.5                                                Standard MHA                          1.8                               Standard MHA
+                            LRKV (r=64)                                                     LRKV (r=64)                                                             LRKV (r=64)
+10                          GQA                                                             GQA                                                                     GQA
+ 8                          MQA                   3.0                                       MQA                                                                     MQA
+                            MLA                                                             MLA                                   1.6                               MLA
+
+                                                  2.5                                                                             1.4
+Eigenvalue
+                                                           Eigenvalue62.0                                                         1.2
+                                                                                                                      Eigenvalue
+4                                                 1.5                                                                             1.0
+
+2                                                 1.0                                                                             0.8
+
+0                                                 0.5                                                                             0.6
+
+    2.5 5.0 Ei7g.5enval1u0e.0Inde1x2.5 15.0 17.5       2.5 5.0 Ei7g.5enval1u0e.0Inde1x2.5 15.0 17.5                                    2.5 5.0 Ei7g.5enval1u0e.0Inde1x2.5 15.0 17.5
+
+Figure 16. Uncentered eigenvalue spectra at early, middle, and late layers (2.5B scale). The eigenvalue distribution of uncentered head
+similarity matrices S shows broader separation between methods than PCA-based analysis. LRKV maintains eigenvalue spectra nearly
+identical to Standard MHA across all depth regimes. MQA shows elevated leading eigenvalues and faster tail decay, indicating stronger
+head correlation in the uncentered view—but PCA analysis reveals much of this is due to the shared mean direction rather than loss of
+diversity. Early layers show slightly higher leading eigenvalues across all methods, indicating a stronger shared component in bilinear
+form space at lower layers; deeper layers exhibit more uniform spectra, consistent with variance being distributed across more modes.
+
+  patterns. Off-diagonal entries (head-to-head similarities) show comparable magnitudes and spatial distribution,
+  indicating that low-rank factorization does not artificially increase or decrease head correlations in the uncentered
+  space.
+
+• No emergent clustering: Standard MHA shows diffuse correlations without strong block structure (aside from diagonal
+  dominance). LRKV maintains this property, suggesting heads remain independently specialized rather than forming
+  redundant groups, even before centering removes shared mean structure.
+
+• GQA shows group structure: At 2.5B scale with 6 KV groups of 3 heads each, GQA’s heatmap reveals visible
+  within-group structure—heads sharing KV projections exhibit stronger mutual similarity. This validates that partial KV
+  sharing induces measurable correlation visible in raw similarity space.
+
+• Quantitative confirmation: The mean off-diagonal similarity for LRKV (r=64) is within 0.02–0.04 of Standard
+  MHA across layers, confirming the visual similarity is not merely qualitative. This tight correspondence holds in both
+  uncentered and PCA-based analysis.
+
+                                                                    20
+                                                                                 Low-Rank Key Value Attention
+
+                                                  Eigenvalue Spectra of Head Similarity Matrices (128M)
+
+          Early Layer (L=0)                                                              Middle Layer (L=6)                                        Late Layer (L=11)
+
+   5                                Standard MHA  2.25                                                         Standard MHA       4.0                                                                Standard MHA
+                                    LRKV (r=16)                                                                LRKV (r=16)                                                                           LRKV (r=16)
+                                    LRKV (r=64)                                                                LRKV (r=64)                                                                           LRKV (r=64)
+                                    MQA           2.00                                                         MQA                3.5                                                                MQA
+   4                                                                                                                                                                                                 MLA
+                                    MLA                                                                        MLA                3.0                                                                GQA
+                                    GQA                                                                        GQA
+                                                  1.75
+Eigenvalue
+                                                         Eigenvalue31.50                                                          2.5
+                                                                                                                      Eigenvalue
+                                                                                                                                  2.0
+
+   2                                              1.25                                                                            1.5
+
+                                                                           1.00                                                   1.0
+   1
+
+                                                  0.75                                                                            0.5
+
+   0      2 Eige3nvalue In4dex 5         6        0.50 1                                 2 Eige3nvalue In4dex 5        6               1     2 Eige3nvalue In4dex 5                                                   6
+       1
+
+Figure 17. Uncentered eigenvalue spectra at 128M scale. With 6 heads, the eigenvalue structure is more pronounced. LRKV (r=64)
+tracks Standard MHA closely, while LRKV (r=16) shows slightly elevated leading eigenvalues in later layers, consistent with reduced
+effective rank. MQA exhibits the most concentrated spectra in the uncentered view, with a dominant leading eigenvalue suggesting strong
+head redundancy—but this is largely due to the shared KV mean direction rather than true loss of diversity, as PCA analysis reveals.
+
+          Standard MHA      1.00    LRKV (r=16)                                  1.00    LRKV (r=64)           1.00          MQA             1.00                                               MLA                   1.00
+
+0                           0.75 0                                               0.75 0                        0.75 0                        0.75 0                                                                   0.75
+
+1                           0.50 1                                               0.50 1                        0.50 1                        0.50 1                                                                   0.50
+
+                            0.25 2                                               0.25 2                        0.25 2                        0.25 2                                                                   0.25
+Head Index2
+                                             Head Index0.00                      0.00                          0.00                          0.00                                                                     0.00
+                                                                                          Head Index
+                                                                                                                                       Head Index
+                                                                                                                                                                                    Head Index
+3                           0.25 3                                               0.25 3                        0.25 3                        0.25 3                                                                   0.25
+
+4                           0.50 4                                               0.50 4                        0.50 4                        0.50 4                                                                   0.50
+
+5                           0.75 5                                               0.75 5                        0.75 5                        0.75 5                                                                   0.75
+
+      0 1 He2ad Ind3ex 4 5  1.00    0 1 He2ad Ind3ex 4 5                         1.00    0 1 He2ad Ind3ex 4 5  1.00    0 1 He2ad Ind3ex 4 5  1.00                                               0 1 He2ad Ind3ex 4 5  1.00
+
+Figure 18. Head similarity matrices at 128M scale. With fewer heads (6 vs 18), individual head relationships are more visible. LRKV
+(r=64) shows similarity structure nearly identical to Standard MHA, with moderate positive correlations but no dominant clusters. LRKV
+(r=16) exhibits slightly stronger correlations, consistent with its reduced effective rank. The mean off-diagonal similarity for LRKV
+(r=64) is within 0.02–0.04 of Standard MHA across layers, providing quantitative confirmation of the visual similarity. These uncentered
+heatmaps complement the PCA-based analysis by showing the raw pairwise similarities before mean removal.
+
+C.9. Key Findings from PCA Analysis
+
+1. LRKV preserves head independence within 1% of standard attention. At 2.5B scale, LRKV achieves 93.5%
+PCA-based effective rank versus 94.0% for Standard MHA (0.5pp gap). This near-perfect preservation occurs despite 52.6%
+KV cache size, validating that rank-64 residuals provide sufficient capacity for head specialization. The consistency across
+all 36 layers demonstrates depth-invariant factorization quality.
+
+2. The MQA compensation effect. MQA’s 4.8pp improvement from uncentered (86.2%) to PCA-based (91.0%) effective
+rank at 2.5B scale reveals a previously unknown mechanism: forced KV sharing creates a strong mean bilinear form, but
+heads compensate by diversifying query projections around this mean. The centered analysis isolates this true independence,
+showing MQA is less constrained than prior metrics suggest. This effect is consistent at 128M scale (5.8pp improvement),
+confirming it is a fundamental property of MQA rather than a scale-specific artifact.
+
+3. MLA sits between GQA and MQA in diversity space. MLA achieves 91.6% PCA-based effective rank at 2.5B,
+placing it between GQA (91.7%) and MQA (91.0%). This makes architectural sense: MLA’s latent bottleneck constrains
+heads more than GQA’s group sharing but less than MQA’s complete sharing, with per-head decompression allowing
+specialization after the bottleneck. At 128M scale, MLA shows 78.5% effective rank, slightly below MQA (78.4%),
+suggesting the latent bottleneck is more constraining at smaller scales where bottleneck capacity is limited.
+
+4. Scale-dependent behavior. The gap between uncentered and PCA-based metrics shrinks from 128M to 2.5B (e.g.,
+LRKV: 13.2pp gap at 128M vs 4.8pp at 2.5B), suggesting larger models develop stronger head specialization around shared
+structure rather than purely independent representations. This transition indicates that model scale affects not just capacity
+but the fundamental organization principle of attention heads.
+
+                                                                        21
+                                                             Low-Rank Key Value Attention
+
+5. Rank selection determines capacity. Comparing LRKV configurations reveals that appropriate rank is critical. At
+128M scale, r=16 (12.5% of head dimension) achieves 81.5% PCA-based effective rank, while r=64 (50%) achieves
+83.0%—a modest 1.5pp improvement in diversity but substantial performance difference (0.881 vs 0.875 BPB). This
+confirms that representational capacity, not geometric properties, determines quality: even moderate diversity can yield
+strong performance if the rank provides sufficient degrees of freedom.
+
+C.10. Comparison to Prior Diversity Metrics
+
+Our PCA-based approach differs from prior work in several key respects:
+
+CKA/SVCCA (Kornblith et al., 2019; Raghu et al., 2017). These methods compare activation similarities (repre-
+sentations), not functional operators. While CKA uses centered Gram matrices (providing the ”C” in ”Centered Kernel
+Alignment”), it analyzes activation space rather than weight-space bilinear forms. Our contribution is applying the centering
+principle to the space of attention operators themselves, revealing compensation mechanisms invisible when analyzing
+activations.
+
+Attention pattern similarity (Michel et al., 2019; Voita et al., 2019). These behavioral metrics measure which tokens
+heads attend to on specific inputs. They depend on input data distribution and don’t directly measure the representational
+capacity encoded in the parameterization. Our approach analyzes the parameterization itself, providing a data-independent
+measure of potential diversity.
+
+Raw weight comparison. Directly comparing WhK or WhQ matrices is not gauge-invariant: arbitrary per-head rotations
+that preserve attention function can make identical heads appear different or vice versa. The bilinear form WQ(WK)⊤ is
+the minimal gauge-invariant object for comparison.
+
+Uncentered Gram matrices. Several prior analyses(Zhang et al., 2023) form head similarity matrices (often using
+uncentered correlations or kernel similarities) and interpret their spectra directly; our contribution is to apply explicit kernel
+centering in the space of gauge-invariant attention operators, which separates shared mean structure from variance around
+the mean. This conflates mean structure (shared baselines) with spread (true diversity), masking compensation effects like
+MQA’s query specialization. Our centered analysis isolates intrinsic dimensionality independent of mean direction.
+
+The combination of (i) gauge-invariant bilinear forms, (ii) centered Gram matrix (kernel PCA), and (iii) PCA interpretation
+as variance explained provides, to our knowledge, the first principled operator-space analysis of transformer head diversity.
+This methodology reveals phenomena invisible to prior approaches, such as the MQA compensation effect and the precise
+quantification of LRKV’s near-perfect diversity preservation.
+
+C.11. Methodological Limitations and Extensions
+
+Limitations. Our analysis focuses on final trained checkpoints and does not track how the factorization evolves during
+training. The PCA-based metric measures potential diversity encoded in the parameterization but not behavioral diversity on
+specific inputs. The gauge-invariant similarity metric is one of many possible inner products on bilinear forms; alternative
+metrics might reveal additional structure.
+
+Future extensions. Several directions merit exploration: (1) Analyzing PCA eigenvalue dynamics during pretraining to
+understand how shared and head-specific structure co-evolve. (2) Comparing parameterization-based diversity (this work)
+with input-dependent behavioral diversity to understand their relationship. (3) Extending the framework to cross-attention in
+encoder-decoder models, where query and key-value heads may have different sizes. (4) Investigating whether PCA-guided
+initialization or regularization can improve training dynamics by explicitly encouraging high-variance factorizations.
+
+D. Experimental Setup (Full Details)
+
+D.1. Pretraining Configuration
+
+We pretrain from scratch a family of decoder-only Transformer language models with parameter counts ranging from 128M
+to 6.3B on the FineWeb-Edu dataset (Penedo et al., 2024). Unless otherwise stated, model scale (e.g., 128M, 2.5B, 6.3B)
+
+                                                                        22
+                              Low-Rank Key Value Attention
+
+Table 4. Mathematical comparison of attention mechanisms. We compare how different mechanisms parameterize key/value projections
+and where compression is applied. Here X ∈ RT ×d is the token sequence, dh = d/H is the head dimension, H is the number of heads,
+
+and r, dc ≪ dh.
+
+Method        KV projection form                           Rank constraint               Compression axis
+Standard MHA  WhK,V ∈ Rd×dh (independent per head)                                       None
+MQA           WhK,V = WsKha,Vred ∀h                        None (full rank)              Across heads (complete sharing)
+GQA           WhK,V = WgK(h,V) for group g(h)              rank(WhK,V ) = rank(Wshared)  Across heads (group-wise sharing)
+MLA           WhK,V = WdownWuKp,,Vh                        Full rank within group
+LRKV (ours)   WhK,V = WsKha,Vred + UhK,V (BhK,V )⊤         rank(WhK,V ) ≤ dc             Across tokens (latent bottleneck)
+                                                           rank(WhK,V − WsKha,Vred) ≤ r  Across heads (additive low-rank de-
+                                                                                         viations)
+
+refers to the parameter count of the base architecture with standard multi-head attention (MHA). Alternative attention
+mechanisms (LRKV, MQA, GQA, MLA) replace only the attention module while keeping all other architectural components
+fixed, which will result in reduced total parameter count due to reparameterized key-value projections.
+
+Model Architecture Summary. Table 5 provides complete architectural specifications for all model scales evaluated in
+this work.
+
+Table 5. Complete model architectural specifications. All models use dhead = 128 and FFN expansion ratio of 4 (i.e., dFFN = 4 × dmodel).
+
+                    Scale     Layers                Heads  dmodel  dFFN   Vocab Size
+
+                    128M        12                     6    768    3072      50304
+                    512M        24                    12   1536    6144      50304
+                    1.2B        24                    12   1536    6144      50304
+                    2.5B        18                    18   2304    9216      50304
+                    6.3B        32                    32   4096    16384     50304
+
+Training Configuration Summary. Table 6 provides complete training configuration details across all model scales.
+
+Table 6. Training configuration across model scales. Batch size refers to number of sequences; total tokens per batch = batch size ×
+context length. All models trained on FineWeb-Edu with Muon+AdamW optimization.
+
+Scale Context Batch Size Tokens/Batch Total Tokens Compute (EF)                          Purpose
+
+128M          2048      16    32,768                       100B            31.0               Ablations
+512M          8192       4    32,768                       50B            153.6            Long context
+1.2B          2048  8 (GA=2)  32,768                       50B            304.7            Scaling study
+2.5B          2048  8 (GA=2)  32,768                       50B            635.2          Main experiments
+6.3B          2048  8 (GA=2)  32,768                       50B            1603.3           Scaling study
+
+GA=gradient accumulation steps. EF=ExaFLOPs. 128M overtrained (100B tokens) for low-variance ablations; others use compute-near-
+optimal budgets (Hoffmann et al., 2022).
+
+Optimization Details. We use a hybrid optimizer strategy: the Muon optimizer (Sardana & Havens, 2024) for Transformer
+weight matrices and AdamW for embeddings, with component-specific learning rates (matrix: 0.02, embedding: 0.2,
+unembedding: 0.004). All models are optimized using cosine learning rate decay with linear warmup (2000 steps), weight
+decay 0.1, and gradient clipping at 1.0.
+
+Hardware and Precision. All experiments are run on a single 8×H200 GPU node in mixed-precision (bfloat16) mode.
+Full architectural and optimization hyperparameters, including learning rate schedules and detailed optimizer settings, are
+provided in Appendix F.
+
+Evaluation Metrics. Training progress is monitored using the cross-entropy loss and bits-per-byte (BPB) on held-out
+validation split of FineWeb-Edu. These metrics allow consistent comparison across model scales and serve as the primary
+indicators of data efficiency and convergence quality.
+
+                                                                        23
+                                                             Low-Rank Key Value Attention
+
+D.2. Mid-training Configuration
+After pretraining, we perform supervised fine-tuning (mid-training) on a curated mixture of instructional data to improve
+downstream task performance. The mid-training dataset consists of three components:
+
+1. SmolTalk (Allal et al., 2024) with 460K conversational examples for general instruction-following
+
+2. MMLU auxiliary train (Hendrycks et al., 2021) with 100K multiple-choice questions spanning diverse academic
+   subjects
+
+3. GSM8K (Cobbe et al., 2021) with 8K grade-school math problems including calculator tool use
+
+This yields a total training mixture of approximately 568K examples. Validation is performed on held-out test splits using
+proportional sampling (24K SmolTalk, 5.2K MMLU, 420 GSM8K examples).
+
+We train for one full epoch over the mid-training mixture with a batch size of 524,288 tokens and sequence length of 2048.
+We use a decayed linear schedule for the learning rate, using AdamW for the embeddings and Muon for the remaining
+parameters. Models are evaluated every 150 steps using bits-per-byte on the validation set. All mid-training runs use the
+same hyperparameters across different attention mechanisms to ensure fair comparison.
+
+D.3. Attention Mechanism Configurations
+
+To evaluate the effectiveness of low-rank KV factorization, we compare LRKV against four baseline attention mechanisms
+across all model scales. Table 7 provides complete configuration details for all methods and scales.
+
+Table 7. Attention mechanism configurations across model scales. KV cache percentages are relative to Standard MHA. All models
+use dhead = 128 and 2048-token context (except 512M long-context with 8192 tokens).
+
+                      Standard                 MQA / GQA                           MLA / LRKV
+
+Scale  Heads KV Heads Cache MQA KV GQA KV GQA Cache MLA dc LRKV r LRKV Cache
+
+128M   6              6              100% 1 (16.7%) 3 (50%)   50%    128 (8.3%)          46    52.6%
+512M                                                                                           48.2%
+1.2B   12             12             100% 1 (8.3%) 4 (33.3%)  33.3%  256 (8.3%)          51    48.2%
+2.5B                                                                                           48.5%
+6.3B   12             12             100% 1 (8.3%) 4 (33.3%)  33.3%  256 (8.3%)          51    45.3%
+
+       18             18             100% 1 (5.6%) 6 (33.3%)  33.3%  384 (8.3%)          55
+
+       32             32             100% 1 (3.1%) 2 (6.3%)   6.3%   1024 (12.5%)        54
+
+512M-8K† 12           12             100% 1 (8.3%) 4 (33.3%)  33.3%  256 (8.3%)          51    48.2%
+
+       †512M-8K denotes the long-context configuration with 8192-token sequences. All other models use 2048-token context.
+
+KV Cache Calculation. All KV cache percentages are reported relative to Standard MHA’s memory usage. For LRKV, the
+
+reported cache size assumes an optimized implementation that caches the shared projection Wshared and per-head low-rank
+latents RhK,V rather than the fully reconstructed key-value matrices, following the theoretical analysis in Section 3. The
+                      dh +H r     1      r
+cache ratio follows:    H dh   =  H  +  dh  .
+
+This configuration balances memory efficiency with model expressiveness: LRKV uses approximately half the KV cache
+
+of Standard MHA while maintaining full representational capacity through low-rank adaptation, outperforming both
+
+memory-minimal approaches (MQA, MLA) and full attention in downstream task performance.
+
+D.4. Rank Ablation Experiments
+
+To systematically evaluate how residual rank affects LRKV’s performance-memory tradeoff, we conduct comprehensive
+ablation studies at the 128M scale. These experiments isolate the effect of rank selection while controlling for all other
+architectural and training factors.
+
+LRKV Rank Ablation. We train five 128M parameter models with LRKV using ranks r ∈ {8, 16, 32, 64, 128} on
+100B tokens of FineWeb-Edu. All models use identical architecture (6 heads, dmodel = 768, dhead = 128), optimization
+hyperparameters, and training schedule. Table 8 presents complete results.
+
+                                               24
+                           Low-Rank Key Value Attention
+
+Table 8. LRKV rank ablation and MLA latent dimension comparison (128M scale, 100B tokens). All models use 6 heads with
+dh = 128. Cache percentages relative to Standard MHA baseline.
+
+Configuration  Rank/Latent KV Cache CE Loss ↓ BPB ↓                  Notes
+
+LRKV-8                     LRKV Rank Ablation                Insufficient capacity
+LRKV-16                                                          Below MHA
+LRKV-32         r=8        22.9%   2.908       0.881
+LRKV-64        r = 16      29.2%   2.905       0.880         Approaching MHA
+LRKV-128       r = 32      41.7%   2.896       0.877            Exceeds MHA
+               r = 64      66.7%   2.888       0.875
+MLA-128        r = 128     116.7%  2.877       0.873       Best, but >100% cache
+MLA-192
+MLA-384                    MLA Latent Dimension Ablation      Minimal memory
+                                                                        –
+Standard MHA   dc = 128    8.3%    2.901       0.876
+GQA            dc = 192    12-5%   2.898       0.876      Comparable to LRKV-64
+MQA            dc = 384    25.0%   2.894       0.875
+                                                                    Baseline
+                                  Baselines                             –
+
+               6 KV heads  100%    2.903       0.878         Severe quality loss
+                3 groups   50.0%   2.918       0.883
+               1 KV head   16.7%   2.929       0.886
+
+Key Findings. The ablation reveals that performance improves monotonically with rank, confirming that representational
+capacity (not geometric properties of the factorization) determines modeling quality. Ranks around r ≈ 0.36–0.43 × dh
+(46–55 for dh = 128) provide the optimal tradeoff: sufficient capacity to exceed Standard MHA performance while
+achieving substantial cache reduction.
+
+Comparing methods at matched cache budgets reveals LRKV’s architectural advantage: LRKV at 41.7% cache (r = 32,
+BPB=0.877) slightly underperforms MLA at 50.0% cache (dc = 384, BPB=0.875), but LRKV at 66.7% cache (r = 64,
+BPB=0.875) matches MLA-384 performance. However, LRKV avoids the sequence-length-dependent reconstruction
+overhead inherent to MLA’s latent compression (see Appendix F), providing better inference latency characteristics at long
+context lengths.
+
+All ablation models are trained for 100B tokens (rather than compute-optimal allocation) to reduce variance and enable
+high-confidence comparison of architectural capacity at fixed training budget.
+
+D.5. Long Context Experiments
+
+To evaluate LRKV’s effectiveness at extended sequence lengths, we conduct 8192-token context experiments using 512M
+parameter models trained on 50B tokens (153.6 ExaFLOPs).
+
+Configuration. The 512M models use 12 attention heads with dmodel = 1536 and dhead = 128, with 24 layers matching
+the 1.2B scale architecture. We compare LRKV (r = 51, 48.2% cache), GQA (4 groups, 33.3% cache), MLA (dc = 256,
+8.3% cache), and MQA (8.3% cache) against Standard MHA baseline.
+
+Batching Strategy. To maintain computational throughput while accommodating 4× longer contexts, we adjust batch size
+to keep total tokens per batch constant. Standard 2048-context runs use batch size 16 (32,768 tokens per batch); 8192-context
+runs use batch size 4 (32,768 tokens per batch). This ensures comparable gradient noise and optimizer dynamics while
+scaling to long contexts.
+
+Results. Table 9 presents validation performance at 8192-token context length after 50B tokens (153.6 ExaFLOPs).
+
+LRKV achieves the strongest performance, outperforming Standard MHA by 2.7% while using less than half the KV cache
+(48.2% vs 100%). All KV-efficient methods (LRKV, GQA, MLA, MQA) outperform the full Standard MHA baseline at 8K
+context, suggesting that some degree of KV compression may provide implicit regularization benefits at longer sequences.
+However, LRKV’s 2.7% advantage over MHA (compared to GQA’s 1.3%, MLA’s 0.9%, and MQA’s 0.4%) demonstrates
+that head-specific low-rank residuals are particularly effective for maintaining quality at extended context lengths.
+
+These results validate LRKV’s applicability to long-context scenarios where memory efficiency is critical, demonstrating that
+
+                                                                        25
+                                          Low-Rank Key Value Attention
+
+Table 9. Long context performance (512M models, 8K context, 50B tokens). Degradation computed relative to MHA baseline.
+
+                            Method        KV Cache  CE Loss ↓  BPB ↓    vs. MHA
+
+                            Standard MHA     100%      2.740   0.494    baseline
+                            LRKV            48.2%      2.665   0.481     -2.7%
+                            GQA             33.3%      2.704   0.488      -1.3%
+                            MLA              8.3%      2.714   0.489      -0.9%
+                            MQA              8.3%      2.728   0.492      -0.4%
+
+low-rank factorization preserves head diversity more effectively than aggressive sharing (MQA, GQA) or latent compression
+(MLA) approaches at extended sequence lengths.
+
+D.6. Downstream Evaluation Tasks
+After midtraining, we evaluate all models on five standard benchmarks:
+
+   • ARC-Easy and ARC-Challenge (Clark et al., 2018): Question answering requiring scientific reasoning
+   • MMLU (Hendrycks et al., 2021): Multi-task language understanding across 57 subjects
+   • GSM8K (Cobbe et al., 2021): Grade-school math word problems
+   • HumanEval (Chen et al., 2022): Python code generation from docstrings
+
+All evaluations follow standard zero-shot or few-shot protocols as specified in the original benchmark papers.
+
+E. Pretraining-Downstream Correlation Analysis
+
+                            Pretraining vs Downstream Performance
+
+                             38
+
+Downstream Performance (%)  37
+
+                            36
+
+                            35                                                  MLA
+                            34                                                  MQA
+                                                                                GQA
+                                   0.728                                        Standard MHA
+                                                                                LRKV
+                                                                                Trend (R²=0.786)
+
+                                          0.726 0.724 0.722 0.720
+
+                                          Pretraining BPB (lower is better)
+
+Figure 19. Pretraining quality predicts downstream performance. Scatter plot relating pretraining validation BPB (x-axis, inverted)
+to downstream combined performance (y-axis) across all attention mechanisms at 2.5B scale. A strong positive correlation emerges
+(R = 0.786), demonstrating that models with better pretraining performance consistently achieve higher downstream scores. LRKV
+occupies the optimal position with both the lowest pretraining BPB (0.719) and highest downstream performance (37.9%), while Standard
+MHA achieves 0.723 BPB and 35.3% downstream.
+
+To validate the relationship between pretraining quality and downstream performance, we analyze the correlation between
+validation BPB and combined benchmark scores across all architectures after midtraining (Figure 19). The strong positive
+
+                                                    26
+                                                             Low-Rank Key Value Attention
+
+correlation (R²=0.786) demonstrates that models achieving lower pretraining loss consistently deliver superior downstream
+performance. LRKV achieves the lowest pretraining BPB (0.719) and highest downstream score (37.9%), while Standard
+MHA attains 0.723 BPB and 35.3% downstream.
+
+This correlation suggests that architectural improvements that enhance language modeling performance are not orthogonal
+to, but rather aligned with, practical task capabilities. The consistent 2.6 percentage point downstream advantage LRKV
+maintains over Standard MHA directly stems from its BPB pretraining improvement, confirming that low-rank KV
+factorization provides fundamental capacity gains that manifest across both pretraining and downstream evaluation regimes.
+
+This relationship validates that LRKV’s architectural improvements during pretraining directly translate to enhanced
+downstream capabilities, confirming the effectiveness of low-rank KV factorization for both language modeling and
+task-specific adaptation.
+
+F. Additional Experimental Details and Computational Analysis
+
+F.1. Batching and Optimization Hyperparameters
+
+For models up to 256M parameters, we use a global batch size of 16 sequences (2048 tokens each). For the larger 1B–6.3B
+models, we reduce the physical batch size to 8 sequences and apply gradient accumulation of 2 steps to maintain an
+equivalent effective batch size. This setup ensures comparable gradient noise scale and optimizer dynamics across all model
+sizes. All runs employ weight decay of 0.1, Adam β1 = 0.9, β2 = 0.95, and gradient clipping at 1.0.
+
+F.2. Memory-Computation Trade-offs in Attention Mechanisms
+
+Modern attention mechanisms present a fundamental trade-off between cache memory (storage) and per-token computation
+(latency). We analyze this trade-off across standard attention, query-sharing variants, and compression-based approaches.
+
+The Compression Paradigm: Lossy vs. Lossless. Attention mechanisms can be understood through the lens of
+compression theory:
+
+   • Multi-Latent Attention (MLA) implements lossy compression: it compresses K/V representations into a low-
+      dimensional latent space Z = XWdown, caching only Z. During generation, full K/V need not be explicitly materialized;
+      instead, interaction with the cached latent requires per-step projection overhead, e.g., qK⊤ = (qWuKp )Z⊤ and
+      aV = (aZ)WuVp . This introduces additional per-token computation proportional to the latent dimension, and scales
+      linearly with sequence length through dot products with Z⊤.
+
+   • LRKV implements near-lossless compression with additive structure: it caches both shared full-rank features (K¯ , V¯ )
+      and compact per-head latents (RhK , RhV ). It avoids explicitly materializing per-head Kh, Vh tensors; instead, attention
+      can be computed using associative forms (Eq. 6–7). Beyond the unavoidable O(T ) scan over cached tokens in attention,
+      LRKV introduces only O(Hrdh) additional per-step projection work that does not grow with T .
+
+This distinction is critical for autoregressive generation: both MLA and LRKV incur the unavoidable O(T ) cost to compare
+against cached tokens, but MLA introduces additional per-step projection work tied to the latent bottleneck, whereas LRKV’s
+extra work depends only on r and does not increase with T .
+
+Quantitative Analysis: Memory vs. Latency. We compare the memory footprint and inference-time computational
+characteristics of different attention mechanisms during autoregressive generation. Table 10 reports (1) the KV cache size
+stored per token and (2) the additional reconstruction overhead required per generation step, beyond the standard O(T )
+attention computation inherent to cached autoregressive decoding.
+
+Key observations.
+
+  1. Standard attention, MQA, and GQA incur no additional reconstruction cost at inference time, as per-head or shared
+      key/value tensors are directly cached.
+
+  2. MLA achieves the smallest cache footprint but introduces an additional latent-to-head expansion step whose cost
+
+                                                                        27
+                  Low-Rank Key Value Attention
+
+Table 10. Memory and inference-time characteristics of attention mechanisms. Cache size is measured per token. Reconstruction overhead
+denotes additional computation beyond standard O(T ) cached attention.
+
+Method            Cache / Token Extra Cost / Step T -Dependence
+
+Standard Attn.       2H dh                               O(1)    None
+MQA                   2dh                                O(1)    None
+GQA (G=3)            2Gdh                                O(1)    None
+MLA (dc=128)           dc                             O(T dcdh)  Linear
+LRKV (r=16)       2(dh +H r)                          O(H rdh )  None
+
+Extra cost refers to reconstruction needed to obtain per-head K/V representations. MLA requires latent-to-head expansion over the cached
+sequence unless expanded K/V are stored or fused kernels are used.
+
+scales with the cached sequence length T , unless expanded representations are stored (which increases memory) or
+specialized fused kernels are used.
+
+3. LRKV trades a modest increase in cache size relative to MLA for sequence-length-independent reconstruction
+   overhead. This avoids T -dependent expansion during generation while preserving per-head expressivity through
+   low-rank residuals.
+
+4. As a result, LRKV occupies an intermediate point in the memory–latency design space: it substantially reduces KV
+   memory relative to full attention while avoiding the sequence-dependent reconstruction overhead introduced by more
+   aggressive compression schemes.
+
+G. KV Cache Memory Measurements
+
+This appendix presents detailed measurements of KV cache memory usage during inference for all attention mechanisms
+evaluated in this work.
+
+G.1. Measurement Methodology
+
+All memory measurements are obtained by instantiating cache tensors with the exact shapes used during inference and
+measuring their memory footprint using PyTorch’s tensor.numel() and element size() methods. Measurements
+use bfloat16 precision (2 bytes per element) with batch size 1 and sequence length 2048 tokens, matching our experimental
+configuration.
+
+G.2. Cache Structure by Method
+
+Table 11 summarizes the cache structure for each attention mechanism, showing tensor shapes and memory formulas for
+inference with batch size B, sequence length T , number of layers L, number of heads H, head dimension dh, group size G,
+latent dimension dc, and rank r.
+
+Table 11. KV cache structure by attention mechanism. All measurements use bfloat16 precision (2 bytes per element).
+
+Method            Cached Tensor/s                     Total Memory (bytes)
+Standard MHA      Shape: (L, B, H, T, dh)             2 × L × B × H × T × dh × 2
+MQA               Shape: (L, B, 1, T, dh)             2 × L × B × T × dh × 2
+GQA               Shape: (L, B, H/G, T, dh)           2 × L × B × (H/G) × T × dh × 2
+MLA               Shape: (L, B, T, dc) (latents)      L × B × T × dc × 2
+LRKV (Optimized)  Shared: (L, B, T, dh)               2 × L × B × T × (dh + H × r) × 2
+                  Latents: (L, B, H, T, r)
+
+                                                  28
+                                 Low-Rank Key Value Attention
+
+G.3. Measured Results
+
+Table 12 presents measured memory usage across all three model scales. The optimized LRKV implementation (using
+LRKVCache from lrkv attention fused.py) achieves substantial memory savings compared to standard MHA
+while maintaining full representational capacity.
+
+Table 12. Measured KV cache memory during inference. All values measured for T=2048 tokens, batch size 1, bfloat16 precision,
+using rank r = 64 for LRKV and latent dimensions as specified in main paper.
+
+Method                                  128M              2.5B                       6.3B
+
+Standard MHA                          72.0 MB          648.0 MB                  1152.0 MB
+MQA                              12.0 MB (16.7%)   36.0 MB (5.6%)             36.0 MB (3.1%)
+GQA                              36.0 MB (50.0%)  216.0 MB (33.3%)            72.0 MB (6.2%)
+MLA                              24.0 MB (33.3%)  216.0 MB (33.3%)           288.0 MB (25.0%)
+LRKV                             48.0 MB (52.6%)  360.0 MB (48.4%)           612.0 MB (45.1%)
+
+G.4. Scale-Dependent Efficiency
+
+LRKV’s cache percentage relative to standard MHA improves with model scale:
+
+                                 Ratio = dh + H · r = 1 + r
+                                                  H · dh  H dh
+
+                                                    1 64
+                                 128M (H=6): + = 0.526 = 52.6%
+
+                                                    6 128
+
+                                                     1 64
+                                 2.5B (H=18): + = 0.484 = 48.4%
+
+                                                    18 128
+
+                                               1 64
+                                 6.3B (H=32):      + = 0.451 = 45.1%
+                                               32 128
+
+This demonstrates that LRKV’s efficiency increases with model scale: larger models with more heads benefit more from the
+shared component, achieving greater relative memory savings while maintaining fixed rank r = 64.
+
+H. Limitations and Future Work
+
+H.1. Limitations
+
+Our experiments focus on decoder-only language models at scales up to 6.3B parameters. The design space for large-scale
+Transformer training is extremely large, spanning model size, training data, optimization schedules, attention mechanisms,
+and hardware/software configurations, many of which interact in nontrivial ways. As a result, it is infeasible to exhaustively
+benchmark all combinations or to claim that any single configuration is universally optimal across setups.
+
+Our empirical evaluation therefore samples this space using widely adopted architectures, training recipes, and system
+implementations on modern accelerator hardware. While this provides a representative and practically relevant assessment,
+different choices of model scale, data regime, training duration, or system optimizations may shift the precise efficiency–
+performance trade-offs.
+
+To facilitate independent validation and extension, we will release our training code and configuration details, enabling
+replication and exploration across alternative setups. We also note that the relative efficiency of different KV compression
+strategies may vary with hardware characteristics such as memory bandwidth, kernel fusion, and cache behavior.
+
+                                                  29
+

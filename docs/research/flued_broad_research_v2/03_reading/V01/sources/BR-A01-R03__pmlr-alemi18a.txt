@@ -1,0 +1,578 @@
+
+=== PDF page 1 ===
+                          Fixing a Broken ELBO
+
+
+
+     Alexander A. Alemi 1 Ben Poole 2 * Ian Fischer 1 Joshua V. Dillon 1  Rif A. Saurous 1 Kevin Murphy 1
+
+
+                 Abstract                        2014; Rezende et al., 2014).  Alternatively, we can con-
+    Recent work in unsupervised representation learn-         sider other divergence measures, such as the reverse KL,
+                                                    L(θ) = KL[p(x|θ) || ˆp(x)], as is done when ﬁtting certain     ing has focused on learning deep directed latent-
+     variable models. Fitting these models by maxi-         kinds of generative adversarial networks (GANs). However,
+    mizing the marginal likelihood or evidence is typ-         the fundamental problem is that these loss functions only
+     ically intractable, thus a common approximation        depend on p(x|θ), and not on p(x, z|θ). Thus they do not
+      is to maximize the evidence lower bound (ELBO)        measure the quality of the representation at all, as discussed
+     instead. However, maximum likelihood training          in (Husz´ar, 2017; Phuong et al., 2018).  In particular, if
+    (whether exact or approximate) does not neces-      we have a powerful stochastic decoder p(x|z, θ), such as
+      sarily result in a good latent representation, as we        an RNN or PixelCNN, a VAE can easily ignore z and still
+    demonstrate both theoretically and empirically.         obtain high marginal likelihood p(x|θ), as noticed in (Bow-
+     In particular, we derive variational lower and up-      man et al., 2016; Chen et al., 2017). Thus obtaining a good
+     per bounds on the mutual information between      ELBO (and more generally, a good marginal likelihood) is
+     the input and the latent variable, and use these         not enough for good representation learning.
+    bounds to derive a rate-distortion curve that char-                                                             In this paper, we argue that a better way to assess the value
+     acterizes the tradeoff between compression and                                                            of representation learning is to measure the mutual infor-
+     reconstruction accuracy. Using this framework,                                                      mation I between the observed X and the latent Z.  In
+   we demonstrate that there is a family of models                                                               general, this quantity is intractable to compute, but we can
+    with identical ELBO, but different quantitative                                                             derive tractable variational lower and upper bounds on it.
+    and qualitative characteristics. Our framework                                           By varying I, we can tradeoff between how much the data
+     also suggests a simple new method to ensure that        has been compressed vs how much information we retain.
+     latent variable models with powerful stochastic         This can be expressed using the rate-distortion or RD curve
+     decoders do not ignore their latent code.               from information theory, as we explain in section 2. This
+                                                    framework provides a solution to the problem of powerful
+                                                         decoders ignoring the latent variable which is simpler than
+1. Introduction                                                               the architectural constraints of (Chen et al., 2017), and more
+Learning a “useful” representation of data in an unsu-    general than the “KL annealing” approach of (Bowman
+pervised way is one of the “holy grails” of current ma-    et al., 2016). This framework also generalizes the β-VAE
+chine learning research. A common approach to this    approach used in (Higgins et al., 2017; Alemi et al., 2017).
+problem  is to ﬁt a latent variable model of the form                                                              In addition to our unifying theoretical framework, we empir-
+p(x, z|θ) = p(z|θ)p(x|z, θ) to the data, where x are the                                                                   ically study the performance of a variety of different VAE
+observed variables, z are the hidden variables, and θ are                                                     models — with both “simple” and “complex” encoders, de-
+the parameters. We usually ﬁt such models by minimizing                                                             coders, and priors — on several simple image datasets in
+L(θ) = KL[ˆp(x) || p(x|θ)], which is equivalent to max-                                                         terms of the RD curve. We show that VAEs with powerful
+imum likelihood training.  If this is intractable, we may                                                             autoregressive decoders can be trained to not ignore their
+instead maximize a lower bound on this quantity, such as                                                                   latent code by targeting certain points on this curve. We
+the evidence lower bound (ELBO), as is done when ﬁtting                                                               also show how it is possible to recover the “true generative
+variational autoencoder (VAE) models (Kingma & Welling,                                                          process” (up to reparameterization) of a simple model on
+                                                        a synthetic dataset with no prior knowledge except for the  *Work done during an internship at DeepMind.  1Google AI
+2Stanford University. Correspondence to: Alexander A. Alemi     true value of the mutual information I (derived from the
+<alemi@google.com>.                                          true generative model). We believe that information con-
+                       th                                             straints provide an interesting alternative way to regularize
+Proceedings of the 35   International Conference on Machine                                                              the learning of latent variable models.
+Learning, Stockholm, Sweden, PMLR 80, 2018. Copyright 2018
+by the author(s).
+
+=== PDF page 2 ===
+                                                 Fixing a Broken ELBO
+
+2. Information-theoretic framework            H ≡− Z dx p∗(x) log p∗(x)                   (3)
+
+In this section, we outline our information-theoretic view                                                         Z        Z
+of unsupervised representation learning. Although many of      D ≡−  dx p∗(x)   dz e(z|x) log d(x|z)     (4)
+these ideas have been studied in prior work (see section 3),
+                                                       Z        Z              e(z|x)
+we provide a unique synthesis of this material into a single       R ≡   dx p∗(x)   dz e(z|x) log               (5)
+                                                                              m(z)coherent, computationally tractable framework. In section 4,
+we show how to use this framework to study the properties
+                                                     where d(x|z) (the “decoder”) is a variational approximation
+of various recently-proposed VAE model variants.
+                                                                to pe(x|z), and m(z) (the “marginal”) is a variational ap-
+                                                          proximation to pe(z). A detailed derivation of these bounds
+Unsupervised Representation Learning We will con-     is included in Appendices D.1 and D.2.
+vert each observed data vector x into a latent representa-                              H is the data entropy which measures the complexity of
+tion z using any stochastic encoder e(z|x) of our choos-                                                        our dataset, and can be treated as a constant outside our
+ing.  This then induces the joint distribution pe(x, z) =                                                                control. D is the distortion as measured through our en-
+p∗(x)e(z|x) and the corresponding marginal posterior                                                             coder, decoder channel, and is equal to the reconstruction
+pe(z) = R dx p∗(x)e(z|x) (the “aggregated posterior” in                                                            negative log likelihood. R is the rate, and depends only
+Makhzani et al. (2016); Tomczak & Welling (2017)) and                                                  on the encoder and variational marginal; it is the average
+conditional pe(x|z) = pe(x, z)/pe(z).                                                                   relative KL divergence between our encoding distribution
+Having deﬁned a joint density, a symmetric, non-negative,   and our learned marginal approximation. (It has this name
+reparameterization-independent measure of how much in-    because it measures the excess number of bits required to
+formation one random variable contains about the other is    encode samples from the encoder using an optimal code
+given by the mutual information:                           designed for m(z).) For discrete data1, all probabilities in
+                               X are bounded above by one and both the data entropy and
+                                                                 distortion are non-negative (H ≥0, D ≥0). The rate is           ZZ                    pe(x, z)
+    Ie(X; Z) =    dx dz pe(x, z) log p∗(x)pe(z).    (1)    also non-negative (R ≥0), because it is an average KL                                                             divergence, for either continuous or discrete Z.
+
+(We use the notation Ie to emphasize the dependence on our                                                   Phase Diagram  The positivity constraints and the sand-
+choice of encoder. See appendix C for other deﬁnitions of
+                                                       wiching bounds (Equation (2)) separate the RD-plane into
+mutual information.) There are two natural limits the mutual
+                                                                 feasible and infeasible regions, visualized in Figure 1. The
+information can take. In one extreme, X and Z are indepen-
+                                                     boundary between these regions is a convex curve (thick
+dent random variables, so the mutual information vanishes:
+                                                         black line). We now explain qualitatively what the differ-
+our representation contains no information about the data
+                                                              ent areas of this diagram correspond to. For simplicity, we
+whatsoever. In the other extreme, our encoding might just
+                                                                  will consider the inﬁnite model family limit, where we have
+be an identity map, in which Z = X and the mutual infor-
+                                                      complete freedom in specifying e(z|x), d(x|z) and m(z)
+mation becomes the entropy in the data H(X). While in                                                            but consider the data distribution p∗(x) ﬁxed.
+this case our representation contains all information present
+in the original data, we arguably have not done anything   The bottom horizontal line corresponds to the zero distortion
+meaningful with the data. As such, we are interested in     setting, which implies that we can perfectly encode and
+learning representations with some ﬁxed mutual informa-   decode our data; we call this the auto-encoding limit. The
+tion, in the hope that the information Z contains about X is    lowest possible rate is given by H, the entropy of the data.
+in some ways the most salient or useful information.         This corresponds to the point (R = H, D = 0). (In this
+                                                                  case, our lower bound is tight, and hence d(x|z) = pe(x|z).)
+Equation 1 is hard to compute, since we do not have access
+                                      We can obtain higher rates at zero distortion, or at any
+to the true data density p∗(x), and computing the marginal
+                                                               other ﬁxed distortion by making the marginal approximation
+pe(z) = R dx pe(x, z) can be challenging.  For the for-                                               m(z) a weaker approximation to pe(z), and hence simply
+mer problem, we can use a stochastic approximation, by
+                                                            increasing the cost of encoding our latent variables, since
+assuming we have access to a (suitably large) empirical
+                                                         only the rate and not the distortion depends on m(z).
+distribution ˆp(x). For the latter problem, we can leverage
+tractable variational bounds on mutual information Barber   The left vertical line corresponds to the zero rate setting.
+& Agakov (2003); Agakov (2006); Alemi et al. (2017) to    Since R = 0 =⇒  e(z|x) = m(z), we see that our en-
+get the following variational lower and upper bounds:        coding distribution e(z|x) must itself be independent of x.
+
+                                                                                     1If the input space is continuous, we can consider an arbitrarily
+        H −D ≤Ie(X; Z) ≤R              (2)    ﬁne discretization of the input.
+
+=== PDF page 3 ===
+                                                 Fixing a Broken ELBO
+
+                                                         d(x|z) to model the true likelihood pe(x|z), will lead to
+                                                        a gap with respect to the optimal black surface. However,
+                                                        our inequalities must still hold, which suggests that there
+                                                                will still be a one dimensional optimal frontier, D(R), or
+                                          R(D) where optimality is deﬁned to be the tightest achiev-
+                                                            able sandwiched bound within the parametric family. We
+                                                                 will use the term RD curve to refer to this optimal surface
+                                                                 in the rate-distortion (RD) plane.
+
+                                                          Furthermore, by the same arguments as above, this surface
+                                                        should be monotonic in both R and D, since for any solu-
+                                                                     tion, with only very mild assumptions on the form of the
+                                                             parametric families, we should always be able to make m(z)
+                                                                    less accurate in order to increase the rate at ﬁxed distortion
+                                                              (see shift from red curve to blue curve in ﬁg. 1), or make
+                                                                the decoder d(x|z) less accurate to increase the distortion at
+                                                   ﬁxed rate (see shift from red curve to green curve in ﬁg. 1).
+                                                          Since the data entropy H is outside our control, this surface
+                                                      can be found by means of constrained optimization, either
+                                                       minimizing the distortion at some ﬁxed rate (see section 4),
+                                                             or minimizing the rate at some ﬁxed distortion.
+
+                                                    Connection to β-VAE   Alternatively, instead of consid-
+Figure 1. Schematic representation of the phase diagram in the    ering the rate as ﬁxed, and tracing out the optimal dis-
+RD-plane. The distortion (D) axis measures the reconstruction     tortion as a function of the rate D(R), we can perform
+error of the samples in the training set. The rate (R) axis mea-    a Legendre transformation and can ﬁnd the optimal rate
+sures the relative KL divergence between the encoder and our own    and distortion for a ﬁxed β =  ∂D∂R , by minimizing
+marginal approximation. The thick black lines denote the feasible
+                                                                  mine(z|x),m(z),d(x|z) D + βR. Writing this objective out
+boundary in the inﬁnite model capacity limit.
+                                                                 in full, we get
+
+                                                                Z        Z
+                                                        min       dx p∗(x)   dz e(z|x)
+Thus the latent representation is not encoding any informa-              e(z|x),m(z),d(x|z)                                                                                                                           (6)
+tion about the input and we have failed to create a useful                                          e(z|x)
+                                                            −log d(x|z) + β log             .
+learned representation. However, by using a suitably pow-                                  m(z)
+erful decoder, d(x|z), that is able to capture correlations
+                                                                           If we set β = 1, (and identify e(z|x) →q(z|x), d(x|z) →
+between the components of x we can still reduce the dis-
+                                                             p(x|z), m(z) →p(z)) this matches the ELBO objective
+tortion to the lower bound of H, thus achieving the point
+                                                        used when training a VAE (Kingma & Welling, 2014), with
+(R = 0, D = H); we call this the auto-decoding limit.
+                                                                the distortion term matching the reconstruction loss, and the
+(Note that since R is an upper bound on the non-negative
+                                                                  rate term matching the “KL term” (ELBO = −(D + R)).
+mutual information, in the limit that R = 0, the bound must
+                                                         Note, however, that this objective does not distinguish be-
+be tight, which guarantees that m(z) = pe(z).) We can
+                                                    tween any of the points along the diagonal of the optimal
+achieve solutions further up on the D-axis, while keeping
+                                RD curve, all of which have β = 1 and the same ELBO.
+the rate ﬁxed, simply by making the decoder worse, and
+                                                  Thus the ELBO objective alone (and the marginal likeli-
+hence our reconstructions worse, since only the distortion
+                                                       hood) cannot distinguish between models that make no use
+and not the rate depends on d(x|z).
+                                                            of the latent variable (autodecoders) versus models that
+Finally, we discuss solutions along the diagonal line. Such   make large use of the latent variable and learn useful repre-
+points satisfy D = H −R, and hence both of our bounds are     sentations for reconstruction (autoencoders), in the inﬁnite
+tight, so m(z) = pe(z) and d(x|z) = pe(x|z). (Proofs of    model family, as noted in Husz´ar (2017); Phuong et al.
+these claims are given in Sections D.3 and D.4 respectively.)    (2018).
+
+So far, we have considered the inﬁnite model family limit.    In the ﬁnite model family case, ELBO targets a single point
+If we have only ﬁnite parametric families for each of    along the rate distortion curve, the point with slope 1. Ex-
+d(x|z), m(z), e(z|x), we expect in general that our bounds     actly where this slope 1 point lies is a sensitive function
+will not be tight. Any failure of the approximate marginal    of the model architecture and the relative powers of the
+m(z) to model the true marginal pe(z), or the decoder    encoder, decoder and marginal.
+
+=== PDF page 4 ===
+                                                 Fixing a Broken ELBO
+
+If we allow a general β ≥0, we get the β-VAE objective     variational bounds on mutual information, and made close
+used in (Higgins et al., 2017; Alemi et al., 2017). This    analogies and comparisons to maximum likelihood learning
+allows us to smoothly interpolate between auto-encoding    and variational autoencoders. Recently, information the-
+behavior (β ≪1), where the distortion is low but the rate    ory has been useful for reinterpreting the ELBO (Hoffman
+is high, to auto-decoding behavior (β ≫1), where the  & Johnson, 2016), and understanding the class of tractable
+distortion is high but the rate is low, all without having to     objectives for training generative models (Zhao et al., 2018).
+change the model architecture. Notice however that if our
+                                                      Recent work has also presented information maximization
+model family was rich enough to have a region of its RD-
+                                                              as a solution to the problem of VAEs ignoring the latent code.
+curve with some ﬁxed slope (e.g. in the extreme case, the
+                                                  Zhao et al. (2017) modiﬁes the ELBO by replacing the rate
+β = 1 line in the inﬁnite model family limit), the β-VAE
+                                                        term with a divergence from the aggregated posterior to the
+objective cannot uniquely target any of those equivalently
+                                                                prior and proves that solutions to this objective maximize
+sloped points. In these cases, fully exploring the frontier
+                                                             the representational mutual information. However, their
+would require a different constraint.
+                                                                objective requires leveraging techniques from implicit varia-
+                                                                   tional inference as the aggregated posterior is intractable to
+3. Related Work                                          evaluate. Chen et al. (2016) also presents an approach for
+                                                     maximizing information but requires the use of adversarial
+Improving VAE representations.  Many recent papers
+                                                              learning to match marginals in the input space. Concurrent
+have introduced mechanisms for alleviating the problem
+                                                  work from Phuong et al. (2018) present a similar framework
+of unused latent variables in VAEs. Bowman et al. (2016)
+                                                                  for maximizing information in a VAE through a variational
+proposed annealing the weight of the KL term of the ELBO
+                                                       lower bound on the generative mutual information. Eval-
+from 0 to 1 over the course of training but did not consider
+                                                            uating this bound requires sampling the generative model
+ending weights that differed from 1. Higgins et al. (2017)
+                                                      (which is slow for autoregressive models) and computing
+proposed the β-VAE for unsupervised learning, which is a
+                                                             gradients through model samples (which is challening for
+generalization of the original VAE in which the KL term is
+                                                                discrete input spaces). In Section 4, we present a similar
+scaled by β, similar to this paper. However, their focus was
+                                                        approach that uses a tractable bound on information that can
+on disentangling and did not discuss rate-distortion tradeoffs
+                                                     be applied to discrete input spaces without sampling from
+across model families. Recent work has used the β-VAE
+                                                              the model.
+objective to tradeoff reconstruction quality for sampling
+accuracy (Ha & Eck, 2018). Chen et al. (2017) present a
+bits-back interpretation (Hinton & Van Camp, 1993). Modi-                                                      Generative models and compression.  Rate-distortion
+fying the variational families (Kingma et al., 2016), priors                                                          theory has been used in compression to tradeoff the size
+(Papamakarios et al., 2017; Tomczak & Welling, 2017), and                                                            of compressed data with the ﬁdelity of the reconstruction.
+decoder structure (Chen et al., 2017) have also been pro-                                                      Recent approaches to compression have leveraged deep
+posed as a mechanism for learning better representations.                                                                  latent-variable generative models for images, and explored
+                                                                tradeoffs in the RD plane (Gregor et al., 2016; Ball´e et al.,
+                                                       2017; Johnston et al., 2017). However, this work focuses
+Information theory and representation learning.  The
+                                                  on a restricted set of architectures with simple posteriors
+information bottleneck framework leverages information
+                                                      and decoders and does not study the impact that architecture
+theory to learn robust representations (Tishby et al., 1999;
+                                                            choices have on the marginal likelihood and structure of the
+Shamir et al., 2010; Tishby & Zaslavsky, 2015; Alemi et al.,
+                                                                representation.
+2017; Achille & Soatto, 2016; 2017).  It allows a model
+to smoothly trade off the minimality of the learned repre-
+sentation (Z) from data (X) by minimizing their mutual    4. Experiments
+information, I(X; Z), against the informativeness of the
+                                                Toy Model  In this section, we empirically show a case
+representation for the task at hand (Y ) by maximizing their
+                                                   where the usual ELBO objective can learn a model which
+mutual information, I(Z; Y ). Tishby & Zaslavsky (2015)
+                                                               perfectly captures the true data distribution, p∗(x), but
+plot an RD curve similar to the one in this paper, but they
+                                                   which fails to learn a useful latent representation. How-
+only consider the supervised setting.
+                                                                  ever, by training the same model such that we minimize
+Maximizing mutual information to power unsupervised rep-    the distortion, subject to achieving a desired target rate R∗,
+resentational learning has a long history. Bell & Sejnowski   we can recover a latent representation that closely matches
+(1995) uses an information maximization objective to derive    the true generative process (up to a reparameterization),
+the ICA algorithm for blind source separation. Slonim et al.    while also perfectly capturing the true data distribution. In
+(2005) learns clusters with the Blahut-Arimoto algorithm.    particular, we solve the following optimization problem:
+Barber & Agakov (2003) was the ﬁrst to introduce tractable     mine(z|x),m(z),d(x|z) D + |σ −R| where σ is the target rate.
+
+=== PDF page 5 ===
+                                                 Fixing a Broken ELBO
+
+(Note that, since we use very ﬂexible nonparametric models,    dataset from Larochelle & Murray (2011)4.
+we can achieve pe(x) = p∗(x) while ignoring z, so using
+                                        We examine several VAE model architectures that have been
+the β-VAE approach would not sufﬁce.)
+                                                      proposed in the literature. In particular, we consider sim-
+We create a simple data generating process that consists    ple and complex variants for the encoder and decoder, and
+of a true latent variable Z∗= {z0, z1} ∼Ber(0.7) with    three different types of marginal. The simple encoder is
+added Gaussian noise and discretization. The magnitude    a CNN with a fully factored 64 dimensional Gaussian for
+of the noise was chosen so that the true generative model    e(z|x); the more complex encoder is similar, but followed
+had I(x; z∗) = 0.5 nats of mutual information between    by 4 steps of mean-only Gaussian inverse autoregressive
+the observations and the latent. We additionally choose a   ﬂow (Kingma et al., 2016), with each step implemented as a
+model family with sufﬁcient power to perfectly autoencode    3 hidden layer MADE (Germain et al., 2015) with 640 units
+or autodecode. See Appendix E for more detail on the data     in each hidden layer. The simple decoder is a multilayer
+generation and model.                                      deconvolutional network; the more powerful decoder is a
+                                               PixelCNN++ (Salimans et al., 2017) model. The simple
+Figure 2 shows various distributions computed using three
+                                                          marginal is a ﬁxed isotropic Gaussian, as is commonly used
+models. For the left column (2a), we use a hand-engineered
+                                                          with VAEs; the more complicated version has a 4 step 3 layer
+encoder e(z|x), decoder d(x|z), and marginal m(z) con-
+                                  MADE (Germain et al., 2015) mean-only Gaussian autore-
+structed with knowledge of the true data generating mech-
+                                                                gressive ﬂow (Papamakarios et al., 2017). We also consider
+anism to illustrate an optimal model. For the middle (2b)
+                                                              the setting in which the marginal uses the VampPrior from
+and right (2c) columns, we learn e(z|x), d(x|z), and m(z)
+                                                   (Tomczak & Welling, 2017). We will denote the particular
+using effectively inﬁnite data sampled from p∗(x) directly.
+                                                    model combination by the tuple (+/−, +/−, +/ −/v), de-
+The middle column (2b) is trained with ELBO. The right
+                                                        pending on whether we use a simple (−) or complex (+) (or
+column (2c) is trained by targeting R = 0.5 while minimiz-
+                                                          (v) VampPrior) version for the (encoder, decoder, marginal)
+ing D.2 In both cases, we see that p∗(x) ≈g(x) ≈d(x)
+                                                                 respectively. In total we consider 2 × 2 × 3 = 12 models.
+for both trained models (2bi, 2ci), indicating that optimiza-
+                                       We train them all to minimize the β-VAE objective in Equa-
+tion found the global optimum of the respective objectives.
+                                                                 tion 6. Full details can be found in Appendix F. Runs were
+However, the VAE fails to learn a useful representation, only
+                                                      performed at various values of β ranging from 0.1 to 10.0,
+yielding a rate of R = 0.0002 nats,3 while the Target Rate
+                                                          both with and without KL annealing (Bowman et al., 2016).
+model achieves R = 0.4999 nats. Additionally, it nearly
+perfectly reproduces the true generative process, as can be    Figure 3a(i) shows the converged RD location for a total
+seen by comparing the yellow and purple regions in the    of 209 distinct runs across our 12 architectures, with differ-
+z-space plots (2aii, 2cii) – both the optimal model and the    ent initializations and βs on the MNIST dataset. The best
+Target Rate model have two clusters, one with about 70%   ELBO we achieved was ˆH = 80.2 nats, at R = 0. This
+of the probability mass, corresponding to class 0 (purple     sets an upper bound on the true data entropy H for the static
+shaded region), and the other with about 30% of the mass   MNIST dataset. The dashed line connects (R = 0, D = ˆH)
+(yellow shaded region) corresponding to class 1. In contrast,    to (R = ˆH, D = 0), This implies that any RD value
+the z-space of the VAE (2bii) completely mixes the yellow    above the dashed line is in principle achievable in a pow-
+and purple regions, only learning a single cluster. Note that     erful enough model. The stepwise black curves show the
+we reproduced essentially identical results with dozens of    monotonic Pareto frontier of achieved RD points across
+different random initializations for both the VAE and the     all model families. The grey solid line shows the corre-
+penalty VAE model – these results are not cherry-picked.     sponding convex hull, which we approach closely across
+                                                                           all rates. The 12 model families we considered here, ar-
+                                                        guably a representation of the classes of models considered
+MNIST: RD curve  In this section, we show how com-    in the VAE literature, in general perform much worse in
+paring models in terms of rate and distortion separately is    the auto-encoding limit (bottom right corner) of the RD
+more useful than simply observing marginal log likelihoods,    plane. This is likely due to a lack of power in our current
+and allows a detailed ablative comparison of individual ar-    marginal approximations, and suggests more experiments
+chitectural modiﬁcations. We use the static binary MNIST    with powerful autoregressive marginals, as in van den Oord
+                                                                      et al. (2017).   2Note that the target value R = I(x; z∗) = 0.5 is computed
+with knowledge of the true data generating distribution. However,    Figure 3a(iii) shows the same data, but this time focusing on
+this is the only information that is “leaked” to our method, and in                                                               the conservative Pareto frontier across all architectures with
+general it is not hard to guess reasonable targets for R for a given
+                                                                    either a simple deconvolutional decoder (blue) or a complextask and dataset.
+   3This is an example of VAEs ignoring the latent space. As                                                  4https://github.com/yburda/iwae/tree/
+decoder power increases, even β = 1 is sufﬁcient to cause the                                               master/datasets/BinaryMNIST
+model to collapse to the autodecoding limit.
+
+=== PDF page 6 ===
+                                                 Fixing a Broken ELBO
+
+
+
+
+
+         (a) Optimal (hand-constructed)                           (b) VAE                                    (c) Target Rate
+
+Figure 2. Toy Model illustrating the difference between ﬁtting a model by maximizing ELBO (b) vs minimizing distortion for a ﬁxed rate (c).
+Top (i): Three distributions in data space: the true data distribution, p∗(x), the model’s generative distribution, g(x) = Pz m(z)d(x|z),
+and the empirical data reconstruction distribution, d(x) = Px′ Pz ˆp(x′)e(z|x′)d(x|z). Middle (ii): Four distributions in latent space:
+the learned (or computed) marginal m(z), the empirical induced marginal e(z) = Px ˆp(x)e(z|x), the empirical distribution over z
+values for data vectors in the set X0 = {xn : zn = 0}, which we denote by e(z0) in purple, and the empirical distribution over z values
+for data vectors in the set X1 = {xn : zn = 1}, which we denote by e(z1) in yellow. Bottom: Three K × K distributions: (iii) e(z|x),
+(iv) d(x|z) and (v) p(x′|x) = Pz e(z|x)d(x′|z).
+
+
+autoregressive decoder (green). Notice the systematic fail-    powerful PixelCNN++ decoder, and a powerful VampPrior
+ure of simple decoder models at the lowest rates. Besides    marginal.
+that discrepancy, the frontiers largely track one another at
+                                                                            • When β = 1.10 (right column), the model obtains
+rates above 22 nats. This is perhaps unsurprising consid-
+                                    R = 0.0004, D = 80.6, ELBO=-80.6 nats, which is
+ering we trained on the binary MNIST dataset, for which
+                                                          an example of an autodecoder. The tiny rate indicates
+the measured pixel level sampling entropy on the test set is
+                                                                         that the decoder ignores its latent code, and hence the
+approximately 22 nats. When we plot the same data where
+                                                                  reconstructions are independent of the input x. For
+we vary the encoder (ii) or marginal (iv) from simple to
+                                                              example, when the input is x = 8 (bottom row), the re-
+complex, we do not see any systematic trends. Figure 3b
+                                                                   construction is ˆx = 3. However, the generated images
+shows the same raw data, but we plot -ELBO=R+D versus
+                                                                       in ﬁg. 4b sampled from the decoder look good. This is
+R. Here some of the differences between individual model
+                                                          an example of an autodecoder.
+families’ performances are more easily resolved.
+                                                                            • When β = 0.1 (left column), the model obtains R =
+                                                             156, D = 4.8 , ELBO=-161 nats. Here the model is an
+MNIST: Samples  To qualitatively evaluate model perfor-                                                                     excellent autoencoder, generating nearly pixel-perfect
+mance, Figure 4 shows sampled reconstructions and genera-                                                                    reconstructions. However, samples from this model’s
+tions from some of the runs, which we have grouped into                                                                             prior, as shown in ﬁg. 4b, are very poor quality, which
+rough categories: autoencoders, syntactic encoders, seman-                                                                                    is also reﬂected in the worse ELBO. This is an example
+tic encoders, and autodecoders. For reconstruction, we pick                                                                  of an autoencoder.
+an image x at random, encode it using z ∼e(z|x), and then                                                                            • When β = 1.0, (third column), we get R = 6.2, D =
+reconstruct it using ˆx ∼d(x|z). For generation, we sample                                                                    74.1, ELBO=-80.3. This model seems to retain seman-
+z ∼m(z), and then decode it using x ∼d(x|z). In both                                                                           tically meaningful information about the input, such
+cases, we use the same z each time we sample x, in order                                                                   as its class and width of the strokes, but maintains syn-
+to illustrate the stochasticity implicit in the decoder. This is                                                                          tactic variation in the individual reconstructions, so
+particularly important to do when using powerful decoders,                                              we call this a semantic encoder. In particular, notice
+such as autoregressive models.                                                                         that the input “2” is reconstructed as a similar “2” but
+In Figures 4a and 4b, we study the effect of changing β         with a visible loop at the bottom (top row). This model
+(using KL annealing from low to high) on the same -+v         also has very good generated samples. This semantic
+model, corresponding to a VAE with a simple encoder, a        encoding arguably typiﬁes what we want to achieve in
+
+=== PDF page 7 ===
+                                                 Fixing a Broken ELBO
+
+
+
+
+
+                           (a) Distortion vs Rate                                         (b) ELBO (R + D) vs Rate
+
+Figure 3. Rate-distortion curves on MNIST. (a) We plot the best (R, D) value obtained by various models, denoted by the tuple (e, d, m),
+where e ∈{−, +} is the simple Gaussian or complex IAF encoder, d ∈{−, +} is the simple deconv or complex pixelCNN++ decoder,
+and m ∈{−, +, v) is the simple Gaussian, complex MAF or even more complex Vamp marginal. The top left shows all architectures
+individually. The next three panels show the computed frontier as we sweep β for a given pair (or triple) of model types. (b) The same
+data, but on the skew axes of -ELBO = R + D versus R. Shape encodes the marginal, lightness of color denotes the decoder, and ﬁll
+denotes the encoder.
+
+
+     unsupervised learning: we have learned a highly com-   Omniglot We repeated the experiments on the omniglot
+     pressed representation that retains semantic features of     dataset, and ﬁnd qualitatively similar results.  See ap-
+     the data. We therefore call it a “semantic encoder”.      pendix B for details.
+   • When β =  0.15 (second column), we get R =
+     120.3, D = 8.1, ELBO=-128. This model retains both                                                        5. Discussion and further work
+     semantic and syntactic information, where each digit’s
+     style is maintained, and also has a good degree of   We have presented a theoretical framework for understand-
+     compression. We call this a “syntactic encoder”. How-    ing representation learning using latent variable models in
+     ever, at these higher rates the failures of our current    terms of the rate-distortion tradeoff. This constrained op-
+     architectures to approach their theoretical performance    timization problem allows us to ﬁt models by targeting a
+    becomes more apparent, as the corresponding ELBO    speciﬁc point on the RD curve, which we cannot do using
+     of 128 nats is much higher than the 81 nats we obtain at    the β-VAE framework.
+    low rates. This is also evident in the visual degradation
+                                                            In addition to the theoretical contribution, we have con-
+     in the generated samples (Figure 4b).
+                                                        ducted a large set of experiments, which demonstrate the
+Figure 4c shows what happens when we vary the model     tradeoffs implicitly made by several recently proposed VAE
+for a ﬁxed value of β = 1, as in traditional VAE training.    models. We conﬁrmed the power of autoregressive decoders,
+Here only 4 architectures are shown (the full set is available     especially at low rates. We also conﬁrmed that models with
+in Figure 5 in the appendix), but the pattern is apparent:    expressive decoders can ignore the latent code, and pro-
+whenever we use a powerful decoder, the latent code is    posed a simple solution to this problem (namely reducing
+independent of the input, so it cannot reconstruct well. How-    the KL penalty term to β < 1). This ﬁx is much easier to
+ever, Figure 4a shows that by using β < 1, we can force    implement than other solutions that have been proposed in
+such models to do well at reconstruction. Finally, Figure 4d     the literature, and comes with a clear theoretical justiﬁcation.
+shows 4 different models, chosen from the Pareto frontier,    Perhaps our most surprising ﬁnding is that all the current
+which all have almost identical ELBO scores, but which    approaches seem to have a hard time achieving high rates
+exhibit qualitatively different behavior.                          at low distortion. This suggests the need to develop better
+
+=== PDF page 8 ===
+                                                 Fixing a Broken ELBO
+
+
+
+
+
+               (a) Reconstructions from -+v with β = 0.1 −1.1.            (b) Generations from -+v with β = 0.1 −1.1
+
+
+
+
+
+           (c) Reconstructions from 4 VAE models with β = 1.         (d) Reconstructions from models with the same ELBO.
+
+Figure 4. Here we show sampled reconstructions z ∼e(z|x), ˆx ∼d(x|z) and generations z ∼m(z), ˆx ∼d(x|z) from various model
+conﬁgurations. Each row is a different sample. Column ‘data’ is the input for reconstruction. Column ‘sample’ is a single binary image
+sample. Column ‘average’ is the mean of 5 different samples of the decoder holding the encoding z ﬁxed. (a-b) By adjusting β in a ﬁxed
+model architecture, we can smoothly interpolate between nearly perfect autoencoding on the left and nearly perfect autodecoding on the
+right. In between the two extremes are examples of syntactic encoders and semantic encoders. (c) By ﬁxing β = 1 we see the behavior
+of different architectures when trained as traditional VAEs. Here only 4 architectures are shown but the sharp transition from syntactic
+encoding on the left to autodecoding on the right is apparent. At β = 1, only one of the 12 architectures achieved semantic encoding. The
+complete version is in Figure 5 in the Appendix. (d) Here we show a set of models all with similar, competative ELBOs. While these
+models all have similar ELBOs, their qualitative performance is very different, again smoothly interpolating between the perceptually
+good reconstructions of the syntactic decoder, the syntactic variation of the semantic encoder, and ﬁnally two clear autodecoders. A more
+complete trace can be found at Figure 6. See text for discussion.
+
+
+marginal posterior approximations, which should in princi-    Achille, A. and Soatto, S. Emergence of Invariance and
+ple be able to reach the autoencoding limit, with vanishing      Disentangling in Deep Representations. Proceedings of
+distortion and rates approaching the data entropy.                the ICML Workshop on Principled Approaches to Deep
+                                                            Learning, 2017.
+Finally, we strongly encourage future work to report rate and
+distortion values independently, rather than just reporting    Agakov, F. V.  Variational Information Maximization in
+the log likelihood, which fails to distinguish qualitatively       Stochastic Environments. PhD thesis, University of Edin-
+different behavior of certain models.                            burgh, 2006.
+
+                                                        Alemi, A. A., Fischer, I., Dillon, J. V., and Murphy, K. Deep
+References                                                    Variational Information Bottleneck. In ICLR, 2017.
+
+Achille, A. and Soatto, S. Information Dropout: Learning     Ball´e, J., Laparra, V., and Simoncelli, E. P.  End-to-end
+  Optimal Representations Through Noisy Computation.      Optimized Image Compression. In ICLR, 2017.
+  In Information Control and Learning, September 2016.
+                                                            Barber, D. and Agakov, F. V. Information maximization in  URL http://arxiv.org/abs/1611.01353.
+                                                             noisy channels : A variational approach. In NIPS. 2003.
+
+=== PDF page 9 ===
+                                                 Fixing a Broken ELBO
+
+Bell, A.  J. and Sejnowski,  T.  J.   An information-   Kingma, D. P. and Welling, M. Auto-encoding variational
+  maximization approach to blind separation and blind      Bayes. In ICLR, 2014.
+  deconvolution.  Neural computation, 7(6):1129–1159,
+                                                  Kingma, D. P., Salimans, T., Jozefowicz, R., Chen, X.,  1995.
+                                                                 Sutskever, I., and Welling, M. Improved variational infer-
+Bowman, S. R., Vilnis, L., Vinyals, O., Dai, A. M., Joze-      ence with inverse autoregressive ﬂow. In NIPS. 2016.
+  fowicz, R., and Bengio, S. Generating sentences from a
+                                                       Lake, B. M., Salakhutdinov, R., and Tenenbaum, J. B.  continuous space. CoNLL, 2016.
+                                                        Human-level concept learning through probabilistic pro-
+Chen, X., Duan, Y., Houthooft, R., Schulman, J., Sutskever,     gram induction. Science, 350(6266):1332–1338, 2015.
+    I., and Abbeel, P. Infogan: Interpretable representation
+                                                            Larochelle, H. and Murray, I. The neural autoregressive  learning by information maximizing generative adversar-
+                                                                     distribution estimator. In AI/Statistics, 2011.   ial nets. arXiv preprint 1606.03657, 2016.
+
+                                                     Makhzani, A., Shlens, J., Jaitly, N., and Goodfellow, I.Chen, X., Kingma, D. P., Salimans, T., Duan, Y., Dhariwal,
+                                                              Adversarial autoencoders. In ICLR, 2016.   P., Schulman, J., Sutskever, I., and Abbeel, P. Variational
+  Lossy Autoencoder. In ICLR, 2017.
+                                                       Papamakarios, G., Murray, I., and Pavlakou, T. Masked
+                                                                  autoregressive ﬂow for density estimation. In NIPS. 2017.Germain, M., Gregor, K., Murray, I., and Larochelle, H.
+  Made: Masked autoencoder for distribution estimation.                                                     Phuong, M., Welling, M., Kushman, N., Tomioka, R.,
+  In ICML, 2015.                                                      and Nowozin,  S.   The mutual autoencoder:  Con-
+                                                                      trolling  information  in  latent code  representations,Gregor, K., Besse, F., Rezende, D. J., Danihelka, I., and
+                                                         2018. URL https://openreview.net/forum?  Wierstra, D. Towards conceptual compression. In Ad-
+                                              id=HkbmWqxCZ.  vances In Neural Information Processing Systems, pp.
+  3549–3557, 2016.                                                      Rezende, D. J., Mohamed, S., and Wierstra, D. Stochas-
+                                                                             tic backpropagation and approximate inference in deepHa, D. and Eck, D. A neural representation of sketch draw-
+                                                                generative models. In ICML, 2014.   ings. International Conference on Learning Represen-
+   tations, 2018. URL https://openreview.net/                                                           Salimans, T., Karpathy, A., Chen, X., and Kingma, D. P. Pix-
+  forum?id=Hy6GHpkCW.                                                            elcnn++: Improving the pixelcnn with discretized logistic
+                                                          mixture likelihood and other modiﬁcations.  In ICLR,Higgins, I., Matthey, L., Pal, A., Burgess, C., Glorot, X.,
+                                                          2017.  Botvinick, M., Mohamed, S., and Lerchner, A. β-VAE:
+  Learning Basic Visual Concepts with a Constrained Vari-                                                        Shamir, O., Sabato, S., and Tishby, N. Learning and gen-
+   ational Framework. In ICLR, 2017.                                                                    eralization with the information bottleneck. Theoretical
+                                                     Computer Science, 411(29):2696 – 2711, 2010.
+Hinton, G. E. and Van Camp, D. Keeping the neural net-
+  works simple by minimizing the description length of                                                       Slonim, N., Atwal, G. S., Tkaˇcik, G., and Bialek, W.
+  the weights. In Proc. of the Workshop on Computational                                                           Information-based clustering.  PNAS, 102(51):18297–
+  Learning Theory, 1993.                                                         18302, 2005.
+
+Hoffman, M. D. and Johnson, M. J.  Elbo surgery: yet                                                           Tishby, N. and Zaslavsky, N. Deep learning and the infor-
+  another way to carve up the variational evidence lower                                                        mation bottleneck principle. In 2015 IEEE Information
+  bound. In NIPS Workshop in Advances in Approximate                                                        Theory Workshop (ITW), 2015.
+  Bayesian Inference, 2016.
+                                                           Tishby, N., Pereira, F., and Biale, W.  The information
+Husz´ar,  F.    Is maximum likelihood useful for repre-                                                                bottleneck method. In The 37th annual Allerton Conf. on
+  sentation  learning?,  2017.   URL http://www.                                                       Communication, Control, and Computing, pp. 368–377,
+  inference.vc/maximum-likelihood-for-                                                           1999. URL https://arxiv.org/abs/physics/
+  representation-learning-2/.                                               0004057.
+
+Johnston, N., Vincent, D., Minnen, D., Covell, M., Singh,                                                   Tomczak, J. M. and Welling, M. VAE with a VampPrior.
+   S., Chinen, T., Hwang, S. J., Shor, J., and Toderici, G.      ArXiv e-prints, 2017.
+  Improved Lossy Image Compression with Priming and
+  Spatially Adaptive Bit Rates for Recurrent Networks.   van den Oord, A., Vinyals, O., and kavukcuoglu, k. Neural
+  ArXiv e-prints, 2017.                                            discrete representation learning. In NIPS. 2017.
+
+=== PDF page 10 ===
+                                                 Fixing a Broken ELBO
+
+Zhao, S., Song, J., and Ermon, S.  Infovae: Information
+  maximizing variational autoencoders.  arXiv preprint
+  1706.02262, 2017.
+
+Zhao,  S., Song,  J., and Ermon, S.  The information-
+  autoencoding family: A lagrangian perspective on la-
+   tent variable generative modeling, 2018. URL https:
+  //openreview.net/forum?id=ryZERzWCZ.

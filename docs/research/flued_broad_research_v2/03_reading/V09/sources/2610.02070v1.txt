@@ -1,0 +1,2671 @@
+                                       Preprint
+
+                                       CAUSAL MEMORY POLICY: MAKING MEMORY UTILITY
+                                            IDENTIFIABLE BY INTERVENING ON RETRIEVAL
+
+                                       Arman Behnam                      Binghui Wang
+                                       Department of Computer Science    Department of Computer Science
+                                       Illinois Institute of Technology  Illinois Institute of Technology
+                                       Chicago, IL                       Chicago, IL
+
+                                       abehnam@hawk.illinoistech.edu     bwang70@iit.edu
+
+arXiv:2610.02070v1 [cs.AI] 1 Oct 2026                                             ABSTRACT
+
+                                                 Memory-augmented large language models must decide which memories to retain,
+                                                 and recent systems do so by estimating each memory’s effect on task performance.
+                                                 However, these estimates rely entirely on retrieved memories. When a memory
+                                                 is never retrieved, store-level interventions produce identical outcomes, leaving
+                                                 its utility unidentified. This is a retrieval-level positivity violation, invisible to
+                                                 diagnostics that examine only memory operations.
+                                                 We introduce Causal Memory Policy (CMP), a causal framework that restores
+                                                 identification by intervening on retrieval itself, reserving a fixed number of
+                                                 context slots for memories sampled with known propensity scores. CMP es-
+                                                 timates memory utility via self-normalized inverse propensity weighting un-
+                                                 der a balanced assignment design with fixed sampling propensities. We prove
+                                                 the causal factorization of memory utility through retrieval, the unbiasedness
+                                                 and exact variance of the estimator, and the optimal decision rule under irre-
+                                                 versible operations. Empirically, identification fails for 54% of required mem-
+                                                 ories on LongMemEval and 67% on LoCoMo, and the failure persists in a de-
+                                                 ployed memory system. CMP improves discrimination between required and
+                                                 non-required memories from 0.54 to 0.66 AUC. Finally, we show that identi-
+                                                 fied memory utility alone is insufficient for retention decisions: per-query utility
+                                                 reaches 0.78 AUC on the query for which it is estimated. Code is available at:
+                                                 https://anonymous.4open.science/r/cmp-release-D0C3/.
+
+                                       1 INTRODUCTION
+
+                                       Large language models (LLMs) exhibit remarkable capabilities across a broad spectrum of tasks, but
+                                       remain fundamentally constrained by fixed context windows that limit the information accessible at
+                                       inference time. As the scope and duration of LLM deployments grow, effective management of what is
+                                       remembered, forgotten, and reorganized becomes a first-order design challenge. Memory-augmented
+                                       LLMs (Zhong et al., 2024; Wang et al., 2024b) address this limitation by maintaining external memory
+                                       stores that persist across interactions, enabling long-horizon reasoning, user personalization, and
+                                       incremental knowledge accumulation. A detailed discussion of related work is in Appendix A.
+
+                                       Deciding what to retain requires estimating the utility of each memory. Recent systems estimate
+                                       this quantity from per-memory success and failure counts (Simsek, 2026), paired trajectories with
+                                       and without a candidate memory (Gao et al., 2026), controlled interventions on the candidate
+                                       set (Srivastava, 2026), and explicit retention budgets (Wu et al., 2026). All of these estimators rely
+                                       solely on memories already retrieved by the logging policy (see Appendix H.1 for an example). This
+                                       raises four fundamental questions: (1) When is memory utility identified from logged interactions?
+                                       Identification requires observing a memory both present and absent in the retrieved context, which no
+                                       deterministic logging policy guarantees. (2) What does an estimator return when the estimand is not
+                                       identified? A degenerate contrast often yields an estimate near zero, making identification failure
+                                       indistinguishable from genuinely low memory utility. (3) Which memory management policies are
+                                       affected? Only policies that rank memories by estimated utility are susceptible; recency- or frequency-
+                                       based heuristics never evaluate the affected memories. (4) How can identification be restored, and
+
+                                                                                                  1
+Preprint
+
+at what cost? Randomization must be introduced into retrieval, since perturbing the memory store
+leaves the retrieved context unchanged whenever the perturbed memory is not retrievable.
+
+The root cause is that retrieval mediates the effect of the memory state on task output. A memory
+influences an answer only if it is retrieved into the context the model reads, so intervening on the
+memory store affects the output only through what retrieval subsequently surfaces. Memory utility
+therefore factorizes into two components: the probability of retrieval and the contribution once
+retrieved. Logged interactions cannot distinguish a memory with genuinely low utility from one
+that was never given the opportunity to contribute. This is a positivity violation, the causal inference
+condition requiring every unit to have a nonzero probability of receiving each treatment. Because
+the violation occurs at the level of retrieval, diagnostics that verify exploration only over memory
+operations fail to detect it. Existing causal approaches to memory management do not address
+this retrieval-level positivity failure. They either place the ground-truth answer inside the selection
+loop (Srivastava, 2026), which is unavailable at deployment, or verify overlap only over the operations
+selected by the policy (Li et al., 2026), leaving retrieval itself uncontrolled.
+
+We propose a corrected view: memory utility as a retrieval-mediated causal effect. We formalize a
+memory-augmented LLM as a structural causal model (SCM) (Pearl, 2009), where retrieval mediates
+the effect of memory operations on task outputs. Structural causal models have also been used to
+explain graph neural network predictions through their causal subgraphs (Behnam and Wang, 2024)
+and to learn representations when labels cause the observed features (Behnam and Wang, 2026); here
+they expose a support condition that associational memory scores leave unchecked. Built on this
+formulation, we develop the Causal Memory Policy (CMP), whose components resolve the above
+four questions: (i) Identification. We derive a factorization of memory utility into retrievability
+and conditional usefulness, prove the resulting non-identifiability under deterministic retrieval, and
+explain why unidentified estimators converge to values near zero rather than becoming undefined,
+answering Questions (1) and (2). (ii) Restoring identification and cost. We introduce a randomized
+exposure design that reserves k context slots for memories sampled with known propensity, restoring
+positivity by construction while requiring a budget that scales only with the candidate pool being
+identified, answering Question (4). (iii) Empirical characterization. We quantify retrieval-level
+positivity failure on two benchmarks and a deployed memory system, identifying when utility-based
+policies are affected and when heuristic policies are not, answering Question (3). (iv) Decision theory.
+We characterize what identified memory utility can support by deriving the Bayes-optimal policy
+under asymmetric reversible and irreversible operations, and show that no aggregation available to a
+retention policy predicts a memory’s utility on unseen queries.
+
+We evaluate CMP on LongMemEval (Wu et al., 2024) (long-horizon retention over ∼ 490-turn
+histories), LoCoMo (Maharana et al., 2024) (multi-session dialogue with many queries over a single
+memory store), HotpotQA (Yang et al., 2018) and MuSiQue (Trivedi et al., 2022) (2–4-hop reasoning,
+as replication), and Mem0 (Chhikara et al., 2025) (a deployed memory system, as transfer). We
+find that retrieval-level identification failure is substantial rather than an implementation artifact: it
+affects 54% of required memories on LongMemEval and 67% on LoCoMo, and persists in Mem0,
+where unretrieved evidence has a median retrieval rank of 139 among 291 stored memories. Store-
+level randomization leaves the retrieved context unchanged on 52.2% of perturbations, causing
+utility-based eviction to perform no better than chance (lift 0.97). Restricting evaluation to retrieved
+memories eliminates the gap between the two estimators (0.655 vs. 0.658 AUC), localizing the failure
+to positivity. CMP raises discrimination between required and non-required memories from 0.54 to
+0.66 AUC, and per-query estimation raises it to 0.78. Finally, we show that identified utility alone
+does not determine retention: no aggregation over observed queries predicts a memory’s value on
+unseen queries, indicating that the remaining limitation lies in the estimand.
+
+2 PROBLEM FORMULATION
+
+We formalize a memory-augmented LLM as an SCM and memory operations as causal interventions.
+We show that retrieval mediates all paths from memory state to task output and derive the identification
+condition imposed by this mediation. A summary of the notation is in Table 5 in the Appendix B.
+
+2.1 MEMORY SYSTEM AS A STRUCTURAL CAUSAL MODEL
+
+Definition 1 (Memory-Augmented LLM as SCM). A memory-augmented LLM is an SCM M =
+(U, V, F). Exogenous variables U = {Q, C} consist of user queries Q drawn from a task distribution
+Q and observed context C (conversation metadata, task type), with realizations qt and ct. Endogenous
+variables V = {M, R, O, Y } are defined as: Mt ∈ 2M is the memory state at time t and a finite
+
+                                                           2
+Preprint
+
+set of stored memories from universe M, Rt ⊆ Mt is the retrieved subset for query qt ∈ Q,
+
+Ot ∈ O ≜ {store, forget, consolidate, noop} is the memory operation applied at time t,
+each parameterized by its arguments as in Definition 2, and Yt ∈ Y is the output of a downstream task.
+The structural equations F are Rt = fR(Mt, qt) (retrieval), Yt = fY (Rt, qt, θLLM) (generation),
+Ot = fO(Mt, qt, ct) (operation selection), and Mt+1 = fM (Mt, Ot, qt) (memory transition).
+
+Here, ct denotes the observed context (e.g., conversation metadata and task type) on which the policy
+conditions when selecting an operation, and θLLM denotes the frozen LLM parameters. Note that ct
+enters fO but not fY : the generator receives only the retrieved memories and the query, so every path
+from the memory state to the output passes through Rt. This mediation underlies the identification
+result in Section 2.3 and holds by construction in all our experiments: the generator takes as input
+
+only the retrieved memory texts and the question, without any item metadata.
+
+Figure 1 presents       Time t  C1: Query-induced confounding                       Time t+1
+the causal DAG of a                                                                                             qt+1
+                                              qt
+
+memory-augmented                                                                    C3: Irreversible forgetting
+LLM in two consecu-
+
+tive time steps. Black  Mt                       Rt                Yt               Mt+1                         Rt+1       Yt+1
+
+solid edges denote              C2: Retrieval support  do(m ∈ Rt)
+structural equations;                    failure
+
+red dashed edges                ct               Ot         Zm(t) do(·)                   ct+1                   Ot+1
+denote confounding
+paths through the       Structural dependency          Query/context dependence           C4: No oracle for optimal memory
+query qt and context    Retrieval-mediated path        Exposure intervention (CMP)
+ct; thick blue edges
+denote the mediating    Figure 1: Causal DAG of memory-augmented LLMs across two timesteps.
+
+retrieval step. The DAG contains two sequential mediators with distinct roles. First, an operation Ot
+affects future outputs only through the memory state it produces, giving the chain Ot → Mt+1 with
+
+no direct path from an operation to a later output. This is why memory utility, rather than operation
+
+choice, is the estimand in Definition 3. Second, the memory state affects the output only through the
+
+retrieved subset, Mt → Rt → Yt, since Yt depends on Mt exclusively through Rt = fR(Mt, qt).
+
+This second mediation determines whether the estimand is identifiable. Together, the two mediators
+
+form the causal chain Ot → Mt+1 → Rt+1 → Yt+1. The reverse edge Mt → Ot captures the
+
+policy selecting an operation based on current memory state. The graph remains acyclic as forward
+
+and reverse edges connect different time steps.
+
+Prior work states the first mediation and leaves the second implicit. Only the second governs
+identification: an operation always induces a memory state, whereas a memory state containing
+m need not retrieve m. We therefore describe memory utility as retrieval-mediated to emphasize
+that identifiability is determined by retrieval. Each memory operation corresponds to a concrete
+modification of the memory state. We formalize these as interventions in the SCM.
+
+Definition 2 (Memory Operations as Causal Interventions). A memory operation o ∈ O
+acts as an intervention do(Mt+1 = fo(Mt)). store(mnew, Mt) is Mt+1 = Mt ∪ {mnew},
+forget(m, Mt) is Mt+1 = Mt \ {m}, consolidate(mi, mj, Mt) is Mt+1 = (Mt \
+{mi, mj}) ∪ {MERGE(mi, mj)}, where MERGE(mi, mj) produces a single memory preserving
+content of both inputs mi and mj, and noop(Mt) is Mt+1 = Mt.
+
+The central estimand is the causal effect of an individual memory on downstream task utility.
+
+DefinitionU3t((mM)em=orEyq,Uc tYiltit|yd).o(TMhet =utiMlitt+y mof),mqetm, cot ry−mEaqt,ctimYte |t,dog(ivMent =meMmt−ormy),stqatt,ectM,t, is: (1)
+
+where Mt+m = Mt ∪ {m} and Mt−m = Mt \ {m} denote the memory states (not operations) with
+and without m, respectively, and the expectation marginalizes over the query q and context c.
+
+Ut(m) underlies every memory decision: retaining m if Ut(m) > 0. Section 2.3 shows that Ut(m)
+factorizes through retrieval into a conditional utility UR(m), and that the factorization collapses when
+identification fails. For consolidation, the additive criterion Ut(mi) + Ut(mj) ignores interactions
+between memories. We therefore define consolidation directly through the joint intervention:
+
+      ∆consol(mi, mj ) = E[Y | do(Mt = (Mt \ {mi, mj }) ∪ {MERGE(mi, mj )})] − E[Y | do(Mt)] , (2)
+
+and consolidate when ∆consol(mi, mj) > 0. Because both terms are expectations over whole memory
+states, any interaction between mi and mj is already inside them, so no additivity is assumed. We
+
+                                                       3
+Preprint
+
+define this criterion so that the operation space is complete, but we do not claim a policy for it. It
+faces the same identification condition as Ut(m), and Section 3.3 shows that neither can drive a
+policy without aggregating over queries in a way we find unavailable.
+
+2.2 CORE CHALLENGES
+
+The causal formulation reveals four fundamental challenges, annotated in Figure 1:
+
+C1 Confounded effect estimation. The query qt simultaneously influences the memory operation
+     Ot, the retrieved set Rt, and the outcome Yt (red dashed edges in Figure 1), confounding
+     naive comparisons of memory configurations. Without adjustment, performance differences are
+     incorrectly attributed to memory content instead of query difficulty or user intent.
+
+C2 Support failure through the mediator. The intervention do(Mt) reaches Yt only through Rt
+     (thick blue edge in Figure 1). A memory the retriever never surfaces contributes to no output,
+     so Mt+m and Mt−m induce identical retrieved sets, and the two interventional arms become the
+     same experiment. The resulting contrast collapses toward zero, making an unretrieved memory
+     indistinguishable from one with genuinely zero utility. Only the latter justifies forget, so a
+     policy cannot distinguish safe from destructive eviction.
+
+C3 Irreversible operations. forget permanently removes a memory, preventing any future re-
+     estimation of its utility. By contrast, noop is reversible: a memory retained in error can be
+     evicted later. Decision rules that treat the two errors symmetrically are therefore misspecified.
+
+C4 No ground-truth oracle. The optimal memory state is never observed. Unlike supervised
+     learning, there is no target memory configuration to train against; the value of each memory
+     operation must be inferred solely from its downstream effects.
+
+2.3 RETRIEVAL-MEDIATED IDENTIFICATION
+
+Estimating memory utility requires two conditions. Exchangeability: timesteps where m is present
+must be comparable to those where it is absent, so outcome differences are attributable to m rather
+than to the circumstances under which it appears. Overlap: both cases must occur, since an effect
+cannot be estimated from one alone. Exchangeability is a property of the assignment mechanism,
+whereas overlap is a property of its support. Retrieval mediation of Section 2.1 determines where
+overlap must hold, and it is precisely there that it fails. Since Rt mediates the effect of memory on the
+output, memory utility factorizes into the probability of retrieval and utility conditional on retrieval.
+
+Proposition 1 (Retrieval-Mediated Factorization). Let do(m ∈ R) denote inserting m into the
+retrieved set R, displacing its lowest-ranked memory, and do(m ∈/ R) denote removing m and filling
+its slot with the highest-ranked memory not already in R, so that |R| remains fixed across both arms.
+Both are dynamic interventions: the displaced or substituted memory depends on the realized ranking
+at (Mt, qt). Under Definition 1, for any m and any (q, c),
+
+                  U (m | q, c) = P (m ∈ R | q, c) · UR(m | q, c), U (m) = Eq,c U (m | q, c) ,
+                                                                                                                                  (3)
+
+                  UR(m | q, c) ≜ E Y | do(m ∈ R), q, c − E Y | do(m ∈/ R), q, c .
+
+Proposition 1 factorizes memory utility into two terms: retrievability, P (m ∈ R | q, c), the probability
+that m is retrieved for query q; and conditional utility, UR(m | q, c), the change in expected outcome
+caused by including m in the retrieved context while holding the context size fixed. Their product is
+the contribution of m for (q, c), and U (m) averages it over the query distribution. The factorization
+also identifies where overlap must hold. Because its first factor is a retrieval probability, overlap is
+required in the retrieval variable, not in the operation variable.
+
+Assumption 1 (Retrieval Positivity). For all m ∈ Mt and all (q, c) in the support:
+
+          P m ∈ Rt | qt = q, ct = c > 0.                                            (4)
+
+Assumption 1 is the only assumption CMP requires. When it fails, the retrieval probability in Eq. 3 is
+zero, causing the product to collapse to zero regardless of the conditional utility. Section 3 constructs
+a design in which this assumption holds by construction, with P (m ∈ Rt | q, c) fixed and known. By
+contrast, prior methods that estimate memory utility from logged interactions additionally require
+two conditions (stated as Conditions 1 and 2 in Appendix C.4).
+
+Theorem 1 (Non-Identifiability under Retrieval Support Failure). Fix (q, c) and suppose P (m ∈
+R | q, c) = 0. Then fR(M +m, q) = fR(M −m, q), hence Y (M +m) = Y (M −m) almost surely, and
+U (m | q, c) = 0 irrespective of UR(m | q, c). Consequently, UR(m | q, c) is not identified by any
+design that holds M−m fixed while randomizing only whether m is included.
+
+                                       4
+Preprint
+
+      (a) exposure schedule                             (b) one timestep                 (c) three experimental arms
+
+                                        supplies Et   B−k slots, by rank                 observational No randomization
+
+                                               Mtm∈P    top-(B−k)                    fY  Yt store-level Mt randomized    UˆR(m), σˆ(m)
+                                                                                 Rt
+           t = 1, . . . , T                                                              exposure Rt randomized
+each memory receives nm expo-                                 Et
+sures, em = nm/T is known                                                                same estimator, dif-
+                                                     k slots, propensity em              ferent randomization
+
+Figure 2: Overview of CMP. (a) Balanced exposure assigns the T k exposure slots evenly across
+the exposure pool, fixing each memory’s propensity by design. (b) At each timestep, the context
+consists of the top-(B − k) retrieved memories together with k randomly exposed memories. (c) CMP
+compares three designs that differ only in the randomized variable while using the same estimator.
+
+Theorem 1 separates two failure modes that are observationally indistinguishable: a memory with
+UR(m) = 0 and one with P (m ∈ R | q, c) = 0 produce the same observed contrast. An estimate
+near zero therefore admits two interpretations: the memory has no utility, or the design never tests
+whether it has utility. Only the former justifies forget. The same asymmetry applies to store: a
+memory never stored generates no future observations, so its utility can never be estimated.
+
+2.4 PROBLEM STATEMENT
+
+Given logged interactions with a memory-augmented LLM, estimate the conditional utility UR(m |
+q, c) for every memory a policy may act on. Theorem 1 shows that no design randomizing only the
+memory state can do so when P (m ∈ R | q, c) = 0, regardless of sample size or the extent of store-
+level randomization. The problem is therefore to construct a design that guarantees Assumption 1
+over a specified set of memories and estimates UR from the resulting data.
+
+3 CAUSAL MEMORY POLICY
+
+We develop the Causal Memory Policy (CMP), which operationalizes retrieval-mediated identifica-
+tion through three components (Figure 2). Component (i) introduces a randomized retrieval exposure
+design in which a fixed number of context slots are withheld from the ranker and filled by memories
+sampled with known probability. This guarantees Assumption 1 by construction, makes the propensity
+a design parameter, and removes confounding on the randomized arm. Component (ii) estimates
+memory utility by self-normalized inverse-propensity weighting, while including observational and
+store-level randomized estimators as comparators to isolate the contribution of the design from that of
+the estimator. Component (iii) derives the Bayes-optimal decision rule under the asymmetry between
+reversible and irreversible operations, and shows that every aggregation over queries available to a
+retention policy is either attenuated or degenerate.
+
+These components address the challenges of Section 2.2: Component (i) resolves C1 and C2 by
+randomizing the retrieval mediator; Component (ii) addresses C4 by recovering utility solely from
+downstream outcomes and separating design effects from estimation effects; and Component (iii)
+addresses C3 by deriving the appropriate decision rule and identifying the remaining obstruction after
+utility is identified. Theoretical guarantees for each CMP component are established in Appendix C.
+
+3.1 RANDOMIZED RETRIEVAL EXPOSURE
+
+Theorem 1 shows that randomizing only the memory state cannot identify UR(m) for memories the
+retriever never surfaces. The obstruction is that retrieval is deterministic: given (Mt, qt), the ranker
+returns a single retrieved set, so a memory outside it is never observed in context and its two potential
+outcomes are never both realized. Store-level randomization cannot resolve this because retrieval is
+applied after the store is perturbed. We therefore randomize the mediator itself by reserving a fixed
+number of retrieval slots for randomized exposure rather than ranking. Specifically, At each timestep,
+the B context slots are filled by two mechanisms:
+
+          Exposure design: Rt = top-(B − k)(Mt, qt) ∪ Et, Et ⊂ P, |Et| = k,                                              (5)
+
+where B is the context budget and k ≤ B is the number of slots reserved for exposure. The remaining
+
+B − k slots are filled by the deterministic retriever rule of Definition 1, while Et is sampled from an
+exposure pool P ⊆ Mt. The extremes recover two familiar designs: k = 0 gives ordinary retrieval,
+whereas k = B removes the ranker entirely.
+
+Across T timesteps, the T k exposure slots are allocated as evenly as possible across P and randomly
+assigned to timesteps. Thus each memory m ∈ P receives exactly nm ∈ {⌊T k/|P|⌋, ⌈T k/|P|⌉}
+
+                                                     5
+Preprint
+
+exposures, and its propensity em = nm/T is known exactly. The propensities are fixed by design
+rather than estimated, so Assumption 1 holds by construction with minm em > 0.
+
+Balanced assignment is essential. Independent inclusion with the same expected count gives
+nm ∼ Binomial(T, k/|P|), which leaves many memories underexposed. For example, at T = 90,
+k = 2, and |P| = 32, the expected count is 5.6, yet roughly one third of the pool receives fewer than
+five exposures. Balanced assignment instead guarantees every memory exactly five or six exposures.
+Two properties of the design are worth noting. First, an exposure draw may select a memory already
+present in the deterministic retrieval, so the realized context contains at most B distinct memories;
+we report the realized context size in Section 4. Second, each memory receives T k/|P| exposures, so
+the horizon required to identify the entire pool grows linearly with |P|/k (see Appendix C in detail).
+
+Exposure pool P determines which memories can be identified. In our experiments, P contains
+the memories relevant to the evaluated queries together with the highest-ranked and a uniform sample
+of the remaining store, while retrieval continues over the full store. The experiments therefore
+establish that randomizing the retrieval mediator restores identification, but not that a deployable pool
+selector captures the memories that matter. Section 4 evaluates three practical selection rules and
+finds their recall near zero, identifying pool selection as the remaining open problem.
+
+3.2 UTILITY ESTIMATION UNDER KNOWN PROPENSITY
+
+We write Zm(t) = 1m∈Rt for the exposure retrieval indicator with Tm+ = {t : Zm(t) = 1}, Tm− =
+{t : Zm(t) = 0}. Since em is known, conditional utility is estimated by the self-normalized (Hájek)
+inverse-propensity weighting estimator (Imbens and Rubin, 2015):
+
+UˆR(m) =             t Zm(t)Yt/em −  t(1 − Zm(t))Yt/(1 − em)      =  1          Yt  −        1             Yt.  (6)
+                      t Zm(t)/em      t(1 − Zm(t))/(1 − em)
+                                                                     nm  t∈Tm+            T  −  nm  t∈Tm−
+
+The second equality follows from balanced assignment, which fixes nm in advance. Consequently,
+the weight sums are constants, the estimator reduces to a difference of arm means, and its variance,
+σ+2 /nm + σ−2 /(T − nm), is exact rather than conditional on realized arm sizes. Equation 6 provides
+both the point estimate and, via Proposition 2, the standard error σˆ(m) used in Section 3.3. Self-
+
+normalization removes the propensity-dependent scaling of ordinary inverse-propensity weighting,
+
+making estimates directly comparable across memories.
+
+Proposition 2 (Hájek Estimator Under Balanced Exposure). Under the exposure design of Eq. 5
+with balanced assignment, E[UˆR(m)] = UR(m) for every m ∈ P, and Var(UˆR(m)) = σ+2 /nm +
+σ−2 /(T − nm) exactly, with nm fixed by the design.
+
+We compare CMP with two estimators targeting the same estimand under alternative designs. The
+observational comparator estimates propensity and outcome models from logged interactions.
+
+                      Propensity: pˆ m∈M | M −m, q, c = softmax gψ(M −m, q, c) ,                                (7)
+
+                      Outcome: µˆ a, M −m, q, c = hξ ϕ(a, M −m, q, c) ,
+
+where a ∈ {0, 1} is the inclusion status, gψ is trained by maximum likelihood on logged inclusions,
+hξ is a regression head, and ψ concatenates the inclusion indicator with mean-pooled embeddings of
+the remaining memories, the query, and the context. Both models condition on M −m, which is the
+
+adjustment set held fixed in Definition 3. They are combined using the augmented inverse-propensity
+
+weighted (AIPW) estimator (Robins et al., 1994; Bang and Robins, 2005) over the n logged timesteps:
+
+             1  n
+             n
+Uˆobs(m)  =          µˆ(1, Mi−m, qi, ci) − µˆ(0, Mi−m, qi, ci)                                                  (8)
+
+                i=1
+
++  pˆ(m∈     1m∈Mi    qi, ci)  Yi − µˆ(1, Mi−m, qi, ci)  −  1  −        1m∈/Mi   qi, ci)  Yi − µˆ(0, Mi−m, qi, ci)
+             | Mi−m,                                              pˆ(m∈ | Mi−m,
+
+Proposition 3 establishes consistency for U (m) when either model is correctly specified.
+
+Proposition 3 (Double Robustness of the Observational Comparator). Uˆobs(m) −→p U (m) if either pˆ
+or µˆ is correctly specified.
+
+The store-level randomized comparator perturbs store membership, retaining each memory indepen-
+dently with probability 1 − pflip, and estimates Uˆexp(m) by a difference of arm means over timesteps
+where m is present or absent under the randomization.
+
+                                                         6
+Preprint
+
+Proposition 4 (Unbiasedness of Store-Level Arm). Under independent store-level perturbation with
+rate pflip, Uˆexp(m) is an unbiased utility EM−m [E[Y | m ∈ M, M −m] − E[Y | m ∈/ M, M −m]] ,
+regardless of confounding, with variance σ+2 /|Tm+| + σ−2 /|Tm−|.
+
+The three estimators differ only in the variable they randomize: none (observational), memory state
+Mt (store-level), or retrieved set Rt (exposure). By Theorem 1, only the exposure design retains
+support for memories the retriever never surfaces, while all three coincide whenever support is
+available. This isolates the contribution of the design rather than the estimator, and Section 4 verifies
+this by restricting the comparison to memories with support under the store-level design.
+Disagreement diagnostic: We define Γ(m) = |Uˆobs(m) − Uˆexp(m)|/(σˆo2bs(m) + σˆe2xp(m))1/2, the
+standardized disagreement between the observational and store-level arms. Its null is composite:
+rejection indicates failure of at least one of exchangeability, negligible interaction, or correct model
+specification. We therefore use Γ only as a diagnostic, leaving operational decisions to the uncertainty
+of the CMP estimate itself (Section 3.3).
+
+3.3 FROM ESTIMATES TO OPERATIONS
+
+An estimate becomes an operation through a decision rule. Challenge C3 makes this rule asymmetric:
+forget permanently removes both the memory and any opportunity to re-estimate its utility, whereas
+noop is reversible at the next capacity decision. Let H denote the number of future queries over
+which a retained memory would still contribute, and τ the number of queries until the decision is
+revisited, so that λ = H/τ ≥ 1 is the irreversibility ratio. Assuming the posterior UR(m) | UˆR, σˆ ∼
+N (UˆR(m), σˆ2(m)) with losses Lforget = H max(0, UR) and Lnoop = τ max(0, −UR).
+Theorem 2 (One-Sided Abstention is Bayes-Optimal). Let λ = H/τ ≥ 1 and z = UˆR(m)/σˆ(m).
+The Bayes-optimal rule is forget(m) ⇐⇒ gλ(z) < 0, where gλ is strictly increasing with a
+unique root z⋆(λ) satisfying z⋆(λ) < 0 for λ > 1, z⋆(1) = 0, and z⋆(λ) → −∞ as λ → ∞.
+
+         forget(m) ⇐⇒ UˆR(m) < z⋆(λ)σˆ(m), gλ(z) = λzΦ(z) + zΦ(−z) + (λ − 1)ϕ(z). (9)
+ Here ϕ and Φ denote the standard normal density and distribution functions. Since gλ is strictly
+increasing, the threshold z⋆(λ) is unique. Thus only sufficiently negative estimates trigger eviction.
+A two-sided rule, |UˆR(m)| > δσˆ(m), is strictly dominated because it can evict confidently useful
+memories. When a memory lacks support, σˆ → ∞, so z → 0 and the rule abstains.
+
+Eq. 9 is nonetheless insufficient to specify a retention policy. The rule requires a scalar UˆR(m),
+whereas Proposition 1 makes utility query-dependent. Since retention is decided before the next query
+is known, a policy must aggregate over Q, but every admissible aggregation is degenerate. Averaging
+attenuates utility by the fraction of queries requiring the memory (one in thirty on LoCoMo), while
+maxq UˆR(m | q) eliminates attenuation but is positive for nearly every memory. Aggregations
+weighted by similarity to the future query avoid both problems but require information unavailable at
+decision time. Section 4 evaluates all three and none improves on retaining everything. The same
+reasoning applies to the other operations: store has the opposite asymmetry, committing unless
+the estimate is confidently negative, while consolidate inherits the same asymmetry as forget
+because MERGE destroys both inputs. Both face the same aggregation problem.
+
+We therefore present CMP as an identified measurement of per-query memory utility rather than a
+retention policy. On held-out LoCoMo, it separates required from non-required memories for the
+query on which it is estimated with an AUC of 0.784, compared with 0.581 when the same estimator
+is pooled across queries. The loss in performance shows that the limitation lies not in estimation but
+in the estimand: a single scalar per memory cannot represent a quantity that varies with the query.
+
+3.4 CMP ALGORITHM
+
+CMP operates in three phases, summarized in Algorithms in Appendix D.
+
+(1) Phase 1: warm-up. Collect interaction data under the default policy with the exposure design in
+Eq. 5. At each timestep, record (Mt, qt, ct, Rt, Z(t), Yt), including the realized exposure indicators
+from which propensities are obtained.
+(2) Phase 2: model fitting. Estimate UˆR(m) and σˆ(m) for each m ∈ P via Eq. 6, fit propensity and
+outcome models in Eq. 7, and compute Γ(m) to audit support under the observational comparator.
+(3) Phase 3: online execution. Continue serving responses while maintaining UˆR(m | q) and
+σˆ(m | q) online from new interactions. These estimates are consumed by downstream policies: Eq. 9
+
+                                                           7
+Preprint
+
+Table 1: Retrieval support failure. P = 0 de-                             1.0
+notes the fraction of required memories never                                      step preferred, ΔAIC = -329.5
+surfaced by the retriever; Store is the mean
+number of memories available at query time.                               0.8 INDEPENDENT subset, n = 30 items
+†Mem0 rewrites source turns, requiring anno-
+tated evidence to be matched to stored memo-            task correctness              linear fit
+ries. We report the least-conditioned of three
+matching rules; see Appendix F.4 for details.                             0.6         step fit at 1.0
+
+                                                                                      binned mean, 95% Wilson CI
+
+                                                                          0.4
+
+                                                                          0.2
+
+Setting            Required P = 0 Store                                   0.0         0.25             0.50       0.75         1.00
+                                                                                0.00
+
+LongMemEval (indep.) 113 54.0% 487                                                    fraction of required evidence retrieved
+
+LongMemEval (all)  170 61.2% 487                        Figure 3: Task-correctness against the frac-
+                                                        tion of required evidence retrieved, Long-
+LoCoMo             359 66.9% 588                        MemEval independent subset.
+
+Mem0 2.0.18†       109 28.4% 291
+
+gives the decision rule for a single query, Section 3.3 shows why no aggregation over Q yields a
+retention policy, and Section 4 evaluates three candidate aggregations.
+
+4 EXPERIMENTS
+
+Our experiments answer four questions. Q1: how often does Assumption 1 fail in practice? Q2: can
+better retrieval repair it, or is randomization necessary? Q3: does randomizing the mediator restore
+identification, and is the gain due to the design or the estimator? Q4: does identified utility support a
+retention policy? Section 4.1 answers Q1, Q2; Section 4.2 answers Q3; and Section 4.3 answers Q4.
+
+Setup. We evaluate on LongMemEval (Wu et al., 2024), LoCoMo (Maharana et al., 2024), Hot-
+potQA (Yang et al., 2018), MuSiQue (Trivedi et al., 2022), and Mem0 (Chhikara et al., 2025).
+LongMemEval is our primary benchmark, LoCoMo supports evaluation under a query distribution,
+HotpotQA and MuSiQue generalize to multi-hop retrieval, and Mem0 evaluates a deployed memory
+system. We use gemini-3.7-flash and report token-level F1 and exact match. We do not report
+LLM-as-judge accuracy because of the reproducibility concerns discussed in Appendix I.1. More
+dataset details are in Appendix E.1. By default, CMP uses B = 6 context slots and |P| ≈ 32–36.
+Experiment-specific values of k and T , together with complete protocols, are given in Appendix E–H.
+
+4.1 EMPIRICAL IDENTIFICATION FAILURE
+
+Table 1 quantifies identification failure by measuring the fraction of required memories with P (m ∈
+R | q, c) = 0. On LongMemEval, retrieval support is strongly bimodal: 61 of 113 are never retrieved
+and a further 6 almost never are, 37 are retrieved on more than 80% of draws, and only 9 fall
+between 0.1 and 0.8. Consequently, store-level randomization leaves the retrieved set unchanged on
+52.2% of interventions on Mt, producing 940 distinct retrieved contexts compared with 3,939 under
+randomized exposure at the same costs.
+
+A larger retrieval budget does not resolve the failure. In Mem0, recovering 50% required memories
+never surfaced by the retriever requires expanding the retrieval window to 138 memories, and
+recovering 90% requires 286, effectively abandoning retrieval. Mem0 also exposes a separate write-
+time limitation: across 11,651 memories over 55 histories, every operation is an addition, with no
+updates or deletions, so contradictory facts accumulate. This limitation concerns the write policy.
+See more analysis in Appendix F.4. The misses are disproportionately costly. Figure 3 shows that
+partial retrieval contributes little: task correctness remains near 0.2 until every required memory is
+retrieved, then jumps to 0.73. The reason is that these tasks require all supporting memories jointly;
+retrieving only a subset typically leaves the model unable to produce the correct answer.
+
+4.2 EXPOSURE RESTORES IDENTIFICATION
+
+Table 2 compares store-level randomization and CMP Table 2: Estimation and decision quality on
+under identical evaluation budgets. We report dis- two designs (only differ in randomized vari-
+crimination (AUC between required and non-required able) and LongMemEval independent subset.
+
+memories), nomination lift (the relative rate at which                    Design                       AUC Lift Gold loss
+required memories are nominated for eviction), and
+gold loss (required memories destroyed per 100 re-                        Store-level rand. 0.542 0.97 10.9
+claimed slots under Eq. 9 with λ = 10).                                   Exposure (CMP) 0.664 0.68 5.2
+
+                                                8
+Preprint
+
+CMP consistently outperforms store-level randomization, improving discrimination from 0.542 to
+0.664 and halving gold loss from 10.9 to 5.2. Moreover, store-level estimates nominate required
+memories at nearly random (lift = 0.97), whereas CMP reduces this to 0.68, making required
+memories substantially less likely to be selected for eviction. Table 3 locates the gap. Stratifying by
+retrieval support, the two designs are indistinguishable where the store-level design has both arms,
+and the entire advantage sits in the stratum where it has none. The limitation is therefore the design,
+not the estimator: store-level estimation is not less accurate.
+
+Appendix G.2 compares five memory policies on Table 3: Discrimination by retrieval support,
+
+the same axis and finds that heuristic rules nominate LongMemEval independent subset. Median |t|
+required memories at 0.00–0.11 times the chance is the store-level estimate’s significance.
+
+rate, so the identification failure binds on policies
+
+that rank by estimated utility and not on those that Support n AUC gap Median |t|
+
+do not. Appendix H.1 provides detailed support-        P =0    61 exposure only 0.83
+stratified analyses and per-memory case studies
+                                                       0 < P < 0.8 15 +0.09           1.7
+
+(one memory identified only by CMP, one identified P ≥ 0.8 37 +0.003                  3.66
+
+by both designs, and one identified by neither).
+
+4.3 ABLATION
+
+Table 4 separates the design from the decision rule. The two are complementary: holding the decision
+rule fixed, randomized exposure reduces gold loss from 15 to 6, while holding the design fixed,
+abstention reduces it from 27 to 6. Abstention can act on identified memories, whereas randomized
+exposure restores identification for memories lacking retrieval support. Two-sided abstention performs
+worse than no abstention, destroying 14.1 versus 9.0 required memories per 100 reclaimed. It admits
+confidently useful memories into the eviction pool, the behavior ruled out by Theorem 2.
+
+Extending the design symmetrically also fails. Table 4: Component ablation on LongMemEval.
+
+Adding a forced-exclusion slot closes the remain- Gold loss is reported per 100 reclaimed slots.
+ing support gap but yields only a 0.007 AUC gain
+
+while increasing destroyed memories from 6 to 10. Variant      AUC Destroyed Gold loss
+
+Three of the four additional losses are memories CMP (full)    0.664 6                5.2
+
+the one-sided design could not estimate. Identifi- – one-sided abstention 0.664 27    9.0
+
+cation is not free: exposing more memories also – exposure design 0.542 15            10.9
+
+exposes them to erroneous eviction.                    – both  0.542 35               11.7
+
+                                                       two-sided abstention 0.664 22  14.1
+A third variant isolates the effect of the estimand. two-sided exposure 0.671 10
+                                                                                      6.6
+
+Averaging utility across queries dilutes the signal
+
+because most memories are relevant to a small fraction of queries (1/30 for 77 of 109 gold memories
+
+on LoCoMo). Estimating query-specific utility improves discrimination from 0.581 to 0.784 on
+
+the required-memory subset; the pooled estimand over all pool members is 0.551 (Appendix H.2)
+
+and increases the utility gap between required and non-required memories from 0.038 to 0.300,
+
+confirming that the remaining limitation is in the estimand.
+
+Identified utility does not determine retention. Per-query utility is accurate for the query on
+which it is estimated but does not transfer across queries. On a disjoint half of each conversation,
+no query-independent aggregation achieves correlation above r = 0.10 with realized contribution,
+whereas ground-truth has r = 0.286 on the same pairs. This is not a power issue: 99.3% of required
+(memory, query) cells are identified with five draws per arm. The limitation is structural. A retention
+policy cannot condition on a future query, while query-independent aggregations either dilute the
+signal or, in the case of maxq UˆR(m | q, c), retain essentially every memory. We therefore make
+no retention claim. CMP provides an identified measurement of per-query memory utility, and our
+results show that this quantity alone is insufficient to determine what to retain. Appendix H.8 provides
+additional analyses of retrieval failure, retrieval scaling, and exposure-budget tradeoffs.
+
+5 CONCLUSION
+
+We presented CMP, a causal framework that treats memory utility as a retrieval-mediated effect. Under
+deterministic retrieval, many memories are never observed in both treatment arms, leaving their utility
+unidentifiable from logged interactions. This affects half the required memories on LongMemEval
+and persists in a deployed memory system. CMP restores identification by randomizing retrieval
+exposure with known propensity. We prove identification, unbiased estimation, and the optimal
+decision rule under irreversible operations.
+
+                                                  9
+Preprint
+
+AI USE STATEMENT
+In this work, we used generative AI tools for writing assistance, including editing and polishing prose,
+and for code assistance in implementing the experimental harness and analysis scripts. We also used
+generative AI tools as the generation and embedding backends under study; these are the object of the
+experiments, and their versions are pinned and reported in Appendix E.3. We did not use generative
+AI tools to generate research ideas, to produce experimental results, or to write the theoretical claims
+or their proofs. All AI-assisted code was reviewed by the authors and its outputs verified against the
+recorded artifacts; several measurement errors introduced during implementation were found by this
+process and are reported in Appendix I.3. We take responsibility for the final content of this work,
+including all text, claims, and artifacts.
+REPRODUCIBILITY STATEMENT
+All theoretical claims are stated with their assumptions in Section 2.3 and proved in Appendix C;
+Assumption 1 is the only condition our method requires, and the conditions needed by the comparator
+estimators are stated separately in Appendix C.4. Benchmark construction, the item selection and its
+exclusions, model versions, and the exposure design parameters for every experiment are given in
+Appendix E, and the measurement protocol for each reported quantity in Appendix F. Appendix D
+specifies the exposure allocation and estimation procedures. Appendix I records the discrepancies we
+found in our own apparatus, including a metadata leak in the repository’s default serving path that
+does not affect the reported arms, and the instability of the LLM-judge protocol, which is why we
+report only deterministic metrics. Assignment permutations, item selections, and pool constructions
+are seeded and the seeds are stored with the results they produced. Code, per-item outputs, and scores
+are available at https://anonymous.4open.science/r/cmp-release-D0C3/.
+ETHICS STATEMENT
+This work uses only publicly available benchmarks and involves no human subjects, no personally
+identifying information, and no data collection. The conversational benchmarks we evaluate contain
+synthetic or released dialogue, and we introduce no new data. Our method randomizes which stored
+memories are placed in a model’s context, which changes the information available to the system on
+a fraction of interactions; in a deployed setting this could degrade individual responses, and Section 4
+reports the measured cost. Deployments should weigh that cost against the value of the estimates
+the design produces. We report a failure mode in a third-party memory system, and we do so to
+characterize a condition that applies to the class of systems.
+
+                                                          10
+Preprint
+
+REFERENCES
+
+Amin Abolghasemi, Leif Azzopardi, Seyyed Hadi Hashemi, Maarten de Rijke, and Suzan Verberne.
+   Evaluation of attribution bias in generator-aware retrieval-augmented large language models. In
+  Findings of the Association for Computational Linguistics: ACL 2025, pages 21105–21124, 2025.
+
+Michael C Anderson, Robert A Bjork, and Elizabeth L Bjork. Remembering can cause forgetting:
+   retrieval dynamics in long-term memory. Journal of experimental psychology: Learning, memory,
+   and cognition, 20(5):1063, 1994.
+
+Heejung Bang and James M Robins. Doubly robust estimation in missing data and causal inference
+   models. Biometrics, 61(4):962–973, 2005.
+
+Arman Behnam and Binghui Wang. Graph neural network causal explanation via neural causal
+   models. In European conference on computer vision, pages 410–427. Springer, 2024.
+
+Arman Behnam and Binghui Wang. Measure-theoretic anti-causal representation learning. Advances
+   in Neural Information Processing Systems, 38:61375–61431, 2026.
+
+Arman Behnam, Muskan Garg, Xingyi Liu, Maria Vassilaki, Jennifer St. Sauver, Ronald C Petersen,
+   and Sunghwan Sohn. Causal explanation from mild cognitive impairment progression using graph
+   neural networks. In 2024 IEEE International Conference on Bioinformatics and Biomedicine
+  (BIBM), pages 6349–6355. IEEE, 2024.
+
+Peter J Bickel, Chris AJ Klaassen, Peter J Bickel, Ya’acov Ritov, J Klaassen, Jon A Wellner, and
+  YA’Acov Ritov. Efficient and adaptive estimation for semiparametric models, volume 4. Johns
+   Hopkins University Press Baltimore, 1993.
+
+Robert A Bjork, Elizabeth L Bjork, et al. A new theory of disuse and an old theory of stimulus
+   fluctuation. From learning processes to cognitive processes: Essays in honor of William K. Estes,
+   2:35–67, 1992.
+
+Hanxiang Chao, Yihan Bai, Rui Sheng, Tianle Li, and Yushi Sun. Stale: Can llm agents know when
+   their memories are no longer valid?, 2026. URL https://arxiv. org/abs/2605.06527.
+
+Cheng Chen, Maria D Molina, Mengqi Liao, and Eugene Cho Snyder. Relational gains, privacy strains:
+   Exploring users’ perceptions and experiences with chatgpt’s memory feature. In Proceedings of
+   the 2026 CHI Conference on Human Factors in Computing Systems, pages 1–17, 2026.
+
+Prateek Chhikara, Dev Khant, Saket Aryan, Taranjeet Singh, and Deshraj Yadav. Mem0: Building
+   production-ready ai agents with scalable long-term memory. arXiv, 2025.
+
+Benjamin Cohen-Wang, Harshay Shah, Kristian Georgiev, and Aleksander Ma˛dry. Contextcite:
+  Attributing model generation to context. Advances in Neural Information Processing Systems, 37:
+   95764–95807, 2024.
+
+Nima Dehghani and Michael Levin. Bio-inspired ai: Integrating biological complexity into artificial
+   intelligence. arXiv preprint arXiv:2411.15243, 2024.
+
+Zixiang Ji Di Wu, Asmi Kawatkar, Bryan Kwan, Jia-Chen Gu, Nanyun Peng, and Kai-Wei Chang.
+   Longmemeval-v2: Evaluating long-term agent memory toward experienced colleagues, 2026a.
+  URL https://arxiv. org/abs/2605.12493.
+
+Ijeoma Noella Ezeji, Matthew Adigun, and Kayode Oki. Towards enhancing computational complex-
+   ity in explainable decision support system: Exploring bio-inspired approaches. Procedia Computer
+  Science, 258:430–442, 2025.
+
+Dongyang Fan, Tyler J Rotello, and Sai Praneeth Karimireddy. Do data valuations make good data
+   prices? arXiv preprint arXiv:2504.05563, 2025.
+
+Haowen Gao, Haoran Chen, Can Wang, Shasha Guo, Liang Pang, Zhaoyang Liu, Huawei Shen, and
+  Xueqi Cheng. Skillaudit: Ground-truth-free skill evolution via paired trajectory auditing. arXiv
+   preprint arXiv:2606.14239, 2026.
+
+                                                          11
+Preprint
+
+Amirata Ghorbani and James Zou. Data shapley: Equitable valuation of data for machine learning.
+   In International conference on machine learning, pages 2242–2251. PMLR, 2019.
+
+Yongkang Hu, Xiangbo Yang, Yunhan Xu, and Jingpeng Sun. Causal-aware reliability assessment of
+   single-channel eeg for transformer-based sleep staging. Frontiers in Neuroscience, 19:1670124,
+   2025.
+
+Yuanzhe Hu, Yu Wang, and Julian McAuley. Evaluating memory in llm agents via incremental
+   multi-turn interactions. In International Conference on Learning Representations, volume 2026,
+   pages 156259–156291, 2026.
+
+Ziheng Huang, Sebastian Gutierrez, Hemanth Kamana, and Stephen MacNeil. Memory sandbox:
+  Transparent and interactive memory management for conversational agents. In Adjunct Proceedings
+   of the 36th Annual ACM Symposium on User Interface Software and Technology, pages 1–3, 2023.
+
+Guido W Imbens and Donald B Rubin. Causal inference in statistics, social, and biomedical sciences.
+  New York, 517, 2015.
+
+Ray Jiang, Silvia Chiappa, Tor Lattimore, András György, and Pushmeet Kohli. Degenerate feedback
+   loops in recommender systems. In Proceedings of the 2019 AAAI/ACM Conference on AI, Ethics,
+   and Society, pages 383–390, 2019.
+
+Thorsten Joachims, Adith Swaminathan, and Tobias Schnabel. Unbiased learning-to-rank with biased
+   feedback. In Proceedings of the tenth ACM international conference on web search and data
+   mining, pages 781–789, 2017.
+
+Taesan Kim, Hyeongjun Yun, Jaegul Choo, and Chung Park. Don’t let bandit feedback pull continual
+   llm-recommender updates off target. arXiv preprint arXiv:2605.18899, 2026.
+
+Dharshan Kumaran, Demis Hassabis, and James L McClelland. What learning systems do intelligent
+   agents need? complementary learning systems theory updated. Trends in cognitive sciences, 20(7):
+   512–534, 2016.
+
+Matt J Kusner, Joshua Loftus, Chris Russell, and Ricardo Silva. Counterfactual fairness. Advances in
+   neural information processing systems, 30, 2017.
+
+Patrick Lewis, Ethan Perez, Aleksandra Piktus, et al. Retrieval-augmented generation for knowledge-
+   intensive nlp tasks. Advances in neural information processing systems, 2020.
+
+Ruoran Li, Xinghua Zhang, Haiyang Yu, Shitong Duan, Xiang Li, Wenxin Xiang, Chonghua Liao,
+  Xudong Guo, Yongbin Li, and Jinli Suo. Mempo: Self-memory policy optimization for long-
+   horizon agents. arXiv preprint arXiv:2603.00680, 2026.
+
+Jiaqi Ma, Zhe Zhao, Xinyang Yi, Ji Yang, Minmin Chen, Jiaxi Tang, Lichan Hong, and Ed H Chi.
+   Off-policy learning in two-stage recommender systems. In Proceedings of The Web Conference
+  2020, pages 463–473, 2020.
+
+Adyasha Maharana, Dong-Ho Lee, Sergey Tulyakov, Mohit Bansal, Francesco Barbieri, and Yuwei
+   Fang. Evaluating very long-term conversational memory of llm agents. In Annual Meeting of the
+  Association for Computational Linguistics, 2024.
+
+James L McClelland, Bruce L McNaughton, and Andrew K Lampinen. Integration of new information
+   in memory: new insights from a complementary learning systems perspective. Philosophical
+  Transactions of the Royal Society B: Biological Sciences, 375(1799), 2020.
+
+Ikhtiyor Nematov, Tarik Kalai, Elizaveta Kuzmenko, Gabriele Fugagnoli, Dimitris Sacharidis, Katja
+   Hose, and Tomer Sagi. Source attribution in retrieval-augmented generation. In Joint Euro-
+   pean Conference on Machine Learning and Knowledge Discovery in Databases, pages 317–332.
+   Springer, 2025.
+
+Charles Packer, Sarah Wooders, Kevin Lin, Vivian Fang, Shishir G Patil, Ion Stoica, and Joseph E
+   Gonzalez. Memgpt: Towards llms as operating systems. arXiv preprint arXiv:2310.08560, 2023.
+
+                                                          12
+Preprint
+
+Joon Sung Park, Joseph O’Brien, Carrie Jun Cai, Meredith Ringel Morris, Percy Liang, and Michael S
+   Bernstein. Generative agents: Interactive simulacra of human behavior. In Proceedings of the 36th
+   annual acm symposium on user interface software and technology, pages 1–22, 2023.
+
+Judea Pearl. Causality. Cambridge university press, 2009.
+
+Jirui Qi, Gabriele Sarti, Raquel Fernández, and Arianna Bisazza. Model internals-based answer
+   attribution for trustworthy retrieval-augmented generation. In Proceedings of the 2024 Conference
+   on Empirical Methods in Natural Language Processing, pages 6037–6053, 2024.
+
+Vishal Raman, Abhijith Ragav, et al. Remi: A novel causal schema memory architecture for
+   personalized lifestyle recommendation agents. arXiv preprint arXiv:2509.06269, 2025.
+
+James M Robins, Andrea Rotnitzky, and Lue Ping Zhao. Estimation of regression coefficients when
+   some regressors are not always observed. Journal of the American statistical Association, 1994.
+
+Paul R Rosenbaum and Donald B Rubin. The central role of the propensity score in observational
+   studies for causal effects. Biometrika, 70(1):41–55, 1983.
+
+Max Schemmer, Niklas Kuehl, Carina Benz, Andrea Bartos, and Gerhard Satzger. Appropriate
+   reliance on ai advice: Conceptualization and the effect of explanations. In Proceedings of the 28th
+   international conference on intelligent user interfaces, pages 410–422, 2023.
+
+Bernhard Schölkopf, Francesco Locatello, Stefan Bauer, Nan Rosemary Ke, Nal Kalchbrenner,
+  Anirudh Goyal, and Yoshua Bengio. Toward causal representation learning. Proceedings of the
+  IEEE, 109(5):612–634, 2021.
+
+Baris Simsek. When to forget: A memory governance primitive. arXiv preprint arXiv:2604.12007,
+   2026.
+
+Saksham Sahai Srivastava. Causal intervention-based memory selection for long-horizon llm agents.
+   arXiv preprint arXiv:2605.17641, 2026.
+
+Robert Stickgold. Sleep-dependent memory consolidation. Nature, 437(7063):1272–1278, 2005.
+
+Ana I Torre-Bastida, Josu Diaz-de Arcaya, Eneko Osaba, Khan Muhammad, David Camacho, and
+  Javier Del Ser. Bio-inspired computation for big data fusion, storage, processing, learning and
+  visualization: state of the art and future directions. Neural Computing and Applications, 37(28):
+   23097–23127, 2025.
+
+Harsh Trivedi, Niranjan Balasubramanian, Tushar Khot, and Ashish Sabharwal. musique: Multihop
+   questions via single-hop question composition. Transactions of the Association for Computational
+  Linguistics, 10:539–554, 2022.
+
+Endel Tulving and Zena Pearlstone. Availability versus accessibility of information in memory for
+  words. Journal of verbal learning and verbal behavior, 5(4):381–391, 1966.
+
+Endel Tulving and Donald M Thomson. Encoding specificity and retrieval processes in episodic
+   memory. Psychological review, 80(5):352, 1973.
+
+Bingkai Wang, Fan Li, and Rui Wang. Handling incomplete outcomes and covariates in cluster-
+   randomized trials: doubly-robust estimation, efficiency considerations, and sensitivity analysis.
+   arXiv preprint arXiv:2401.11278, 2024a.
+
+Ke Wang, Jiahui Zhu, Minjie Ren, Zeming Liu, Shiwei Li, Zongye Zhang, Chenkai Zhang, Xiaoyu
+  Wu, Qiqi Zhan, Qingjie Liu, et al. A survey on data synthesis and augmentation for large language
+   models. arXiv preprint arXiv:2410.12896, 2024b.
+
+Weizhi Wang, Li Dong, Hao Cheng, Xiaodong Liu, Xifeng Yan, Jianfeng Gao, and Furu Wei.
+  Augmenting language models with long-term memory. Advances in Neural Information Processing
+  Systems, 36:74530–74543, 2023.
+
+Beining Wu, Zihao Ding, Jun Huang, and Yanxiao Zhao. Forget to improve: On-device llm-agent
+   continual learning via budget-curated memory. arXiv preprint arXiv:2606.25115, 2026.
+
+                                                          13
+Preprint
+Di Wu, Hongwei Wang, Wenhao Yu, Yuwei Zhang, Kai-Wei Chang, and Dong Yu. Longmemeval:
+
+   Benchmarking chat assistants on long-term interactive memory. arXiv preprint arXiv:2410.10813,
+   2024.
+Yuhuai Wu, Markus N Rabe, DeLesley Hutchins, and Christian Szegedy. Memorizing transformers.
+   arXiv preprint arXiv:2203.08913, 2022.
+Wujiang Xu, Zujie Liang, Kai Mei, Hang Gao, Juntao Tan, and Yongfeng Zhang. A-mem: Agentic
+   memory for llm agents. arXiv preprint arXiv:2502.12110, 2025.
+Zhilin Yang, Peng Qi, Saizheng Zhang, Yoshua Bengio, William Cohen, Ruslan Salakhutdinov,
+   and Christopher D Manning. Hotpotqa: A dataset for diverse, explainable multi-hop question
+   answering. In Empirical methods in natural language processing, 2018.
+Zikun Ye and Hema Yoganarasimhan. Document valuation in llm summaries: A cluster shapley
+   approach. arXiv preprint arXiv:2505.23842, 2025.
+Wanjun Zhong, Lianghong Guo, Qiqi Gao, He Ye, and Yanlin Wang. Memorybank: Enhancing large
+   language models with long-term memory. In AAAI conference on artificial intelligence, 2024.
+
+                                                          14
+Preprint
+
+Appendix
+
+A Related Work                   17
+
+B Notation                       18
+
+C Theoretical Guarantees         19
+
+C.1 Retrieval-Mediated Identification . . . . . . . . . . . . . . . . . . . . . . . . . . . 19
+
+C.2 Estimation Under the Exposure Design . . . . . . . . . . . . . . . . . . . . . . . . 20
+
+C.3 Decision Rules Under Irreversibility . . . . . . . . . . . . . . . . . . . . . . . . . 21
+
+C.4 Conditions Required by the Observational Comparator . . . . . . . . . . . . . . . 22
+
+C.5 The Store-Level Randomized Comparator . . . . . . . . . . . . . . . . . . . . . . 23
+
+C.6 AIPW Estimator: Consistency, Efficiency, and Robustness . . . . . . . . . . . . . 24
+
+D Algorithm Details              25
+
+E Experimental Setup             27
+
+E.1 Benchmark Datasets . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 27
+
+E.2 Retrieval Function Specification . . . . . . . . . . . . . . . . . . . . . . . . . . . 27
+
+E.3 Systems and Implementation . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 28
+
+E.4 Exposure Design Parameters . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 28
+
+E.5 Outcome Measurement . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 28
+
+E.6 Statistical Procedure . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 29
+
+F Measurement Protocols          29
+
+F.1 Retrieval Support . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 29
+
+F.2 Estimation Under Exposure . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 30
+
+F.3 Comparator Arms . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 30
+
+F.4 Deployed-System Replay . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 30
+
+F.5 Cross-Query Transfer . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 31
+
+F.6 Selector and Eviction Rules . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 31
+
+G Baselines and Comparisons      32
+
+G.1 Memory Policies Implemented . . . . . . . . . . . . . . . . . . . . . . . . . . . . 32
+
+G.2 Reported Comparisons . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 32
+
+G.3 Omitted Comparisons . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 33
+
+G.4 Retrieval Selectors . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 33
+
+H Additional Results             33
+
+H.1 Worked Examples . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 33
+
+                             15
+Preprint
+
+H.2 Identification by Benchmark . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 34
+H.3 Cost of Exposure . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 35
+H.4 Ablation Details . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 35
+H.5 Retrieval Scoring . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 36
+H.6 Cross-Query Transfer . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 36
+H.7 Suspect Items . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 37
+H.8 Extended Analysis . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 37
+
+I Reproducibility and Known Discrepancies  38
+
+I.1 Evaluation Instruments . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 38
+
+I.2 Implementation Discrepancies . . . . . . . . . . . . . . . . . . . . . . . . . . . . 38
+
+I.3 Pool Construction Determines the Conclusion . . . . . . . . . . . . . . . . . . . . 38
+
+I.4 Compute and Cost . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 39
+
+I.5 Artifacts . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 39
+
+J Limitations                              39
+
+K Applications of This Work                39
+
+                             16
+Preprint
+
+A RELATED WORK
+
+Memory-augmented LLMs. Retrieval-augmented generation (Lewis et al., 2020) establishes the
+paradigm of conditioning LLM outputs on passages retrieved from an external store. Memory-
+Bank (Zhong et al., 2024) introduces Ebbinghaus-inspired forgetting curves for long-term retention;
+generative agents (Park et al., 2023) maintain hierarchical memory with reflection in simulated social
+environments; and memorizing transformers (Wu et al., 2022) embed persistent key–value memory
+directly into attention layers. More recent work has augmented LLMs with unbounded long-term
+stores (Wang et al., 2023), evaluated memory over extended conversations (Maharana et al., 2024),
+and developed agentic memory management. In particular, A-Mem (Xu et al., 2025) draws on
+the Zettelkasten method to autonomously organize memories through note construction and link
+generation. Despite these advances, memory operations are still largely governed by hand-designed
+mechanisms, e.g., similarity thresholds, recency scores, and capacity constraints, rather than a formal
+framework for determining when and why a memory operation improves downstream performance.
+
+Estimating per-memory utility. Recent systems estimate the contribution of each memory rather
+than assuming it. Memory governance based on per-memory success and failure counts (Simsek,
+2026) converges to a conditional success probability; paired trajectory auditing (Gao et al., 2026)
+isolates a candidate’s effect by executing with and without it; budget-curated retention (Wu et al.,
+2026) selects memories under an explicit capacity constraint; and causal memory selection (Srivastava,
+2026) scores candidates through controlled interventions on the candidate set. These approaches
+differ in their estimators and supervision, but share a common dependency: evidence about a memory
+can be collected only when the retriever surfaces it. Our contribution is orthogonal to the particular
+utility estimator: the retrieval-support condition we identify is a prerequisite for all of them. Moreover,
+causal memory selection (Srivastava, 2026) requires access to the ground-truth answer within the
+selection loop, an additional source of supervision that is generally unavailable at deployment.
+
+Memory policy optimization. MemGPT (Packer et al., 2023) draws on operating-system virtual
+memory to let LLMs page information between context and external storage, but relies on the LLM’s
+own judgment for management decisions without formal optimization. More recently, MemPO (Li
+et al., 2026) proposes self-memory policy optimization, framing memory as a learnable action
+within an RL loop and introducing trajectory-level and memory-level advantage estimation for credit
+assignment. MemPO achieves strong empirical gains on long-horizon benchmarks by training the
+agent to autonomously compress and retain information. However, RL-based approaches optimize
+memory decisions end-to-end without asking whether the effect of an individual memory is identified
+from the data the system collects. The reward signal may be observed even when the per-memory
+contrast needed to attribute that reward is not. Our work identifies a prior condition: the effect of a
+specific memory can be identified from retrieval-conditioned observations only where the retriever
+provides support for that memory. Where retrieval provides no such support, end-to-end optimization
+cannot by itself recover the missing per-memory contrast.
+
+Memory consolidation in cognitive science. Complementary learning systems theory (Kumaran
+et al., 2016; McClelland et al., 2020) posits that biological memory relies on two interacting systems:
+a fast hippocampal store for episodic details and a slow neocortical store for consolidated abstractions.
+Sleep-dependent consolidation selectively strengthens, integrates, and prunes memories according to
+their future relevance (Stickgold, 2005). Prior AI work (Torre-Bastida et al., 2025; Dehghani and
+Levin, 2024; Ezeji et al., 2025) has drawn bio-inspired heuristics from these theories, but does not
+formally characterize when consolidation improves downstream performance. We instead formulate
+consolidation as a joint intervention (Eq. 2), making explicit the causal quantity that a consolidation
+decision would require. This quantity remains subject to the same identification condition as the
+single-memory estimand; accordingly, our criterion characterizes the effect of consolidation rather
+than prescribing a consolidation policy.
+
+Causal inference in machine learning. Structural causal models (SCMs) (Pearl, 2009) provide the
+formal language for reasoning about interventions (do-calculus) and counterfactuals. This causal
+perspective has yielded principled methods across several areas: counterfactual fairness (Kusner
+et al., 2017) uses SCMs to define equitable predictions; causal representation learning (Schölkopf
+et al., 2021) seeks latent factors that reflect the underlying data-generating process; and inverse
+propensity weighting (Rosenbaum and Rubin, 1983) underpins treatment-effect estimation and off-
+policy evaluation. Doubly robust estimators (Robins et al., 1994; Wang et al., 2024a) combine
+outcome modeling with propensity weighting, providing consistency when either model is correctly
+
+                                                          17
+Preprint
+
+specified while reducing variance of pure IPW. Recent work has begun integrating causal reasoning
+into LLM-based agents: Causal-aware LLMs (Hu et al., 2025) embed SCMs into RL agents through
+a learning–adapting–acting paradigm for environment modeling, while REMI (Raman et al., 2025)
+constructs personal causal knowledge graphs for lifestyle recommendation. Neither, however, applies
+causal inference to memory management itself. Doing so requires more than transplanting standard
+causal machinery: as Section 2.3 shows, identification depends critically on the retrieval process,
+whose support determines which memory effects can be learned from the observed data.
+
+B NOTATION
+
+Table 5 summarizes the notation used throughout the paper.
+
+            Table 5: Summary of notation used throughout the paper.
+
+          Symbol            Description
+
+          M = (U, V, F)     Structural causal model (Def. 1)
+          Mt                Memory state at time t
+          Mt−m              Memory state excluding m, Mt \ {m}
+          M                 Universe of possible memories
+          Rt                Retrieved subset at time t
+          Ot                Memory operation at time t
+          O                 Operation space {store, forget, consolidate, noop}
+          Yt                Task output at time t
+          qt, ct            Query and observed context at time t
+          Q                 Task distribution over queries
+          θLLM              Frozen LLM parameters
+
+          Ut(m)             Memory utility at time t (Def. 3); written U (m) when unambiguous
+          UR(m | q, c)      Conditional utility given retrieval (Eq. 3)
+          ∆consol(mi, mj )  Consolidation criterion (Eq. 2)
+
+          B                 Context budget, number of memories the generator receives
+          k                 Slots withheld from the ranker per timestep, k ≤ B
+          P                 Exposure pool, memories whose utility is estimated
+          T                 Horizon, number of estimation draws
+          Et                Exposed set at time t (Eq. 5)
+          Zm(t)
+          nm                Retrieval indicator 1m∈Rt , randomized by the design
+          em                Exposures allocated to m under balanced assignment
+          Tm+, Tm−          Known exposure propensity, em = nm/T
+                            Timesteps with m exposed and not exposed
+          UˆR(m)
+                            Hájek estimate of UR(m) (Eq. 6)
+          σˆ(m)             Standard error of UˆR(m) (Prop. 2)
+          σ+2 , σ−2         Outcome variance within the exposed and unexposed arms
+          Uˆobs(m)
+          Uˆexp(m)          Observational (AIPW) comparator (Eq. 8)
+          pflip
+          pˆ, µˆ            Store-level randomized comparator
+          Γ(m)              Store-level perturbation rate
+          ψ                 Propensity and outcome models (Eq. 7)
+                            Disagreement diagnostic, reported as a support audit
+          H, τ              Feature map for the outcome model (Eq. 7)
+          gλ
+          z⋆(λ)             Horizon and interval to the next decision
+          ϕ, Φ              Threshold function of Eq. 9
+          ϵp                Abstention threshold, the root of gλ
+          nmin              Standard normal density and distribution function
+          Λ                 Propensity clipping threshold for the observational comparator, 0.01
+                            Minimum draws per arm for a memory to count as identified
+                            Sensitivity parameter for unmeasured confounding
+
+                            18
+Preprint
+
+C THEORETICAL GUARANTEES
+
+This appendix collects the formal statements and proofs supporting Sections 2.3 and 3. Appendix C.1
+proves the factorization and non-identifiability results that motivate the exposure design; Appendix C.2
+gives the estimator’s properties and the budget it requires; Appendix C.3 proves the decision rule
+under irreversible operations; and Appendix C.4 states the conditions required by the observational
+comparator, which CMP does not need.
+
+C.1 RETRIEVAL-MEDIATED IDENTIFICATION
+
+This subsection proves the two results of Section 2.3. Both follow from the single structural fact that
+Yt depends on Mt only through Rt, and neither requires an assumption beyond Definition 1 and the
+slot-substitution convention of Proposition 1, which fixes what do(m ∈/ R) means.
+Proposition 1 (Retrieval-Mediated Factorization). Let do(m ∈ R) denote inserting m into the
+retrieved set R, displacing its lowest-ranked memory, and do(m ∈/ R) denote removing m and filling
+its slot with the highest-ranked memory not already in R, so that |R| remains fixed across both arms.
+Both are dynamic interventions: the displaced or substituted memory depends on the realized ranking
+at (Mt, qt). Under Definition 1, for any m and any (q, c),
+
+                  U (m | q, c) = P (m ∈ R | q, c) · UR(m | q, c), U (m) = Eq,c U (m | q, c) ,
+                                                                                                                                  (3)
+
+                  UR(m | q, c) ≜ E Y | do(m ∈ R), q, c − E Y | do(m ∈/ R), q, c .
+
+Proof. Fix (M −m, q, c) and suppress M −m in the notation throughout, since it is held fixed. Write
+A = 1m∈R for the retrieval indicator under the observational regime, so Pr(A = 1) = P (m ∈ R |
+q, c). By Definition 1, Y = fY (R, q, θLLM), so Y is a deterministic function of R given (q, θLLM)
+and the intervention do(M = M +m) acts on Y only by changing R.
+Consider the two states M +m and M −m of Definition 3. Under the slot-substitution convention
+stated in Proposition 1, |R| is held fixed across the two arms, so the retrieved sets differ in at most
+the single element m: either m ∈ fR(M +m, q) and fR(M −m, q) replaces it by the highest-ranked
+memory not already retrieved, or m ∈/ fR(M +m, q) and the two retrieved sets coincide. Partitioning
+on which case obtains,
+
+                 E Y | do(M = M +m), q, c − E Y | do(M = M −m), q, c
+
+                  = Pr(A = 1) · E Y | do(m ∈ R), q, c − E Y | do(m ∈/ R), q, c
+
+                     + Pr(A = 0) · 0,
+since on the event A = 0 the two interventions induce the same retrieved set and therefore the same
+outcome. The second factor in the first term is UR(m | q, c) by definition, giving
+
+                               U (m | q, c) = P (m ∈ R | q, c) · UR(m | q, c).
+Taking the expectation over (M −m, q, c) and applying Definition 3 yields Eq. 3.
+
+Remark 1 (Store-level randomization does not repair this at feasible horizons). A design that perturbs
+the entire store rather than m alone can in principle surface m: under independent retention at rate
+1 − pflip, a memory at rank r enters the top-B whenever at least r − B of the r − 1 higher-ranked
+memories are dropped, an event of probability Pr[Bin(r − 1, pflip) ≥ r − B] > 0. The obstruction is
+therefore overlap rather than identification in the strict sense. It is nonetheless binding: at pflip = 0.1,
+B = 6, and r = 23, this probability is below 10−8, so observing a single inclusion requires a horizon
+beyond any feasible budget. Section 4 measures the consequence: 52.2% of store perturbations left
+the retrieved set unchanged, and no perturbation produced an inclusion for the memories of Table 1.
+Theorem 1 (Non-Identifiability under Retrieval Support Failure). Fix (q, c) and suppose P (m ∈
+R | q, c) = 0. Then fR(M +m, q) = fR(M −m, q), hence Y (M +m) = Y (M −m) almost surely, and
+U (m | q, c) = 0 irrespective of UR(m | q, c). Consequently, UR(m | q, c) is not identified by any
+design that holds M−m fixed while randomizing only whether m is included.
+
+Proof. Fix (M −m, q, c) with P (m ∈ R | q, c) = 0. Then m ∈/ fR(M +m, q) almost surely, and by
+the slot-substitution convention fR(M −m, q) differs from fR(M +m, q) only by removing m and
+backfilling; since m was not present, no removal occurs and
+
+                                fR(M +m, q) = fR(M −m, q) almost surely.
+
+                                                          19
+Preprint
+
+Because Y = fY (R, q, θLLM) is a deterministic function of R given (q, θLLM), the two arms produce
+identical outcomes, so U (m | q, c) = 0. This also follows from Proposition 1 with the leading factor
+equal to zero, and holds for every value of UR(m | q, c).
+
+For the second claim, let D be any design that assigns membership of Mt by a known or unknown
+randomization, and let Π denote the induced distribution over observed trajectories (Mt, Rt, qt, ct, Yt).
+Every realization of D determines Rt = fR(Mt, qt) through the same deterministic map, so for any
+two memory states differing only in m the observed Rt and hence Yt are identical.
+
+The restriction to (q, c) matters here. A design may well surface m at some other query (q′, c′) and
+thereby identify UR(m | q′, c′), but UR is a conditional quantity: observations at (q′, c′) place no
+constraint on its value at (q, c) without a further assumption relating the two, which Definition 1 does
+not supply. Consequently Π is invariant to UR(m | q, c): two data-generating processes agreeing in
+every respect except the value of UR(m | q, c) induce the same distribution over observables. No
+functional of Π can therefore distinguish them, which is the definition of non-identifiability. The
+argument does not use the form of the randomization and applies in particular when membership of
+Mt is randomized with propensity bounded away from zero and one.
+
+Remark 2 (Why the failure is invisible). Theorem 1 concerns identification, not estimation. An
+estimator applied to such a memory does not fail to return a value; it returns a difference of two
+sample means drawn from the same distribution, which concentrates at zero. The estimate is therefore
+indistinguishable from that of a memory with UR(m) = 0, and the two are separated only by the
+design’s support, which the estimate itself does not report.
+
+In the strongest case the two arms contain byte-identical contexts on every draw, and the estimate is
+exactly zero with zero variance; Appendix H.1 gives such a memory.
+
+C.2 ESTIMATION UNDER THE EXPOSURE DESIGN
+
+Proposition 2 (Hájek Estimator Under Balanced Exposure). Under the exposure design of Eq. 5
+
+with balanced assignment, E[UˆR(m)] = UR(m) for every m ∈ P, and Var(UˆR(m)) = σ+2 /nm +
+σ−2 /(T − nm) exactly, with nm fixed by the design.
+
+Proof. Write Zm(t) = 1m∈Rt . Balanced round-robin assignment (Algorithm 2) fixes the number
+
+of exposures nm =  T    Zm(t)  in  advance,  with  em  =  nm/T   known.     Two  consequences  follow
+                   t=1
+
+immediately and are used throughout.
+
+The arm sizes are deterministic. |Tm+| = nm and |Tm−| = T − nm hold with probability one, not
+in expectation. The randomness in the design lies entirely in which timesteps receive the exposure,
+
+drawn by a uniformly random permutation of the assignment, and not in how many.
+
+The self-normalized weights collapse. Since Zm(t) ∈ {0, 1} and em does not vary with t,
+
+                        t Zm(t)Yt/em  =      t Zm(t)Yt    =   1        Yt,
+                         t Zm(t)/em           t Zm(t)        nm
+                                                                 t∈Tm+
+
+and symmetrically for the excluded arm with T − nm in place of nm. This is the second equality of
+Eq. 6.
+
+Unbiasedness. By construction the permutation is drawn independently of (qt, ct) and of the outcome
+
+mechanism, so Zm(t) ⊥⊥ (qt, ct). Writing µ1 = E[Yt | Zm(t) = 1] and µ0 = E[Yt | Zm(t) = 0], each
+term of the first arm satisfies E[Yt | t ∈ Tm+] = µ1, and the arm is an average of nm such terms, so
+    1
+E  nm     t∈Tm+ Yt = µ1. The same holds for the second arm with µ0. Hence
+
+          E UˆR(m) = µ1 − µ0 = E Y | do(m ∈ R) − E Y | do(m ∈/ R) = UR(m),
+
+where the second equality holds because the exposure indicator is assigned by the design and is
+therefore independent of all other variables in M, so conditioning on it coincides with intervening on
+it. No assumption on confounding between (qt, ct) and the memory state is used.
+
+Variance. In the estimation regime, the memory state is held fixed across draws, so outcomes at
+distinct draws are independent given the design; under a sequentially evolving store, the potential
+
+                                             20
+Preprint
+
+outcomes are auto-correlated through Mt, and the expression below is a lower bound. Writing
+σ+2 = Var(Yt | Zm(t) = 1) and σ−2 = Var(Yt | Zm(t) = 0),
+
+          Var UˆR(m)  = Var   1         Yt  + Var      1           Yt  = σ+2 + σ−2 .
+                             nm                    T −nm                  nm T − nm
+
+                                 t∈Tm+                      t∈Tm−
+
+The denominators are constants fixed by the design, so this expression is exact and not conditional
+on realized arm sizes. Under independent inclusion with Pr(Zm(t) = 1) = em the arm sizes
+are Binomial(T, em) and the corresponding statement holds only conditionally on them, with an
+additional term from their variability; balanced assignment removes it.
+
+The standard error used in Section 3.3 is σˆ(m) = σˆ+2 /nm + σˆ−2 /(T − nm) 1/2 with σˆ±2 the
+within-arm sample variances, and is defined whenever nm ≥ 2 and T − nm ≥ 2.
+
+Corollary 1 (Exposure Budget). Under balanced assignment with budget B, exposed slots k, and
+pool P, every m ∈ P receives nm ∈ {⌊T k/|P|⌋, ⌈T k/|P|⌉} exposures. Attaining a minimum of
+nmin draws in each arm for every pool member therefore requires
+
+                                                      |P |
+                                        T   ≥ nmin ·     ,                            (10)
+                                                      k
+
+so the horizon grows linearly in |P|/k and does not depend on |Mt|.
+
+Proof. By construction the T k exposure slots are divided as evenly as possible among |P| members,
+so nm ≥ ⌊T k/|P|⌋ for every m. Requiring ⌊T k/|P|⌋ ≥ nmin gives Eq. 10. The excluded arm
+satisfies T − nm ≥ nmin when ⌈T k/|P|⌉ ≤ T − nmin, that is when k/|P| < 1 with margin. When
+k is large relative to |P| a memory may be exposed on nearly every timestep and the excluded arm
+starves; Section 4.3 reports this case.
+
+Remark 3 (What the budget does not buy). Eq. 10 bounds the horizon required to identify the
+members of P, not the full store Mt. Identifying additional memories requires enlarging P, increasing
+the required horizon proportionally. The budget therefore trades coverage for horizon, and the choice
+of P determines which memories can be identified.
+
+C.3 DECISION RULES UNDER IRREVERSIBILITY
+
+Section 3.3 asks what an identified estimate supports as an operation. The answer turns on an
+asymmetry in the losses rather than on the estimate’s precision: forget destroys the memory and
+the channel through which its utility could be re-estimated, while noop is revisited at the next
+decision point. The following result characterizes the Bayes rule under that asymmetry.
+Theorem 2 (One-Sided Abstention is Bayes-Optimal). Let λ = H/τ ≥ 1 and z = UˆR(m)/σˆ(m).
+The Bayes-optimal rule is forget(m) ⇐⇒ gλ(z) < 0, where gλ is strictly increasing with a
+unique root z⋆(λ) satisfying z⋆(λ) < 0 for λ > 1, z⋆(1) = 0, and z⋆(λ) → −∞ as λ → ∞.
+
+Proof. Under the posterior U ∼ N (UˆR(m), σˆ2(m)), write z = UˆR(m)/σˆ(m) and use the standard
+truncated-normal moments
+
+          E[max(0, U )] = σˆ zΦ(z) + ϕ(z) , E[max(0, −U )] = σˆ −zΦ(−z) + ϕ(z) .
+
+Eviction is preferred iff E[Lforget] < E[Lnoop], that is iff
+
+                               Hσˆ zΦ(z) + ϕ(z) < τ σˆ −zΦ(−z) + ϕ(z) .
+
+Dividing by τ σˆ > 0 and setting λ = H/τ , this is λ[zΦ(z) + ϕ(z)] + zΦ(−z) − ϕ(z) < 0, which is
+gλ(z) < 0 for gλ as in Eq. 9.
+(i) Monotonicity. Using ϕ′(z) = −zϕ(z),
+
+             gλ′ (z) = λΦ(z) + λzϕ(z) + Φ(−z) − zϕ(z) − (λ − 1)zϕ(z)
+                    = λΦ(z) + Φ(−z) + zϕ(z) λ − 1 − λ + 1 = λΦ(z) + Φ(−z) > 0.
+
+                                            21
+Preprint
+
+(ii) Existence, uniqueness, and sign of the root. gλ(0) = (λ − 1)ϕ(0) > 0 for λ > 1, and
+gλ(z) → −∞ as z → −∞ since zΦ(−z) → −∞ while the remaining terms are bounded. Continuity
+and (i) give a unique root, and gλ(0) > 0 places it strictly below zero. The rule gλ(z) < 0 is therefore
+z < z⋆(λ), which is Eq. 9.
+(iii) The symmetric case. At λ = 1, g1(z) = z[Φ(z) + Φ(−z)] = z, whose unique root is z = 0;
+the rule reduces to thresholding on the sign of UˆR(m) and abstention disappears.
+(iv) Monotonicity in λ. ∂gλ/∂λ = zΦ(z) + ϕ(z) = E[max(0, U )]/σˆ > 0 for every z, so gλ
+increases pointwise in λ and its root moves left; strict monotonicity of z⋆ follows from (i) and the
+implicit function theorem. Since zΦ(z) + ϕ(z) > 0 everywhere, for any fixed z there is a λ beyond
+which gλ(z) > 0, so no finite z remains in the eviction region as λ → ∞.
+
+Corollary 2 (Two-sided rules are dominated). For λ > 1, any rule that evicts some m with UˆR(m) >
+0 incurs strictly greater expected loss than abstaining on that m.
+
+Proof. If UˆR(m) > 0 then z > 0, and by (i)–(ii) of Theorem 2, gλ(z) > gλ(z⋆) = 0. Since
+gλ(z) < 0 characterizes the region where eviction has lower expected loss, eviction is strictly worse
+than noop at every such z. A rule of the form |UˆR(m)| > δσˆ(m) evicts on z > δ and is therefore
+dominated for every δ > 0.
+
+Remark 4 (Behaviour under failed identification). When a memory has no support, σˆ(m) is un-
+bounded and z → 0, so gλ(z) → (λ − 1)ϕ(0) > 0 and the rule abstains. The rule therefore degrades
+to noop exactly on the memories of Theorem 1, without requiring a separate diagnostic to detect
+them.
+Remark 5 (Calibration). Solving gλ(z⋆) = 0 numerically gives z⋆(10) ≈ −0.90, z⋆(100) ≈
+−1.72, and z⋆(1000) ≈ −2.42. The threshold grows logarithmically in λ, so even a thousand-fold
+irreversibility penalty calls for roughly 2.4 standard errors.
+
+C.4 CONDITIONS REQUIRED BY THE OBSERVATIONAL COMPARATOR
+
+The observational comparator of Section 3.2 estimates U (m) from logged interactions without
+randomization, and therefore requires two conditions the exposure design does not.
+Condition 1 (Inclusion-Level Ignorability). Conditional on (Mt−m, qt, ct), the inclusion indicator
+1m∈Mt is independent of the potential outcomes: Yt(a) ⊥⊥ 1m∈Mt | Mt−m, qt, ct for a ∈ {0, 1}.
+
+The assumption is stated at the level of the treatment the estimator uses. Inclusion is a determin-
+istic function of the operation history, so per-step ignorability for Ot does not by itself deliver
+exchangeability for 1m∈Mt .
+Condition 2 (Feasibility-Restricted Positivity). For all feasible operations o ∈ O(Mt) and all
+(M, q, c) in the support, p(Ot = o | Mt = M, qt = q, ct = c) > 0.
+
+Restricting to the feasible set O(Mt) avoids requiring nonzero probability for structurally impossible
+operations. This is the overlap condition prior work verifies, and it is independent of Assumption 1.
+Under these two conditions the observational estimator is consistent for U (m) if either nuisance
+model is correctly specified.
+Proposition 3 (Double Robustness of the Observational Comparator). Uˆobs(m) −→p U (m) if either pˆ
+or µˆ is correctly specified.
+
+Proof. We prove double robustness by showing E[Uˆobs(m)] = U (m) when either pˆ = p or µˆ = µ.
+Define the treatment indicator Ai = 1m∈Mi and the shorthand ei = p(m ∈ Mi | Mi−m, qi, ci) for
+the true propensity, eˆi = pˆ(m ∈ Mi | Mi−m, qi, ci) for the estimated propensity, µ1(M −m, q, c) =
+E[Y | m ∈ M, M −m, q, c], and µ0(M −m, q, c) = E[Y | m ∈/ M, M −m, q, c]. The AIPW estimator
+
+                                                           22
+Preprint
+
+(Eq. 8) can be written as:
+
+                          1  n
+                          n
+       Uˆobs(m)      =                  µˆ1(Mi−m, qi, ci) − µˆ0(Mi−m, qi, ci)
+
+                             i=1
+
+                           1n           Ai     (Yi     −  µˆ1(Mi−m,    qi,  ci))  −  1 − Ai   (Yi  −  µˆ0(Mi−m,       qi,  ci))  .
+                        +               eˆi                                          1 − eˆi
+
+                           n
+
+                                 i=1
+
+Case 1: µˆ = µ (outcome model correct). When µˆ1 = µ1 and µˆ0 = µ0, the residuals Yi −
+µˆ1(Mi−m, qi, ci) have conditional mean zero given Ai = 1, qi, ci. Thus:
+
+E      Ai   (Yi  −   µ1(Mi−m         ,  qi  ,  ci))    qi, ci  =  ei   ·  E[Yi  −  µ1(Mi−m, qi, ci)   |  Ai      =  1, qi, ci]   =  0,
+       eˆi                                                        eˆi
+
+regardless of eˆi. The same holds for the 1 − Ai term. Therefore:
+
+                          E[Uˆobs(m)] = E[µ1(M −m, q, c) − µ0(M −m, q, c)] = U (m).
+
+Case 2: pˆ = p (propensity model correct). When eˆi = ei, we expand each summand. For the Ai
+
+term:
+
+                          E  Ai   Yi           qi, ci  =  ei   µ1(Mi−m, qi, ci)      =  µ1(Mi−m, qi, ci).
+                             ei                           ei
+
+Similarly, E     Ai  µˆ1     qi, ci     = µˆ1(Mi−m, qi, ci). The µˆ1 terms from the outcome model and the IPW
+                 ei
+
+correction cancel:
+
+                 E[summandi | Mi−m, qi, ci] = µˆ1 − µˆ0 + µ1 − µˆ1 − (µ0 − µˆ0)
+                                                   = µ1(Mi−m, qi, ci) − µ0(Mi−m, qi, ci).
+
+Thus E[Uˆobs(m)] = E[µ1(M −m, q, c) − µ0(M −m, q, c)] = U (m), regardless of µˆ.
+
+Efficiency. When both models are correct, the influence function of Uˆobs equals the efficient influence
+function for the ATE (Robins et al., 1994):
+
+φ(Y, A, M −m, q, c)          =  µ1(M −m, q, c) − µ0(M −m, q, c) − U (m) +                     A       − µ1) −       1−A          − µ0).
+                                                                                                (Y                         (Y
+
+                                                                                              e                     1−e
+
+By the semiparametric efficiency theory of Bickel et al. (1993),                        Var(φ)     =  σe2ff  is  the  semiparametric
+efficiency bound, and √n(Uˆobs − U (m)) −→d N (0, σe2ff).
+
+Throughout we suppress Mi−m in the conditioning of expectations, since it is held fixed in every
+term; each E[ · | qi, ci] below denotes E[ · | Mi−m, qi, ci].
+
+C.5 THE STORE-LEVEL RANDOMIZED COMPARATOR
+
+Proposition 4 (Unbiasedness of Store-Level Arm). Under independent store-level perturbation with
+rate pflip, Uˆexp(m) is an unbiased utility EM−m [E[Y | m ∈ M, M −m] − E[Y | m ∈/ M, M −m]] ,
+regardless of confounding, with variance σ+2 /|Tm+| + σ−2 /|Tm−|.
+
+Proof. By Proposition 4, the shadow inclusion indicator Zm(t) = 1m∈Mts is drawn independently with
+Pr(Zm(t) = 1) = 1 − pflip, and crucially Zm(t) ⊥⊥ (qt, ct) by construction (since shadow perturbations
+are drawn independently of the query and context at each timestep).
+
+Define the conditional outcome function under the shadow state:
+
+                       µs(z, M −m, q, c) = E[Yts | Zm(t) = z, M−s m, qt = q, ct = c],
+
+where M −m,s denotes the shadow state of all memories except m.
+
+                                                                       23
+Preprint
+
+Consider the expectation:
+                            E[Uˆexp(m)] = E[Yts | m ∈ Mts] − E[Yts | m ∈/ Mts].
+
+Since Zm(t) ⊥⊥ (qt, ct), conditioning on the inclusion of m does not bias the distribution of queries.
+The remaining randomness comes from M −m,s, where each other memory m′ is independently
+included with probability 1 − pflip. Let Pshadow denote this distribution over M −m. Then:
+
+                   E[Yts | m ∈ Mts] = Eq,c EM−m∼Pshadow [E[Y | m ∈ M, M −m, q, c]],
+                   E[Yts | m ∈/ Mts] = Eq,c EM−m∼Pshadow [E[Y | m ∈/ M, M −m, q, c]].
+
+Therefore:
+         E[Uˆexp(m)] = EM−m∼Pshadow Eq,c[Y | m ∈ M, M −m] − Eq,c[Y | m ∈/ M, M −m] ,
+
+which is the marginal utility.
+
+For the variance, since observations across timesteps are independent (conditional on the shadow
+design), and |Tm+| and |Tm−| are the sample sizes in each group:
+
+          Var(Uˆexp(m))   =  Var(Yts | m ∈   Mts)                        +    Var(Yts | m ∈/  Mts)   =   σ+2   +   σ−2     .
+                                     |Tm+|                                            |Tm−|             |Tm+|     |Tm−
+                                                                                                                        |
+
+No assumption on the confounding structure between (qt, ct) and memory operations is required
+because the shadow perturbations are randomized independently of all other variables in the system.
+
+C.6 AIPW ESTIMATOR: CONSISTENCY, EFFICIENCY, AND ROBUSTNESS
+
+Condition 3 (Regularity Conditions for AIPW). The following hold: (i) the propensity is bounded
+away from zero and one: ϵp ≤ pˆ(m∈M | M −m, q, c) ≤ 1 − ϵp for all m, M −m, q, c; (ii) at least
+
+one of pˆ or µˆ converges to its population counterpart at rate op(n−1/4).
+
+Under these regularity conditions, the AIPW estimator inherits the double robustness and efficiency
+
+properties, adapted to the setting where the treatment is memory inclusion 1m∈Mt and the adjustment
+set is (Mt−m, qt, ct).
+
+Proposition 5 (AIPW Consistency for Memory Effects). Under Conditions 1 and 2, and Condition 3,
+
+the AIPW estimator Uˆobs(m) (Eq. 8)       satisfies Uˆobs(m√)                 −→p U (m) if either       pˆ −→p p        or µˆ    −→p µ
+(double robustness). When both models     are consistent, n                   Uˆobs(m) − U (m)          −→d N (0,       σe2ff),  where
+
+σµˆe2fcf oinsvtehregeseamt irpaatreanm−eαtrifcoreffαici>enc1y/4boaunndd  for  the ATE   (asymptotic  normality). If both pˆ and
+                                                                         the  nuisance  models are   fitted by cross-fitting, then
+
+|Uˆobs(m) − U (m)| = Op(n−1/2). Algorithm 3 fits and evaluates on the same log; the consistency of
+Proposition 3 does not require it.
+
+Proof. This theorem adapts the classical AIPW results (Robins et al., 1994; Bang and Robins, 2005)
+to the memory operation setting. The key observation is that memory inclusion A = 1m∈M is a
+binary treatment, (M −m, q, c) is the adjustment set, and Conditions 1 and 2 provide the standard
+unconfounded state and overlap conditions.
+
+Double robustness. This follows directly from Proposition 3, which establishes E[Uˆobs(m)] = U (m)
+when either model is correct. The law of large numbers then gives Uˆobs(m) −→p U (m).
+
+Asymptotic normality. When both models are consistent, the AIPW estimator is asymptotically
+linear with influence function φ (as derived in the proof of Proposition 3). By the CLT:
+
+          √n(Uˆobs(m)                √1   n
+                                       n
+                       −  U (m))  =            φ(Yi, Ai, Mi−m, qi, ci) + op(1) −→d N (0, σe2ff),
+
+                                          i=1
+
+where σe2ff = Var(φ) equals the semiparametric efficiency bound (Bickel et al., 1993).
+
+                                                                         24
+Preprint
+
+                       |E[Uˆobs(m)] − U (m)| = O(∥pˆ − p∥ · ∥µˆ − µ∥) = O(n−2α).
+
+Since 2α > 1/2, this bias is o(n−1/2), and the total error is dominated by the O(n−1/2) variance
+term:
+
+                                       |Uˆobs(m) − U (m)| = Op(n−1/2).
+
+Condition 3(i) ensures the propensity weights are bounded, preventing the variance from exploding.
+In practice, this is enforced by propensity clipping at ϵp.
+
+Propensity-score clipping. The AIPW estimator can suffer from variance explosion when estimated
+propensities approach zero. To prevent this, CMP clips propensities at ϵp > 0:
+
+              pˆclip(m∈M | M −m, q, c) = max pˆ(m∈M | M −m, q, c), ϵp .  (11)
+
+Clipping introduces a controlled bias, bounded by |E[Uˆocblisp(m)] − U (m)| ≤ 2 Pr(p(m∈M | ·) <
+ϵp) · ∥Y ∥∞. For each arm the bias on the clipped region is E[Y (p/ϵp − 1) | p < ϵp], and since
+0 ≤ p < ϵp the factor p/ϵp − 1 lies in [−1, 0). This comes in exchange for variance bounded
+by σY2 /(nϵp2). With ϵp = 0.01 in our experiments, this trade-off keeps the AIPW estimator stable
+under mild positivity violations. Clipping bounds the variance but does not repair support: where
+
+P (m ∈ R | q, c) = 0, Theorem 1 shows no choice of ϵp recovers UR(m).
+
+D ALGORITHM DETAILS
+
+Algorithm 1 gives the three-phase procedure of Section 3.4. Algorithms 2–4 specify the exposure
+assignment, the estimation step, and online operation.
+
+Algorithm 1 Causal Memory Policy (CMP)
+
+Input: Initial memory state M0; context budget B; exposed slots k ≤ B; exposure pool P ⊆ M0; horizon T
+Output: Per-memory estimates {UˆR(m), σˆ(m)}m∈P and comparator estimates
+
+1: {nm}m∈P , π ← BALANCEDASSIGNMENT(P, k, T )                            ▷ Alg. 2
+
+2: em ← nm/T for all m ∈ P                             ▷ propensities are fixed, not estimated
+
+3: L ← ∅                                                                 ▷ interaction log
+
+4: for t = 1 to T do
+
+5: receive query qt, context ct
+
+6: Et ← π(t)                                           ▷ the k memories exposed at t
+
+7: Rt ← top-(B−k)(Mt, qt) ∪ Et
+
+8: Yt ← fY (Rt, qt, θLLM); score Yt
+
+ 9: Zm(t) ← 1m∈Rt for all m ∈ P
+10: L ← L ∪ {(Mt, qt, ct, Rt, Z(t), Yt)}
+
+11: Ot ← fO(Mt, qt, ct)                                                  ▷ default policy
+
+12: Mt+1 ← fM (Mt, Ot, qt)
+
+13: end for                                                              ▷ Alg. 3
+14: {UˆR, σˆ, Uˆobs, Uˆexp, Γ} ← ESTIMATE(L, P, {em})                    ▷ Alg. 4
+15: SERVE(L, P, {em}, {UˆR, σˆ})
+
+                                          25
+Preprint
+
+Algorithm 2 BALANCEDASSIGNMENT: exposure allocation
+
+Input: Pool P; exposed slots per step k; horizon T
+Output: Exposure counts {nm}; assignment π : {1, . . . , T } → Pk
+
+1: S ← multiset containing each m ∈ P repeated ⌊T k/|P|⌋ times
+
+2: distribute the remaining T k − |S| slots to distinct members of P, one each
+
+3: nm ← multiplicity of m in S                                           ▷ nm ∈ {⌊T k/|P|⌋, ⌈T k/|P|⌉}
+
+4: draw a uniformly random permutation ρ of S
+
+5: for t = 1 to T do
+
+6: π(t) ← the t-th block of k consecutive elements of ρ
+
+7: if π(t) contains a repeated memory then
+
+8: swap the duplicate with an element of a later block that does not conflict
+
+9: end if
+
+10: end for
+
+11: return {nm}, π
+
+The swap in Algorithm 2 preserves each nm, leaving propensities unchanged while preventing
+duplicate exposures within a timestep. Overlap with the top-(B − k) retrieval may still reduce the
+realized context below B distinct memories; realized sizes are reported in Appendix F.
+
+Algorithm 3 ESTIMATE: utility estimation and comparators
+
+Input: Log L; pool P; propensities {em}; clipping threshold ϵp
+
+Output: {UˆR(m), σˆ(m), Uˆobs(m), Uˆexp(m), Γ(m)}m∈P
+
+1: for each m ∈ P do
+2: Tm+ ← {t : Zm(t) = 1}, Tm− ← {t : Zm(t) = 0}
+
+3:  UˆR(m)   ←     1      t∈Tm+  Yt  −     1    t∈Tm− Yt                                             ▷ Eq. 6
+                |Tm+ |                  |Tm− |                                                     ▷ Prop. 2
+
+4: σˆ(m) ← σˆ+2 /|Tm+| + σˆ−2 /|Tm−| 1/2                                                             ▷ Eq. 7
+
+5: mark m unidentified if min(|Tm+|, |Tm−|) < nmin                                                   ▷ Eq. 8
+                                                                                                   ▷ Prop. 4
+6: end for
+7: fit pˆ(m∈M | M −m, q, c) and µˆ(a, M −m, q, c) on L
+
+8: clip pˆ ← max(pˆ, ϵp)
+
+ 9: for each m ∈ P do
+10: Uˆobs(m) ← AIPW estimate
+11: Uˆexp(m) ← store-level arm estimate
+
+12: Γ(m) ← |Uˆobs(m) − Uˆexp(m)|/ σˆo2bs(m) + σˆe2xp(m)
+13: end for
+
+14: return all estimates and the identified/unidentified partition of P
+
+In Algorithm 3, Γ(m) serves only as a diagnostic for memories retained by both comparator arms.
+Because its null is composite, it reports disagreement without attributing its cause.
+
+Algorithm 4 SERVE: online operation
+
+Input: Log L; pool P; assignment π; budget B; exposed slots k; current estimates; threshold z⋆(λ)
+
+1: for each incoming query qt do
+
+2: Et ← π(t); Rt ← top-(B−k)(Mt, qt) ∪ Et
+
+3: Yt ← fY (Rt, qt, θLLM); return Yt to the user
+
+4: append (Mt, qt, ct, Rt, Z(t), Yt) to L; update UˆR(m), σˆ(m) incrementally
+
+5: if a downstream policy requests a decision for memory m at query qt then
+
+6:        return forget if UˆR(m) < z⋆(λ) σˆ(m), else noop                                         ▷ Eq. 9
+
+7: end if
+
+8: end for
+
+In Algorithm 4, Line 6 applies Theorem 2 to a single query, not a retention policy. A retention
+policy must aggregate over queries, but Section 3.3 shows that every admissible aggregation is either
+attenuated or degenerate. Memories marked unidentified in Algorithm 3 have unbounded σˆ and
+therefore never satisfy the forget criterion, so no additional abstention mechanism is required.
+
+                                                          26
+Preprint
+
+E EXPERIMENTAL SETUP
+
+E.1 BENCHMARK DATASETS
+
+We evaluate on two conversational memory benchmarks, two multi-hop question answering datasets
+for replication, and one deployed memory system. For each, we describe the benchmark and the
+structural property that determines what claims it can support.
+
+LongMemEval (Wu et al., 2024). A benchmark for long-horizon conversational memory. We use
+the longmemeval_s variant, comprising 500 records with haystacks averaging 487 turns. Each
+question is annotated with the sessions containing its required evidence, and turns within those
+sessions carry a has_answer flag. We focus on the 51 multi-evidence items whose annotations
+identify more than one required session. Based on the structure of the required evidence, we
+classify them as INDEPENDENT (30), OVERLAPPING (9), FILTERED (4), or SUSPECT (8). The
+SUSPECT items are excluded from aggregate results and reported separately in Appendix H. The
+INDEPENDENT subset contains 113 required memories, and the 43 items excluding SUSPECT contain
+170. LongMemEval provides exactly one evaluation question per memory store; therefore, it supports
+estimating per-query memory utility but cannot evaluate transfer across queries.
+
+LoCoMo (Maharana et al., 2024). A long-term, multi-session dialogue benchmark containing 10
+conversations (5,882 turns) and 1,986 annotated questions. Unlike LongMemEval, each conversation
+is queried multiple times, allowing the same memory to contribute to different questions: 750 of 1,425
+required memories are needed by at least two questions. LoCoMo is therefore the only benchmark
+in our study that supports evaluating memory utility across queries and the transfer analysis. Under
+the same retrieval protocol as LongMemEval, it contains 359 required (question, memory) pairs over
+stores averaging 588 memories.
+
+HotpotQA (Yang et al., 2018) and MuSiQue (Trivedi et al., 2022). Multi-hop question answering,
+used to test whether the identification result depends on conversational data. We sample 150 questions
+from each, stratified by question type for HotpotQA (bridge 120, comparison 30) and by hop count
+for MuSiQue (2-hop 78, 3-hop 47, 4-hop 25), matching the population proportions.
+
+The standard distractor setting provides only 10 paragraphs per question, yielding a curated candidate
+set rather than a realistic memory store. We therefore pool all passages from the sampled questions
+into a shared corpus per dataset: 6,342 supporting sentences for HotpotQA and 2,959 paragraphs
+for MuSiQue. No sampled question shares annotated evidence with another (0/360 gold units on
+HotpotQA and 0/388 on MuSiQue).
+
+In HotpotQA, gold evidence always spans two documents but ranges from 2 to 5 supporting sentences
+(mean 2.4). In MuSiQue, the number of gold paragraphs equals the annotated hop count. We therefore
+report both unit-level recall and distinct-source coverage, since retrieving multiple units from the
+same source may still miss other required evidence.
+
+Mem0 (Chhikara et al., 2025), version 2.0.18. A deployed memory system, used to test transfer.
+We replay LongMemEval histories through Mem0’s own extraction, storage, and retrieval path
+without modification, recording every add() call, the memories it creates, and the candidate window
+passed to its memory manager. Stores average 291 memories after replay. Because Mem0 rewrites
+source turns into its own phrasing, annotated gold turns must be matched to stored memories before
+evaluation; Appendix F.4 describes the matching procedure and reports its uncertainty.
+
+E.2 RETRIEVAL FUNCTION SPECIFICATION
+
+The retrieval function Rt = fR(Mt, qt) (Def. 1) selects a part of memories relevant to the current
+query.
+
+Embedding and similarity. We use all-MiniLM-L6-v2 from the sentence-transformers library
+
+to compute 384-dimensional embeddings for both queries and memories. All embeddings are
+
+computed  locally  on  CPU.  Relevance  is  measured  by  cosine  similarity:  sim(qt, m)  =    e(qt )⊤ e(m)   .
+                                                                                              ∥e(qt )∥·∥e(m)∥
+
+Selection. The deterministic rule returns the highest-scoring memories to fill its allotted slots,
+subject to a minimum similarity threshold τret = 0.3; memories below the threshold are not retrieved
+regardless of rank, and fewer than the allotted number are returned when too few clear it. Under
+
+                                            27
+Preprint
+
+the exposure design of Eq. 5 the rule fills B − k slots, with the remaining k supplied by balanced
+round-robin draws from P.
+
+E.3 SYSTEMS AND IMPLEMENTATION
+
+Retrieval. Memories are embedded with all-MiniLM-L6-v2 (384 dimensions) and ranked by
+cosine similarity. Under the exposure design of Eq. 5, the deterministic retriever fills B − k context
+slots, while the remaining k are assigned by balanced round-robin exposure from P (Algorithm 2).
+Embeddings are computed once at insertion and cached. For the retrieval analysis, we additionally
+evaluate the bi-encoders BGE-M3, jina-embeddings-v5-small, gemini-embedding-2,
+and text-embedding-3-large, together with the cross-encoder BGE-reranker-v2-m3,
+applied to the top 50 cosine-retrieved candidates.
+
+Generation. All outcomes are generated by a pinned gemini-3.7-flash at temperature 0 with
+max_output_tokens = 1024. Reasoning tokens cannot be disabled on this model and consume
+part of the budget; we log reasoning and visible tokens separately and flag every truncation. The
+generator receives exactly the retrieved memory texts and the question, with no item metadata; see
+Appendix I for a discrepancy between this and the repository’s default serving path.
+
+Memory representation. Each stored memory is a single conversational turn. Memory rendering
+differs across experiment families, and we note this in Appendix I because it affects the comparability
+of absolute scores across families, though not within them.
+
+E.4 EXPOSURE DESIGN PARAMETERS
+
+Table 6 gives the design parameters for every experiment reported in Section 4. These differ across
+experiments and the differences are load-bearing: the number of exposed slots k determines whether
+a memory retrieved by the deterministic rule has an excluded arm, and the horizon T together with
+the pool size |P| determines draws per memory through Corollary 1.
+
+Table 6: Exposure design parameters by experiment. Draws per memory is T k/|P|; the identification
+bar requires at least nmin = 5 in each arm. On LoCoMo the horizon is spread across roughly
+30 questions per conversation, so the pooled row supplies 5.0 draws per memory but only 3 per
+(memory, question) cell, which is why the per-query estimand requires a separate design.
+
+          Analysis                Benchmark B k T |P| Draws/mem.
+
+          Identification, single query LongMemEval 6 2 90 ≈ 32  5.6
+
+          Two-sided exposure      LongMemEval 6 2 90 ≈ 32       5.6
+
+          Identification, pooled  LoCoMo        6 2 90 36       5.0
+
+          Identification, per query LoCoMo      6 6 30 36       5.0
+
+The pooled and per-query settings differ in two essential ways. First, the per-query design concentrates
+the horizon on fewer questions, providing enough draws to estimate a query-specific contrast. Second,
+it sets k = B, removing the deterministic retriever from the estimation draws entirely. This is
+necessary because required memories have median cosine rank 3: with B − k = 4 deterministic
+slots they are retrieved on every draw, leaving no excluded arm, and increasing T cannot create
+one. The two-sided design of Section 4.3 resolves the same obstruction by forcing exclusion of a
+deterministically retrieved memory.
+
+Exposure pool construction. The exposure pool P consists of the required memories for the
+evaluated questions, plus the 20 highest-ranked and 10 uniformly sampled memories from the
+remainder of the store. Retrieval still ranks over the full store. This oracle pool isolates the effect of
+randomized exposure on identification; Appendix H.8 shows that practical pool-selection rules fail to
+recover comparable coverage.
+
+E.5 OUTCOME MEASUREMENT
+
+Outcomes are evaluated by token-level F1 and exact match after standard normalization (lowercasing,
+article and punctuation removal, and whitespace collapse). For aggregation and enumeration ques-
+tions, we additionally compute task correctness: whether the response contains the correct numeric
+
+                                            28
+Preprint
+
+result (aggregation) or all gold list elements (enumeration). We report task correctness as the primary
+metric for multi-evidence items and F1 as secondary, since F1 rewards partial evidence whereas task
+correctness requires all required evidence to be retrieved.
+
+Exact match can also underestimate correctness on the multi-hop benchmarks, where gold answers
+sometimes include leading prepositions omitted by otherwise correct responses. We therefore
+additionally report a containment metric, computed offline from stored responses, and explicitly note
+whenever it leads to a different conclusion.
+
+Why LLM-as-judge accuracy is not reported. We do not report judge-based accuracy anywhere
+in this paper. The protocol scores abstentions as correct at rates between 11% and 65% depending
+on the policy, so it rewards retrieving nothing. Rescoring a fixed set of 50 outputs 20 times yields
+accuracies spanning 0.30 to 0.38, and seven distinct backend configurations appear across 2,000
+calls, with variance estimates differing threefold across runs on identical inputs. No single dispersion
+figure characterizes the instrument, and we therefore report only deterministic metrics.
+
+E.6 STATISTICAL PROCEDURE
+
+Comparisons are paired at the item level on LongMemEval and at the question level on LoCoMo, with
+standard errors clustered by conversation. For experiments involving randomized context sets, we
+report the number of draws per cell and, for random-selection baselines, the number of independent
+runs averaged.
+Identification criterion. A memory is treated as identified when |UˆR(m)| > 2σˆ(m) and both
+arms contain at least nmin = 5 draws. The minimum-draw requirement is not redundant with the
+significance test: under inverse-propensity weights, a single observation in a thin arm can produce
+both a large estimate and a large t statistic, so the significance test alone admits high-variance
+singletons. Appendix H reports how the coverage comparison changes under each criterion, including
+a case where the ordering between two designs reverses. Coverage counts estimates that exist, which
+is why we judge designs on discrimination instead.
+
+Experimental discipline. All experiments were preceded by pilot runs with manual inspection
+of raw generations. These uncovered three implementation errors before large-scale execution:
+an insufficient reasoning-token budget producing empty responses, a gold-turn reconstruction bug
+affecting the oracle selector, and a candidate-window attribution bug that inverted rank measurements.
+Each would have completed successfully while yielding misleading quantitative results.
+
+F MEASUREMENT PROTOCOLS
+
+This section defines the evaluation procedures used to produce the results in Section 4. Where
+measurements differ across benchmarks, we state the benchmark-specific definitions explicitly, since
+they affect the interpretation of the reported results.
+
+F.1 RETRIEVAL SUPPORT
+
+The quantity P (m ∈ R | q, c) is defined over the perturbations induced by the estimating design,
+not the deterministic retriever itself. For a fixed (m, q), retrieval is deterministic; the probability
+is taken over repeated perturbations of the store. Thus, P (m ∈ R | q, c) = 0 identifies memories
+that are never surfaced under that design (see Appendix H.1 for a worked case). We estimate
+P (m ∈ R | q, c) as the fraction of perturbed draws in which m appears in the retrieved set.
+Consequently, P (m ∈ R | q, c) = 0 implies an empty included arm, and Theorem 1 applies.
+
+Required memories. The definition differs by benchmark and we state each explicitly, because a
+mismatched definition changes the reported rate.
+
+LongMemEval. A turn is required for a question when it lies in a gold session and carries the
+has_answer flag. Support is computed per (question, required turn) pair, and since each item has
+one question the pair count equals the turn count.
+
+LoCoMo. A turn is required if annotated as evidence for a question. Because the same conversation
+is queried by many questions, retrieval support is defined per (question, required turn) pair. A turn
+
+                                                          29
+Preprint
+
+retrieved for one question but not another should not be counted as supported overall, as doing so
+substantially understates support failure.
+
+Mem0. A stored memory is required when it matches a required turn by the procedure of Appendix F.4.
+Because Mem0 returns 20 results per read regardless of the requested limit, its support rate is
+computed at that effective depth and is not comparable in level to the top-6 retrieval used elsewhere;
+we report it as evidence that the failure occurs in a deployed system, not that its magnitude is smaller.
+
+Perturbation efficacy. We report the fraction of store-level perturbations that leave the retrieved set
+unchanged, measured by comparing each perturbed retrieval with the unperturbed retrieval for the
+same store and query. This quantifies how often perturbing the store fails to change the model’s input.
+
+F.2 ESTIMATION UNDER EXPOSURE
+
+Estimates follow Algorithm 3 with the parameters in Table 6. Three implementation details bear on
+the reported results.
+
+Known propensities. Algorithm 2 serializes the exposure assignment before generation, and each
+propensity is read directly as em = nm/T . No propensity model is fitted for the exposure arm.
+
+Realized context size. A randomly exposed memory may already appear in the deterministic retrieval,
+reducing the realized context below the nominal budget B. We record the realized context size
+for every draw; under the two-sided design it averages 4.81 versus a nominal 5, corresponding to
+collisions in roughly one draw in five.
+
+Self-normalization. All reported estimates use the Hájek estimator. Without self-normalization,
+inverse-propensity estimates inherit a multiplicative factor 1/em that varies across memories. Consis-
+tent with this, unnormalized estimates correlate with retrievability (r = 0.123 on LongMemEval and
+0.289 on LoCoMo), whereas Hájek estimates show no correlation (0.014 and −0.005, respectively).
+
+F.3 COMPARATOR ARMS
+
+Store-level randomized arm. Each memory in P is independently retained with probability 1 − pflip,
+after which the ranker is applied to the perturbed store. Estimates are computed from timesteps at
+which m is eligible for inclusion, so that its presence or absence is determined by the randomization.
+Otherwise, timesteps where m was never eligible enter the excluded arm and bias the contrast.
+
+Observational arm. The propensity and outcome models of Eq. 7 are fitted on logged interactions,
+conditioning on (M −m, q, c). Propensities are clipped at ϵp, bounding the weights while introducing
+O(ϵp) bias.
+Support-restricted comparison. To isolate support failure from estimator quality, we restrict both
+designs to memories with P (m ∈ R | q, c) ≥ 0.8, i.e., those retrieved on nearly every draw. The two
+designs are then compared on the same memories and outcomes; outside this subset, the store-level
+design lacks an included arm, so the comparison is undefined.
+
+F.4 DEPLOYED-SYSTEM REPLAY
+We replay each LongMemEval history through Mem0 in batches of five conversational exchanges,
+matching its own API granularity, and record per add() call: the turns ingested, the memory
+identifiers created, the operations emitted, and the candidate window passed to the memory manager.
+Nothing in Mem0 is modified.
+
+Write path. Mem0 passes the top-ranked existing memories to its manager as candidates when
+deciding what to do with new content. To determine whether a superseding fact arrives while its
+stale counterpart is visible, the history is replayed in batches up to the turn preceding the superseding
+turn, and that turn is then added alone, so the recorded window is keyed to that turn’s own extracted
+fact. Batched addition produces a window keyed to whichever fact embedded last, which is generally
+unrelated; we report this in Appendix I as a measurement error we corrected.
+
+The 18 required memories Mem0 never surfaces sit at median rank 139 of 291, the 48th percentile,
+with cosine similarity spanning 0.4475 to 0.5977 across ranks 15–296, so neither a wider retrieval
+window nor a similarity threshold reliably recovers them. Additional analyses show that the 18
+
+                                                          30
+Preprint
+
+required memories never surfaced by Mem0 have median rank 139 of 291 (48th percentile), while
+cosine similarity ranges from 0.4475 to 0.5977 across ranks 15–296, indicating that neither increasing
+the retrieval window nor similarity threshold reliably recovers them.
+
+Matching stored memories to annotated evidence. Mem0 rewrites source turns into its own
+phrasing, so gold turns cannot be matched by string identity. We constrain candidates using Mem0’s
+own provenance, restricting the search to memories created by the add() call that ingested the gold
+turn, which reduces the candidate set from roughly 300 memories to a mean of 4.1. Within that set
+we compute two independent signals: a value signal matching shared numeric or named-entity tokens,
+and an embedding signal matching cosine similarity.
+
+The two signals agree on 69% of pairs after this constraint, improved from 22% without it. We report
+every Mem0 figure under three matching rules and give the spread, because the residual disagreement
+is not negligible and its direction is not neutral. Approximately one third of the residual cases are pairs
+whose evidence carries no numeric token, for which the value signal is structurally uninformative.
+
+Selection in the agreement subset. Restricting to pairs where both signals agree yields a much
+lower support failure rate, and this is an artifact. Agreement requires an exact shared token, which
+is a property correlated with retrievability: agreed matches sit at median rank 3 of 291 against 12
+for the remainder. Conditioning on agreement therefore selects on the outcome being measured. We
+report the least-conditioned rate as the estimate and the agreement-conditioned rate only as a bound
+whose bias direction is known.
+
+F.5 CROSS-QUERY TRANSFER
+
+The transfer analysis tests whether utility estimated from one set of queries predicts a memory’s
+contribution to another. we use LoCoMo, the only dataset with multiple questions per memory store.
+
+Split. Each conversation’s questions are partitioned into estimation and held-out halves by a recorded
+seed, stratified so that both halves contain questions whose required evidence overlaps and questions
+whose does not. Estimates are formed using only the estimation half.
+
+Realized contribution. On the held-out half we measure each memory’s contribution in two ways:
+by deletion, removing it from the context and recording the change in outcome; and by insertion,
+adding it to a context that lacks it. The two are reported separately because they can differ in sign for
+the same memory.
+
+Aggregations tested. A retention policy must aggregate per-query utility estimates before the next
+query is known. We evaluate three aggregations: the mean, the maximum, and a similarity-weighted
+mean using the cosine similarity between each estimation query and the held-out query. The similarity-
+weighted variant is an oracle reference because it uses information unavailable at deployment. As a
+positive control, we correlate held-out contributions with the ground-truth per-query evidence labels,
+showing that the signal is present and recoverable.
+
+Prompt-identity check. For each policy, we record the number of held-out questions whose post-
+eviction context is identical to the no-eviction baseline. A policy never changing the prompt cannot
+change the outcome, and reporting this distinguishes a genuine null from a policy that did not act.
+
+F.6 SELECTOR AND EVICTION RULES
+
+Retrieval selectors. For the scoring analysis of Appendix H.8 we compare, at matched context
+budgets: cosine over each of five bi-encoders; a cross-encoder reranker applied to the top 50 cosine
+candidates; maximal marginal relevance, sweeping its trade-off parameter over {0.3, 0.5, 0.7, 0.9}
+and reporting the full curve; a coverage-greedy selector that adds at each step the memory maximizing
+marginal coverage of required evidence; and the annotated evidence itself. The last two use gold
+knowledge and are reported as ceilings, never as methods.
+
+Eviction rules. For the nomination analysis we compare four deployable rules that a capacity-bound
+system could run without gold knowledge: lowest access frequency, lowest cosine similarity to the
+query, a recency-weighted blend of the two, and newest-first. Each nominates the 30 lowest-scoring
+memories as removal candidates. We additionally evaluate nomination by estimated utility under
+each estimation design.
+
+                                                          31
+Preprint
+
+Chance baseline. Nomination rates are reported as lift over chance, defined as the observed rate at
+which a rule nominates a required memory divided by the rate expected if it nominated uniformly
+at random from the same store. Raw rates across rules with different candidate-set sizes are not
+comparable, and reporting them without this normalization would misstate the comparison.
+
+G BASELINES AND COMPARISONS
+
+This paper studies identification rather than benchmarking memory systems. Accordingly, this section
+describes the implemented systems, the reported comparisons and their rationale, and the comparisons
+we omit.
+
+G.1 MEMORY POLICIES IMPLEMENTED
+
+We implement five memory management policies spanning the design space; all share the retrieval,
+generation, and scoring path of Appendix E.3, so differences are attributable to the management
+policy alone.
+
+Recency. A first-in-first-out buffer. When capacity is exceeded, the oldest memory by insertion order
+is evicted. No content is examined.
+
+MemoryBank (Zhong et al., 2024). Ebbinghaus-inspired forgetting. Each memory carries a retention
+score that decays exponentially with elapsed time and is reset on access; eviction removes the lowest
+score. Retention therefore tracks access recency.
+
+MemGPT (Packer et al., 2023). LLM-managed paging between a working context and external
+storage, with the model itself issuing page-in and page-out calls. Eviction decisions are made by
+prompting.
+
+A-Mem (Xu et al., 2025). Zettelkasten-style organization. Memories are linked by semantic similarity
+at write time and evicted by a combination of link degree and similarity to recent queries.
+
+MemPO (Li et al., 2026). Reinforcement learning over memory operations, optimizing a policy that
+selects among store, forget, and consolidate from downstream task reward.
+
+G.2 REPORTED COMPARISONS
+
+The mechanism this paper identifies concerns which memories a policy nominates for removal, so
+we compare policies on that axis directly. Each rule nominates the 30 lowest-scoring memories in a
+store as removal candidates, and we measure how often a required memory appears among them,
+normalized by the rate expected under uniform nomination from the same store.
+
+Table 7: Nomination of required memories as removal candidates, LongMemEval independent subset.
+Lift is the observed rate divided by the rate expected under uniform nomination; 1.00 is chance.
+
+          Nomination rule           Signal used           Lift over chance
+
+          Lowest access frequency   Access counts         0.00–0.11
+          Lowest cosine similarity  Query similarity         0.00
+          Recency-weighted blend    Both
+          Newest-first              Insertion order       0.00–0.01
+                                                          0.34–0.86
+
+          Utility, store-level estimates Estimated U (m)  0.97
+          Utility, exposure estimates Estimated UR(m)     0.68
+
+Table 7 shows three things. First, heuristic policies rarely nominate required memories for eviction.
+This is not because they identify and preserve them, but because required memories are accessed
+substantially more often than typical ones (1.892× on average, in 29 of 30 items). Rules that evict
+the least accessed, least similar, or oldest memories therefore avoid the evidence that matters. Their
+competitiveness stems from this exclusion effect rather than accurate utility estimation, indicating
+that the identification failure affects only policies that rank memories by estimated utility.
+
+Second, store-level utility estimates provide essentially no guidance for eviction. Their nomination
+rate is indistinguishable from chance, consistent with the observed AUC of 0.542. In contrast,
+
+                                    32
+Preprint
+
+exposure-based estimates reduce the nomination rate to 0.68, indicating that identified utility carries
+meaningful information about which memories should not be evicted.
+
+Third, the newest-first heuristic is the exception. It nominates required memories at a rate of 0.34–
+0.86, because required evidence tends to arrive late in the conversation, making it roughly an order of
+magnitude more destructive than the other heuristic policies.
+
+G.3 OMITTED COMPARISONS
+
+We also conducted a conventional system-level comparison, evaluating the five baseline policies
+against CMP on downstream task accuracy. We do not report these results for three reasons.
+
+1. The outcome metric is unreliable. As shown in Appendix E.5, the LLM judge rewards absten-
+   tions (11–65% of judged-correct responses) and varies substantially across repeated evaluations
+   (accuracy 0.30–0.38), making policy rankings unstable.
+
+2. Item matching was not verified. The CMP and baseline evaluations selected items through different
+   execution paths, and we did not establish that they were evaluated on identical examples.
+
+3. The default serving path leaked metadata. The repository’s default prompt exposes question type
+   and date (Appendix I), making its absolute scores incomparable with the metadata-free evaluation
+   used throughout this paper.
+
+For completeness, on the subset of matched items we could verify, none of the five baseline policies
+differed significantly from CMP in token-F1 or exact match. This is consistent with Table 7: policies
+that rarely evict required memories leave the retrieved evidence, and therefore the generated answer,
+essentially unchanged.
+
+G.4 RETRIEVAL SELECTORS
+
+We evaluate whether stronger retrieval can repair retrieval support failure. The comparison includes
+five bi-encoders, a cross-encoder reranker, maximal marginal relevance (MMR), and a coverage-
+greedy selector, with annotated evidence as an oracle ceiling. Protocols are given in Appendix F.6,
+and complete results in Appendix H. We report the full MMR parameter sweep because its optimum
+is informative: across all datasets, the best setting nearly disables the diversity term.
+
+H ADDITIONAL RESULTS
+
+H.1 WORKED EXAMPLES
+
+Existing methods estimate memory utility by intervening on the store: comparing outcomes with
+and without a memory in the store. This works only when the retriever surfaces that memory. Other-
+wise, both arms produce the same retrieved context and the same outcome, making an unidentified
+memory indistinguishable from one with zero utility. In contrast, CMP intervenes on retrieval: it
+reserves a fixed number of context slots for memories sampled with known probability. Utility is
+then estimated from these randomized exposures with a quantified standard error (rather than from
+the retriever’s decisions). This thus turns previously unidentified utilities into identifiable ones with
+quantified uncertainty. Below we will show details examples to illustrate it.
+
+The three memories below are from the LongMemEval independent subset, selected on arm structure
+and text length. All are from the LongMemEval independent subset. Figure 4 shows the arm structure
+of all three under both designs. Each block is 90 estimation draws; blue marks draws in which the
+memory was retrieved, grey those in which it was not. (a) Store-level perturbation never surfaces the
+memory, so both arms contain the same contexts and the estimate is exactly zero with zero variance;
+exposure supplies six inclusions and recovers a signal. (b) The memory sits high enough in the
+ranking that exposure never excludes it, leaving no contrast. (c) Both designs have both arms, and the
+point estimates agree to three decimal places.
+
+A memory the store-level design cannot see. Item gpt4_2f56ae70 asks which streaming service
+the user began using most recently, with gold answer Disney+. One required turn reads: “I’m having
+trouble finding a specific documentary I saw on Disney+ during my free trial last month.” It sits at
+cosine rank 23 of 458, so P (m ∈ R | q, c) = 0.
+
+                                                          33
+Preprint
+
+(a) gpt4_2f56ae70, rank 23/458                  (b) 2e6d26dc, rank 3/494                       (c) 28dc39ac, rank 4/431
+store-level                                     store-level                                    store-level
+
+                           0 of 90 retrieved                               78 of 90 retrieved                             80 of 90 retrieved
+                           Uˆ = 0.000 ± 0.000                              Uˆ = 0.014 ± 0.009                             Uˆ = 0.157 ± 0.050
+
+exposure                                        exposure                                       exposure
+                           6 of 90 retrieved                               90 of 90 retrieved                             27 of 90 retrieved
+                           Uˆ = +0.704 ± 0.329                             Uˆ undefined                                   Uˆ = 0.156 ± 0.226
+
+retrieved (included arm)  not retrieved (excluded arm) each block = 90 draws
+
+Figure 4: Arm structure for three required memories. (a) Store-level randomization does not surface
+the memory, so both arms contain identical contexts and no estimate exists; exposure recovers one.
+(b) The mirror case: the memory always ranks high enough that exposure does not exclude it, so
+exposure has no estimate and store-level does. (c) Where both designs have both arms, they agree
+to three decimal places, but exposure’s standard error is 4.5 times larger: randomization spent on a
+memory the ranker already varies is wasted.
+
+Under store-level perturbation the estimate is 0.000 with standard error 0.000: the retrieved set was
+byte-identical across all 90 draws, so the two arms contained the same experiment. Under exposure
+the same memory yields +0.704 ± 0.329 from six forced inclusions. Ninety draws of store-level
+randomization produced no information; six of retrieval-level randomization produced a signal two
+standard errors from zero, at the minimum exposure count the identification criterion admits.
+
+A memory the exposure design cannot see. Item 2e6d26dc asks how many babies were born to
+friends and family, gold answer 5. A required turn about twin newborns sits at cosine rank 3 of 494
+and is retrieved on essentially every draw. Store-level perturbation identifies it weakly, 0.014 ± 0.009.
+Exposure cannot: with 90 inclusions and no exclusions, the Hájek estimate is undefined. This is the
+case in which CMP’s own support condition fails: Assumption 1 requires both arms, and a memory
+the ranker always retrieves has no excluded arm under uniform exposure. Section 4.3 reports the
+symmetric design that closes this gap and why we do not adopt it. Figure 4(b) shows the missing arm.
+
+A memory both designs identify. Item 28dc39ac asks for total hours spent gaming, gold answer
+140. A required turn reporting 25 hours sits at rank 4 of 431 and is retrieved often enough for both
+designs to have support. Store-level gives 0.1566 ± 0.0497; exposure gives 0.1563 ± 0.2257. The
+point estimates agree to three decimal places, and the example was not chosen for this. Figure 4(c)
+shows both arms populated. The agreement is the point: it shows the two designs estimate the same
+quantity, which is what allows the aggregate gap in Table 3 to be attributed to coverage rather than to
+a difference in what is being measured. Exposure is nonetheless less efficient here, with 4.5 times the
+standard error, because it spends draws on a memory the ranker already varies. This is an inefficiency
+of allocating exposure uniformly over the pool, and it indicates the natural refinement: allocate by
+expected information gain, concentrating draws on memories whose contrast the ranker does not
+already supply. Exposure is worse here: the same estimate at 4.5 times the standard error. The design
+allocates exposure uniformly over the pool, so memories the ranker already varies receive draws
+that produce no contrast the store-level design lacks. This example is included because it shows the
+two designs target the same estimand, and because it bounds the claim: exposure’s advantage is in
+coverage, not in estimation quality on common support.
+
+Required is not the same as useful. A second required turn in 28dc39ac, reporting 10 hours
+for a different game, has a recovered utility of −0.256 ± 0.065. Surfacing one partial summand in
+isolation leads the model to report that summand rather than the total, so a memory that is necessary
+for the answer can be harmful when retrieved without its companions. Annotated gold status and
+conditional utility are distinct quantities, and only the second is what a policy would act on.
+
+H.2 IDENTIFICATION BY BENCHMARK
+
+Table 8 reports the support failure rate and discrimination for each benchmark under matched
+measurement, together with the design differences that prevent a like-for-like comparison of levels.
+
+Three design differences bear on these rows. LongMemEval items carry one question each, so the
+estimate is inherently per query; LoCoMo items carry roughly thirty, so a pooled estimate averages
+a memory’s contribution across questions for most of which it is irrelevant. Aligning the required-
+
+                                                34
+Preprint
+
+Table 8: Retrieval support failure and discrimination by benchmark. Support failure is the fraction
+of required (question, memory) pairs with P (m ∈ R | q, c) = 0. AUC separates required from
+non-required memories by estimated utility.
+
+Benchmark                    Pairs          P =0          Store  AUC store   AUC exposure
+
+LongMemEval (independent)     113           54.0%          487      0.542         0.664
+LongMemEval (all − suspect)   170           61.2%          487      0.529           —
+LoCoMo (pooled estimand)      359           66.9%          588      0.513
+LoCoMo (per-query estimand)   359           66.9%          588                    0.551
+Mem0 2.0.18                   109   0.284 [0.208, 0.375]   291        —           0.784
+                                                                      —
+                                                                                    —
+
+Table 9: Answer-quality cost of one-sided exposure (k = 2 of B = 6), paired per item.
+
+          Population n Exposure Cosine Diff.                     t  p
+
+          Independent 30            0.197  0.223          −0.026 −0.76 0.45
+                                    0.155  0.168          −0.013 −0.54 0.59
+          All − suspect 43          0.165  0.175          −0.010 −0.50 0.62
+
+          All                51
+
+memory label with the questions that actually generated draws recovers 65% of the gap between the
+two LoCoMo rows. Mem0 returns 20 results per read regardless of the requested limit, against the
+top-6 retrieval used elsewhere, and counts extracted facts.
+
+Support-restricted comparison. Restricted to memories with P (m ∈ R | q, c) ≥ 0.8, the store-
+level and exposure designs give AUC 0.655 and 0.658 respectively, a difference within noise. The
+store-level estimator is not weak; its aggregate deficit arises entirely from memories on which it
+has no support. The gradient is monotone in support: median |t| is 0.83 at P = 0 against 3.66 at
+P ≥ 0.8, with 15% and 59% of estimates respectively distinguishable from zero.
+
+Perturbation efficacy. Store-level perturbation leaves the retrieved set identical to the unperturbed
+ranking on 52.2% of draws on LongMemEval and 53.2% on LoCoMo. Under a matched generation
+budget the store-level design produced 940 distinct context sets against 3,939 for the exposure design
+when the query is held fixed; when the query varies across draws the ratio falls to 1.41, since query
+variation supplies context variety that store perturbation does not have to provide.
+
+H.3 COST OF EXPOSURE
+
+Reserving context slots for randomized draws displaces ranked memories and can lower answer
+quality while estimates are collected. We measure this on the LongMemEval independent subset
+by comparing each item’s mean token-F1 over its 90 exposure draws against its token-F1 under
+unperturbed cosine top-6 retrieval. The baseline consists of the store-level draws whose retrieved set
+equals the unperturbed ranking, which occur on 52.2% of draws, consistent with the (1 − pflip)B =
+0.531 expected under independent retention. Within each item these draws share one retrieved set
+and one outcome, so the baseline is a single value per item rather than an average.
+
+Exposure lowers F1 on 10 of 30 independent items, raises it on 14, and leaves 6 unchanged, so
+the median change is zero. The negative mean is driven by two items on which cosine already
+retrieves the correct evidence, with baseline F1 of 0.87 and 1.00: there, displacing two of six slots
+can only remove evidence that was working. We report the full-sample figure as the cost and do not
+exclude these items. The cost is therefore not a uniform degradation but a concentrated one, borne by
+queries the ranker already serves well, which is the population on which exposure also buys the least
+identification.
+
+H.4 ABLATION DETAILS
+
+Table 10 decomposes the difference between designs and decision rules. Gold loss is the number
+of required memories destroyed per 100 slots reclaimed; we report it because it isolates the two
+mechanisms cleanly, and note in Appendix H.6 that it does not predict answer quality.
+
+                                                          35
+Preprint
+
+Table 10: Component ablation, LongMemEval independent subset, eviction budget 10 per item.
+Destroyed counts required memories evicted; gold loss normalizes by slots reclaimed.
+
+          Variant                                AUC        Evicted  Destroyed  Gold loss
+
+          Exposure + one-sided gate              0.664        116         6        5.2
+          Exposure, ungated                      0.664        300        27        9.0
+          Store-level + one-sided gate           0.542        138        15        10.9
+          Store-level, ungated                   0.542        300        35        11.7
+
+          Exposure + two-sided gate              0.664        156        22        14.1
+          Store-level + two-sided gate           0.542        132        28        21.2
+          Two-sided exposure + one-sided gate    0.671        151        10        6.6
+
+Table 11: Recall of required evidence at matched context budget. Bi-encoders span two orders of
+magnitude in parameter count. Coverage-greedy uses gold knowledge and serves as a ceiling.
+
+Selector                                         Type                              Headroom recovered
+
+Five bi-encoders (MiniLM to gemini-embedding-2)  Pointwise                    at chance on contradiction pairs
+Cross-encoder reranker (BGE-reranker-v2-m3)      Pointwise  10% LongMemEval, 30–33% HotpotQA, 17–24% MuSiQue
+Maximal marginal relevance                       Set-aware
+                                                                                      −2.7% to +4.8%
+Coverage-greedy (ceiling)                        Set-aware
+                                                                                              95%
+
+The components are not substitutes. Holding the rule fixed at one-sided, the design reduces
+destroyed memories from 15 to 6; holding the design fixed at exposure, the rule reduces them from
+27 to 6. Neither alone approaches the joint result. The reason is structural: a confidence threshold
+filters estimates that exist, and on the 54% of memories without support there is nothing to filter.
+
+Two-sided gating is worse than no gating. Every two-sided configuration has a higher gold-loss rate
+than its ungated counterpart, 21.2 against 11.7 for the store-level design. The rule |UˆR(m)| > δσˆ(m)
+admits confidently useful memories into the eviction pool, which Corollary 2 shows is strictly
+dominated. The effect is visible in the data and not only in the loss function.
+
+Two-sided exposure closes the support gap and does not help. Adding a forced-exclusion slot
+gives every permanently retrieved memory an excluded arm, raising the excluded-arm count from 0.0
+to 21.1 for all 40 affected memories. It buys 0.007 AUC and destroys more memories, 10 against
+6. Three of the four additional losses are memories the one-sided design could not estimate at all.
+Identification is therefore not free: making a memory measurable moves it into the candidate pool,
+where a confidently signed but incorrect estimate can act on it.
+
+The measured cost in answer quality is −0.0069 F1 pooled across all exclusions, with a tail reaching
+−0.64 on items whose required evidence occupies the deterministic slots. The pooled figure is the
+population effect and the tail is heterogeneity; we report both, since an item-level maximum overstates
+the typical cost by roughly two orders of magnitude.
+
+H.5 RETRIEVAL SCORING
+
+Table 11 reports whether the support failure is repairable by better ranking. It is not: scoring quality
+moves recall by hundredths while the functional form of the selector moves it by tenths.
+
+Two observations. The five bi-encoders rank the current of two contradicting facts above the stale one
+on 45.7–55.7% of pairs, a band containing chance, and the largest model tested is not the best. And
+on every corpus the swept optimum for maximal marginal relevance is the setting that most nearly
+disables its diversity term, so the redundancy penalty is not merely unhelpful but actively costly when
+required evidence is topically similar.
+
+H.6 CROSS-QUERY TRANSFER
+
+Table 12 reports whether utility estimated on one set of queries predicts contribution on a disjoint set.
+Power is not the constraint: 99.3% of required cells are identified with at least five draws per arm,
+and the control recovers the signal from the same data. Within the query on which it was estimated,
+
+                                                 36
+Preprint
+
+Table 12: Correlation between estimated utility and realized contribution on held-out queries in
+LoCoMo. Ground-truth per-query evidence labels provide a positive control, confirming that the
+signal is recoverable from the same data.
+
+          Predictor                               Deletion  Insertion
+
+          Pooled estimate                         −0.060     +0.023
+          Nearest estimation query                 < 0.11    < 0.11
+          Similarity-weighted mean                 < 0.11    < 0.11
+          Maximum over estimation queries          < 0.11    < 0.11
+
+          Ground-truth evidence labels (control)  +0.286        —
+
+the per-query estimate separates required from non-required memories at 0.784 AUC against 0.581
+pooled, with a mean gap in estimated utility of 0.300 against 0.042. The estimator works; the estimate
+does not transfer.
+
+Degeneracy of the admissible aggregation. A retention policy cannot condition on the query it
+has not yet received, so the only admissible aggregation is query-independent. The maximum over
+estimation queries is positive for essentially every memory, since a memory that helps some query
+among thirty is never confidently harmful, and the resulting rule evicts nothing: the post-eviction
+context is identical to the control on 300 of 300 held-out questions. The similarity-weighted form
+resolves this but requires the future query.
+
+Attenuation of the pooled estimand. On LoCoMo, 77 of 109 required memories are required
+by exactly one of thirty estimation questions, so a pooled contrast averages one large effect with
+twenty-nine zeros. The pooled estimate rises with the number of questions for which a memory is
+required: −0.014 at zero, +0.024 at one, +0.042 at two, with the first step significant at p = 0.028.
+The estimator recovers the effect where the effect concentrates.
+
+H.7 SUSPECT ITEMS
+
+Eight of the 51 multi-evidence LongMemEval items have gold answers that cannot be derived from
+their annotated evidence. In one case, the annotated values sum to $850 while the gold answer is
+$5,850; in another, computing the gold average requires ages absent from every annotated turn. Even
+with all annotated evidence provided, exact-match accuracy on these items is only 0.554 and token-F1
+is 0.522, implying that 44.6% remain unanswerable under perfect retrieval. We therefore exclude
+these items from all aggregate results and report them separately.
+
+H.8 EXTENDED ANALYSIS
+
+Why the retriever misses required evidence. The memories the retriever never surfaces are not
+scored as irrelevant. For the 18 required memories Mem0 never retrieves, cosine similarities span
+only 0.4475–0.5977 while their ranks range from 15 to 296 in stores averaging 291 memories. The
+embedder therefore provides little separation between required evidence and background, leaving the
+final ranking largely determined by noise within this narrow similarity band. Consequently, neither
+widening the retrieval window nor replacing the scorer can substantially improve support, since both
+operate on an ordering that contains little signal about the quantity of interest.
+
+Retrieval scoring in full. Six embedding models spanning two orders of magnitude in parameter
+count rank the current fact above a contradictory stale fact on only 45.7–55.7% of pairs, essentially
+chance, and the largest model is not the best. A cross-encoder reranker recovers only part of the
+available headroom, improving recall by 10% on LongMemEval, 30–33% on HotpotQA, and 17–
+24% on MuSiQue, compared with 95% for a coverage-greedy selector that conditions on previously
+selected evidence. Maximal marginal relevance changes recall by only −2.7% to +4.8%, and its
+optimal parameter nearly disables the diversity term on every dataset. Overall, improving the scorer
+changes recall by only a few percentage points, whereas changing the selector changes it by tenths.
+
+Exposure budget scaling. Each memory receives T k/|P| exposure draws. The measured values
+match this prediction (3.60, 0.90, and 0.36 draws per memory for pool sizes 50, 200, and 487,
+
+                                                          37
+Preprint
+
+respectively). At full store size, 63.9% of memories receive no randomized exposure and none reaches
+the five-draw identification threshold, reducing discrimination from 0.765 to 0.651. Concentrating
+exposure on a candidate pool is therefore required by the arithmetic. This, however, requires a pool
+selector that contains the memories that matter. None of the deployable selectors in Appendix G
+provides adequate coverage, so pool selection remains the principal open problem.
+
+I REPRODUCIBILITY AND KNOWN DISCREPANCIES
+
+This section documents the evaluation instruments and implementation issues relevant to reproducing
+and interpreting the reported results.
+
+I.1 EVALUATION INSTRUMENTS
+
+The LLM judge is not stable. Rescoring the same 50 responses 20 times at temperature 0 yields
+accuracies from 0.30 to 0.38. Across 2,000 scoring calls, the provider reported 7 backend configu-
+rations, and variance estimates on identical inputs differed by up to a factor of three. Because this
+variability is comparable to the effects under study, we report only deterministic evaluation metrics.
+
+The judge scores abstention as success. Across policies, 11%–65% of responses judged correct are
+refusals to answer. A policy that retrieves nothing and abstains is therefore rewarded, and correcting
+for this reverses the ranking of methods on LongMemEval. This is a property of the evaluation
+protocol rather than of any particular method.
+
+Exact match understates correctness on multi-hop data. Gold answers in HotpotQA and MuSiQue
+sometimes include leading prepositions omitted by otherwise correct responses, causing exact match
+to score them as incorrect. We therefore report a containment metric alongside exact match and note
+whenever the two lead to different conclusions.
+
+Eight benchmark items are unanswerable as annotated. Appendix H.7 analyzes the eight
+SUSPECT items. Even with perfect retrieval, 44.6% remain incorrect, establishing a performance
+ceiling inherited by any evaluation on this subset.
+
+I.2 IMPLEMENTATION DISCREPANCIES
+
+The repository’s default answer path leaks item metadata. The serving code constructs a context
+line populated with the question type and question date, which reaches the generator. This does
+not affect any result in this paper: every experimental arm we report constructs its prompt from the
+retrieved memory texts and the question alone, verified by reconstructing the exact prompt from
+stored artifacts. But it means absolute scores obtained through the default path are not comparable to
+those reported here, and it is one reason the system-level comparison of Appendix G.3 is withheld.
+
+It also bears on Definition 1. In the arms we report, ct has no edge to Yt and retrieval mediates every
+path from the memory state to the output. Under the default path ct would be a direct cause of Yt,
+though not a path from Mt, so Propositions 1 and 1 are unaffected either way.
+Memory rendering differs across experiment families. Some arms present a stored turn as raw
+content, others prefix a role or speaker label. All are deterministic functions of the retrieved set alone,
+so mediation and the identification results are unaffected, but absolute scores are not byte-comparable
+across families. Every comparison we report is within a family.
+
+Reasoning tokens cannot be disabled. The generator consumes part of its output budget on
+reasoning tokens that are not returned. We log reasoning and visible tokens separately and flag every
+truncation. Truncation occurs on 2 of 41,961 calls (0.005%) at a 1,024-token budget, with mean
+output 190.8 tokens and p95 = 394, and truncated cells are regenerated. A further 20 calls (0.048%)
+returned empty responses without truncating.
+
+I.3 POOL CONSTRUCTION DETERMINES THE CONCLUSION
+
+A methodological finding that our own measurements depend on. Evaluating selection policies over a
+small curated candidate set and over the full store can yield opposite conclusions on the same items
+with the same policies. On curated sets of at most ten candidates, recency-based selection performs
+
+                                                          38
+Preprint
+
+within 0.03 of an oracle; over full stores its recall of required memories is 0.000 through a context
+budget of eight. Similarity-based selection is significantly worse than random among topically similar
+candidates and significantly better among off-topic ones, with the sign reversing on pool size.
+
+We report every result in this paper over full stores for this reason, and we note it here because it is a
+property of how such comparisons are constructed.
+
+I.4 COMPUTE AND COST
+
+All experiments run on a single workstation with an 8-core CPU and 64 GB of RAM; no GPU is
+required, as generation is served by API and embedding models run on CPU. Evaluation is parallelized
+across items with eight workers. Total API expenditure across the experiments reported here is
+$193.06 over 80,187 generation calls, of which the deployed-system replay accounts for $106.55.
+Earlier exploratory runs on the main benchmarks were conducted without cost instrumentation and
+their expenditure is not recoverable, so this figure covers the experiments described in Appendices F
+and H. Cost logs are written per experiment and are append-only; every reported figure is traceable to
+a logged call count and token count.
+
+I.5 ARTIFACTS
+
+We release the estimation code, exposure assignment procedure, evaluation harness, per-experiment
+protocols, and raw generated outputs with their scores. Every table in Section 4 and in Appendix is
+reproducible from the released artifacts and recorded seeds. Assignment permutations, item selections,
+and pool constructions are seeded and the seeds are stored alongside the results they produced.
+
+J LIMITATIONS
+
+Identification does not deliver a retention policy. CMP produces an identified measurement of
+per-query memory utility, and we show that this quantity does not by itself determine what to retain.
+A retention decision precedes the next query, so a policy must aggregate over queries, and every
+aggregation available to it is either attenuated by the fraction of queries for which a memory is
+required, or degenerate in the sense that it retains everything. The aggregation that would work uses
+information a deployed policy does not have. We therefore make no eviction claim, and closing this
+gap requires either a different estimand or a source of information about the query distribution that
+we do not assume.
+
+The exposure budget scales with the pool, not the store. By Corollary 1, identifying the members
+of an exposure pool P requires a horizon growing linearly in |P|/k. At realistic store sizes, uniform
+exposure leaves most memories with no randomized draws, so the design must concentrate exposure
+on a candidate set. That requires a pool selector containing the memories that matter, and the three
+deployable rules we test have near-zero nomination of required memories. Our demonstration uses a
+pool constructed with knowledge of which memories are required, which isolates the identification
+effect and does not establish that a practical selector recovers it. Exposure also has a direct cost while
+estimates are collected: displacing ranked slots changes answer quality by −0.026 F1 on average, not
+statistically distinguishable from zero but concentrated on queries the ranker already answers well.
+
+Scope. The identification failure binds on policies that rank memories by estimated utility. Heuristic
+policies are largely unaffected, not because they identify required memories but because required
+memories are accessed more often than typical ones, so frequency-, similarity-, and recency-based
+eviction routes around them. The result therefore constrains a class of methods rather than memory
+management in general. Our evidence is also drawn from a small number of benchmarks and one
+deployed system, and the level of the failure varies across them with the retrieval configuration.
+
+K APPLICATIONS OF THIS WORK
+
+Retrieval-augmented generation and context attribution. Retrieval-augmented generation con-
+ditions a model’s output on documents retrieved from an external corpus (Lewis et al., 2020), and
+context attribution asks which of those documents caused the answer. The field has moved from
+generating citations toward measuring causal influence directly. ContextCite ablates context sources
+
+                                                          39
+Preprint
+
+and fits a surrogate to the resulting changes in output (Cohen-Wang et al., 2024), Shapley-based
+methods value each retrieved document by its marginal contribution across subsets (Nematov et al.,
+2025), and internals-based methods trace an answer to its context through the model’s own activa-
+tions (Qi et al., 2024); the reliability of these attributions is now itself under study (Abolghasemi et al.,
+2025). Every one of these methods operates on documents already in the context. A document the
+retriever did not surface offers nothing to ablate, so attribution is silent about it and cannot distinguish
+a document that is irrelevant from one that was never tested. This is Assumption 1 failing in a second
+setting. Attribution explains the answer the system gave, but it cannot say whether a better answer
+was available from evidence the retriever passed over. Proposition 1 separates the two quantities
+attribution conflates, retrievability and conditional usefulness, and randomized exposure supplies the
+arm attribution lacks, so the contribution of an unretrieved document becomes estimable at the cost
+of displacing some ranked evidence while estimates are collected.
+
+Data valuation and content compensation. Data valuation assigns each data source a measure of its
+contribution to a model’s behavior, and as generative search replaces ranked links with synthesized
+answers, it is increasingly proposed as the basis for compensating the providers of that content. Data
+Shapley established valuation for training data (Ghorbani and Zou, 2019). Recent work extends it to
+documents supplied as context at inference time, valuing the sources of LLM-generated summaries
+with clustered Shapley approximations (Ye and Yoganarasimhan, 2025) and adapting payment rules
+from mechanism design to retrieval-augmented data markets (Fan et al., 2025). These methods
+value the documents a retriever surfaces. Under leave-one-out and mechanism-design payments
+only retrieved documents are compensated (Fan et al., 2025), so a document the ranker never places
+in context receives nothing regardless of what it would have contributed. The undervaluation is
+systematic: it tracks retrieval rank, and a document that is never retrieved generates no evidence that
+it should be. Theorem 1 explains why collecting more logs under the same retriever cannot correct
+this. CMP’s exposure design gives every document in a pool a known, positive probability of entering
+the context, which separates a document’s value from the ranker’s assessment of it and makes the
+value of unretrieved sources identifiable.
+
+Recommender systems and counterfactual evaluation. Recommender systems learn from logged
+feedback that exists only for items the serving policy chose to show, which makes exposure bias a
+central problem in the field. Inverse-propensity methods correct for it in learning to rank (Joachims
+et al., 2017), feedback loops in which unexposed items remain unexposed are well documented (Jiang
+et al., 2019), and two-stage architectures, in which a candidate-generation stage gates what a ranking
+stage can evaluate, have required off-policy corrections of their own (Ma et al., 2020). The problem
+has now reached LLM-based recommenders, where self-normalized inverse propensity scoring
+corrects exposure bias in continual post-deployment updates (Kim et al., 2026). This literature
+largely treats an unexposed item as recoverable: an item not shown today can be explored tomorrow,
+so exposure bias is a problem of estimation efficiency. That assumption fails whenever an action
+removes an item from future support, as in catalog delisting, inventory retirement, or memory eviction,
+where a positivity violation becomes permanent. Two of our results carry over. The mediation of
+Section 2.1 is the two-stage architecture, and identifying an item the candidate stage never passes
+requires randomizing that stage itself, as Section 3.1 does for retrieval. Theorem 2 characterizes the
+Bayes decision when an action destroys the ability to re-estimate, which is the decision a platform
+faces when it retires items on the basis of exposure-biased logs.
+
+Cognitive science of memory. Cognitive psychology has long distinguished whether a memory is
+stored from whether it can be retrieved. Items a person fails to recall are often still available and can be
+recovered with an appropriate cue (Tulving and Pearlstone, 1966), a dependence encoding specificity
+attributes to the match between the retrieval cue and the conditions of storage (Tulving and Thomson,
+1973). The theory of disuse formalizes the two as separate quantities, storage strength and retrieval
+strength (Bjork et al., 1992), and retrieval is competitive, since retrieving some items suppresses
+related ones (Anderson et al., 1994). Complementary learning systems theory has carried related
+ideas into models of consolidation (Kumaran et al., 2016; McClelland et al., 2020), but the distinction
+between storage and access has not informed how artificial memory is valued. Memory systems
+infer a memory’s value from behavior, which conflates the two quantities cognitive science keeps
+apart. Proposition 1 is their computational form: presence in the store is availability, P (m ∈ R | q, c)
+is accessibility, and UR is the value of a memory once accessed. The parallel extends to method.
+Cognitive science revealed available but inaccessible memories by changing the cue, and randomized
+exposure plays the same role, a cued-recall manipulation run with known probability. Retrieval
+
+                                                          40
+Preprint
+
+competition has an analogue as well: a deterministic ranker that repeatedly surfaces the same
+memories deprives the rest of evidence, and utility-ranked eviction then removes them.
+Human–AI interaction and longitudinal relationships. Persistent memory turns interaction with
+an assistant into a relationship that accumulates across sessions. Commercial assistants now retain
+information about users between conversations and offer controls to inspect and delete it, and
+interface research has made stored memories visible and editable (Huang et al., 2023). A recent
+study of ChatGPT’s memory feature found that users perceive AI memory as unforgetful, that most
+experienced violated expectations on learning what it retained, and that they want greater visibility
+and control (Chen et al., 2026). Appropriate reliance on such a system requires that users can tell
+when it errs (Schemmer et al., 2023). Longitudinal clinical records raise the same question in a
+high-stakes form: causal explanation with graph neural networks has been applied to the progression
+of mild cognitive impairment (Behnam et al., 2024), and a memory-augmented assistant serving
+such a user faces costly irreversible errors whenever it forgets. Transparency interfaces show what a
+memory system stores, not what it uses, and on LongMemEval the two differ substantially: 54% of
+required memories are never retrieved. Such a memory appears in a memory viewer yet is functionally
+forgotten, so the user’s belief that the assistant does not forget diverges from its behavior, and the error
+is unobservable, since the answer the memory would have produced is never shown. The divergence
+compounds over longitudinal use. A memory that is never retrieved produces no evidence of its value,
+utility-ranked eviction then deletes it, and information the user chose to share disappears without
+the system having tested whether it mattered. Proposition 1 distinguishes a stored memory from an
+accessible one, the distinction an honest memory interface would display, and randomized exposure
+lets a system learn whether a shared memory helps.
+Evaluating long-term memory in LLM agents. The application closest to this work is the evaluation
+of agent memory itself. LongMemEval (Wu et al., 2024) and LoCoMo (Maharana et al., 2024)
+established long-horizon recall as the standard test, and a second generation of benchmarks extends it
+to memory that changes over time: whether agents recognize that a memory is no longer valid (Chao
+et al.), how they handle forgetting and test-time learning (Hu et al., 2026), and how memory supports
+agents in environments beyond dialogue (Di Wu et al.). All of these query a system and score its
+answer, which measures recall for the questions asked. A retention decision depends on something
+else, a memory’s value for questions not yet asked, and a benchmark that queries each store once
+cannot measure it. LongMemEval does exactly that: every store carries a single question, and among
+its multi-evidence items none of the 203 required memories is needed by a second question. Our
+framework specifies what retention evaluation requires, namely several queries against one store with
+overlapping required evidence, and LoCoMo meets it, with 750 of 1,425 required memories shared
+across questions. It also supplies a validity check that can be run before any policy is compared: a
+benchmark whose required memories the evaluated retriever never surfaces measures the retriever,
+and Assumption 1 can be tested on it directly.
+
+                                                          41
+

@@ -1,0 +1,1599 @@
+                                        Disentangling and Integrating Relational and Sensory
+                                               Information in Transformer Architectures
+
+                                        Awni Altabaa 1 John Lafferty 2
+
+arXiv:2405.16727v3 [cs.LG] 20 Jun 2025                          Abstract                                 1. Introduction
+
+                                              Relational reasoning is a central component of             A central goal of machine learning research is to develop
+                                              generally intelligent systems, enabling robust and         a universal architecture capable of learning and reasoning
+                                              data-efficient inductive generalization. Recent            across a wide range of tasks and data modalities. Theo-
+                                              empirical evidence shows that many existing neu-           retical frameworks for understanding human and animal
+                                              ral architectures, including Transformers, struggle        intelligence seek to explain intelligent behavior through a
+                                              with tasks requiring relational reasoning. In this         small set of fundamental principles [1]. However, in ma-
+                                              work, we distinguish between two types of infor-           chine intelligence, there is a tension between the objective
+                                              mation: sensory information about the properties           of developing a general architecture and the need to incorpo-
+                                              of individual objects, and relational information          rate inductive biases that are beneficial for specific tasks [2,
+                                              about the relationships between objects. While             3]. When faced with finite training data and numerous
+                                              neural attention provides a powerful mechanism             solutions to empirical risk minimization, inductive biases
+                                              for controlling the flow of sensory information be-        steer the learning algorithm towards solutions with desirable
+                                              tween objects, the Transformer lacks an explicit           properties, enhancing data efficiency and generalization. A
+                                              computational mechanism for routing and pro-               core scientific challenge of machine learning is to identify a
+                                              cessing relational information. To address this            complete and broadly applicable set of inductive biases that
+                                              limitation, we propose an architectural extension          promote robust, flexible, and data-efficient learning across a
+                                              of the Transformer framework that we call the              diverse set of problems.
+                                              Dual Attention Transformer (DAT), featuring two
+                                              distinct attention mechanisms: sensory attention           Relational reasoning is a central component of generally
+                                              for directing the flow of sensory information, and         intelligent systems and is believed to underlie human abili-
+                                              a novel relational attention mechanism for direct-         ties for abstraction and systematic generalization [4–7]. The
+                                              ing the flow of relational information. We em-             power of relational reasoning lies in its capacity to generate
+                                              pirically evaluate DAT on a diverse set of tasks           inferences and generalizations in systematic and novel ways,
+                                              ranging from synthetic relational benchmarks to            even across instances which are superficially very different
+                                              complex real-world tasks such as language mod-             but have similarities on an abstract structural level. This
+                                              eling and visual processing. Our results demon-            grants humans a capacity for out-of-distribution generaliza-
+                                              strate that integrating explicit relational compu-         tion, data efficiency, and continual learning, which modern
+                                              tational mechanisms into the Transformer archi-            machine learning is yet to match [8–10]. Replicating this
+                                              tecture leads to significant performance gains in          ability in machine intelligence can ultimately lead to univer-
+                                              terms of data efficiency and parameter efficiency.         sal inductive generalization from a finite set of observations
+                                                                                                         to an infinite set of novel instances [11].
+                                              1Department of Statistics and Data Science, Yale
+                                        University 2Department of Statistics and Data Science,           The ability of artificial intelligence systems to perform rela-
+                                        Wu Tsai Institute, Yale University. Correspondence to:           tional reasoning has long been an area of active study across
+                                        Awni Altabaa <awni.altabaa@yale.edu>, John Lafferty              various approaches to AI. In symbolic modeling frame-
+                                        <john.lafferty@yale.edu>.                                        works, the relationships between symbols are explicitly de-
+                                                                                                         fined in the language of logic and mathematics [12–14].
+                                        Proceedings of the 42 nd International Conference on Machine     However, such approaches often require hand-crafted repre-
+                                        Learning, Vancouver, Canada. PMLR 267, 2025. Copyright 2025      sentations and suffer from the symbol grounding problem,
+                                        by the author(s).                                                limiting their ability to generalize to variations in the task or
+                                                                                                         input outside a certain domain. By contrast, deep learning
+                                                                                                         approaches build data-dependent representations that are, in
+                                                                                                         principle, capable of generalizing across diverse conditions.
+
+                                                                                                      1
+Relational & Sensory Processing in Transformers
+
+However, recent work exploring the ability of deep learning         We empirically evaluate this architecture on a diverse set of
+models to learn relational tasks finds that seemingly simple        tasks, ranging from synthetic benchmarks on relational rea-
+relational inferences can be remarkably difficult for pow-          soning to complex real-world tasks such as language mod-
+erful neural network architectures [15–23]. An emerging             eling and visual processing. Our results demonstrate that
+hypothesis, which we explore further here, explains this            integrating explicit relational mechanisms into the Trans-
+through the lens of inductive biases, arguing that neural           former architecture leads to significant performance gains
+networks struggle with relational reasoning because they            in terms of data efficiency and parameter efficiency.
+overemphasize individual object representations—sensory
+information—while lacking explicit mechanisms for encod-            2. Disentangling Attention over Sensory and
+ing and processing relational information [24].                        Relational Information
+
+In this work, we explore this idea in the context of the            2.1. Standard Attention: Attention over Sensory
+Transformer architecture [25], which offers a promising                  Information
+starting point for building a versatile, general-purpose neu-
+ral architecture. Although Transformers, like other neu-            The attention mechanism of standard Transformers can be
+ral architectures, struggle to learn abstract relational rep-       understood as a differentiable computational mechanism for
+resentations [19–23], there is encouraging evidence that            dynamically routing sensory information between different
+Transformer-based foundation models acquire some rela-              elements in the input. An object emits a query that is com-
+tional reasoning ability [26–32] through large-scale training       pared against the keys of each object in its context via an
+on large amounts of data [33–36]. This presents an op-              inner product. A “match” occurs when the inner product is
+portunity to explore Transformer-based architectures with           large, causing an encoding of the features of the attended
+built-in neural mechanisms and inductive biases for explicit        object to be retrieved and added to the residual stream of
+and enhanced relational reasoning capabilities, seeking to          the receiver. Formally, attention between an object x ∈ Rd
+imbue the Transformer architecture with a greater capacity          and a context y = (y1, . . . , yn) ∈ Rn×d takes the form
+for efficient induction of abstractions.
+                                                                    Attention(x, (y1, . . . , yn))
+To introduce our proposal, we highlight a distinction be-
+tween two types of information which are encoded in the             n
+internal representation of Transformer models: sensory in-
+formation, which represents features of individual objects,         = αi(x, y)ϕv(yi), where,                            (1)
+and relational information, representing comparisons and
+relationships between objects. In the standard attention                               i=1  ϕaqttn(x), ϕkattn(yi)  n,
+mechanism of Transformers, relational information is entan-
+gled with sensory information, limiting the model’s ability         α(x, y) = Softmax                              i=1
+to learn to explicitly represent and reason about the relation-
+ships between objects. In particular, in standard attention,        where ϕaqttn, ϕakttn are learnable query and key maps control-
+relational information directs the flow of information (i.e.,       ling the selection criterion, and ϕv is a learnable value map
+attention scores encoding a selection criterion), while the         controlling what information about yi is sent. The attention
+values routed are representations of the sensory attributes of      scores α(x, y) are used to retrieve a convex combination of
+individual objects. In this work, we explore a new type of
+attention mechanism we call relational attention, in which          the values, where αi(x, y) denotes the i-th component.
+the values being routed are themselves representations of
+relationships between the source and the target, computed           Here, the retrieved information is sensory, comprising the
+explicitly as a series of comparisons under learned feature         features and attributes of individual objects in the context.
+maps. This equips the model with a mechanism for explic-            For this reason, we refer to standard neural attention as
+itly routing and processing relational information, decou-          “sensory attention”.
+pling it from sensory features.
+                                                                    2.2. Relational Attention: Attention over Relational
+We integrate relational attention with the standard attention            Information
+mechanism of Transformers, yielding a variant of multi-
+head attention that processes both sensory and relational           Standard neural attention does not explicitly capture infor-
+information in parallel. The resulting Dual Attention Trans-        mation about the relationship between the source/sender and
+former (DAT) architecture disentangles the two types of             the target/receiver, making relational learning in standard
+information during the information retrieval stage and inte-        Transformers inefficient [15, 16, 18–24, 37]. We propose re-
+grates them during the local processing stage of each layer.        lational attention, an attention mechanism for dynamically
+                                                                    routing relational information between objects.
+
+                                                                    Mirroring standard attention, this operation begins with each
+                                                                    object emitting a query and a key, which are compared via
+                                                                    an inner product to compute attention scores determining
+                                                                    which objects to attend to. Next, instead of retrieving the
+
+                                                                 2
+       Relational & Sensory Processing in Transformers
+
+       𝑣1 𝑦1                                                               𝑟(𝑥, 𝑦1) + 𝑠1 𝑦1
+
+𝑥     𝑣2 𝑦2                                                           𝑥  𝑟(𝑥, 𝑦2) + 𝑠2 𝑦2
+
+                                          ⋮                                  ⋮                                             ⋮
+
+       𝑣𝑛 𝑦𝑛                                                             𝑟(𝑥, 𝑦𝑛) + 𝑠𝑛 𝑦𝑛
+
+    (a) Attention(x, (y1, . . . , yn))                                       (b) RelationalAttention(x, (y1, . . . , yn))
+
+Figure 1. Standard self-attention retrieves sensory information vi about the attributes of individual objects while relational attention
+retrieves relational information r(x, yi) about the relationship between the objects in the context and the target. Each relation is tagged
+with a symbol si which acts as an abstract variable identifying the source. In both cases, information is aggregated according to the
+attention scores αi, which are computed by a softmax over inner products of queries and keys.
+
+sensory features of the selected object, relational attention            structure to the relation function, transforming it into a posi-
+retrieves the relation between the two objects—defined as                tive semi-definite kernel that defines a pseudometric on the
+a series of comparisons between the two objects under dif-               object space, along with a corresponding geometry.
+ferent feature subspaces. In addition, a symbolic identifier
+is sent to indicate the identity of the sender to the receiver.          2.3. Symbol Assignment Mechanisms
+Formally, this operation is defined as follows.
+                                                                         To process relational information effectively, the receiver
+RelationalAttention(x, (y1, . . . , yn))                                 must have two pieces of information: 1) its relationship to
+                                                                         the objects in its context, and 2) the identity of the object
+    n                                                                    associated with each relation. In relational attention, the
+                                                                         former is captured by r(x, yi) and the latter by si. The
+    = αi(x, y) r(x, yi)Wr + siWs , where,                                symbols si are used to tag each relation with the identity
+                                                                         information of the sender.
+                   i=1                       n,
+                                                                         The symbol si identifies or points to the object yi, but, im-
+α(x, y) = Softmax ϕqattn(x), ϕakttn(yi)      i=1                         portantly, is designed to not fully encode the features of the
+r(x, yi) = ϕqre,ℓl (x), ϕkre,lℓ(yi) ℓ∈[dr],                              object. Instead, the symbols si function as abstract refer-
+                                                                         ences to objects, perhaps viewed as a connectionist analog
+(s1, . . . , sn) = SymbolRetriever(y; Slib)                              of pointers in traditional symbolic systems. In particular, by
+                                                                         drawing symbol vectors from a finite library Slib, relational
+                                                  (2)                    attention maintains a relation-centric representation. This
+                                                                         separation between sensory and relational information is key
+Thus, relational attention between the object x and the con-             to decoupling relational attention disentangled from sensory
+                                                                         features, enabling generalization across relations.
+text y = (y1, . . . , yn) retrieves a convex combination of the
+relation vectors {r(x, yi)}in=1, representing x’s relationship           The notion of the “identity” of an object can vary depending
+with each object in the context. Relational attention also               on context. In this work, we consider modeling three types
+                                                                         of identifiers: 1) position, 2) relative position, or 3) an equiv-
+retrieves a symbol vector si that encodes the identity infor-            alence class over features. For each type of identifier, we
+                                                                         model a corresponding symbol assignment mechanism [22].
+mation of the attended object. The role and implementation               We find that different symbol assignment mechanisms are
+                                                                         more effective in different domains.
+of the symbols will be discussed in the next subsection.
+As with standard attention, ϕaqttn, ϕkattn are learned feature           Positional Symbols. In some applications, it is suffi-
+maps that govern the attention selection criterion. A separate           cient to identify objects through their position in the in-
+set of query and key feature maps, ϕrqe,ℓl , ϕkre,lℓ, ℓ ∈ [dr], are      put sequence. We maintain a library of symbols Slib =
+learned to represent the relation between the sender and the             (s1, . . . , smax_len) ∈ Rmax_len×d and assign si to the i-th ob-
+receiver. For each ℓ ∈ [dr], the feature maps ϕqre,ℓl , ϕrke,lℓ ex-      ject in the sequence. These are essentially learned positional
+tract specific attributes from the object pair, which are com-           embeddings.
+
+pared by an inner product. This produces a dr-dimensional
+
+relation vector representing a fine-grained series of com-
+parisons (⟨ϕqre,ℓl (x), ϕkre,lℓ(yi)⟩)ℓ∈[dr] across different feature
+subspaces.
+
+In certain tasks [21–23], a useful inductive bias on the
+relations function r(·, ·) is symmetry; i.e., r(x, y) =
+r(y, x), ∀x, y. This corresponds to using the same feature
+filter for the query and key maps, ϕqrel = ϕkrel. This adds
+
+                                                                      3
+Relational & Sensory Processing in Transformers
+
+Position-Relative Symbols. Often, the relative position                     Algorithm 1: Dual Attention
+with respect to the receiver is a more useful identifier than               Input: x = (x1, . . . , xn) ∈ Rn×d
+absolute position. This can be implemented with position-
+relative embeddings. We learn a symbol library Slib =                       Compute self-attention heads
+(s−∆, . . . , s−1, s0, s1, . . . , s∆) ∈ R(2∆+1)×d, where ∆ is
+the maximum relative position, and relational attention be-                 α(h) ← Softmax (x Wqa,thtn)(x Wka,thtn)⊺ , h ∈ [nhsa]
+comes j αij (r(xi, xj ) Wr + sj−i Ws).
+                                                                            ei(h) ← αi(jh)xj Wvh, i ∈ [n], h ∈ [nsha]
+Symbolic Attention. In certain domains, some information
+about the objects’ features is necessary to identify them for                         j
+the purposes of relational processing. Yet, to maintain a rela-
+tional inductive bias, we would like to avoid a full encoding               ei  ← concat  ei(1)  ,  .  .  .  ,  e(nhsa  )  Wosa,  i ∈ [n]
+of object-level features. In symbolic attention, we learn a
+set of symbol vectors, Slib = (s1, . . . , sns ) ∈ Rns×d and                                                      i
+a matching set of feature templates Flib = (f1, . . . , fns ).
+We retrieve a symbol for each object by an attention oper-                  Assign symbols:
+ation that matches the input vectors xi against the feature                  s = (s1, . . . , sn) ← SymbolRetriever(x; Slib)
+templates fj and retrieves symbols sj.
+                                                                            Compute relational attention heads
+  SymbolicAttention(x) = Softmax (x Wq) Fl⊤ib Slib.
+                                                                    (3)     α(h) ← Softmax (x Wqa,thtn)(x Wka,thtn)⊺ , h ∈ [nhra]
+
+Here, Slib, Flib, Wq are learned parameters. This can be                    rij ← xi Wqr,eℓl, xj Wkr,eℓl ℓ∈[dr] i, j ∈ [n]
+thought of as implementing a learned differentiable “equiv-
+alence class map” over feature embeddings. Crucially, the                   ai(h) ← αi(jh) rij Wrh + sj Wsh , i ∈ [n], h ∈ [nhra]
+number of symbols (i.e., feature equivalence classes) is fi-
+nite, which enables relational attention to still produce a                           j
+relation-centric representation while tagging the relations
+with the necessary identifier.                                              ai ← concat   ai(1)  ,  .  .  .  ,  a(nhra  )  Wora,  i ∈ [n]
+
+2.4. What Class of Functions can Relational Attention                                                             i
+     Compute?
+                                                                            Output :  concat(ei, ai)      n
+To give some intuition about the type of computation that                                                 i=1
+relational attention can perform, we present the following
+expressivity result. The following theorem states that rela-                3. Integrating Attention over Sensory and
+tional attention can approximate any function on X × Yn                        Relational Information
+that 1) selects an element in (y1, . . . , yn), then 2) computes
+a relation with it. Both the selection criterion and the rela-              3.1. Dual Attention
+tion function are arbitrary, and the selection criterion can be
+query-dependent. The formal statement and proof are given                   One of the keys to the success of the Transformer archi-
+in Appendix A.                                                              tecture is the use of so-called multi-head attention. This
+                                                                            involves computing multiple attention operations in parallel
+Theorem 1 (Informal). Let Select : X × Yn → Y be an                         at each layer and concatenating the output, enabling the
+arbitrary preference selection function, which selects an                   model to learn multiple useful criteria for routing informa-
+element among (y1, . . . , yn) based on a query-dependent                   tion between objects. However, in standard Transformers,
+preorder relation {≼x}x∈X . Let Rel : X × Y → Rdr be                        these attention heads focus solely on routing sensory in-
+an arbitrary continuous relation function on X × Y. There                   formation, lacking explicit support for routing relational
+exists a relational attention module that approximates the                  information between objects.
+function Rel(x, Select(x, y)) to arbitrary precision.
+                                                                            We posit that both sensory and relational information are
+                                                                            crucial for robust and flexible learning over sequences or col-
+                                                                            lections of objects. To this end, we propose an extension of
+                                                                            multi-head attention comprising two distinct types of atten-
+                                                                            tion heads: sensory attention (i.e., standard self-attention),
+                                                                            and relational attention. This yields a powerful mechanism
+                                                                            for dynamically routing both sensory and relational infor-
+                                                                            mation in parallel. Our hypothesis is that by having access
+                                                                            to both computational mechanism, the model can learn to
+                                                                            select between them based on the current task or context,
+                                                                            as well as compose them to create highly-expressive and
+                                                                            flexible computational circuits.
+
+                                                                            Algorithm 1 describes the proposed module, referred to as
+                                                                            dual attention. The number of sensory attention heads nhsa
+
+                                                                         4
+Relational & Sensory Processing in Transformers
+
+Algorithm 2: Dual Attention Encoder Block                          Algorithm 3: Dual Attention Decoder Block
+Input :x ∈ Rn×d                                                    Input :x, y ∈ Rn×d
+x ← Norm(x + DualAttn(x))
+x ← Norm(x + MLP(x))                                               x ← Norm(x + DualAttn(x))
+                                                                   x ← Norm(x + CrossAttn(x, y))
+Output: x                                                          x ← Norm(x + MLP(x))
+                                                                   Output: x
+
+and number of relational attention heads nrha are hyperpa-         gorithms 2 and 3 in Appendix B define encoder and decoder
+rameters. The sensory attention heads attend to sensory            blocks with dual attention. Composing these blocks yields
+information while the relational attention heads attend to re-     the Dual Attention Transformer architecture.
+lational information. The combined nh := nsha + nhra heads
+are then concatenated to produce the output. The result is         The Dual Attention Transformer framework supports all
+a representation of contextual information with integrated         architectural variants of the standard Transformer, making
+sensory and relational components. Appendix B provides             it applicable to a wide range of task paradigms. An encoder-
+further discussion on the details of the architecture and its      decoder architecture with causal dual-head attention in the
+implementation.                                                    decoder can be applied to sequence-to-sequence tasks, as in
+                                                                   the original Transformer paper [25]. An encoder-only archi-
+Attention Masks & Causality. Any type of attention mask            tecture can be used for a BERT-style language embedding
+(e.g., causal mask for autoregressive language modeling)           model [40] or a ViT-style vision model [41]. A decoder-only
+can be implemented in relational attention in the same way         architecture with causal dual-head attention can be used for
+as for standard self-attention (i.e., mask is added to αihj        autoregressive language modeling.
+pre-softmax).
+                                                                   4. Empirical evaluation
+Positional Encoding. There exists different methods in the
+literature for encoding positional information in the Trans-       We empirically evaluate the Dual Attention Transformer
+former architecture. For example, [25] propose adding posi-        (abbreviated, DAT) architecture on a range of tasks span-
+tional embeddings to the input, [38] propose adding relative-      ning different domains and modalities. Our goal is to assess
+positional embeddings at each attention operation, and [39]        the impact of integrating relational inductive biases into
+propose rotary positional embeddings (RoPE) which apply a          the Transformer architecture. We begin with a synthetic
+position-dependent map to the queries and keys pre-softmax.        relational learning benchmark to evaluate DAT’s relational
+These methods are compatible with dual attention and are           computational mechanisms in a more controlled setting.
+configurable options in our public implementation.                 We then proceed to evaluate the proposed architecture on
+                                                                   more complex real-world tasks, including mathematical
+Computational complexity. The computational complex-               problem-solving, image recognition, and language model-
+ity of relational attention scales similarly to standard self-     ing. These experiments cover multiple task paradigms and
+attention with a O(n2) dependence on sequence length.              architectural variants, including: discriminative (encoder-
+Like standard attention, relational attention can be computed      only architecture), sequence-to-sequence (encoder-decoder),
+in parallel via efficient matrix multiplication operations.        autoregressive language modeling (decoder-only), and vi-
+                                                                   sion (ViT-style architecture) tasks. For each experiment, we
+Symmetric relations. A symmetry constraint can be in-              compare a DAT model that incorporates both sensory and
+jected into the relations rij by imposing that Wqrel = Wkrel,      relational heads against a standard Transformer where all
+which is a useful inductive bias when the task-relevant rela-      heads are ordinary sensory attention heads. The difference
+tions are inherently symmetric.                                    in performance highlights the impact of integrating both
+                                                                   types of attention heads, enabling a richer representation
+3.2. The Dual Attention Transformer Architecture                   of sensory and relational information. We summarize the
+                                                                   experimental results below and defer certain experimental
+The standard Transformer architecture is composed of re-           details to Appendix C.
+peated blocks of attention (information retrieval) followed
+by an MLP (local processing). Our proposed Dual Atten-             4.1. Sample-Efficient Relational Reasoning: Relational
+tion Transformer follows this same structure, but replaces              Games
+multi-head self-attention with dual attention (Algorithm 1).
+At each layer, dual attention dynamically retrieves both sen-      We begin our empirical evaluation with the “Relational
+sory and relational information from the previous level of         Games” benchmark for visual relational reasoning proposed
+computation, which is then processed locally by an MLP. Al-
+
+                                                                5
+                                                      Relational & Sensory Processing in Transformers
+
+Generalization Accuracy                         same                           occurs                                xoccurs
+
+                         0.9                              0.9                                    0.9
+                         0.8                              0.8                                    0.8
+                         0.7                              0.7                                    0.7
+                         0.6                              0.6                                    0.6
+
+                              500 1000 1500 2000 2500          500 1000 1500 2000 2500           500 1000 1500 2000 2500
+                                       Training Set Size                Training Set Size                 Training Set Size
+
+                              between                          match pattern                                        Model
+
+Generalization Accuracy  0.9                              0.9                                          DAT (nhsa = 0, nrha = 2) [421K]
+                                                                                                       DAT (nsha = 1, nrha = 1) [404K]
+                         0.8                              0.8                                          T (nhsa = 8, nrha = 0) [481K]
+                                                                                                       T (nsha = 2, nhra = 0) [481K]
+                         0.7                              0.7                                          T (nsha = 8, nhra = 0) [386K]
+                                                                                                       T (nsha = 2, nhra = 0) [386K]
+                         0.6                              0.6
+
+                              500 1000 1500 2000 2500          5000 10000 15000 20000 25000
+                                       Training Set Size                      Training Set Size
+
+Figure 2. Learning curves on the relational games benchmark. Each subplot corresponds to a different task. Numbers in square brackets in
+legend labels indicate parameter counts. Solid lines indicate the mean over 5 trials with different random seeds and the shaded regions
+indicate bootstrap 95% confidence intervals. DAT is more data-efficient at relational learning compared to a Transformer.
+
+by Shanahan et al. [20]. The dataset consists of a family of        however, the difference is only marginal, suggesting that the
+binary classification tasks, each testing a model’s ability to      model is able to learn to select the computational mecha-
+identify a particular visual relationship among a series of         nisms that are most relevant to the given task. We provide
+objects (see Figure 6 for examples). The input is an RGB            further discussion in Appendix C.1, including results com-
+image depicting a grid of objects, and the target is a binary       paring against previously-proposed relational architectures
+classification indicating whether the particular relationship       with stricter inductive biases.
+holds for this input. This forms a controlled synthetic setting
+for evaluating DAT’s effectiveness in relational learning.          4.2. Relational Inductive Biases for Symbolic Reasoning
+                                                                         in Sequence-to-Sequence tasks: Mathematical
+Our goal in this section is to explore how the relational                Problem Solving
+computational mechanisms of DAT affect data-efficiency in
+relational learning—that is, how much data is necessary to          Next, we evaluate DAT on a set of mathematical problem-
+learn a given task. We evaluate learning curves by varying          solving tasks based on the benchmark contributed by Saxton
+the size of the training set, training each model until con-        et al. [42]. Mathematical problem-solving is an interesting
+vergence, and evaluating on a hold-out validation set. We           test for neural models because it requires more than statisti-
+test two configurations of DAT: one with only relational            cal pattern recognition—it requires inferring laws, axioms,
+attention heads, and one with a combination both sensory            and symbol manipulation rules. The benchmark consists of
+and relational heads. We include several Transformer base-          a suite of mathematical problem-solving tasks, with each
+lines, varying the number of attention heads and the model          task’s dataset consisting of a set of question-answer pairs.
+dimension, controlling for parameter count. The results are         The tasks range across several topics including solving equa-
+depicted in Figure 2.                                               tions, adding polynomials, expanding polynomials, differen-
+                                                                    tiating functions, predicting the next term in a sequence, etc.
+We find that DAT is significantly more sample-efficient,            An example of a question in the “polynomials__expand”
+particularly at more difficult tasks. Both configurations of        task is “Expand (5x − 3)(2x + 1)” with the target answer
+DAT are consistently more sample-efficient compared to the          “10x2 − x − 3”. This is modeled as a sequence-to-sequence
+standard Transformer. The effect is particularly dramatic on        task with character-level encoding.
+the ‘match pattern’ task which is the most difficult and
+requires identifying a second-order relation (i.e., a relation      We compare DAT against Transformers using an encoder-
+between relations). We note that these tasks are purely re-         decoder architecture. The encoder processes the question,
+lational in the sense that pairwise same/different relations        and the decoder autoregressively generates the answer while
+between objects are a sufficient statistic for predicting the       cross-attending to the encoder. We explore how perfor-
+target. This suggests that relational attention is sufficient       mance scales with model size by varying the number of
+for solving the task. Indeed, the DAT variant with only rela-       layers. In the Transformer, all attention heads are standard
+tional heads performs slightly better than the variant with a       self-attention with nhsa = 8, while in DAT we have a combi-
+combination of both sensory and relational heads. Notably,          nation of both types of attention heads with nhsa = nhra = 4.
+
+                                                                 6
+          Relational & Sensory Processing in Transformers
+
+                   algebra__linear_1           algebra__sequence_next_term                                        calculus__differentiate
+
+          0.8                                                                        1.000
+          0.7
+Accuracy  0.6                                  0.95
+          0.5                                                                                              0.999
+
+                750K 1M 1.25M 1.5M 1.75M       0.90                                  0.998
+                 Model Size (Parameter Count)         750K 1M 1.25M 1.5M 1.75M                750K 1M 1.25M 1.5M 1.75M
+                                                       Model Size (Parameter Count)
+                  polynomials__expand                                                          Model Size (Parameter Count)
+                                                          polynomials__add
+          0.9
+                                               0.88
+          0.8
+Accuracy                                       0.86                                                               Model
+                750K 1M 1.25M 1.5M 1.75M                                                                          Transformer
+                 Model Size (Parameter Count)  0.84                                                               DAT
+                                                      750K 1M 1.25M 1.5M 1.75M
+                                                       Model Size (Parameter Count)
+
+Figure 3. Average character-level accuracy on different mathematical problem-solving tasks measured at different model sizes. Error bars
+indicate bootstrap 95% confidence intervals over 5 trials. DAT outperforms a standard Transformer across model sizes, suggesting that
+relational computational mechanisms confer benefits on sequence-to-sequence tasks that involve symbolic computation.
+
+Figure 3 depicts the character-level accuracy for DAT and            which are similar across some attributes (e.g., texture) but
+Transformers across varying model sizes. We find that the            different across others (e.g., color). In particular, the rela-
+DAT model outperforms the standard Transformer at all                tions in relational attention can be interpreted as taking the
+model scales and across all tested tasks. This suggests              source patch as a filter and comparing it against each patch
+that the relational computational mechanisms of DAT are              in the image under different transformations.
+beneficial for the type of symbolic processing involved in
+solving mathematical problems.                                       We evaluate a ViT-style DAT architecture (ViDAT), and
+                                                                     compare it against a standard ViT on the CIFAR image
+4.3. Visual Processing with Relational Inductive Biases              recognition benchmarks [44]. We train directly on CIFAR-
+                                                                     10 and CIFAR-100, respectively, without pretraining on
+As a general sequence model, the Transformer architec-               larger datasets. During training, we use random cropping,
+ture can be applied to visual inputs by dividing an image            MixUp [45], and CutMix [46] as data augmentation tech-
+into patches that are then flattened, linearly embedded into         niques. We evaluate 8-layer models with dmodel = dff =
+vectors, and passed in as a sequence. Through a series of            384. The ViT model has nhsa = 12 standard self-attention
+attention and MLP operations, the visual input is processed          heads, while the DAT model uses both sensory and rela-
+for the downstream visual task. This architecture is referred        tional heads, with an even split of nhsa = nrha = 6. We use
+to as a Vision Transformer (ViT) [41]. Although Transform-           symmetric relations rij based on the intuition that visual
+ers lack the explicit spatial inductive biases found in models       processing involves symmetric attribute-similarity relations.
+like convolutional networks, recent work has demonstrated            In Appendix C.3, we present ablations, additional results,
+its effectiveness at scale [43], demonstrating the versatility       visualizations of learn relations, and further discussion.
+of attention as a computational mechanism across several
+data modalities.                                                     Table 1 reports the classification accuracy of each model.
+                                                                     ViDAT outperforms ViT on both datasets, suggesting that
+In this section, we explore how the relational computa-              relational computational mechanisms enhance visual pro-
+tional mechanisms introduced in DAT—namely, relational               cessing. These experiments show that relational inductive
+attention—impact visual processing tasks. We hypothesize             biases can be useful for image recognition. We hypothe-
+that visual processing benefits from attending to both sen-          size that relational processing is even more important in
+sory and relational information. That is, when processing a          visual tasks requiring complex scene parsing, where rea-
+local region of a visual input (e.g., a patch, object, or object     soning about the relationships between constituent objects
+part), it is useful consider not only the sensory features of        is essential. Recent work on scene understanding in large
+other regions but also the relationships between these re-           vision-language models supports this view [47–49]. We
+gions. For example, this captures information about similar          leave the exploration of such tasks for future work.
+objects occurring in multiple places in the scene, or objects
+
+                                                                  7
+                          Relational & Sensory Processing in Transformers
+
+4.4. Relational Inductive Biases in Language Modeling                         10B
+
+Language understanding involves processing and organizing                                                   Perplexity
+relational information, such as syntactic structures, semantic
+roles, and contextual dependencies, to extract meaning from                   5B                            15.0
+words and their connections within sentences. Transformers
+have been remarkably effective at language modeling, with                                                   18.0
+neural scaling laws demonstrating that increasing model
+size and dataset size result in predictable improvements                                                    21.0
+in performance across a range of language tasks [34, 35].
+While the standard attention mechanism of Transformers is             Tokens                                24.0
+able to capture simple positional and syntactic relations in
+its attention scores, this is only used to control the flow of                                              27.0
+information between tokens rather than explicitly encoding
+relational information in the latent embeddings themselves.                   2B                            30.0
+The relational attention mechanism of DAT enables explic-
+itly learning relational contextual information that is directly                                            Model
+encoded in each token’s latent embedding.
+                                                                                                            DAT
+In this section, we evaluate DAT on causal language mod-
+eling, exploring the impact of its relational computational                   1B                            Transformer
+mechanisms in the domain of language. We use a decoder-
+only architecture, where the model receives a sequence of                          350M  750M         1.3B
+tokens as input and is trained to causally predict the next                              Param Count
+token at each position. We train on 10 billion tokens of the
+FineWeb-Edu dataset [50], which is a curated dataset of               Figure 4. Performance scaling of DAT compared to a standard
+high-quality educational text data from CommonCrawl. We               Transfomer on language modeling: DAT is more data-efficient and
+train models at multiple parameter scales, up to 1.3 billion          more parameter-efficient.
+parameters, to study the scaling properties of DAT on lan-
+guage modeling with respect to both model size and data               Beyond performance improvements, we also find evidence
+size. Details of training and architectural hyperparameters           that relational attention encodes human-interpretable seman-
+are given in Appendix C.4, together with further discussion           tic relations. Figure 5 depicts a visualization of the relations
+of the results.                                                       rij learned by a DAT language model. We observe that
+                                                                      the relations learned by relational attention tend to encode
+Figure 4 depicts the scaling properties of DAT’s language             semantic relations, rather than syntactic relations. That is, re-
+modeling performance with respect to model size and data              lational activations rij ∈ Rdr are large between tokens with
+size, compared to a standard Transformer. We observe that             related meanings. We believe that further exploration of this
+DAT demonstrates greater data and parameter efficiency,               phenomenon from a mechanistic interpretability perspective
+achieving improved performance across model and data                  could offer an exciting avenue for future research. Such
+scales. This suggests that DAT’s relational computational             an exploration would be complementary to interpretability
+mechanisms confers benefits in language processing.                   efforts seeking to understand the attention scores of standard
+                                                                      Transformers, which have been found to attend e.g., based
+                                                                      on position, syntax, and punctuation [51–53].
+
+Dataset    Model  Params    Accuracy                                  5. Conclusion
+CIFAR-10
+CIFAR-100  ViT     7.1M   86.4 ± 0.1%                                 Summary. The standard attention mechanism of Transform-
+           ViDAT   6.0M   89.7 ± 0.1%                                 ers provides a versatile mechanism for retrieval of sensory
+           ViT     7.2M   68.8 ± 0.2%                                 information from a given context, but does not explicitly
+           ViDAT   6.1M   70.5 ± 0.1%                                 support retrieval of relational information. In this work,
+                                                                      we presented an extension of the Transformer architecture
+Table 1. Classification accuracy on image recognition with the        that disentangles and integrates sensory and relational in-
+CIFAR-10 and CIFAR-100 datasets. Each training configuration is       formation through a variant of multi-head attention with
+repeated 10 times with different random seeds; we report the mean     two distinct types of attention heads: standard self-attention
+accuracy ± the standard error of mean. DAT outperforms a stan-        for sensory information and a novel relational attention
+dard Vision Transformer, suggesting that relational computational     mechanism for relational information. We empirically eval-
+mechanisms are useful for visual processing tasks.                    uate this architecture and find that it yields performance
+                                                                      improvements across a range of tasks and modalities.
+
+                                                                      Limitations & Future Work. The proposed architecture
+                                                                      introduces several hyperparameters and possible configu-
+                                                                      rations. Although we carried out ablations on the major
+                                                                      configuration choices (e.g., composition of head types, sym-
+                                                                      metry, symbol assignment mechanisms), an expanded em-
+                                                                      pirical investigation would help develop an improved under-
+                                                                      standing of the behavior of this architecture under different
+                                                                      configurations. We also note that our implementation of the
+                                                                      Dual-Attention Transformer currently lacks the hardware-
+                                                                      aware optimizations available for standard Transformers
+                                                                      (e.g., Flash-Attention [54]), which makes it slower to train
+
+                                                                   8
+Relational & Sensory Processing in Transformers
+
+Figure 5. Relational attention in DAT language models encodes human-interpretable semantic relations. A visualization of the relations
+rij learned by a 24-layer 343M-parameter DAT language model. Top. Visualization of one relation dimension in the first layer,
+focusing on the token ‘model’, which has high activation with the tokens ‘state’, ‘machine’, and ‘mathematical’. Bottom.
+Visualization of one relation dimension in the twelfth layer, focusing on the token ‘state’, which has high activation with the tokens
+‘mathematical’, ‘model’, and ‘computation’.
+
+overall (though we expect similar optimizations to be possi-     Acknowledgment
+ble). An important direction for future work is the mecha-
+nistic interpretability [53, 55, 56] of DAT models, focusing     This research was supported by the funds provided by the
+on identifying specific circuits that perform key computa-       National Science Foundation and by DoD OUSD (R&E)
+tions, to better understand the performance improvements         under Cooperative Agreement PHY-2229929 (The NSF AI
+observed in complex domains like language modeling.              Institute for Artificial and Natural Intelligence).
+
+Code and Reproducibility                                         Impact Statement
+
+Our implementation of the Dual Attention Transformer ar-         This work develops a variant of the Transformer architec-
+chitecture is open-sourced at https://github.com/                ture, called the Dual Attention Transformer, that integrates
+Awni00/dual-attention and published as a Python                  explicit relational computational mechanisms to enhance
+package. Pre-trained model weights, including the 1.3B-          data-efficiency and generalization in learning relational pro-
+parameter DAT language model, are made publicly available        cessing. This advancement has the potential to improve
+and can be loaded directly using the package. Additionally,      performance in applications requiring structured reasoning.
+we provide code for running the experiments described in         Like other developments in Transformer architectures, this
+this paper, along with instructions for reproducing our re-      research shares the potential societal consequences associ-
+sults and access to the experimental logs.                       ated with the broader field.
+
+                                                              9
+Relational & Sensory Processing in Transformers
+
+References                                                      [16] David Barrett et al. “Measuring abstract reasoning
+                                                                        in neural networks”. In: International conference on
+ [1] Gary F Marcus. “The algebraic mind: Integrating                    machine learning. PMLR. 2018 (cited on page 2).
+        connectionism and cognitive science”. MIT press,
+        2003 (cited on page 1).                                 [17] Felix Hill et al. “Learning to Make Analogies by
+                                                                        Contrasting Abstract Relational Structure”. In: Inter-
+ [2] David H Wolpert, William G Macready, et al. “No                    national Conference on Learning Representations.
+        free lunch theorems for search”. Tech. rep. Citeseer,           2019 (cited on page 2).
+       1995 (cited on page 1).
+                                                                [18] Taylor W. Webb, Ishan Sinha, and Jonathan D. Co-
+ [3] Jonathan Baxter. “A model of inductive bias learn-                 hen. “Emergent Symbols through Binding in External
+        ing”. In: Journal of artificial intelligence research           Memory”. Mar. 2021. arXiv: 2012.14601 [cs]
+       (2000) (cited on page 1).                                       (cited on page 2).
+
+ [4] Dedre Gentner. “Structure-mapping: A theoretical           [19] Adam Santoro et al. “A Simple Neural Network Mod-
+        framework for analogy”. In: Cognitive science (1983)            ule for Relational Reasoning”. June 2017. arXiv:
+       (cited on page 1).                                              1706.01427 [cs] (cited on page 2).
+
+ [5] Richard E Snow, Patrick C Kyllonen, Brachia Mar-           [20] Murray Shanahan et al. “An Explicitly Relational
+        shalek, et al. “The topography of ability and learning          Neural Network Architecture”. In: Proceedings of the
+        correlations”. In: Advances in the psychology of hu-           37th International Conference on Machine Learning.
+        man intelligence (1984) (cited on page 1).                      2020 (cited on pages 2, 6, 19).
+
+ [6] Charles Kemp and Joshua B Tenenbaum. “The dis-             [21] Giancarlo Kerg et al. “On Neural Architecture Induc-
+        covery of structural form”. In: Proceedings of the Na-          tive Biases for Relational Tasks”. June 2022. arXiv:
+        tional Academy of Sciences (2008) (cited on page 1).            2206.05056 [cs] (cited on pages 2, 3, 19).
+
+ [7] Keith J Holyoak. “Analogy and relational reasoning”.       [22] Awni Altabaa et al. “Abstractors and relational cross-
+        In: The Oxford handbook of thinking and reasoning               attention: An inductive bias for explicit relational
+       (2012) (cited on page 1).                                        reasoning in Transformers”. In: The Twelfth Inter-
+                                                                        national Conference on Learning Representations.
+ [8] Brenden M Lake et al. “Building machines that learn                2024 (cited on pages 2, 3, 19, 25–27).
+        and think like people”. In: Behavioral and brain sci-
+        ences (2017) (cited on page 1).                         [23] Awni Altabaa and John Lafferty. “Learning Hierar-
+                                                                        chical Relational Representations through Relational
+ [9] Brian Cantwell Smith. “The promise of artificial in-               Convolutions”. Feb. 2024. arXiv: 2310 . 03240
+        telligence: reckoning and judgment”. Mit Press, 2019            [cs] (cited on pages 2, 3).
+       (cited on page 1).
+                                                                [24] Taylor W. Webb et al. “The Relational Bottleneck
+[10] Rodrigo Nogueira, Zhiying Jiang, and Jimmy Lin.                    as an Inductive Bias for Efficient Abstraction”. In:
+       “Investigating the Limitations of Transformers with             Trends in Cognitive Sciences (May 2024) (cited on
+        Simple Arithmetic Tasks”. 2021. arXiv: 2102 .                   page 2).
+       13019 [cs.CL] (cited on page 1).
+                                                                [25] Ashish Vaswani et al. “Attention Is All You Need”. In:
+[11] Anirudh Goyal and Yoshua Bengio. “Inductive bi-                   Advances in neural information processing systems
+        ases for deep learning of higher-level cognition”. In:         (2017) (cited on pages 2, 5, 17).
+       Proceedings of the Royal Society A (2022) (cited on
+        page 1).                                                [26] Jason Wei et al. “Chain-of-thought prompting elicits
+                                                                        reasoning in large language models”. In: Advances in
+[12] Allen Newell. “Physical symbol systems”. In: Cogni-                neural information processing systems (2022) (cited
+        tive science (1980) (cited on page 1).                          on page 2).
+
+[13] Stevan Harnad. “The symbol grounding problem”. In:         [27] Takeshi Kojima et al. “Large language models are
+       Physica D: Nonlinear Phenomena (1990) (cited on                  zero-shot reasoners”. In: Advances in neural informa-
+        page 1).                                                        tion processing systems (2022) (cited on page 2).
+
+[14] Jerry A Fodor and Zenon W Pylyshyn. “Connection-           [28] Karthik Valmeekam et al. “Large Language Models
+        ism and cognitive architecture: A critical analysis”.           Still Can’t Plan (A Benchmark for LLMs on Planning
+        In: Cognition (1988) (cited on page 1).                         and Reasoning about Change)”. In: NeurIPS 2022
+                                                                       Foundation Models for Decision Making Workshop.
+[15] Brenden Lake and Marco Baroni. “Generalization                     2022 (cited on page 2).
+       without systematicity: On the compositional skills
+        of sequence-to-sequence recurrent networks”. In: In-
+        ternational conference on machine learning. PMLR.
+        2018 (cited on page 2).
+
+10
+Relational & Sensory Processing in Transformers
+
+[29] Jie Huang and Kevin Chen-Chuan Chang. “Towards                    at Scale”. In: International Conference on Learning
+        Reasoning in Large Language Models: A Survey”.                Representations. 2021 (cited on pages 5, 7, 20).
+        2023. arXiv: 2212 . 10403 [cs.CL] (cited on
+        page 2).                                               [42] David Saxton et al. “Analysing Mathematical Rea-
+                                                                       soning Abilities of Neural Models”. In: International
+[30] Taylor Webb, Keith J Holyoak, and Hongjing Lu.                   Conference on Learning Representations. 2019 (cited
+       “Emergent analogical reasoning in large language                on pages 6, 19).
+        models”. In: Nature Human Behaviour (2023) (cited
+        on page 2).                                            [43] Xiaohua Zhai et al. “Scaling vision transformers”. In:
+                                                                      Proceedings of the IEEE/CVF conference on com-
+[31] Jie Huang et al. “Large Language Models Cannot                    puter vision and pattern recognition. 2022 (cited on
+        Self-Correct Reasoning Yet”. 2024. arXiv: 2310 .               page 7).
+        01798 [cs.CL] (cited on page 2).
+                                                               [44] Alex Krizhevsky. “Learning multiple layers of fea-
+[32] Iman Mirzadeh et al. “GSM-Symbolic: Understand-                   tures from tiny images”. Tech. rep. 2009 (cited on
+        ing the Limitations of Mathematical Reasoning                  pages 7, 20).
+        in Large Language Models”. 2024. arXiv: 2410 .
+        05229 [cs.LG] (cited on page 2).                       [45] Hongyi Zhang et al. “mixup: Beyond Empirical
+                                                                       Risk Minimization”. In: International Conference
+[33] Tom B. Brown et al. “Language Models are Few-Shot                 on Learning Representations. 2018 (cited on pages 7,
+        Learners”. 2020. arXiv: 2005.14165 [cs.CL]                     22).
+       (cited on page 2).
+                                                               [46] Sangdoo Yun et al. “Cutmix: Regularization strategy
+[34] Jared Kaplan et al. “Scaling Laws for Neural                      to train strong classifiers with localizable features”.
+        Language Models”. 2020. arXiv: 2001 . 08361                    In: Proceedings of the IEEE/CVF international con-
+        [cs.LG] (cited on pages 2, 8, 23).                             ference on computer vision. 2019 (cited on pages 7,
+                                                                       22).
+[35] Jordan Hoffmann et al. “Training Compute-Optimal
+        Large Language Models”. 2022. arXiv: 2203 .            [47] Justin Johnson et al. “CLEVR: A Diagnostic Dataset
+       15556 [cs.CL] (cited on pages 2, 8).                            for Compositional Language and Elementary Visual
+                                                                       Reasoning”. In: Proceedings of the IEEE Conference
+[36] Aaron Grattafiori et al. “The Llama 3 Herd of Mod-                on Computer Vision and Pattern Recognition (CVPR).
+        els”. 2024. arXiv: 2407.21783 [cs.AI] (cited                   2017 (cited on page 7).
+        on page 2).
+                                                               [48] Aimen Zerroug et al. “A benchmark for composi-
+[37] Adam Santoro et al. “Relational Recurrent Neural                  tional visual reasoning”. In: Advances in neural infor-
+        Networks”. In: Advances in Neural Information Pro-             mation processing systems (2022) (cited on page 7).
+        cessing Systems. Curran Associates, Inc., 2018 (cited
+        on page 2).                                            [49] Bingchen Zhao et al. “Benchmarking Multi-Image
+                                                                       Understanding in Vision and Language Models: Per-
+[38] Peter Shaw, Jakob Uszkoreit, and Ashish Vaswani.                  ception, Knowledge, Reasoning, and Multi-Hop Rea-
+       “Self-Attention with Relative Position Representa-              soning”. In: arXiv preprint arXiv:2406.12742 (2024)
+        tions”. In: Proceedings of the 2018 Conference of             (cited on page 7).
+        the North American Chapter of the Association for
+       Computational Linguistics: Human Language Tech-         [50] Anton Lozhkov et al. “FineWeb-Edu”. May 2024
+        nologies, Volume 2 (Short Papers). Ed. by Marilyn             (cited on pages 8, 23).
+       Walker, Heng Ji, and Amanda Stent. New Orleans,
+        Louisiana: Association for Computational Linguis-      [51] Kevin Clark et al. “What Does BERT Look At? An
+        tics, June 2018 (cited on page 5).                            Analysis of BERT’s Attention”. 2019. arXiv: 1906.
+                                                                       04341 [cs.CL] (cited on page 8).
+[39] Jianlin Su et al. “RoFormer: Enhanced Transformer
+       with Rotary Position Embedding”. Nov. 2023. arXiv:      [52] Phu Mon Htut et al. “Do Attention Heads in BERT
+        2104.09864 [cs] (cited on pages 5, 17).                       Track Syntactic Dependencies?” 2019. arXiv: 1911.
+                                                                      12246 [cs.CL] (cited on page 8).
+[40] Jacob Devlin et al. “BERT: Pre-training of Deep Bidi-
+        rectional Transformers for Language Understanding”.    [53] Nelson Elhage et al. “A Mathematical Frame-
+        In: Proceedings of the 2019 Conference of the North           work for Transformer Circuits”. In: Transformer
+       American Chapter of the Association for Computa-               Circuits Thread (2021). https://transformer-
+        tional Linguistics. Association for Computational              circuits.pub/2021/framework/index.html (cited on
+        Linguistics, June 2019 (cited on page 5).                      pages 8, 9).
+
+[41] Alexey Dosovitskiy et al. “An Image is Worth              [54] Tri Dao et al. “Flashattention: Fast and memory-
+       16x16 Words: Transformers for Image Recognition                 efficient exact attention with IO-awareness”. In: Ad-
+                                                                       vances in Neural Information Processing Systems
+                                                                      (2022) (cited on page 8).
+
+11
+Relational & Sensory Processing in Transformers
+
+[55] Catherine Olsson et al. “In-context Learning and          [69] Guilherme Penedo et al. “The FineWeb Datasets: De-
+        Induction Heads”. In: Transformer Circuits Thread              canting the Web for the Finest Text Data at Scale”.
+       (2022). https://transformer-circuits.pub/2022/in-               2024. arXiv: 2406 . 17557 [cs.CL] (cited on
+        context-learning-and-induction-heads/index.html                page 23).
+       (cited on page 9).
+                                                               [70] Alec Radford et al. “Language models are unsuper-
+[56] Kevin Ro Wang et al. “Interpretability in the Wild:               vised multitask learners”. In: OpenAI blog (2019)
+        a Circuit for Indirect Object Identification in GPT-2         (cited on page 23).
+        Small”. In: The Eleventh International Conference
+        on Learning Representations. 2023 (cited on page 9).   [71] Ronen Eldan and Yuanzhi Li. “TinyStories: How
+                                                                       Small Can Language Models Be and Still Speak Co-
+[57] Gerard Debreu et al. “Representation of a preference              herent English?” May 2023. arXiv: 2305.07759
+        ordering by a numerical function”. In: Decision pro-           [cs] (cited on page 26).
+        cesses (1954) (cited on page 13).
+
+[58] Awni Altabaa and John Lafferty. “Approximation of
+        Relation Functions and Attention Mechanisms”. Feb.
+        2024. arXiv: 2402 . 08856 [cs, stat] (cited
+        on page 14).
+
+[59] Noam Shazeer. “GLU Variants Improve Trans-
+        former”. Feb. 2020. arXiv: 2002 . 05202 [cs,
+        stat] (cited on page 17).
+
+[60] Yann N Dauphin et al. “Language modeling with
+        gated convolutional networks”. In: International con-
+        ference on machine learning. PMLR. 2017 (cited on
+        page 17).
+
+[61] Dan Hendrycks and Kevin Gimpel. “Gaussian Error
+        Linear Units (GELUs)”. 2016. arXiv: 1606.08415
+        [cs.LG] (cited on page 17).
+
+[62] Hugo Touvron et al. “Llama 2: Open Foundation and
+        Fine-Tuned Chat Models”. July 2023. arXiv: 2307.
+        09288 [cs] (cited on page 17).
+
+[63] Jimmy Lei Ba, Jamie Ryan Kiros, and Geoffrey E.
+        Hinton. “Layer Normalization”. 2016. arXiv: 1607.
+        06450 [stat.ML] (cited on page 17).
+
+[64] Biao Zhang and Rico Sennrich. “Root mean square
+        layer normalization”. In: Advances in Neural Infor-
+        mation Processing Systems (2019) (cited on page 17).
+
+[65] Ruibin Xiong et al. “On layer normalization in the
+        transformer architecture”. In: International Confer-
+        ence on Machine Learning. PMLR. 2020 (cited on
+        page 17).
+
+[66] Francesco Locatello et al. “Object-Centric Learn-
+        ing with Slot Attention”. Oct. 2020. arXiv: 2006.
+       15055 [cs, stat] (cited on page 18).
+
+[67] Joshua Ainslie et al. “GQA: Training Generalized
+        Multi-Query Transformer Models from Multi-Head
+        Checkpoints”. In: Proceedings of the 2023 Confer-
+        ence on Empirical Methods in Natural Language Pro-
+        cessing. Singapore: Association for Computational
+        Linguistics, 2023 (cited on page 22).
+
+[68] Ekin D. Cubuk et al. “AutoAugment: Learning Aug-
+        mentation Policies from Data”. 2019. arXiv: 1805.
+        09501 [cs.CV] (cited on page 22).
+
+12
+Relational & Sensory Processing in Transformers
+
+A. Function Class of Relational Attention: a universal approximation result
+
+To gain a better understanding of the types of functions that can be computed by relational attention, we presented a simple
+approximation result (Theorem 1) in Section 2.4. Here, we will provide a formal statement of the result and prove it.
+
+Recall that relational attention is a mapping on Rd × Rn×d → Rdout , where d is the dimension of the input objects and dout
+is the output dimension. For convenience, we denote the “query space” by X and the “key space” by Y, though both are Rd
+in this setting. Relational attention takes as input a query x ∈ X and a collection of objects y = (y1, . . . , yn) ∈ Yn and
+computes the following
+
+n
+
+RA(x, y) = αi(x; y) r(x, yi) Wr + si Ws ,                         (4)
+
+i=1
+
+α(x; y) = Softmax  ϕaqttn(x), ϕakttn(yi)            n     ∈ ∆n,   (5)
+                                                    i=1
+
+r(x, yi) = ϕrqe,ℓl (x), ϕrke,lℓ(yi) ℓ∈[dr] ∈ Rdr ,                (6)
+
+(s1, . . . , sn) = SymbolRetriever (y; Slib) ∈ Rn×dout ,          (7)
+
+where ϕqattn, ϕakttn, ϕrqe,ℓl , ϕrke,lℓ : Rd → Rdk are the feature maps defining the attention mechanism and the relation, respec-
+tively. For this section, these are multi-layer perceptrons. Note that in Algorithm 1 these are linear maps, but they are
+preceded by multi-layer perceptron in Algorithms 2 and 3, which makes the overall function class the same. Moreover, for
+this analysis we will take Wr = I, dout = dr and Ws = 0. We will later discuss how the role of symbols fits within the
+message of the result.
+
+The following result states that relational attention can approximate any function of the form: 1) select an object in
+(y1, . . . , yn) by an arbitrary query-dependent selection criterion, and 2) compute an arbitrary relation r : X × Y → Rdr
+with the selected object. This is formalized below.
+
+To formalize (1), we adopt an abstract and very general formulation of a “selection criterion” in terms of a family of
+preference preorders, {≼x}x: for each possible query x, the preorder ≼x defines a preference over objects in Y to be
+selected. Intuitively, “y1 ≼x y2” means that y2 is more relevant to the query x than y1.
+
+More precisely, for each query x ∈ X , ≼x is a complete (for each y1, y2 ∈ Y, either y1 ≼ y2 or y2 ≼x y1), reflexive
+(y ≼x y for all y ∈ Y), and transitive (y1 ≼x y2 and y2 ≼x y3 implies y1 ≼x y3) relation. For each x ∈ X , ≼x induces a
+preordered space (Y, ≼x). This implicitly defines two additional relations: ≺x and ∼x. We will write y1 ≺x y2 if “y1 ≼x y2
+and not y2 ≼x y1”, and y1 ∼ y2 if “y1 ≼x y2 and y2 ≼x y1”.
+
+For a collection of objects y = (y1, . . . , yn) ∈ Yn and a query x ∈ X , the preorder ≼x defines a selection function
+
+Select(x, (y1, . . . , yn)) := max ((y1, . . . , yn), key =≼x) .  (8)
+
+That is, Select(x, y) returns the most relevant element with respect to the query x. In particular, it returns yi when
+yi ≻x yj, ∀j ≠ i (and may return an arbitrary element if no unique maximal element exists in (y1, . . . , yn)).
+
+We will assume some regularity conditions on the family of preorders {≼x}x which essentially stipulate that: 1) nearby
+elements in Y have a similar preference with respect to each x, and 2) nearby queries in X induce similar preference
+preorders.
+
+Assumption 1 (Selection criterion is query-continuous and key-continuous). The family of preorder relations {≼x}x∈X
+satisfies the following:
+
+1. Key-continuity. For each x ∈ X , ≼x is continuous. That is, for any sequence (yi)i such that yi ≼x z and yi → y∞,
+   we have y∞ ≼x z. Equivalently, for any y ∈ Y, {z ∈ Y : z ≼x y} and {z ∈ Y : y ≼x z} are closed sets in Y.
+
+2. Query-continuity. Under key-continuity, Debreu et al. [57] shows that for each x ∈ X , there exists a continuous in
+   utility function ux : Y → R for ≼x such that y1 ≼x y2 ⇐⇒ ux(y1) ≤ ux(y2). For query-continuity, we make the
+   further assumption that there exists a family of utility functions {ux : Y → R}x∈X such that u(x, y) := ux(y) is also
+   continuous in its first argument.
+
+                                                                      13
+                                                  Relational & Sensory Processing in Transformers
+
+For technical reasons, for Equation (8) to make sense, we must assume that there exists a unique element to be selected. We
+formulate this in terms of an assumption on the data distribution of the space X × Yn. This is a technical assumption, and
+different forms of such an assumption would be possible (e.g., instead condition on this event).
+
+Assumption 2 (Selection is unique almost always). Let (x, y) ∼ Px,y. For each ε > 0, there exists ηε > 0 such that
+minj̸=i |ux(yi) − ux(yj)| > ηε with probability at least 1 − ε.
+
+Theorem (Function class of relational attention). Let X , Y be compact Euclidean spaces. Let {≼x}x∈X be an ar-
+bitrary family of relevance preorders on Y which are query-continuous and key-continuous (Assumption 1). Let
+Select(x, (y1, . . . , yn)) = max((y1, . . . , yn), key =≼x) be the selection function associated with {≼x}x. Let R : X ×Y →
+Rdr be an arbitrary continuous relation function. Suppose x, y ∼ Px,y and that Assumption 2 holds (i.e., the data distri-
+bution is such that there exists a unique most-relevant element w.h.p). For any ε > 0, there exists multi-layer perceptrons
+ϕaqttn, ϕkattn, ϕrqel, ϕrkel and a choice of symbols such that,
+
+                                    ∥RA(x, (y1, . . . , yn)) − R(x, Select(x, (y1, . . . , yn)))∥∞ < ε
+
+Proof. Condition on the event E := {(x, y) ∈ X × Yn : minj̸=i |ux(yi) − ux(yj)| > ηε}. Let i∗ =
+arg max((y1, . . . , yn), key =≼x) = arg max(ux(y1), . . . , ux(yn)). By [58, Theorem 5.1], for any ε1 > 0, there ex-
+ists MLPs ϕaqttn, ϕakttn such that αi∗ (x, y) > 1 − ε1 for any (x, y) ∈ E. That is, the attention score is nearly 1 for the
+≼x-selected element uniformly over inputs in E.
+
+Similarly, by [58, Theorem 3.1], for any ε2 > 0, there exists MLPs (ϕqre,ℓl , ϕkre,lℓ)ℓ∈[dr] such that r(x, y) :=
+(⟨ϕrqe,ℓl (x), ϕkre,lℓ(y)⟩)ℓ∈[dr] approximates the target relation R uniformly within an error of ε2,
+
+                              ∥R(x, y) − r(x, y)∥∞ < ε2, Lebesgue almost every (x, y) ∈ X × Y.
+
+Thus, we have
+
+               ∥RA(x, (y1, . . . , yn)) − R(x, Select(x, (y1, . . . , yn)))∥∞
+
+                      n
+
+               =         αi(x; y) r(x, yi) − R(x, yi∗ )
+
+                  i=1                                        ∞
+
+                  n
+
+               ≤ ∥αi(x; y) r(x, yi) − R(x, yi∗ )∥∞
+
+                  i=1
+
+               ≤ αi∗ (x, y) ∥r(x, yi∗ ) − R(x, yi∗ )∥∞ + αi(x; y) ∥r(x, yi) − R(x, yi∗ )∥∞
+
+                                                                                       j̸=i∗
+
+               ≤  (1  −  ε1)ε2  +  ε1  max     ∥r(x,  y)  −  R(x,  y∗)∥∞  .
+
+                                       x,y,y∗
+
+Note that maxx,y,y∗ ∥r(x, y) − R(x, y∗)∥∞ is finite since X , Y are compact and r, R are continuous. Letting ε1, ε2 be
+small enough completes the proof.
+
+To summarize the analysis in this section, we showed that relational attention can approximate any computation composed of
+first selecting an object from a collection then computing a relation with that object. We can approximate any well-behaved
+selection criterion by formulating it in terms of an abstract preference preorder, and approximating the corresponding
+utility function (given by a Debreu representation theorem) by inner products of query and key feature maps. We can then
+approximate the target relation function similarly by inner products of a different set of query and key feature maps.
+
+In the analysis above, we set aside the role of the symbols. Note that the function class this approximation result proves
+involves retrieving a relation from a selected object, but does not explicitly encode the identity of the selected object.
+Informally, the receiver knows that it has a particular relation with one of the objects in its context, and knows that this
+relation is with an object that was selected according to a particular selection criterion, but does not know the identity of the
+object beyond that. This is the purpose of adding symbols to relational attention—the retrieved relation is tagged with a
+symbol identifying the source.
+
+                                                             14
+                                                  Relational & Sensory Processing in Transformers
+
+B. Architecture & Implementation Details
+
+In this section, we briefly discuss some details of implementation that may be of interest to some readers. Our code is
+publicly available through the project git repository and includes detailed instructions for reproducing our experimental
+results. We also provide links to experimental logs. Our code uses the PyTorch framework.
+
+B.1. Relational Attention and Dual-Head Attention
+
+The relational attention operation is defined as part of dual-head attention in Algorithm 1. We briefly mention some details
+of the implementation.
+
+Learnable parameters. Let nh := nsha + nhra be the total number of sensory and relational heads. The learnable parameters
+are
+
+• Sensory attention heads. For each head h ∈ [nhsa]:
+
+     ◦ Attention query/key projections: Wqa,thtn, Wka,thtn ∈ R , dmodel×dkey
+     ◦ Value projections: Wvh ∈ R , dmodel×dh
+     ◦ Output projection: Wosa ∈ R . dmodel×dmodel
+
+• Relational attention heads. For each head h ∈ [nhra] and each relation ℓ ∈ [dr]:
+
+     ◦ Attention query/key projections: Wqa,thtn, Wka,thtn ∈ R , dmodel×dkey
+     ◦ Relation query/key projections: Wqr,eℓl, Wkr,eℓl ∈ R , dmodel×dproj
+     ◦ Symbol projection: Wsh ∈ R , dmodel×dh
+     ◦ Relation projection: Wrh ∈ Rdr×dh ,
+     ◦ Output projection: Wora ∈ R . dmodel×dmodel
+
+We let dkey, dh = dmodel/nh to maintain the same dimension for the input and output objects. Similarly, we let dproj =
+dh · nrha/dr so that the number of parameters is fixed as dr varies. That is, we scale dproj down as dr increases; dproj has
+the interpretation of being the dimensionality of the subspace on which we are computing comparisons. So, having a larger
+
+number of relations corresponds to a more fine-grained comparison between the two objects.
+
+To model symmetric relations, we let Wqr,eℓl = Wkr,eℓl. Recall that this has the interpretation of computing a comparison
+between the same attributes in the pair of objects.
+
+Note that the same dr-dimensional relation is used for all nhra attention heads, with a different learned linear map Wrh
+for each head extracting the relevant aspects of the relation for that attention head and controlling the placement in the
+
+residual stream. This allows for useful computations to be shared across all heads. Note also that the head dimension
+
+dh = dmodel/nh is defined in terms of the total number of attention heads and is the same for both sensory attention and
+relational attention. The output of each head is a dh-dimensional vector. This means that after concatenating all the heads,
+the proportion in the final dmodel-dimensional output that corresponds to each attention head type is proportional to the
+number of heads of that type. For example, if nsha = 6, nrha = 2, then 75% of the dmodel-dimensional output is composed of
+the output of sensory attention heads and 25% is composed of the output of relational attention heads. This enables tuning
+
+the relative importance of each head type for the task.
+
+Code. We briefly discuss the code implementing relational attention. We use einsum operations heavily in our implemen-
+
+tation due to the flexibility they offer for implementing general tensor contractions. From Algorithm 1, recall that relational
+
+attention takes the form:     a(ih) ←     αi(jh) rij Wrh + sj Wsh ,
+
+                                                                                               (9)
+
+                                       j
+
+where αi(jh) are the softmax attention scores for head h ∈ [nhra], rij ∈ Rdr are relation vectors, sj ∈ Rdmodel is the symbol
+associated with the j-th input, and Wrh, Wsh map rij and sj, respectively, to dh-dimensional vectors. We assume those are
+already computed and focus on a particular portion of the computation of relational attention. We break up the computation
+
+as follows:                   αi(jh) rij Wrh + sj Wsh =     αi(jh)sj Wsh +     αi(jh)rij Wrh.
+
+                                                                                               (10)
+
+                           j                             j                  j
+
+                                                            15
+                                                  Relational & Sensory Processing in Transformers
+
+Note that we factor out the Wrh linear map and apply it after computing j αi(jh)rij. This is intentional, as will be explained
+below.
+This can be computed in PyTorch via einsum operations as follows.
+
+# sv: (b, n, n_h, d_h)
+# attn_scores: (b, n_h, n, n)
+# relations: (b, n, n, d_r)
+# self.wr: (n_h, d_h, d_r)
+
+attended_symbols = torch.einsum(’bhij,bjhd->bihd’, attn_scores, sv)
+# shape: (b, n, n_h, d_h)
+
+attended_relations = torch.einsum(’bhij,bijr->bihr’, attn_scores, relations)
+# shape: (b, n, n_h, d_r)
+
+attended_relations = torch.einsum(’bihr,hdr->bihd’, attended_relations, self.wr)
+# shape: (b, n, n_h, d_h)
+
+output = attended_symbols + attended_relations
+# shape: (b, n, n_h, d_h)
+
+Here, we assume sv, attn_scores, and relations are already computed, and focus on a particular part of the compu-
+tation. sv[:,:,h,:] = s Wsh, corresponds to the symbols of each object in the context, attn_scores[:,h,:,:] =
+αh are the softmax attention scores, and relations[:, i,j,:] = rij are the relations, which can all be computed
+with simple matrix multiplication operations, very similar to the standard implementations of multi-head attention.
+
+The first line corresponds to computing j αihjsjWsh. The second line corresponds to computing j αihjrij. The third
+line corresponds to applying the linear map Wrh to the retrieved relations at each head. The reason we apply the map Wrh
+after attending to the relations is for memory efficiency reasons. If we were to apply Wrh first, we would need to manifest a
+tensor of dimension b × n × n × nhra × dh, which is of order O(b · n2 · dmodel). Instead, by factoring out Wrh and applying
+it after computing attention, we only need to manifest a tensor of dimension b × n × n × dr, which is much smaller since
+dr ≪ dmodel. This tensor is contracted to a dimension b × n × dr first, then mapped up to b × n × nrha × dh. This makes
+the memory footprint of relational attention of the same order as standard (sensory) attention when dr ≍ nh.
+
+When using position-relative symbols, the implementation is adjusted since we need to compute
+
+   αi(jh) rij Wrh + sj−iWsh                                          (11)
+
+j
+
+instead, where the symbol sj−i sent now depends on both the source j and the target i. Thus, we now compute a symbols
+tensor which is indexed by both the source j and target i: sv[i,j,h,:] = sj−iWsh. Then, the implementation is adjusted
+
+by replacing the first line in the code above with
+
+attended_symbols = torch.einsum(’bhij,ijhd->bihd’, attn_scores, sv)
+
+The full implementation is made available through the project’s github repository.
+
+Composing relational attention to learn hierarchical relations. We remark that composing relational attention modules can
+be interpreted as representing hierarchical or higher-order relations. That is, relations between relations. An example of
+this is the relation tested in the match pattern task in the relational games benchmark. After one iteration of relational
+attention, an object’s representation is updated with the relations it has with its context. A second iteration of relational
+attention now computes a representation of the relation between an object’s relations and the relations of the objects in its
+context.
+
+B.2. Encoder and Decoder Blocks
+
+We briefly mention a few configurations in our implementation that appear in our experiments. We aimed to make our
+implementation configurable to allow for various tweaks and optimizations that have been found in the literature for training
+Transformer models.
+
+                                                                        16
+                                                  Relational & Sensory Processing in Transformers
+Symbol assignment. A shared symbol assignment module is used for all layers in the model. We explore three types of
+symbol assignment mechanisms: positional symbols, position-relative symbols, and symbolic attention. Different symbol
+assignment mechanisms are more well-suited to different tasks. We discuss ablation experiments we carried out on the effect
+of the symbol assignment mechanism in Appendix C.
+MLP block. The MLP block uses a 2-layer feedforward network with a configurable activation function. The intermediate
+layer size is dff = 4 · dmodel by default. We also use the SwiGLU “activation function” [59] in some of our experiments.
+SwiGLU is not merely an activation function, but is rather a neural network layer defined as the component-wise product of
+two linear transformations of the input. It is a type of gated linear unit [60] with the sigmoid activation replaced with a
+Swish activation [61], SwiGLU(x) = Swish(xW + b) ⊗ (xV + c). This is used in the Llama series of models and was
+found to be a useful modification [62].
+Normalization. Either LayerNorm [63] or RMSNorm [64] can be used. Normalization can be performed post-attention,
+like in the original Transformer paper [25], or pre-attention as in [65].
+Positional encoding. Our experiments use either learned positional embeddings or RoPE [39].
+
+                                                                        17
+      Relational & Sensory Processing in Transformers
+
+same  occurs  xoccurs  between                         match patt
+
+Figure 6. Examples of different tasks in the Relational Games benchmark. Each column corresponds to a different task in the benchmark.
+The top row is an example of a positive instance and the bottom row is an example of a negative instance.
+
+C. Experimental Details & Further Discussion
+
+C.1. Relational Games (Section 4.1)
+
+EXPERIMENTAL DETAILS
+
+Dataset details. The Relational Games benchmark datasets consists of 36 × 36 × 3 RGB images depicting a 3 × 3 grid of
+objects which satisfy a particular visual relationship. The task is to identify whether a given relationship holds or not. The
+set of objects consists of simple geometric shapes. Examples of each task are presented in Figure 6. For example, in the
+occurs task, one object is present in the top row and three in the bottom row, and the task is to determine whether the object
+in the top row occurs (i.e., is among) the objects in the bottom row. The most difficult task in the benchmark is the match
+pattern task, where the grid contains a triplet of objects in the top row and another triplet of objects in the bottom row.
+Each triplet satisfies some relationship (e.g., ABC, ABA, ABB, or AAB), and the task is to determine whether the relation in
+the first triplet is the same as the relation in the second triplet. The difficulty in solving this task is that it requires parsing
+a second-order relation (a relation between relations). We remark that composing relational attention modules naturally
+captures this kind of hierarchical relations: the first relational attention operation produces objects representing relational
+information and the second would compute relations between those relations (i.e., second-order relations).
+
+Model architectures. We use a Vision-Transformer-type architecture where the input image is split up into patches, flattened,
+and passed through the sequence model with added learned positional embeddings. We use average pooling at the end and
+pass through an MLP to produce the final prediction. We use a patch size of 12 × 12 which separates objects according to
+the grid structure. We note that in more general visual relational reasoning tasks where there isn’t this type of grid structure,
+it would be appropriate to combine our approach with an object-discovery module such as Slot Attention [66].
+
+We use 2-layer models. The DAT models use dmodel = 128, dff = 256. One set of Transformer baselines uses the same,
+while another is larger with dmodel = 144, dff = 288. All models use SwiGLU “activation”, dropout rate = 0.1, and
+pre-LayerNormalization. For the DAT models, we use positional symbols as the symbol assignment mechanism. The
+composition of sensory and relational attention heads are depicted in the figure. In Figure 2, we use symmetric relations
+(i.e., imposing that Wqrel = Wkrel). Below, we also explore the effect of this inductive bias, evaluating variants without the
+symmetry constraint.
+
+Training details. For each task and model, we evaluated learning curves by varying the training set size and training the
+model until convergence, then evaluating on a hold-out test set. For four out of five of the tasks, we evaluate learning curves
+within the range of 250 to 2, 500 samples, in increments of 250. For the more difficult match pattern, the range is
+from 5, 000 to 25, 000 in increments of 5, 000. The ranges were chosen based on the difficulty of the different tasks in order
+to identify the right “resolution”. When evaluating learning curves, each training set is sampled randomly from the full
+dataset. For each task, model, and training set size, we repeat the experiment 5 times with different random seeds to compute
+approximate confidence intervals (accounting for randomness in sampling the dataset and random initialization). We use an
+Adam optimizer with a learning rate of 0.001, β1 = 0.9, β2 = 0.99, and a batch size of 512. We train for 50 epochs.
+
+                                                                        18
+                                                  Relational & Sensory Processing in Transformers
+
+FURTHER DISCUSSION, EXPLORATION, & ABLATIONS
+
+Comparison to previous relational architectures. Previous research has explored relational learning in synthetic settings,
+proposing various architectures with relational inductive biases. Here, we compare DAT to three such architectures:
+PrediNet [20], CoRelNet [21], and Abstractor [22]. Unlike DAT, these architectures use subtractive rather than additive
+relational inductive biases, imposing constraints on the types of learnable representations to improve relational learning
+efficiency. As a result, they are not general-purpose architectures and cannot be applied to broader domains such as language
+modeling. Nonetheless, it is useful to compare DAT against those architectures to explore the trade-offs of strong inductive
+biases and evaluate DAT in comparison to alternative approaches to relational learning. Figure 7 shows learning curves
+comparing DAT against those baselines. DAT performs competitively with previous relational architectures, generally
+outperforming PrediNet and Abstractor, while performing marginally worse than CoRelNet. It is relevant to note that
+CoRelNet incorporates strong task-specific inductive biases, and was partially designed with this benchmark in mind.
+
+                              same                                      occurs                               xoccurs
+
+Generalization Accuracy                                      0.9                                        0.9
+
+                         0.9
+
+                                                             0.8                                        0.8
+
+                         0.8                                                                            0.7
+
+                                                             0.7
+
+                         0.7                                                                            0.6
+
+                                                             0.6
+
+                         0.6
+
+                              500 1000 1500 2000 2500                   500 1000 1500 2000 2500              500 1000 1500 2000 2500
+                                          Training Set Size                         Training Set Size                    Training Set Size
+
+                              between                                   match pattern
+
+Generalization Accuracy  0.9                                 0.9                                                          Model
+                                                                                                             DAT (nsha = 0, nrha = 2) [421K]
+                         0.8                                 0.8                                             T (nsha = 8, nrha = 0) [481K]
+                                                                                                             T (nsha = 2, nhra = 0) [481K]
+                         0.7                                 0.7                                             T (nsha = 2, nhra = 0) [386K]
+                                                                                                             PrediNet [376K]
+                         0.6                                 0.6
+                                                                                                             CoRelNet [215K]
+                              500 1000 1500 2000 2500             5000  10000 15000 20000        25000
+                                          Training Set Size                   Training Set Size              Abstractor [469K]
+
+Figure 7. Learning curves on the Relational Games benchmark, comparing DAT against previously-proposed relational architectures. DAT
+performs competitively with previous relational architectures.
+
+Ablation over symmetry. We performed an ablation over the symmetry inductive bias in the relations computed in relational
+attention. Our implementation exposes an argument which controls whether the relation r(x, y) = (⟨Wqr,eℓl, Wkr,eℓl⟩)ℓ∈[dr] ∈
+Rdr modeled in relational attention is constrained to be symmetric by setting Wqr,eℓl = Wkr,eℓl. Indeed, we find symmetry to be
+a useful inductive bias in this task. Figure 8 depicts learning curves for the two configurations of DAT comparing symmetric
+RA against asymmetric RA. We find that symmetry results in faster learning curves for both configurations.
+
+C.2. Mathematical Problem-Solving (Section 4.2)
+
+EXPERIMENTAL DETAILS
+
+Dataset details. Saxton et al. [42] propose a benchmark to assess neural models’ ability to perform mathematical reasoning.
+The dataset consists of a suite of tasks in free-form textual input/output format. The tasks cover several topics in mathematics,
+including arithmetic, algebra, and calculus. For each task, the authors programmatically generate 2 × 106 training examples
+and 104 validation examples. Questions have a maximum length of 160 characters and answers have a maximum length of
+30 characters.
+
+Model architectures. We use an encoder-decoder architecture for this experiment, treating it as a sequence-to-sequence
+task. We use character-level encoding with a common alphabet of size 85 containing small and upper case letters, digits
+0-9, and symbols (e.g., *, /, +, -). We vary the number of layers to explore how performance scales with model size
+
+                                                                        19
+                                                 Relational & Sensory Processing in Transformers
+
+                              same                                                         occurs                                 xoccurs
+
+Generalization Accuracy  0.9
+
+                                                            0.8                                                              0.8
+
+                         0.8
+
+                         0.7                                                                                                 0.6
+
+                                                            0.6
+
+                         0.6                                                               500 1000 1500 2000 2500                500 1000 1500 2000 2500
+                                   500 1000 1500 2000 2500
+
+                              Training Set Size                                            Training Set Size                      Training Set Size
+
+                              between                                       match pattern
+
+Generalization Accuracy                                     1.0
+
+                         0.8                                0.8                                                                                    Model
+
+                                                                                      0.6                                         Dual-Attn Transformer (nsha = 1, nrha = 1)
+                         0.6                                                                                                      Dual-Attn Transformer (nhsa = 0, nhra = 2)
+                                                                                                                                  Symmetric RA
+
+                                                                                                                                  Asymmetric RA
+
+                              500 1000 1500 2000 2500                                      5000 10000 15000 20000 25000
+                                       Training Set Size                                                  Training Set Size
+
+                              Figure 8. An ablation of the effect of symmetry in relational attention in the relational games experiments.
+
+in DAT compared to standard Transformers. Each encode/decoder block uses ReLU activation, dropout rate = 0.1, and
+post-normalization. We use dmodel = 128, dff = 256 for the DAT models and dmodel = 144, dff = 288 in the Transformer
+models to control for parameter count and give the Transformer an advantage in the evaluation. Sinusoidal positional
+embeddings are used as the positional encoding method. For all models, the total number of attention heads (across
+self-attention and relational attention) is 8. For the Transformer model, there are only self-attention heads: nsha = 8 for
+both the encoder and decoder. For DAT, we evaluated two configurations for the composition of head types, one with
+nhsa = nrha = 4 in the encoder and nsha = 8, nhra = 0 in the decoder (i.e., standard Transformer Decoder), and one with
+nhsa = 4 = nhra = 4 in the encoder and nhsa = 4 = nrha = 4 in the decoder. The number of cross-attention heads in the
+decoder is 8 in all cases. No symmetry constraint is made on relational attention. Position-relative symbols are used as the
+symbol assignment mechanism, and the symbol library is shared across all layers in both the encoder and decoder.
+
+Training Details. Each model is trained on each task for 50 epochs. We use the Adam optimizer with β1 = 0.9, β2 = 0.995,
+a learning rate of 6 × 10−4, and a batch size of 128. We evaluate and track the per-character accuracy over the course of
+training. We repeat this process 5 times for each combination of model and task with different random seeds to compute
+approximate confidence intervals.
+
+FURTHER DISCUSSION, EXPLORATION, & ABLATIONS
+
+Table 2 reports the full set of results obtained for this experiment, including certain configurations omitted from the figure in
+the main text.
+
+C.3. Visual Processing (Section 4.3)
+
+EXPERIMENTAL DETAILS
+
+Dataset details. In this set of experiments, we use the CIFAR-10 and CIFAR-100 datasets [44] which are datasets of
+labeled small images. The CIFAR-10 dataset consists of 60, 000 32 × 32 RGB images, evenly split across 10 classes. The
+CIFAR-100 dataset consists of 60, 000 RGB images of the same size, evenly split across 100 classes.
+
+Model architectures. We use a ViT-style architecture [41]. RGB images are divided into 4 × 4 patches, flattened, linearly
+embedded into a vector, and fed through an Encoder. We use average pooling followed by an MLP to produce the final
+prediction. We evaluate 8-layer models with dmodel = dff = 384, GeLU activation, Pre-LayerNormalization, and no
+
+                                                                        20
+                             Relational & Sensory Processing in Transformers
+
+Task                         Model        Parameter Count  # Layers  dmodel  Encoder nsha  Encoder nrha  Decoder nsha  Decoder nhra    Accuracy
+algebra__linear_1
+algebra__sequence_next_term  Transformer        692K           2      128          8             0             8             0       62.5 ± 1.1%
+calculus__differentiate      DAT                783K           2      128          4             4             8             0       66.5 ± 1.0%
+polynomials__add             Transformer        871K           2      144          8             0             8             0       64.0 ± 1.5%
+polynomials__expand          DAT                1.09M          3      128          4             4             8             0       68.1 ± 6.5%
+                             Transformer        1.3M           3      144          8             0             8             0       57.0 ± 2.3%
+                             DAT                1.43M          4      128          4             4             8             0       73.1 ± 1.1%
+                             Transformer        1.7M           4      144          8             0             8             0       53.2 ± 1.1%
+                             Transformer        692K           2      128          8             0             8             0       91.1 ± 0.2%
+                             DAT                783K           2      128          4             4             8             0       91.6 ± 0.6%
+                             Transformer        871K           2      144          8             0             8             0       91.4 ± 0.2%
+                             DAT                1.09M          3      128          4             4             8             0       97.0 ± 0.5%
+                             Transformer        1.3M           3      144          8             0             8             0       96.1 ± 0.5%
+                             DAT                1.43M          4      128          4             4             8             0
+                             Transformer        1.7M           4      144          8             0             8             0              –
+                             Transformer        692K           2      128          8             0             8             0       93.4 ± 2.0%
+                             DAT                783K           2      128          4             4             8             0       99.9 ± 0.0%
+                             Transformer        871K           2      144          8             0             8             0       100.0 ± 0.0%
+                             DAT                1.09M          3      128          4             4             8             0       99.9 ± 0.0%
+                             Transformer        1.3M           3      144          8             0             8             0
+                             DAT                1.43M          4      128          4             4             8             0              –
+                             Transformer        1.7M           4      144          8             0             8             0       99.9 ± 0.0%
+                             Transformer        692K           2      128          8             0             8             0       100.0 ± 0.0%
+                             DAT                783K           2      128          4             4             8             0       99.9 ± 0.0%
+                             Transformer        871K           2      144          8             0             8             0       83.3 ± 0.1%
+                             DAT                1.09M          3      128          4             4             8             0       85.6 ± 0.0%
+                             Transformer        1.3M           3      144          8             0             8             0       84.5 ± 0.3%
+                             DAT                1.43M          4      128          4             4             8             0       87.8 ± 0.1%
+                             Transformer        1.7M           4      144          8             0             8             0       86.4 ± 0.3%
+                             Transformer        692K           2      128          8             0             8             0       88.7 ± 0.0%
+                             DAT                783K           2      128          4             4             8             0       87.6 ± 0.2%
+                             Transformer        871K           2      144          8             0             8             0       74.0 ± 0.7%
+                             DAT                1.09M          3      128          4             4             8             0       77.8 ± 0.1%
+                             Transformer        1.3M           3      144          8             0             8             0       74.1 ± 0.6%
+                             DAT                1.43M          4      128          4             4             8             0
+                             Transformer        1.7M           4      144          8             0             8             0              –
+                                                                                                                                     81.0 ± 1.2%
+                                                                                                                                     91.4 ± 0.9%
+                                                                                                                                     89.2 ± 0.5%
+
+Table 2. Full results of mathematical problem-solving experiments. For each task, this table shows the mean test character-level accuracy
+± the standard error of mean for each model configuration.
+
+                                                           21
+                             Relational & Sensory Processing in Transformers
+
+Dataset   Model Parameter Count # Layers dmodel nsha nrha Symmetric rij Accuracy
+CIFAR-10
+          ViT                7.1M        8  384 12 0                          NA   86.4 ± 0.1%
+
+          ViDAT              6.0M        8  384 6 6                           Yes  89.7 ± 0.1%
+                             6.6M
+                                         8  384 6 6                           No   89.5 ± 0.1%
+
+                 ViT         7.2M        8  384 12 0                          NA   68.8 ± 0.2%
+CIFAR-100 ViDAT              6.1M
+                             6.7M        8  384 6 6                           Yes  70.5 ± 0.1%
+
+                                         8  384 6 6                           No   70.5 ± 0.1%
+
+          Table 3. Ablation over symmetry of rij in relational attention for image recognition experiments.
+
+Dataset               Model Parameter Count # Layers dmodel nhsa nrha Accuracy
+CIFAR-10
+                      ViT          7.1M     8  384 12 0 89.5 ± 0.1%
+                      ViDAT        6.0M
+                                            8  384 6 6 91.7 ± 0.1%
+
+CIFAR-100             ViT          7.2M     8  384 12 0 68.2 ± 0.1%
+                      ViDAT        6.1M
+                                            8  384 6 6 70.9 ± 0.1%
+
+Table 4. Classification accuracy on CIFAR-10 and CIFAR-100 with AutoAugment data augmentation during training. Each training
+configuration is repeated 10 times with different random seeds; we report the mean accuracy ± the standard error of mean. DAT continues
+to outperform the standard Vision Transformer.
+
+dropout. The ViT model has nhsa = 12 standard self-attention heads, while the DAT model uses both sensory and relational
+heads, with an even split nsha = nrha = 6. In the main text, we use symmetric relations rij with the intuition that visual
+processing involves symmetric attribute-similarity relations. We also carried out experiments with asymmetric relations
+and discuss the results below. In DAT, we use position-relative symbols as the symbol assignment mechanism. Further, we
+use Grouped Query Attention [67] in DAT to reduce the parameter count to account for the added parameters in relational
+attention.
+
+Training Details. We train for 100 epochs. We use the Adam optimizer with a learning rate schedule consisting of a
+gradual warmup to 10−3 in the first 5 epochs, followed by a cosine rate decay down to 10−5. We use the hyperparameters
+β1 = 0.9, β2 = 0.999, and weight decay of 5 · 10−5. We normalize the images channel-wise such that pixels have mean
+zero and unit standard deviation. In the results reported in Table 1 in the main text, we use random cropping, MixUp [45],
+and CutMix [46] as data augmentation techniques during training. We also report results using AutoAugment [68] below.
+
+FURTHER DISCUSSION, EXPLORATION, & ABLATIONS
+
+Effect of symmetry in rij. In the main text, Table 1 reports DAT results with symmetric relations rij by imposing
+Wqrel = Wkrel. Here, we explore the effect of this choice. Table 3 compares DAT models with and without the symmetry
+constraint. We find no significant difference in performance. Though, we note the smaller parameter count in the symmetric
+variant.
+
+Interpretability Visualization. Figure 9 depicts a visualization of the relations learned by a ViDAT model trained on
+the CIFAR dataset. The relations rij in relational attention can be interpreted as applying the source patch i as a filter,
+comparing it against each patch j. The different components of rij can be seen as analogous to the channels in a convolution
+operation. We see that some relations in the ViDAT model appear to capture a human-interpretable notion of visual similarity
+across patches.
+
+Alternative data augmentation. In the main text, we use random cropping, MixUp, and CutMix data augmentation during
+training. Here, we report results on an alternative data augmentation technique: AutoAugment [68]. AutoAugment is
+an optimized set of data augmentation policies, found through a data-dependent automatic search procedure. At each
+mini-batch, a random sub-policy is chosen which consists of image processing operations such as translation, rotation, or
+shearing. Table 4 reports results using this data augmentation procedure. We continue to find that ViDAT outperforms the
+standard ViT model.
+
+                                                                        22
+                    Relational & Sensory Processing in Transformers
+
+(a) Original Image  (b) A Relation in the First Layer                (c) A Relation in the Fifth Layer
+
+Figure 9. A visualization of the relations rij[ℓ] learned by an 8-layer 6M-parameter ViDAT model trained on CIFAR. The left panel
+depicts the original image input. The middle and right panels depict the first relation in the relation vector rij between the source patch i
+(red outline) and every other patch j. The relation activation is normalized with the tanh function for visualization. The normalized value
+of the relation is represented by a tint in each patch j—a green hue for large positive activations and a red tint for negative activations.
+
+C.4. Language Modeling (Section 4.4)
+
+EXPERIMENTAL DETAILS
+
+Dataset details. The FineWeb-Edu [50] dataset is a curated dataset of text data. It is generated by filtering the large-scale
+FineWeb dataset for LLM pre-training [69] using an educational quality classifier trained on annotations generated by
+Llama3-70B-instruct. FineWeb-Edu has been shown to outperform FineWeb on several benchmarks, demonstrating the
+importance of data quality. We train our language models on a random subset of 10 billion tokens of FineWeb-Edu.
+
+Model Architectures. We use a Decoder-only architecture, with causal attention for autoregressive language modeling. We
+vary model size to explore the scaling properties of DAT with respect to both model size and data size, comparing to the
+scaling properties of standard Transformers. Our architectural hyperparameters follow common choices at different model
+scales, based on scaling analyses performed for Transformers [69]. We explore 3 model scales: 350M (dmodel = 1024, nh =
+16, L = 24), 750M (dmodel = 1536, nh = 24, L = 24), and 1.3B (dmodel = 2048, nh = 32, L = 24) parameters. We use
+dff = 4 · dmodel, GeLU activation, RoPE positional encoding, no bias, no dropout, and Pre-LayerNormalization. We use the
+GPT2 tokenizer [70]. We use symbolic attention as the symbol assignment mechanism, with the number of symbols in
+the symbol library scaling with model size: 1024 symbols and 8 heads for the 350M and 750M scale models, and 2048
+symbols with 16 heads for the 1.3B scale model. We also increase the relation dimension with model size. We don’t impose
+a symmetry constraint, with the intuition that linguistic relations can be asymmetric. We use Grouped Query Attention in
+the DAT models to reduce parameter count to account for the added parameters in relational attention, making them smaller
+overall compared to the Transformer baselines at each parameter scale.
+
+Training Details. We train for 10B Tokens, with each batch containing 524, 288 tokens, split into context windows of 1, 024
+tokens. We use gradient accumulation to fit micro-batches into memory. We use the AdamW optimizer with a maximum
+learning rate of 6 × 10−4 and minimum learning rate of 6 × 10−5, first linearly warming up over the first 715 steps, then
+decaying back down with a cosine schedule. We use β1 = 0.9, β2 = 0.95 and a weight decay of 0.1. We also use gradient
+clipping to unit norm.
+
+FURTHER DISCUSSION, EXPLORATION, & ABLATIONS
+
+Figure 4 in the main text depicts the scaling properties of a DAT language model with respect to model size and data size
+compared to a standard Transformer. Here, we provide a few additional representations of the results. Table 5 reports the
+end-of-training validation perplexity of the different models.
+
+Figure 10 depicts training curves for the different model scales. We observe a power law scaling of the validation loss with
+respect to number of training tokens. This matches the neural scaling laws [34], which suggest that validation loss ought
+to scale roughly as d−α where d is the amount of training data and the exponent α is a constant that depends on model
+
+                                                                        23
+                                                  Relational & Sensory Processing in Transformers
+
+architecture, training details, etc.
+
+                               Table 5. End-of-training validation perplexity in language modeling on FineWeb-Edu dataset.
+
+                        Model        Param count # Tokens dmodel nlayers nsha nrha dr nkhv Perplexity ↓
+
+                        Transformer        353M    10B 1024 24 16 - - -                            16.94
+                        DAT                343M    10B 1024 24 8 8 64 4                            16.09
+
+                        Transformer        757M    10B 1536 24 24 - - -                            14.65
+                        DAT                734M    10B 1536 24 12 12 64 6                          14.31
+
+                        Transformer        1.31B   10B 2048 24 32 - - -                            13.63
+                        DAT                1.27B   10B 2048 24 16 16 128 8                         13.43
+
+                               350M Scale                       750M Scale                         1.3B Scale
+
+                 3.5                               3.3                              3.3                  Transformer - 1.31B
+                 3.4                                                                                     DAT - 1.27B
+                 3.3           Transformer - 353M  3.2          Transformer - 757M  3.2
+                 3.2                                                                                                                10B
+                 3.1           DAT - 343M                       DAT - 734M                            Tokens
+                 3.0
+                 2.9                               3.1                              3.1
+                 2.8
+Validation Loss  2.7                               3.0                              3.0
+
+                    1B                             2.9                              2.9
+
+                                                   2.8                              2.8
+
+                                                   2.7                              2.7
+
+                                                   2.6                              2.6
+
+                                                           2.5                              2.5
+                                                   10B 1B                           10B 1B
+
+                               Tokens                           Tokens
+
+Figure 10. Validation loss on a logarithmic scale to examine data scaling laws. Dual Attention Transformer language models obey similar
+scaling laws as standard Transformers with respect to the amount of training data, while consistently achieving smaller loss at multiple
+model scales.
+
+                                                                24
+                                                  Relational & Sensory Processing in Transformers
+
+D. Comparison to Altabaa et al. [22]: Abstractors and Relational Cross-Attention
+
+A closely related work is Altabaa et al. [22], which proposes a Transformer-based module called the “Abstractor” with
+relational inductive biases. The core operation in the Abstractor is a variant of attention dubbed “relational cross-attention”
+(RCA). In this section, we will discuss the relation between the Dual Attention Transformer and the Abstractor.
+
+D.1. Comparison between RA (this work) and RCA [22]
+
+Altabaa et al. [22] propose a variant of attention called relational cross-attention which shares some characteristics with our
+proposal of what we’re calling “relational attention” in this work. In this discussion, we will use the acronyms RCA and RA,
+respectively to distinguish between the two.
+RCA processes a sequence of objects x = (x1, . . . , xn) and produces a sequence of objects x′ = (x1′ , . . . , xn′ ) via the
+following operation
+
+                                                        x′ ← σrel (ϕq(x)ϕk(x)⊺) s,
+                                                          s = SymbolRetriever(x)
+
+where ϕq, ϕk are query and key transformations, and the symbols s take the same role as in this work. σrel is referred to as a
+“relation activation”. It may be either softmax or an element-wise activation (e.g., tanh, sigmoid, or linear). For the purposes
+of this discussion, let us consider σrel = Softmax, which was used in the majority of the experiments in [22].
+To facilitate the discussion, let us write RA and RCA side-by-side using a common notation.
+
+               RA (this work)                                    RCA [22]
+(x′1, . . . , xn′ ) ← RA(x; Slib),                (x1′ , . . . , x′n) ← RCA(x; Slib)
+
+                              n                                                 n
+
+            xi′ = αij r(xi, xj ) Wr + sj Ws ,                 xi′ = αij sj ,
+
+                            j=1                                               j=1
+
+             α = Softmax ϕq(x)ϕk(x)⊺ ,                         α = Softmax ϕq(x)ϕk(x)⊺ ,
+
+       r(x, y) = ϕrqe,ℓl (x), ϕrke,lℓ(y) ℓ∈[dr],  (s1, . . . , sn) = SymbolRetriever(x; Slib)
+
+(s1, . . . , sn) = SymbolRetriever(x; Slib)
+
+RCA can be understood as self-attention, but the values are replaced with symbols (i.e., Attention(Q ← x, K ← x, V ←
+s)). By viewing the attention scores αij as relations, this has the effect of producing a relation-centric representation. The
+rationale is that in standard self-attention, the attention scores form a type of relation, but these relations are only used as
+an intermediate processing step in an information-retrieval operation. The relations encoded in the attention scores are
+entangled with the object-level features, which have much greater variability. This thinking also motivates the design of RA
+in the present work.
+
+RCA can be understood as computing a pairwise relation ⟨ϕqattn(xi), ϕkattn(xj)⟩ between xi and each xj in the context, and
+retrieving the symbol sj associated with the object xj with which the relation is strongest. That is, RCA treats the relations
+and the attention scores as the same thing. By contrast, the attention operation and computation of relations are separate in
+RA. The attention component is modeled by one set of query/key maps ϕqattn, ϕkattn and the relation component is modeled
+by another set of query/key maps (ϕrqe,ℓl , ϕkre,lℓ)ℓ∈[dr].
+
+The intuitive reason for this choice is that, for many tasks, the optimal “selection criterion” will be different from the
+task-relevant relation. For example, in a language modeling task, you may want to attend to objects on the basis of proximity
+and/or syntax while being interested in a relation based on semantics. Similarly, in a vision task, you may want to attend to
+objects on the basis of proximity, while computing a relation across a certain visual attribute. Thus, the relational attention
+mechanism proposed in this work offers greater flexibility and expressivity compared to RCA.
+
+In RA, the symbols maintain the role of identifying the source. But they are now explicitly attached to a separately
+parameterized relation vector.
+
+                                                                        25
+                                                  Relational & Sensory Processing in Transformers
+
+D.2. Comparison between DAT and the Abstractor
+We now briefly discuss the differences in the corresponding model architectures. Altabaa et al. [22] propose an encoder-
+like module called the Abstractor which consists of essentially replacing self-attention in an Encoder with relational
+cross-attention. That is, it consists of iteratively performing RCA followed by an MLP. The paper proposes sev-
+eral ways to incorporate this into the broader Transformer architecture. For example, some of the experiments use a
+Encoder → Abstractor → Decoder architecture to perform a sequence-to-sequence task. Here, the output of a
+standard Transformer Encoder is fed into an Abstractor, and the Decoder cross-attends to the output of the Abstractor. In
+another sequence-to-sequence experiment, Altabaa et al. [22] use an architecture where the Decoder cross-attends to both
+the Encoder and the Abstractor, making use of both sensory and relational information. In particular, the standard encoder
+and decoder blocks are the same (focusing on sensory information), but an additional module is inserted in between with a
+relational inductive bias.
+By contrast, our approach in this paper is to propose novel encoder and decoder architectures imbued with two distinct types
+of attention heads, one with an inductive bias for sensory information and the other with an inductive bias for relational
+information. This has several potential advantages. The first is versatility and generality. The Abstractor architectures that
+were explored in [22] only explicitly support sequence-to-sequence or discriminative tasks. For example, they do not support
+autoregressive models like modern decoder-only language models (e.g., of the form we experiment with in Section 4.4).
+Moreover, even in sequence-to-sequence tasks, Abstractor architectures only support relational processing over the input
+sequence, but they do not support relational processing over the target sequence (since the decoder does not have RCA).
+Another potential advantage of DAT is simplicity. The Abstractor paper proposes several architectures and configurations
+for the Encoder/Abstractor/Decoder modules, introducing several hyperparameters that are not trivial to choose. Moreover,
+it is unclear how to interpret this kind of architecture as the number of layers increases, and the original paper does not
+experiment with scaling up the number of layers. The final potential advantage is increased expressivity. In DAT, the two
+types of attention heads exist side by side in each layer. This allows relational attention heads to attend to the output of the
+self-attention heads at the previous layer, and vice-versa. This yields broader representational capacity, and potentially more
+interesting behavior as we scale the number of layers.
+
+D.3. How would RCA perform in an DAT-style dual head-type architecture?
+One question one might ask is: how would an DAT-style dual head-type architecture perform if we used Altabaa et al. [22]’s
+RCA instead of the RA head-type proposed in this work? We carried out a few ablation experiments to answer this question.
+Figure 11 compares learning curves on the relational games benchmark between standard DAT (with RA-heads) and a
+version of DAT with Altabaa et al. [22]’s RCA heads. We find that the two models perform similarly, with most differences
+small enough to be within the margin of error. This figure depicts the configuration with asymmetric RA and positional
+symbols.
+Figure 12 depicts the validation loss curves on a small-scale language modeling experiment based on the Tiny Stories
+dataset [71], comparing standard DAT against a version with RCA heads. Here, we find that our relational attention heads
+yield better-performing models, with the RCA-head variant of DAT performing no better than a standard Transformer with a
+matching total number of heads.
+
+                                                                        26
+                                                         Relational & Sensory Processing in Transformers
+
+                              same                                                        occurs                                           xoccurs
+
+Generalization Accuracy  0.8                                  0.8                                                      0.8
+
+                         0.6                                  0.6                                                      0.6
+
+                              500 1000 1500 2000 2500                                500 1000 1500 2000 2500                      500 1000 1500 2000 2500
+                                       Training Set Size                                      Training Set Size                            Training Set Size
+
+                                         between                                            match pattern
+
+Generalization Accuracy                                                         1.0
+
+                         0.8                                  0.8                                                                            Model
+
+                         0.6                                  0.6                                                           Dual-Attn Transformer (nsha = 1, nrha = 1)
+                                                                                                                            Dual-Attn Transformer (nhsa = 0, nrha = 2)
+                                                                                                                            Relational Attention
+
+                                                                                                                            Abstractor’s RCA
+
+                              500 1000 1500 2000 2500                                5000 10000 15000 20000 25000
+                                       Training Set Size                                            Training Set Size
+
+Figure 11. Learning curves for DAT with RA compared with DAT with RCA on the relational games benchmark. The performance is
+similar, with most differences within the margin of error.
+
+                                                                                               Model
+
+                                               2.2                                             Dual-Attn Transformer (nhsa = 6, nrha = 2)
+
+                                                                                               Dual-Attn Transformer (nsha = 4, nhra = 4)
+
+                                                                                               RA Type
+
+                                               2.1                                             Disentangled Relational Attention
+
+                              Validation Loss                                                  Abstractor’s RCA
+
+                                               2.0
+
+                                               1.9
+
+                                               1.8
+
+                                                    0.0  0.2                         0.4  0.6           0.8      1.0        1.2
+
+                                                                                          Tokens                                  ×1010
+
+Figure 12. Ablation of relational attention type. The solid line depicts the form of relational attention proposed in this work. The dotted
+line depicts RCA as proposed by Altabaa et al. [22]. We find that our relational attention mechanism performs better, whereas RCA
+performs no better than a Transformer.
+
+                                                                                          27
+

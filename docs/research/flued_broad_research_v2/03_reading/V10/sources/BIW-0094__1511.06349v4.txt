@@ -1,0 +1,796 @@
+                                        Generating Sentences from a Continuous Space
+
+                                        Samuel R. Bowman∗                                      Luke Vilnis∗
+
+                                        NLP Group and Dept. of Linguistics                     CICS
+
+                                        Stanford University                                    University of Massachusetts Amherst
+
+                                        sbowman@stanford.edu                                   luke@cs.umass.edu
+
+                                        Oriol Vinyals, Andrew M. Dai, Rafal Jozefowicz & Samy Bengio
+                                                                               Google Brain
+
+                                                       {vinyals, adai, rafalj, bengio}@google.com
+
+arXiv:1511.06349v4 [cs.LG] 12 May 2016                       Abstract                             i went to the store to buy some groceries .
+                                                                                                  i store to buy some groceries .
+                                             The standard recurrent neural network                i were to buy any groceries .
+                                             language model (rnnlm) generates sen-                horses are to buy any groceries .
+                                             tences one word at a time and does not               horses are to buy any animal .
+                                             work from an explicit global sentence rep-           horses the favorite any animal .
+                                             resentation. In this work, we introduce              horses the favorite favorite animal .
+                                             and study an rnn-based variational au-               horses are my favorite animal .
+                                             toencoder generative model that incorpo-
+                                             rates distributed latent representations of       Table 1: Sentences produced by greedily decoding
+                                             entire sentences. This factorization al-          from points between two sentence encodings with
+                                             lows it to explicitly model holistic prop-        a conventional autoencoder. The intermediate sen-
+                                             erties of sentences such as style, topic,         tences are not plausible English.
+                                             and high-level syntactic features. Samples
+                                             from the prior over these sentence repre-         assumptions, and makes it capable of modeling
+                                             sentations remarkably produce diverse and         complex distributions over sequences, including
+                                             well-formed sentences through simple de-          those with long-term dependencies. However, by
+                                             terministic decoding. By examining paths          breaking the model structure down into a series of
+                                             through this latent space, we are able to         next-step predictions, the rnnlm does not expose
+                                             generate coherent novel sentences that in-        an interpretable representation of global features
+                                             terpolate between known sentences. We             like topic or of high-level syntactic properties.
+                                             present techniques for solving the diﬃcult
+                                             learning problem presented by this model,            We propose an extension of the rnnlm that is
+                                             demonstrate its eﬀectiveness in imputing          designed to explicitly capture such global features
+                                             missing words, explore many interesting           in a continuous latent variable. Naively, maxi-
+                                             properties of the model’s latent sentence         mum likelihood learning in such a model presents
+                                             space, and present negative results on the        an intractable inference problem. Drawing inspi-
+                                             use of the model in language modeling.            ration from recent successes in modeling images
+                                                                                               (Gregor et al., 2015), handwriting, and natural
+                                        1 Introduction                                         speech (Chung et al., 2015), our model circum-
+                                                                                               vents these diﬃculties using the architecture of a
+                                        Recurrent neural network language models               variational autoencoder and takes advantage of re-
+                                        (rnnlms, Mikolov et al., 2011) represent the state     cent advances in variational inference (Kingma and
+                                        of the art in unsupervised generative modeling         Welling, 2015; Rezende et al., 2014) that introduce
+                                        for natural language sentences. In supervised          a practical training technique for powerful neural
+                                        settings, rnnlm decoders conditioned on task-          network generative models with latent variables.
+                                        speciﬁc features are the state of the art in tasks
+                                        like machine translation (Sutskever et al., 2014;         Our contributions are as follows: We propose a
+                                        Bahdanau et al., 2015) and image captioning            variational autoencoder architecture for text and
+                                        (Vinyals et al., 2015; Mao et al., 2015; Donahue       discuss some of the obstacles to training it as well
+                                        et al., 2015). The rnnlm generates sentences           as our proposed solutions. We ﬁnd that on a stan-
+                                        word-by-word based on an evolving distributed          dard language modeling evaluation where a global
+                                        state representation, which makes it a proba-          variable is not explicitly needed, this model yields
+                                        bilistic model with no signiﬁcant independence         similar performance to existing rnnlms. We also
+                                                                                               evaluate our model using a larger corpus on the
+                                             ∗First two authors contributed equally. Work was  task of imputing missing words. For this task,
+                                        done when all authors were at Google, Inc.             we introduce a novel evaluation strategy using an
+adversarial classiﬁer, sidestepping the issue of in-  of on the target sentence itself. Finally, para-
+tractable likelihood computations by drawing in-      graph vector models (Le and Mikolov, 2014) are
+spiration from work on non-parametric two-sample      non-recurrent sentence representation models. In a
+tests and adversarial training. In this setting,      paragraph vector model, the encoding of a sentence
+our model’s global latent variable allows it to do    is obtained by performing gradient-based inference
+well where simpler models fail. We ﬁnally intro-      on a prospective encoding vector with the goal of
+duce several qualitative techniques for analyzing     using it to predict the words in the sentence.
+the ability of our model to learn high level fea-
+tures of sentences. We ﬁnd that they can produce      2.2 The variational autoencoder
+diverse, coherent sentences through purely deter-
+ministic decoding and that they can interpolate       The variational autoencoder (vae, Kingma and
+smoothly between sentences.                           Welling, 2015; Rezende et al., 2014) is a genera-
+                                                      tive model that is based on a regularized version
+2 Background                                          of the standard autoencoder. This model imposes
+                                                      a prior distribution on the hidden codes z which
+2.1 Unsupervised sentence encoding                    enforces a regular geometry over codes and makes
+                                                      it possible to draw proper samples from the model
+A standard rnn language model predicts each           using ancestral sampling.
+word of a sentence conditioned on the previous
+word and an evolving hidden state. While eﬀec-           The vae modiﬁes the autoencoder architecture
+tive, it does not learn a vector representation of    by replacing the deterministic function ϕenc with
+the full sentence. In order to incorporate a contin-  a learned posterior recognition model, q(z|x). This
+uous latent sentence representation, we ﬁrst need a   model parametrizes an approximate posterior dis-
+method to map between sentences and distributed       tribution over z (usually a diagonal Gaussian) with
+representations that can be trained in an unsuper-    a neural network conditioned on x. Intuitively, the
+vised setting. While no strong generative model       vae learns codes not as single points, but as soft
+is available for this problem, three non-generative   ellipsoidal regions in latent space, forcing the codes
+techniques have shown promise: sequence autoen-       to ﬁll the space rather than memorizing the train-
+coders, skip-thought, and paragraph vector.           ing data as isolated codes.
+
+   Sequence autoencoders have seen some success          If the vae were trained with a standard autoen-
+in pre-training sequence models for supervised        coder’s reconstruction objective, it would learn to
+downstream tasks (Dai and Le, 2015) and in gen-       encode its inputs deterministically by making the
+erating complete documents (Li et al., 2015a).        variances in q(z|x) vanishingly small (Raiko et al.,
+An autoencoder consists of an encoder function        2015). Instead, the vae uses an objective which
+ϕenc and a probabilistic decoder model p(x|z =        encourages the model to keep its posterior distri-
+ϕenc(x)), and maximizes the likelihood of an ex-      butions close to a prior p(z), generally a standard
+ample x conditioned on z, the learned code for        Gaussian (µ = 0, σ = 1). Additionally, this objec-
+x. In the case of a sequence autoencoder, both        tive is a valid lower bound on the true log likelihood
+encoder and decoder are rnns and examples are         of the data, making the vae a generative model.
+token sequences.                                      This objective takes the following form:
+
+   Standard autoencoders are not eﬀective at ex-      L(θ; x) = −kl(qθ(z|x)||p(z))
+tracting for global semantic features. In Table 1,
+we present the results of computing a path or ho-     + Eqθ(z|x)[log pθ(x|z)]       (1)
+motopy between the encodings for two sentences
+and decoding each intermediate code. The in-          ≤ log p(x) .
+termediate sentences are generally ungrammatical
+and do not transition smoothly from one to the        This forces the model to be able to decode plausible
+other. This suggests that these models do not         sentences from every point in the latent space that
+generally learn a smooth, interpretable feature sys-  has a reasonable probability under the prior.
+tem for sentence encoding. In addition, since these
+models do not incorporate a prior over z, they can-      In the experiments presented below using vae
+not be used to assign probabilities to sentences or   models, we use diagonal Gaussians for the prior
+to sample novel sentences.                            and posterior distributions p(z) and q(z|x), using
+                                                      the Gaussian reparameterization trick of Kingma
+   Two other models have shown promise in learn-      and Welling (2015). We train our models with
+ing sentence encodings, but cannot be used in         stochastic gradient descent, and at each gradient
+a generative setting: Skip-thought models (Kiros      step we estimate the reconstruction cost using a
+et al., 2015) are unsupervised learning models that   single sample from q(z|x), but compute the kl di-
+take the same model structure as a sequence au-       vergence term of the cost function in closed form,
+toencoder, but generate text conditioned on a         again following Kingma and Welling (2015).
+neighboring sentence from the target text, instead
+Encoding  Encoding  linear µ                Decoding  Decoding  Decoding     In a recent paper with goals similar to ours,
+LSTM      LSTM                           z  LSTM      LSTM      LSTM      Miao et al. (2015) introduce an eﬀective VAE-
+Cell      Cell                              Cell      Cell      Cell      based document-level language model that models
+                    linear σ                                              texts as bags of words, rather than as sequences.
+                                                                          They mention brieﬂy that they have to train the
+Figure 1: The core structure of our variational au-                       encoder and decoder portions of the network in al-
+toencoder language model. Words are represented                           ternation rather than simultaneously, possibly as a
+using a learned dictionary of embedding vectors.                          way of addressing some of the issues that we dis-
+                                                                          cuss in Section 3.1.
+3 A VAE for sentences
+                                                                          3.1 Optimization challenges
+We adapt the variational autoencoder to text
+by using single-layer lstm rnns (Hochreiter and                           Our model aims to learn global latent represen-
+Schmidhuber, 1997) for both the encoder and the                           tations of sentence content. We can quantify the
+decoder, essentially forming a sequence autoen-                           degree to which our model learns global features
+coder with the Gaussian prior acting as a regu-                           by looking at the variational lower bound objec-
+larizer on the hidden code. The decoder serves as                         tive (1). The bound breaks into two terms: the
+a special rnn language model that is conditioned                          data likelihood under the posterior (expressed as
+on this hidden code, and in the degenerate setting                        cross entropy), and the kl divergence of the pos-
+where the hidden code incorporates no useful in-                          terior from the prior. A model that encodes useful
+formation, this model is eﬀectively equivalent to an                      information in the latent variable z will have a non-
+rnnlm. The model is depicted in Figure 1, and is                          zero kl divergence term and a relatively small cross
+used in all of the experiments discussed below.                           entropy term. Straightforward implementations of
+                                                                          our vae fail to learn this behavior: except in van-
+   We explored several variations on this architec-                       ishingly rare cases, most training runs with most
+ture, including concatenating the sampled z to the                        hyperparameters yield models that consistently set
+decoder input at every time step, using a soft-                           q(z|x) equal to the prior p(z), bringing the kl di-
+plus parametrization for the variance, and using                          vergence term of the cost function to zero.
+deep feedforward networks between the encoder
+and latent variable and the decoder and latent vari-                         When the model does this, it is essentially be-
+able. We noticed little diﬀerence in the model’s                          having as an rnnlm. Because of this, it can ex-
+performance when using any of these variations.                           press arbitrary distributions over the output sen-
+However, when including feedforward networks be-                          tences (albeit with a potentially awkward left-to-
+tween the encoder and decoder we found that it                            right factorization) and can thereby achieve like-
+is necessary to use highway network layers (Srivas-                       lihoods that are close to optimal. Previous work
+tava et al., 2015) for the model to learn. We discuss                     on vaes for image modeling (Kingma and Welling,
+hyperparameter tuning in the appendix.                                    2015) used a much weaker independent pixel de-
+                                                                          coder model p(x|z), forcing the model to use the
+   We also experimented with more sophisticated                           global latent variable to achieve good likelihoods.
+recognition models q(z|x), including a multistep                          In a related result, recent approaches to image gen-
+sampling model styled after draw (Gregor et al.,                          eration that use lstm decoders are able to do well
+2015), and a posterior approximation using nor-                           without vae-style global latent variables (Theis
+malizing ﬂows (Rezende and Mohamed, 2015).                                and Bethge, 2015).
+However, we were unable to reap signiﬁcant gains
+over our plain vae.                                                          This problematic tendency in learning is com-
+                                                                          pounded by the lstm decoder’s sensitivity to sub-
+   While the strongest results with vaes to date                          tle variation in the hidden states, such as that in-
+have been on continuous domains like images, there                        troduced by the posterior sampling process. This
+has been some work on discrete sequences: a tech-                         causes the model to initially learn to ignore z and
+nique for doing this using rnn encoders and de-                           go after low hanging fruit, explaining the data with
+coders, which shares the same high-level architec-                        the more easily optimized decoder. Once this has
+ture as our model, was proposed under the name                            happened, the decoder ignores the encoder and lit-
+Variational Recurrent Autoencoder (vrae) for the                          tle to no gradient signal passes between the two,
+modeling of music in Fabius and van Amersfoort                            yielding an undesirable stable equilibrium with the
+(2014). While there has been other work on includ-                        kl cost term at zero. We propose two techniques
+ing continuous latent variables in rnn-style mod-                         to mitigate this issue.
+els for modeling speech, handwriting, and music
+(Bayer and Osendorfer, 2015; Chung et al., 2015),                         KL cost annealing In this simple approach to
+these models include separate latent variables per                        this problem, we add a variable weight to the kl
+timestep and are unsuitable for our goal of model-                        term in the cost function at training time. At the
+ing global features.                                                      start of training, we set that weight to zero, so
+                                                                          that the model learns to encode as much informa-
+1 0.000435                 1 0.015607
+
+101 0.000555               751 6.977695
+
+201 0.000708               1501 7.502852
+
+301 0.000903               2251 2.323177
+
+401 0.001152               3001 1.373341
+
+501 0.001469               3751 0.886143
+
+601 0.001874               4501 0.850737
+
+701 0.010002%389           5251 0.891682                                                                             8.0     This technique is parameterized by a keep rate
+                                                                                                                          k ∈ [0, 1]. We tune this parameter both for our
+ 801 0.08003%047           6001 0.820286                                                                             7.0  vae and for our baseline rnnlm. Taken to the
+ 901 0.003884              6751 0.880547                                                                             6.0  extreme of k = 0, the decoder sees no input, and is
+1001 0.06004%951           7501 0.887476                                                                             5.0  thus able to condition only on the number of words
+      KL term weight                                                                                                 4.0  produced so far, yielding a model that is extremely
+                                                                                                        KL term value     limited in the kinds of distributions it can model
+1101 0.04006%309           8251 0.922485                                   3.0                                            without using z.
+
+1201 0.02008%036            9001 0.874522                                2.0                                              4 Results: Language modeling
+                            9751 0.969236                                1.0
+1301  00..0011030%0231018  1100500010 0.92806040024  30000  40000        0.0                                              In this section, we report on language modeling
+1401                                                               50000                                                  experiments on the Penn Treebank in an eﬀort to
+                                                                                                                          discover whether the inclusion of a global latent
+1501 0.016551 11251 0.94229S7tep                                                                                          variable is helpful for this standard task. For this
+                                                                                                                          reason, we restrict our vae hyperparameter search
+1601 0.021022 12K0L0t1erm0w.9e8ig9h4t 14                    KL term value                                                 to those models which encode a non-trivial amount
+                                                                                                                          in the latent variable, as measured by the kl di-
+1701 0.026669 12751 0.972859                                                                                              vergence term of the variational lower bound.
+
+180F1igu0r.0e3327:8 Th1e350w1ei1g.0h2t45o9f6 the kl divergence term                                                       Results We used the standard train–test split
+                                                                                                                          for the corpus, and report test set results in Ta-
+190o1f v0.a0r4i2a7t0i5onal14l2o5w1er1.b0o45u3n3d according to a typical                                                   ble 2. The results shown reﬂect the training and
+221000s11igm00..00o56i37d871526anne11a55l70i50n11g 11s..00c27h25e45d7773ule plotted alongside the                         test set performance of each model at the training
+220(1un0w.0e84ig81h4ted)16v5a0l1ue1.o09f27t2h2e kl divergence term for                                                    step at which the model performs best on the de-
+                                                                                                                          velopment set. Our reported ﬁgures for the vae
+230o1ur0.v10a5e745on th17e25P1en1n.04T16r4e3ebank.                                                                        reﬂect the variational lower bound on the test like-
+                                                                                                                          lihood, while for the rnnlms, which can be eval-
+2401 0.131103 18001 1.128839                                                                                              uated exactly, we report the true test likelihood.
+                                                                                                                          This discrepancy puts the vae at a potential dis-
+tion in z as it can. Then, as training progresses, we                                                                     advantage.
+gradually increase this weight, forcing the model to
+smooth out its encodings and pack them into the                                                                              In the standard setting, the vae performs
+prior. We increase this weight until it reaches 1,                                                                        slightly worse than the rnnlm baseline, though
+at which point the weighted cost function is equiv-                                                                       it does succeed in using the latent space to a lim-
+alent to the true variational lower bound. In this                                                                        ited extent: it has a reconstruction cost (99) better
+setting, we do not optimize the proper lower bound                                                                        than that of the baseline rnnlm, but makes up for
+on the training data likelihood during the early                                                                          this with a kl divergence cost of 2. Training a vae
+stages of training, but we nonetheless see improve-                                                                       in the standard setting without both word dropout
+ments on the value of that bound at convergence.                                                                          and cost annealing reliably results in models with
+This can be thought of as annealing from a vanilla                                                                        equivalent performance to the baseline rnnlm, and
+autoencoder to a vae. The rate of this increase is                                                                        zero kl divergence.
+tuned as a hyperparameter.
+                                                                                                                             To demonstrate the ability of the latent variable
+   Figure 2 shows the behavior of the kl cost term                                                                        to encode the full content of sentences in addition
+during the ﬁrst 50k steps of training on Penn Tree-                                                                       to more abstract global features, we also provide
+bank (Marcus et al., 1993) language modeling with                                                                         numbers for an inputless decoder that does not
+kl cost annealing in place. This example reﬂects a                                                                        condition on previous tokens, corresponding to a
+pattern that we observed often: kl spikes early in                                                                        word dropout keep rate of 0. In this regime we
+training while the model can encode information in                                                                        can see that the variational lower bound contains
+z cheaply, then drops substantially once it begins                                                                        a signiﬁcantly larger kl term and shows a substan-
+paying the full kl divergence penalty, and ﬁnally                                                                         tial improvement over the weakened rnnlm, which
+slowly rises again before converging as the model                                                                         is essentially limited to using unigram statistics
+learns to condense more information into z.                                                                               in this setting. While it is weaker than a stan-
+                                                                                                                          dard decoder, the inputless decoder has the inter-
+Word dropout and historyless decoding In                                                                                  esting property that its sentence generating pro-
+addition to weakening the penalty term on the en-                                                                         cess is fully diﬀerentiable. Advances in generative
+codings, we also experiment with weakening the                                                                            models of this kind could be promising as a means
+decoder. As in rnnlms and sequence autoen-                                                                                of generating text while using adversarial training
+coders, during learning our decoder predicts each                                                                         methods, which require diﬀerentiable generators.
+word conditioned on the ground-truth previous
+word. A natural way to weaken the decoder is                                                                                 Even with the techniques described in the pre-
+to remove some or all of this conditioning infor-
+mation during learning. We do this by randomly
+replacing some fraction of the conditioned-on word
+tokens with the generic unknown word token unk.
+This forces the model to rely on the latent variable
+z to make good predictions. This technique is a
+variant of word dropout (Iyyer et al., 2015; Kumar
+et al., 2015), applied not to a feature extractor but
+to a decoder. We also experimented with standard
+dropout (Srivastava et al., 2014) applied to the in-
+put word embeddings in the decoder, but this did
+not help the model learn to use the latent variable.
+Model                         Standard                                       Inputless Decoder
+       Train nll Train ppl Test nll Test ppl                  Train nll Train ppl Test nll Test ppl
+RNNLM
+VAE    100 –    95 100 –                                 116  135 –     600 135 –     > 600
+        98 (2)                                                120 (15)  300 125 (15)    380
+                100 101 (2)                              119
+
+Table 2: Penn Treebank language modeling results, reported as negative log likelihoods and as perplexi-
+ties. Lower is better for both metrics. For the vae, the kl term of the likelihood is shown in parentheses
+alongside the total likelihood.
+
+vious section, including the inputless decoder, we       after pruning, contains approximately 80m sen-
+were unable to train models for which the kl diver-      tences. We ﬁnd that this much larger amount of
+gence term of the cost function dominates the re-        data produces more subjectively interesting gener-
+construction term. This suggests that it is still sub-   ative models than smaller standard language mod-
+stantially easier to learn to factor the data distribu-  eling datasets. We use a ﬁxed word dropout rate of
+tion using simple local statistics, as in the rnnlm,     75% when training this model and all subsequent
+such that an encoder will only learn to encode in-       models unless otherwise speciﬁed. Our models (the
+formation in z when that information cannot be           vae and rnnlm) are trained as language models,
+eﬀectively described by these local statistics.          decoding right-to-left to shorten the dependencies
+                                                         during learning for the vae. We use 512 hidden
+5 Results: Imputing missing words                        units.
+
+We claim that the our vae’s global sentence fea-         Inference method To generate imputations
+tures make it especially well suited to the task of      from the two models, we use beam search with
+imputing missing words in otherwise known sen-           beam size 15 for the rnnlm and approximate iter-
+tences. In this section, we present a technique          ated conditional modes (Besag, 1986) with 3 steps
+for imputation and a novel evaluation strategy in-       of a beam size 5 search for the vae. This allows
+spired by adversarial training. Qualitatively, we        us to compare the same amount of computation
+ﬁnd that the vae yields more diverse and plausible       for both models. We ﬁnd that breaking decod-
+imputations for the same amount of computation           ing for the vae into several sequential steps is nec-
+(see the examples given in Table 3), but precise         essary to propagate information among the vari-
+quantitative evaluation requires intractable likeli-     ables. Iterated conditional modes is a technique
+hood computations. We sidestep this by introduc-         for ﬁnding the maximum joint assignment of a set
+ing a novel evaluation strategy.                         of variables by alternately maximizing conditional
+                                                         distributions, and is a generalization of “hard-em”
+   While the standard rnnlm is a powerful genera-        algorithms like k-means (Kearns et al., 1998). For
+tive model, the sequential nature of likelihood com-     approximate iterated conditional modes, we ﬁrst
+putation and decoding makes it unsuitable for per-       initialize the unknown words to the unk token. We
+forming inference over unknown words given some          then alternate assigning the latent variable to its
+known words (the task of imputation). Except in          mode from the recognition model, and performing
+the special case where the unknown words all ap-         constrained beam search to assign the unknown
+pear at the end of the decoding sequence, sampling       words. Both of our generative models are trained
+from the posterior over the missing variables is in-     to decode sentences from right-to-left, which short-
+tractable for all but the smallest vocabularies. For     ens the dependencies involved in learning for the
+a vocabulary of size V , it requires O(V ) runs of full  vae, and we impute the ﬁnal 20% of each sen-
+rnn inference per step of Gibbs sampling or iter-        tence. This lets us demonstrate the advantages of
+ated conditional modes. Worse, because of the di-        the global latent variable in the regime where the
+rectional nature of the graphical model given by an      rnnlm suﬀers the most from its inductive bias.
+rnnlm, many steps of sampling could be required
+to propagate information between unknown vari-           Adversarial evaluation Drawing inspiration
+ables and the known downstream variables. The            from adversarial training methods for generative
+vae, while it suﬀers from the same intractability        models as well as non-parametric two-sample tests
+problems when sampling or computing map im-              (Goodfellow et al., 2014; Li et al., 2015b; Denton
+putations, can more easily propagate information         et al., 2015; Gretton et al., 2012), we evaluate the
+between all variables, by virtue of having a global      imputed sentence completions by examining their
+latent variable and a tractable recognition model.       distinguishability from the true sentence endings.
+                                                         While the non-diﬀerentiability of the discrete rnn
+   For this experiment and subsequent analysis, we       decoder prevents us from easily applying the ad-
+train our models on the Books Corpus introduced          versarial criterion at train time, we can deﬁne a
+in Kiros et al. (2015). This is a collection of text
+from 12k e-books, mostly ﬁction. The dataset,
+but now , as they parked out front and owen stepped out of the car , he could see
+True: that the transition was complete . RNNLM: it , ” i said . VAE: through the driver ’s door .
+
+you kill him and his                 RNNLM: . ”                   VAE: brother .
+True: men .
+
+not surprising , the mothers dont exactly see eye to eye with me
+
+True: on this matter .               RNNLM: , i said .            VAE: , right now .
+
+Table 3: Examples of using beam search to impute missing words within sentences. Since we decode from
+right to left, note the stereotypical completions given by the rnnlm, compared to the vae completions
+that often use topic data and more varied vocabulary.
+
+Model                 Adv. Err. (%)   NLL             parable, though the rnnlms favoring of generic
+                      Unigram lstm   rnnlm            high-probability endings such as “he said,” gives
+RNNLM (15 bm.)                                        it a slightly lower negative log-likelihood. Mea-
+VAE (3x5 bm.)           28.32 38.92   46.01           suring the rnnlm likelihood of sentences them-
+                       22.39 35.59    46.14           selves produced by an rnnlm is not a good mea-
+                                                      sure of the power of the model, but demonstrates
+Table 4: Results for adversarial evaluation of im-    that the rnnlm can produce what it sees as high-
+putations. Unigram and lstm numbers are the           quality imputations by favoring typical local statis-
+adversarial error (see text) and rnnlm numbers        tics, even though their repetitive nature produces
+are the negative log-likelihood given to entire gen-  easy failure modes for the adversarial classiﬁer.
+erated sentence by the rnnlm, a measure of sen-       Accordingly, under the adversarial evaluation our
+tence typicality. Lower is better on both metrics.    model substantially outperforms the baseline since
+The vae is able to generate imputations that are      it is able to eﬃciently propagate information bidi-
+signiﬁcantly more diﬃcult to distinguish from the     rectionally through the latent variable.
+true sentences.
+                                                      6 Analyzing variational models
+very ﬂexible test time evaluation by training a dis-
+criminant function to separate the generated and      We now turn to more qualitative analysis of the
+true sentences, which deﬁnes an adversarial error.    model. Since our decoder model p(x|z) is a sophis-
+                                                      ticated rnnlm, simply sampling from the directed
+   We train two classiﬁers: a bag-of-unigrams lo-     graphical model (ﬁrst p(z) then p(x|z)) would not
+gistic regression classiﬁer and an lstm logistic re-  tell us much about how much of the data is being
+gression classiﬁer that reads the input sentence and  explained by each of the latent space and the de-
+produces a binary prediction after seeing the ﬁnal    coder. Instead, for this part of the evaluation, we
+eos token. We train these classiﬁers using early      sample from the Gaussian prior, but use a greedy
+stopping on a 80/10/10 train/dev/test split of 320k   deterministic decoder for p(x|z), the rnnlm con-
+sentences, constructing a dataset of 50% complete     ditioned on z. This allows us to get a sense of how
+sentences from the corpus (positive examples) and     much of the variance in the data distribution is be-
+50% sentences with imputed completions (negative      ing captured by the distributed vector z as opposed
+examples). We deﬁne the adversarial error as the      to the decoder. Interestingly, these results qualita-
+gap between the ideal accuracy of the discrimina-     tively demonstrate that large amounts of variation
+tor (50%, i.e. indistinguishable samples), and the    in generated language can be achieved by following
+actual accuracy attained.                             this procedure. In the appendix, we provide some
+                                                      results on small text classiﬁcation tasks.
+Results As a consequence of this experimental
+setup, the rnnlm cannot choose anything outside       6.1 Analyzing the impact of word dropout
+of the top 15 tokens given by the rnn’s initial un-
+conditional distribution P (x1|Null) when produc-     For this experiment, we train on the Books Cor-
+ing the ﬁnal token of the sentence, since it has not  pus and test on a held out 10k sentence test set
+yet generated anything to condition on, and has a     from that corpus. We ﬁnd that train and test set
+beam size of 15. Table 4 shows that this weakness     performance are very similar. In Figure 3, we ex-
+makes the rnnlm produce far less diverse samples      amine the impact of word dropout on the varia-
+than the vae and suﬀer accordingly versus the ad-     tional lower bound, broken down into kl diver-
+versarial classiﬁer. Additionally, we include the     gence and cross entropy components. We drop out
+score given to the entire sentence with the imputed   words with the speciﬁed keep rate at training time,
+completion given a separate independently trained     but supply all words as inputs at test time except
+language model. The likelihood results are com-       in the 0% setting.
+
+                                                         We do not re-tune the hyperparameters for each
+           100% word keep                                                  75% word keep
+           “ no , ” he said .
+           “ thank you , ” he said .                                       “ love you , too . ”
+                                                                           she put her hand on his shoulder and followed him
+           50% word keep                                                   to the door .
+           “ maybe two or two . ”
+           she laughed again , once again , once again , and               0% word keep
+           thought about it for a moment in long silence .
+                                                                           i i hear some of of of
+                                                                           i was noticed that she was holding the in in of the
+                                                                           the in
+
+Table 5: Samples from a model trained with varying amounts of word dropout. We sample a vector from
+the Gaussian prior and apply greedy decoding to the result. Note that diverse samples can be achieved
+using a purely deterministic decoding procedure. Once we use reach a purely inputless decoder in the
+0% setting, however, the samples cease to be plausible English sentences.
+
+           he had been unable to conceal the fact that there was a logical explanation for his inability to
+           alter the fact that they were supposed to be on the other side of the house .
+
+           with a variety of pots strewn scattered across the vast expanse of the high ceiling , a vase of
+           colorful ﬂowers adorned the tops of the rose petals littered the ﬂoor and littered the ﬂoor .
+
+           atop the circular dais perched atop the gleaming marble columns began to emerge from atop the
+           stone dais, perched atop the dais .
+
+keep rate  Cross entropy KL divergence
+
+100T%able 6: G45.r01e01e7 dily deco 0.010358 ded sentences from a model with 75% word keep probability, sampling from
+90%                     40.897953       4.665799
+
+75%lower-likelih37o.71o00d22 area8s.751o51f2 the latent space. Note the consistent topics and vocabulary usage.
+50%                     33.433636       15.13052
+
+0%                      34.825763       20.906685
+
+      60                           90%             75%            50%  0%  taking each token xt = argmaxxt p(xt|x0,...,t−1, z).
+      50                                                                   This allows us to get a sense of how much of the
+      40                                                                   variance in the data distribution is being captured
+      30                                                                   by the distributed vector z as opposed to by local
+      20                                                                   language model dependencies.
+      10
+                                                                              These results, shown in Table 5, qualitatively
+       0                                                                   demonstrate that large amounts of variation in
+                  100%                                                     generated language can be achieved by following
+                                                                           this procedure. At the low end, where very lit-
+                                        Keep rate                          tle of the variance is explained by z, we see that
+                                                                           greedy decoding applied to a Gaussian sample does
+                                   KL divergence        Cross entropy      not produce diverse sentences. As we increase the
+                                                                           amount of word dropout and force z to encode
+Figure 3: The values of the two terms of the cost                          more information, we see the sentences become
+                                                                           more varied, but past a certain point they begin
+keefpuprnobctionxentas wordkl dropout increases.                           to repeat words or show other signs of ungram-
+100%                    3.059872        0.000953        3.060825           maticality. Even in the case of a fully dropped-out
+                                                                           decoder, the model is able to capture higher-order
+90%                     2.706509        0.388772        3.095281           statistics not present in the unigram distribution.
+
+75%                     2.462569        0.695894        3.158463              Additionally, in Table 6 we examine the eﬀect
+                                                                           of using lower-probability samples from the latent
+50%                     2.174506        1.109832        3.284338           Gaussian space for a model with a 75% word keep
+                                                                           rate. We ﬁnd lower-probability samples by ap-
+0%                      2.235086        1.478137        3.713223           plying an approximately volume-preserving trans-
+                                                                           formation to the Gaussian samples that stretches
+run, which results in the model with no dropout                            some eigenspaces by up to a factor of 4. This has
+                                                                           the eﬀect of creating samples that are not too im-
+encoding very little information in z (i.e., the kl                        probable under the prior, but still reach into the
+                                                                           tails of the distribution. We use a random linear
+component is small). We can see that as we lower                           transformation, with matrix elements drawn from
+                                                                           a uniform distribution from [−c, c], with c chosen
+the keep rate for word dropout, the amount of in-                          to give the desired properties (0.1 in our experi-
+
+formation stored in the latent variable increases,
+
+and the overall likelihood of the model degrades
+
+somewhat. Results from the Section 4 indicate
+
+that a model with no latent variable would degrade
+
+in performance signiﬁcantly more in the presence
+
+of heavy word dropout.
+
+   We also qualitatively evaluate samples, to
+demonstrate that the increased kl allows meaning-
+ful sentences to be generated purely from contin-
+uous sampling. Since our decoder model p(x|z) is
+a sophisticated rnnlm, simply sampling from the
+directed graphical model (ﬁrst p(z) then p(x|z))
+would not tell us about how much of the data is
+being explained by the learned vector vs. the lan-
+guage model. Instead, for this part of the qual-
+itative evaluation, we sample from the Gaussian
+prior, but use a greedy deterministic decoder for x,
+input    we looked out at the setting sun .             i went to the kitchen .      how are you doing ?
+mean     they were laughing at the same time .         i went to the kitchen .       what are you doing ?
+samp. 1  ill see you in the early morning .            i went to my apartment .      “ are you sure ?
+samp. 2  i looked up at the blue sky .                 i looked around the room .    what are you doing ?
+samp. 3  it was down on the dance ﬂoor .               i turned back to the table .  what are you doing ?
+
+Table 7: Three sentences which were used as inputs to the vae, presented with greedy decodes from the
+mean of the posterior distribution, and from three samples from that distribution.
+
+          “ i want to talk to you . ”                  sentences decoded (greedily) from codes z1 and z2
+          “i want to be with you . ”                   is the set of sentences decoded from the codes on
+          “i do n’t want to be with you . ”            the line. Examining these homotopies allows us to
+          i do n’t want to be with you .               get a sense of what neighborhoods in code space
+          she did n’t want to be with him .            look like – how the autoencoder organizes infor-
+                                                       mation and what it regards as a continuous defor-
+          he was silent for a long moment .            mation between two sentences.
+          he was silent for a moment .
+          it was quiet for a moment .                     While a standard non-variational rnnlm does
+          it was dark and cold .                       not have a way to perform these homotopies, a
+          there was a pause .                          vanilla sequence autoencoder can do so. As men-
+          it was my turn .                             tioned earlier in the paper, if we examine the ho-
+                                                       motopies created by the sequence autoencoder in
+Table 8: Paths between pairs of random points in       Table 1, though, we can see that the transition be-
+vae space: Note that intermediate sentences are        tween sentences is sharp, and results in ungram-
+grammatical, and that topic and syntactic struc-       matical intermediate sentences. This gives evi-
+ture are usually locally consistent.                   dence for our intuition that the vae learns repre-
+                                                       sentations that are smooth and “ﬁll up” the space.
+ments). Here we see that the sentences are far less
+typical, but for the most part are grammatical and        In Table 8 (and in additional tables in the ap-
+maintain a clear topic, indicating that the latent     pendix) we can see that the codes mostly contain
+variable is capturing a rich variety of global fea-    syntactic information, such as the number of words
+tures even for rare sentences.                         and the parts of speech of tokens, and that all in-
+                                                       termediate sentences are grammatical. Some topic
+6.2 Sampling from the posterior                        information also remains consistent in neighbor-
+                                                       hoods along the path. Additionally, sentences with
+In addition to generating unconditional samples,       similar syntax and topic but ﬂipped sentiment va-
+we can also examine the sentences decoded from         lence, e.g. “the pain was unbearable” vs. “the
+the posterior vectors p(z|x) for various sentences     thought made me smile”, can have similar embed-
+x. Because the model is regularized to produce dis-    dings, a phenomenon which has been observed with
+tributions rather than deterministic codes, it does    single-word embeddings (for example the vectors
+not exactly memorize and round-trip the input. In-     for “bad” and “good” are often very similar due to
+stead, we can see what the model considers to be       their similar distributional characteristics).
+similar sentences by examining the posterior sam-
+ples in Table 7. The codes appear to capture in-       7 Conclusion
+formation about the number of tokens and parts
+of speech for each token, as well as topic informa-    This paper introduces the use of a variational
+tion. As the sentences get longer, the ﬁdelity of      autoencoder for natural language sentences. We
+the round-tripped sentences decreases.                 present novel techniques that allow us to train
+                                                       our model successfully, and ﬁnd that it can eﬀec-
+6.3 Homotopies                                         tively impute missing words. We analyze the la-
+                                                       tent space learned by our model, and ﬁnd that it
+The use of a variational autoencoder allows us to      is able to generate coherent and diverse sentences
+generate sentences using greedy decoding on con-       through purely continuous sampling and provides
+tinuous samples from the space of codes. Addi-         interpretable homotopies that smoothly interpo-
+tionally, the volume-ﬁlling and smooth nature of       late between sentences.
+the code space allows us to examine for the ﬁrst
+time a concept of homotopy (linear interpolation)         We hope in future work to investigate factoriza-
+between sentences. In this context, a homotopy be-     tion of the latent variable into separate style and
+tween two codes z1 and z2 is the set of points on the  content components, to generate sentences condi-
+line between them, inclusive, z(t) = z1∗(1−t)+z2∗t     tioned on extrinsic features, to learn sentence em-
+for t ∈ [0, 1]. Similarly, the homotopy between two    beddings in a semi-supervised fashion for language
+understanding tasks like textual entailment, and to   Sepp Hochreiter and Ju¨rgen Schmidhuber. 1997.
+go beyond adversarial evaluation to a fully adver-       Long short-term memory. Neural computation
+sarial training objective.                               9(8).
+
+References                                            Mohit Iyyer, Varun Manjunatha, Jordan Boyd-
+                                                         Graber, and Hal Daum´e III. 2015. Deep un-
+Dzmitry Bahdanau, Kyunghyun Cho, and Yoshua              ordered composition rivals syntactic methods for
+   Bengio. 2015. Neural machine translation by           text classiﬁcation. In Proc. ACL.
+   jointly learning to align and translate. In Proc.
+   ICLR.                                              Michael Kearns, Yishay Mansour, and Andrew Y
+                                                         Ng. 1998. An information-theoretic analysis of
+Justin Bayer and Christian Osendorfer. 2015.             hard and soft assignment methods for clustering.
+   Learning stochastic recurrent networks. arXiv         In Learning in graphical models, Springer, pages
+   preprint arXiv:1411.7610 .                            495–520.
+
+Julian Besag. 1986. On the statistical analysis of    Yoon Kim. 2014. Convolutional neural networks
+   dirty pictures. Journal of the Royal Statistical      for sentence classiﬁcation. EMNLP .
+   Society Series B (Methodological) pages 48–259.
+                                                      Diederik P. Kingma and Max Welling. 2015. Auto-
+Junyoung Chung, Kyle Kastner, Laurent Dinh,              encoding variational bayes. In Proc. ICLR.
+   Kratarth Goel, Aaron Courville, and Yoshua
+   Bengio. 2015. A recurrent latent variable model    Ryan Kiros, Yukun Zhu, Ruslan Salakhutdinov,
+   for sequential data. In Proc. NIPS .                  Richard S Zemel, Antonio Torralba, Raquel Ur-
+                                                         tasun, and Sanja Fidler. 2015. Skip-thought vec-
+Andrew M. Dai and Quoc V. Le. 2015. Semi-                tors. arXiv preprint arXiv:1506.06726.
+   supervised sequence learning. In Proc. NIPS .
+                                                      Ankit Kumar, Ozan Irsoy, Jonathan Su, James
+Emily Denton, Soumith Chintala, Arthur Szlam,            Bradbury, Robert English, Brian Pierce, Pe-
+   and Rob Fergus. 2015. Deep generative image           ter Ondruska, Ishaan Gulrajani, and Richard
+   models using a laplacian pyramid of adversarial       Socher. 2015. Ask me anything: Dynamic mem-
+   networks. In Proc. NIPS .                             ory networks for natural language processing.
+                                                         arXiv preprint arXiv:1506.07285.
+Bill Dolan, Chris Quirk, and Chris Brockett.
+   2004. Unsupervised construction of large para-     Quoc V. Le and Toma´ˇs Mikolov. 2014. Distributed
+   phrase corpora: Exploiting massively parallel         representations of sentences and documents. In
+   news sources. In Proceedings of the 20th interna-     Proc. ICML.
+   tional conference on Computational Linguistics.
+   Association for Computational Linguistics, page    Jiwei Li, Minh-Thang Luong, and Dan Jurafsky.
+   350.                                                  2015a. A hierarchical neural autoencoder for
+                                                         paragraphs and documents. In Proc. ACL.
+Jeﬀ Donahue, Lisa Anne Hendricks, Sergio
+   Guadarrama, Marcus Rohrbach, Subhashini            Xin Li and Dan Roth. 2002. Learning question
+   Venugopalan, Kate Saenko, and Trevor Darrell.         classiﬁers. In Proceedings of the 19th interna-
+   2015. Long-term recurrent convolutional net-          tional conference on Computational linguistics-
+   works for visual recognition and description. In      Volume 1 . Association for Computational Lin-
+   Proc. CVPR.                                           guistics, pages 1–7.
+
+Otto Fabius and Joost R. van Amersfoort. 2014.        Yujia Li, Kevin Swersky, and Richard Zemel.
+   Variational recurrent auto-encoders. arXiv            2015b. Generative moment matching networks.
+   preprint arXiv:1412.6581.                             In Proc. ICML.
+
+Ian Goodfellow, Jean Pouget-Abadie, Mehdi             Junhua Mao, Wei Xu, Yi Yang, Jiang Wang, Zhi-
+   Mirza, Bing Xu, David Warde-Farley, Sherjil           heng Huang, and Alan Yuille. 2015. Deep cap-
+   Ozair, Aaron Courville, and Yoshua Bengio.            tioning with multimodal recurrent neural net-
+   2014. Generative adversarial nets. In Proc.           works (m-RNN). In Proc. ICLR.
+   NIPS .
+                                                      Mitchell P Marcus, Mary Ann Marcinkiewicz, and
+Karol Gregor, Ivo Danihelka, Alex Graves, and            Beatrice Santorini. 1993. Building a large an-
+   Daan Wierstra. 2015. DRAW: A recurrent neu-           notated corpus of English: The Penn Treebank.
+   ral network for image generation. In Proc.            Computational linguistics 19(2):313–330.
+   ICML.
+                                                      Yishu Miao, Lei Yu, and Phil Blunsom. 2015.
+Arthur Gretton, Karsten M Borgwardt, Malte J             Neural variational inference for text processing.
+   Rasch, Bernhard Scho¨lkopf, and Alexander             arXiv preprint arXiv:1511.06038 .
+   Smola. 2012. A kernel two-sample test. JMLR
+   13(1):723–773.                                     Toma´ˇs Mikolov, Stefan Kombrink, Luka´ˇs Burget,
+                                                         Jan Honza Cˇ ernocky`, and Sanjeev Khudanpur.
+                                                         2011. Extensions of recurrent neural network
+                                                         language model. In Proc. ICASSP .
+Tapani Raiko, Mathias Berglund, Guillaume             Method                Accuracy   F1
+   Alain, and Laurent Dinh. 2015. Techniques
+   for learning binary stochastic feedforward neu-    Feats                     73.2    –
+   ral networks. In Proc. ICLR.                       rae+dp                    72.6    –
+                                                      rae+feats                 74.2    –
+Danilo J. Rezende and Shakir Mohamed. 2015.           rae+dp+feats              76.8  83.6
+   Variational inference with normalizing ﬂows. In
+   Proc. ICML.                                        st                        73.0  81.9
+                                                      Bi-st                     71.2  81.2
+Danilo J. Rezende, Shakir Mohamed, and Daan           Combine-st                73.0  82.0
+   Wierstra. 2014. Stochastic backpropagation and
+   approximate inference in deep generative mod-      vae                       72.9  81.4
+   els. In Proc. ICML.                                vae+feats                 75.0  82.4
+                                                      vae+combine-st            74.8  82.3
+Jasper Snoek, Hugo Larochelle, and Ryan P.            Feats+combine-st          75.8  83.0
+   Adams. 2012. Practical Bayesian optimization       vae+combine-st+feats      76.9  83.8
+   of machine learning algorithms. In Proc. NIPS .
+                                                      Table 9: Results for the msr Paraphrase Corpus.
+Richard Socher, Eric H Huang, Jeﬀrey Pennin,
+   Christopher D Manning, and Andrew Y Ng.            Paraphrase detection For the task of para-
+   2011. Dynamic pooling and unfolding recur-         phrase detection, we use the Microsoft Research
+   sive autoencoders for paraphrase detection. In     Paraphrase Corpus (Dolan et al., 2004). We com-
+   Advances in Neural Information Processing Sys-     pute features from the sentence vectors of sentence
+   tems. pages 801–809.                               pairs in the same way as Kiros et al. (2015), con-
+                                                      catenating the elementwise products and the abso-
+Nitish Srivastava, Geoﬀrey Hinton, Alex               lute value of the elementwise diﬀerences of the two
+   Krizhevsky, Ilya Sutskever, and Ruslan             vectors. We train an 2-regularized logistic regres-
+   Salakhutdinov. 2014. Dropout: A simple             sion classiﬁer and tune the regularization strength
+   way to prevent neural networks from overﬁtting.    using cross-validation.
+   JMLR 15(1):1929–1958.
+                                                         We present results in Table 9 and compare to
+Rupesh Kumar Srivastava, Klaus Greﬀ, and              several previous models for this task. Feats is the
+   Ju¨rgen Schmidhuber. 2015. Training very deep      lexicalized baseline from Socher et al. (2011). rae
+   networks. In Proc. NIPS .                          uses the recursive autoencoder from that work, and
+                                                      dp adds their dynamic pooling step to calculate
+Ilya Sutskever, Oriol Vinyals, and Quoc V. Le.        pairwise features. st uses features from the uni-
+   2014. Sequence to sequence learning with neural    directional skip-thought model, bi-st uses bidirec-
+   networks. In Proc. NIPS .                          tional skip-thought, and combine-st uses the con-
+                                                      catenation of those features. We also experimented
+Lucas Theis and Matthias Bethge. 2015. Gener-         with concatenating lexical features and the two
+   ative image modeling using spatial LSTMs. In       types of distributed features.
+   Proc. NIPS .
+                                                         We found that our features performed slightly
+Oriol Vinyals, Alexander Toshev, Samy Bengio,         worse than skip-thought features by themselves
+   and Dumitru Erhan. 2015. Show and tell: A          and slightly better than recursive autoencoder fea-
+   neural image caption generator. In Proc. CVPR.     tures, and were complementary and yielded strong
+                                                      performance when simply concatenated with the
+Han Zhao, Zhengdong Lu, and Pascal Poupart.           skip-thought features.
+   2015. Self-adaptive hierarchical sentence model.
+   IJCAI .                                            Question classiﬁcation We also conduct ex-
+                                                      periments on the TREC Question Classiﬁcation
+Text classiﬁcation                                    dataset of Li and Roth (2002). Following Kiros
+                                                      et al. (2015), we train an 2-regularized softmax
+In order to further examine the the structure of the  classiﬁer with 10-fold cross-validation to set the
+representations discovered by the vae, we conduct     regularization. Note that using a linear classiﬁer
+classiﬁcation experiments on paraphrase detection     like this one may disadvantage our representations
+and question type classiﬁcation. We train a vae       here, since the Gaussian distribution over hidden
+with a hidden state size of 1200 hidden units on      codes in a vae is likely to discourage linear sepa-
+the Books Corpus, and use the posterior mean of       rability.
+the model as the extracted sentence vector. We
+train classiﬁers on these means using the same ex-       We present results in Table 10. Here, ae is
+perimental protocol as Kiros et al. (2015).           a plain sequence autoencoder. We compare with
+                                                      results from a bag of word vectors (cbow, Zhao
+                                                      et al., 2015) and skip-thought (st). We also com-
+Method           Accuracy
+
+st                   91.4
+Bi-st                89.4
+Combine-st           92.2
+AE                   84.2
+vae                  87.0
+cbow                 87.3
+vae, combine-st      92.0
+
+rnn                  90.2
+cnn                  93.6
+
+Table 10: Results for TREC Question Classiﬁca-
+tion.
+
+pare with an rnn classiﬁer (Zhao et al., 2015) and
+a cnn classiﬁer (Kim, 2014) both of which, un-
+like our model, are optimized end-to-end. We were
+not able to make the vae codes perform better
+than cbow in this case, but they did outperform
+features from the sequence autoencoder. Skip-
+thought performed quite well, possibly because the
+skip-thought training objective of next sentence
+prediction is well aligned to this task: it essen-
+tially trains the model to generate sentences that
+address implicit open questions from the narrative
+of the book. Combining the two representations
+did not give any additional performance gain over
+the base skip-thought model.
+
+Hyperparameter tuning
+
+We extensively tune the hyperparameters of each
+model using an automatic Bayesian hyperparame-
+ter tuning algorithm (based on Snoek et al., 2012)
+over development set data. We run the model with
+each set of hyperpameters for 10 hours, operating
+12 experiments in parallel, and choose the best set
+of hyperparameters after 200 runs. Results for our
+language modeling experiments are reported in Ta-
+ble 11 on the next page.
+
+Additional homotopies
+
+Table 12, on the next page, shows additional homo-
+topies from our model. We observe that intermedi-
+ate sentences are almost always grammatical, and
+often contain consistent topic, vocabulary and syn-
+tactic information in local neighborhoods as they
+interpolate between the endpoint sentences. Be-
+cause the model is trained on ﬁction, including ro-
+mance novels, the topics are often rather dramatic.
+                                           Standard    Inputless Decoder
+                                         rnnlm vae
+                                                       rnnlm  vae
+                                             464 353
+Embedding dim.                               337 191   305    499
+lstm state dim.
+z dim.                                          – 13   68     350
+Word dropout keep rate                      0.66 0.62
+                                                       –      111
+
+                                                       –      –
+
+Table 11: Automatically selected hyperparameter values used for the models used in the Penn Treebank
+language modeling experiments.
+
+            amazing , is n’t it ?        this was the only way .
+            so , what is it ?            it was the only way .
+            it hurts , isnt it ?         it was her turn to blink .
+            why would you do that ?      it was hard to tell .
+            “ you can do it .            it was time to move on .
+            “ i can do it .              he had to do it again .
+            i ca n’t do it .             they all looked at each other .
+            “ i can do it .              they all turned to look back .
+            “ do n’t do it .             they both turned to face him .
+            “ i can do it .              they both turned and walked away .
+            i could n’t do it .
+                                          there is no one else in the world .
+no .                                      there is no one else in sight .
+he said .                                 they were the only ones who mattered .
+“ no , ” he said .                        they were the only ones left .
+“ no , ” i said .                         he had to be with me .
+“ i know , ” she said .                   she had to be with him .
+“ thank you , ” she said .                i had to do this .
+“ come with me , ” she said .             i wanted to kill him .
+“ talk to me , ” she said .               i started to cry .
+ “ do n’t worry about it , ” she said .   i turned to him .
+
+i dont like it , he said .               im ﬁne .
+i waited for what had happened .         youre right .
+it was almost thirty years ago .         “ all right .
+it was over thirty years ago .           you ’re right .
+that was six years ago .                 okay , ﬁne .
+he had died two years ago .              “ okay , ﬁne .
+ten , thirty years ago .                 yes , right here .
+“ it ’s all right here .                 no , not right now .
+“ everything is all right here .         “ no , not right now .
+“ it ’s all right here .                 “ talk to me right now .
+it ’s all right here .                   please talk to me right now .
+we are all right here .                  i ’ll talk to you right now .
+come here in ﬁve minutes .               “ i ’ll talk to you right now .
+                                         “ you need to talk to me now .
+                                         “ but you need to talk to me now .
+
+Table 12: Selected homotopies between pairs of random points in the latent vae space.
+

@@ -1,0 +1,1045 @@
+           Naturalistic Causal Probing for Morpho-Syntax
+
+       Afra Amini1,2 Tiago Pimentel3 Clara Meister1 Ryan Cotterell1,2
+1ETH Zu¨rich, Switzerland 2ETH AI Center, Switzerland 3University of Cambridge, UK
+
+                       afra.amini@inf.ethz.ch tp472@cam.ac.uk
+         clara.meister@inf.ethz.ch ryan.cotterell@inf.ethz.ch
+
+                      Abstract                              a property of interest from the target model’s rep-
+                                                            resentations. If the probe manages to predict the
+     Probing has become a go-to methodology for             property with high accuracy, one may conclude
+     interpreting and analyzing deep neural mod-            that these representations encode information
+     els in natural language processing. However,           about the probed property.
+     there is still a lack of understanding of the
+     limitations and weaknesses of various types               While widely used, probing is not without its
+     of probes. In this work, we suggest a strat-           limitations.1 For instance, probing a pre-trained
+     egy for input-level intervention on naturalistic       model for grammatical gender can only tell us
+     sentences. Using our approach, we intervene            whether information about gender is present in
+     on the morpho-syntactic features of a sen-             the representations,2 it cannot, however, tell us
+     tence, while keeping the rest of the sentence          how or if the model actually uses information
+     unchanged. Such an intervention allows us              about gender in its predictions (Ravichander et al.,
+     to causally probe pre-trained models. We               2021; Elazar et al., 2021; Ravfogel et al., 2021;
+     apply our naturalistic causal probing frame-           Lasri et al., 2022). Furthermore, supervised prob-
+     work to analyze the effects of grammatical             ing cannot tell us whether the property under
+     gender and number on contextualized rep-               consideration is directly encoded in the represen-
+     resentations extracted from three pre-trained          tations, or if it can be recovered from the represen-
+     models in Spanish, the multilingual versions           tations alone due to spurious correlations among
+     of BERT, RoBERTa, and GPT-2. Our exper-                various linguistic properties. In other words, while
+     iments suggest that naturalistic interventions         we might find correlations between a probed
+     lead to stable estimates of the causal effects         property and representations through supervised
+     of various linguistic properties. Moreover, our        probing techniques, we cannot uncover causal
+     experiments demonstrate the importance of              relationships between them.
+     naturalistic causal probing when analyzing
+     pre-trained models.                                       In this work, we propose a new strategy for
+                                                            input-level intervention on naturalistic data to ob-
+           https://github.com/rycolab                       tain what we call naturalistic counterfactuals,
+           /naturalistic-causal-probing                     which we then use to perform causal probing.
+                                                            Through such input-level interventions, we can
+1 Introduction                                              ascertain whether a particular linguistic property
+                                                            has a causal effect on a model’s representations.
+Contextualized word representations are a by-               A number of prior papers have attempted to tease
+product of pre-trained neural language models               apart causal dependencies using either input-level
+and have led to improvements in performance on              or representation-level interventions. For instance,
+a myriad of downstream natural language process-            work on representational counterfactuals has
+ing (NLP) tasks (Joshi et al., 2019; Kondratyuk,            investigated causal dependencies via interventions
+2019; Zellers et al., 2019; Brown et al., 2020).            on neural representations. While quite versatile,
+Despite this performance improvement, though, it            representation-level interventions make it hard—
+is still not obvious to researchers how these rep-
+resentations encode linguistic information. One                 1See Belinkov (2021) for an overview.
+prominent line of work attempts to shed light on                2See Pimentel et al. (2020b), Hewitt et al. (2021), and
+this topic through probing (Alain and Bengio,               Pimentel and Cotterell (2021) for fomalizations of this state-
+2017), also referred to as auxiliary prediction (Adi        ment under information-theoretic frameworks.
+et al., 2017) or diagnostic classification (Hupkes
+et al., 2018). In machine learning parlance, a probe
+is a supervised classifier that is trained to predict
+
+                                                       384
+
+Transactions of the Association for Computational Linguistics, vol. 11, pp. 384–403, 2023. https://doi.org/10.1162/tacl a 00554
+              Action Editor: Miguel Ballesteros. Submission batch: 4/2022; Revision batch: 7/2022; Published 5/2023.
+                      c 2023 Association for Computational Linguistics. Distributed under a CC-BY 4.0 license.
+if not impossible—to determine whether we are                          2 Probing
+only intervening on our property of interest. An-
+other proposed method, templated counterfac-                           There are several types of probing methods that
+tuals, does perform an input-level intervention                        have been proposed for the analysis of NLP mod-
+strategy, which is guaranteed to only affect the                       els, and there are many possible taxonomies of
+probed property. Under such an approach, the re-                       those methods. For the purposes of this paper, we
+searcher first creates a number of templated sen-                      divide previously proposed probing models into
+tences (either manually or automatically), which                       two groups: correlational and causal probes. On
+they then fill with a set of minimal-pair words                        one hand, correlational probes attempt to uncover
+to generate counterfactual examples. However,                          whether a probed property is present in a model’s
+template-based interventions are limited by de-                        representations. On the other hand, causal probes,
+sign: They do not reflect the diversity of sentences                   roughly speaking, attempt to uncover how a model
+present in natural language, and, thus, lead to                        encodes and makes use of a specific probed prop-
+biased estimates of the measured causal effects. Nat-                  erty. We compare and contrast correlational and
+uralistic counterfactuals improve upon template-                       causal probing techniques in this section.
+based interventions in that they lead to unbiased
+estimates of the causal effect.                                        2.1 Correlational Probing
+
+   In our first set of experiments, we employ                          Correlational probing is any attempt to correlate
+naturalistic causal probing to estimate the average                    the input representations with the probed prop-
+treatment effect (ATE) of two morpho-syntactic                         erty of interest. Under correlational probing, the
+features—namely, number and grammatical                                performance of a probe is viewed as the degree
+gender—on a noun’s contextualized representa-                          to which a model encodes information in its rep-
+tion. We show the estimated ATE’s stability across                     resentations about some probed property (Alain
+corpora. In our second set of experiments, we find                     and Bengio, 2017). At various times, correlational
+that a noun’s grammatical gender and its number                        results have been used to claim that language
+are encoded by a small number of directions in                         models have knowledge of various morphologi-
+three pre-trained models’ representations: BERT,                       cal, syntactic, and semantic phenomena (Adi et al.,
+RoBERTa, and GPT-2.3 We further use natural-                           2017; Ettinger et al., 2016; Belinkov et al., 2017;
+istic counterfactuals to causally investigate gender                   Conneau et al., 2018, inter alia). Yet the valid-
+bias in RoBERTa. We find that RoBERTa is                               ity of these claims has been a subject of debate
+much more likely to predict the adjective her-                         (Saphra and Lopez, 2019; Hewitt and Liang, 2019;
+moso(a) (beautiful) for feminine nouns and racio-                      Pimentel et al., 2020a,b; Voita and Titov, 2020).
+nal (rational) for masculine. This suggests that
+RoBERTa is indeed gender-biased in its adjective                       2.2 Causal Probing
+predictions.
+                                                                       A more recent line of work aims to answer the
+   Finally, through our naturalistic counterfactu-                     question: What is the causal relationship between
+als, we show that correlational probes overesti-                       the property of interest and the probed model’s
+mate the presence of certain linguistic properties.                    representations? In natural language, however,
+We compare the performance of correlational                            answering this question is not straightforward:
+probes on two versions of our dataset: one un-                         sentences typically contain confounding factors
+altered and one augmented with naturalistic coun-                      that render analyses tedious. To circumvent this
+terfactuals. While correlational probes achieve                        problem, most work in causal probing relies on
+very high (above 90%) performance when pre-                            interventions, that is, the act of setting a variable
+dicting gender from sentence-level representa-                         of interest to a fixed value (Pearl, 2009). Im-
+tions, they only perform close to chance (around                       portantly, this must be done without altering any
+60%) on the augmented data. Together, our results                      of this variable’s causal parents, thereby keeping
+demonstrate the importance of a naturalistic causal                    their probability distributions fixed.4 As a byprod-
+approach to probing.                                                   uct, these interventions generate counterfactuals,
+
+    3We study the Spanish version of these models, if it exists,           4Consider a set of three random variables with a causal
+or the multilingual version if there is no Spanish version.            structure X → Y → Z (where X causes Y , which causes
+                                                                       Z). If we simply conditioned on Y = 1, we would be left
+                                                                       with the conditional distribution p(x, z | Y = 1) = p(x |
+                                                                       Y = 1)p(z | Y = 1). If we perform an intervention on
+
+                                                                  385
+namely, examples where a specific property of                     Naturalistic Counterfactuals. In this paper,
+interest is changed while everything else is held                 following Zmigrod et al. (2019), we propose a new
+constant. Counterfactuals can then be used to                     and less complex strategy to perform input-level
+perform a causal analysis. Prior probing papers                   interventions by creating naturalistic counterfac-
+have proposed methods using both representa-                      tuals that are not derived from templates. Instead,
+tional and templated counterfactuals, as we dis-                  we derive the counterfactuals from the dependency
+cuss next.                                                        structure of the sentence. By creating counterfac-
+                                                                  tuals on the fly using a dependency parse, we
+Representational Counterfactuals. A few re-                       avoid the biases of manually creating templates.
+cent causal probing papers perform interventions                  Furthermore, our approach guarantees that we
+directly on a model’s representations (Giulianelli                only intervene on the specific linguistic property
+et al., 2018; Feder et al., 2021; Vig et al., 2020;               of interest, for example, changing the grammatical
+Tucker et al., 2021; Ravfogel et al., 2021; Lasri                 gender or number of a noun.
+et al., 2022; Ravfogel et al., 2022a). For example,
+Elazar et al. (2021) use iterative null space pro-                3 The Causal Framework
+jection (INLP; Ravfogel et al., 2020) to remove
+an analyzed property’s information, for example,                  The question of interest in this paper is how con-
+part of speech, from the representations. Although                textualized representations are causally affected
+representational interventions can be applied to                  by a morpho-syntactic feature such as gender or
+situations where other forms of intervention are                  number. To see how our method works, it is eas-
+not feasible, it is often impossible to make sure                 iest to start with an example. Let’s consider the
+only the information about the probed property is                 following pair of Spanish sentences:
+removed or changed.5 In the absence of this guar-
+antee, any causal conclusion should be viewed                      (1) El programador talentoso escribio´ el co´digo.
+with caution.                                                           the.M.SG programmer.M.SG talented.M.SG wrote
+                                                                        the code.
+Templated Counterfactuals. Other work (Vig                              The talented programmer wrote the code.
+et al., 2020; Finlayson et al., 2021), like us, has
+leveraged input-level interventions. However, in                   (2) La programadora talentosa escribio´ el co´digo.
+these cases, the interventions are carried out using                    the.F.SG programmer.F.SG talented.F.SG wrote
+templated minimal-pair sentences, which differ                          the code.
+only with respect to a single analyzed property.                        The talented programmer wrote the code.
+Using these minimal pairs, they estimate the effect
+of an input-level intervention on individual atten-                  The meaning of these sentences is equivalent
+tion heads and neurons. One benefit of template-                  up to the gender of the noun programador, whose
+based approaches is that they create a highly                     feminine form is programadora. However, more
+controlled environment, which guarantees that the                 than just this one word changes from (1) to (2):
+intervention is done correctly, and which may lead                The definite article el changes to la and the
+to insights that would be impossible to gain from                 adjective talentoso changes to talentosa. In the
+natural data. However, since the templates are                    terminology of this paper, we will refer to progra-
+typically designed to analyze a specific property,                mador as the focus noun, as it is the noun whose
+they cover a narrow set linguistic phenomena,                     grammatical properties we are going to change.
+which may not reflect the complexity of language                  We will refer to the changing of (1) to (2) as a
+in naturalistic data.                                             syntactic intervention on the focus noun. Infor-
+                                                                  mally, a syntactic intervention may be thought of
+Y = 1, on the other hand, we are left with a distribution         as taking part in two steps. First, we swap the
+of p(x, z | do(Y ) = 1) = p(x)p(z | Y = 1); thus X’s              focus noun (programador) with another noun that
+distribution is not altered by Y .                                is equivalent up to a single grammatical property.
+                                                                  In this case, we swap programador with progra-
+    5There are, however, methods to mitigate this issue,          madora, which differs only in its gender marking.
+e.g., Ravfogel et al. (2022b) recently proposed an improved       Second, we reinflect the sentence so that all nec-
+(adversarial) method to remove information from a set of          essary words grammatically agree with the new
+representations that greatly reduces the number of removed        focus noun. The result of a syntactic intervention
+dimensions.
+
+                                                             386
+Figure 1: Intervention on the gender of lemma pro-           Notation and Variables. We denote random
+gramador (masculine → feminine). Changes are                 variables in upper-case letters and instances with
+propagated from that noun to its dependent words             lower-case letters. We bold sequences: bold
+accordingly.                                                 lower-case letters represent a sequence of words
+                                                             and bold upper-case letters represent a sequence of
+is a pair of sentences that differ minimally, that is,       random variables. Let f = f1, . . . , fT be a sen-
+only with respect to this one grammatical property           tence (of length T ) where each ft is a word form.
+(Figure 1). Another way of framing the syntactic             In addition, let r be the list of contextual represen-
+intervention is as a counterfactual: What would              tations r = r1, . . . , rT where each rt ∈ Rh, and
+(1) have looked like if programador had been                 is in one-to-one correspondence with the sentence
+feminine? The rest of this section focuses on for-           f , that is, rt is ft’s contextual representations. Fur-
+malizing the notion of a syntactic intervention and          thermore, let = 1, . . . , T be a list of lemmata
+discussing how to use them in a causal inference             and m = m1, . . . , mT a list of morpho-syntactic
+framework for probing.                                       features co-indexed with f ; t is the lemma of
+                                                             ft and mt is its morpho-syntactic features. We
+A Note on Inanimate Nouns. When estimat-                     call m = mt1, . . . , mtK the minimal list of
+ing the effect of grammatical gender here, we                morpho-syntactic features, where each tk is an
+restrict our investigation to animate nouns, for             index between 1 to T . In essence, we drop features
+example, programadora/programador (feminine/                 of the tokens that are dependent on other to-
+masculine programmer). Grammatical gender of                 kens’ morphology. In our example (1) this means
+inanimate nouns is lexicalized, meaning that each            we only include the morpho-syntactic features of
+noun is assigned a single gender, for example,               programador and co´digo, thus m = m2, m6 .6
+puente (bridge) is masculine. In other words, there          We denote the morpho-syntactic feature of inter-
+is not a non-zero probability of assigning each              est as m∗, which, in this work, represents either
+lemmata to each gender, which violates a condi-              the gender g∗ or number n∗ of the focus noun. We
+tion called positivity in causal inference literature.       further denote the lemma of the focus noun as ∗.
+Thus, we cannot perform an intervention on the
+grammatical gender of those words, but rather                Causal Assumptions. Our causal model is in-
+would need to perform an intervention on the                 troduced in Figure 2. It encodes the causal rela-
+lemma itself. We refer to Gonen et al. (2019) for            tionships between U, L, M , F , and R. Explicitly,
+an analysis of the effect of gender on inanimate             we assume the following causal relationships:
+nouns’ representations. Note that a similar lexi-
+calization can also be observed in a few animate                • M and L are causally dependent on U .
+nouns, for example, madre/padre (mother/father).                   The underlying meaning that the writer of
+In such cases, to separate the lemma from gender,                  a sentence wants to convey determines the
+we assume that these words share a hypothetical                    used lemmas and morpho-syntactic features;
+lemma, which in our example represents par-
+enthood, and combining that with gender would                   • In general, Lt can causally affect Mt. Take
+give us the specific forms (e.g., madre/padre).                    the gender of inanimate nouns as an example,
+                                                                   where the lemma determines the gender;
+3.1 The Causal Model
+                                                                • F is causally dependent on L and M . Word
+We now describe a causal model that will allow us                  forms are a combination of lemmata and
+to more formally discuss syntactic interventions.                  morpho-syntactic features;
+
+                                                                • R is causally dependent on F . Contex-
+                                                                   tualized representations are obtained by
+                                                                   processing the sentences through the probed
+                                                                   model.
+
+                                                                 6In this work, we only focus on two morpho-syntactic
+                                                             features: gender and number. To analyze other features, the
+                                                             minimal list should be expanded—e.g., to analyze verb tense,
+                                                             m3 should be added to the list.
+
+                                                        387
+Figure 2: Causal graph for the Spanish sentence El programador talentoso escribio´ el co´digo. before (on the left)
+and after (on the right) an intervention on the grammatical gender of the focus noun.
+
+Dependency Trees. In order to measure the                  Figure 3: Causal model showing dependencies be-
+causal effect of the gender of the focus noun (g∗)         tween the underlying meaning (U ), lemma (L∗) and
+on the contextualized representation (r), all of its       morpho-syntactic features (M∗) of the focus noun,
+causal dependencies must be considered. As our             context (Z), sentences (F ), and contextualized repre-
+causal graph shows (in Figure 2), g∗ not only              sentations (R).
+has a causal effect on the focus noun’s form, but
+also on the definite article el and the adjective          syntactic feature of interest L∗ and M∗ and ag-
+talentoso. Yet, not all word forms in a sentence           gregate the other lemmata and morpho-syntactic
+are affected; for instance, the definite article el        features into an abstract variable, which we call Z
+in the noun phrase el co´digo. Luckily, within a           and refer to as the context. Furthermore, we only
+given sentence, such relationships are naturally           show the aggregation of word forms and repre-
+encoded by that sentence’s dependency tree. The            sentations as F and R in the abstract model. We
+dependency graph d of a sentence f is a directed           will assume for now, and in most of our experi-
+graph created by connecting each word form ft              ments, that the output of the causal model (R in
+for 1 ≤ t ≤ T to its syntactic parent. We use              Figure 3) represents the contextualized represen-
+the information encoded in d by leveraging the             tation of the focus noun. However, as we gener-
+fact that a word form ft is causally dependent             alize later, the output of the causal model can be
+on its syntactic parent. In essence, a dependency          any function of word forms F , such as: The rep-
+tree d implicitly encodes a function dt[m] which           resentation of other words in the sentence, the
+returns the subset of morphological properties that        probability distribution assigned by the model to
+causally affect the form ft. Thus, we are able to          a masked word, or even the output of a down-
+express the complete joint probability distribution        stream task. We note that Figure 3 can be easily
+of our causal model as follows:                            re-expanded into Figure 2 for any specific utter-
+                                                           ance by using its dependency tree.
+p(f , m, , u)                (1)
+
+= p(u) p(m, | u) p(f | m, )
+
+                                   T
+
+= p(u) p(m, | u) p(ft | dt[m], t)
+
+                                 t=1
+
+Abstract Causal Model. We can now simplify
+the causal model from Figure 2 into Figure 3.
+For simplicity, we isolate the lemma and morpho-
+
+                                                      388
+3.2 Naturalistic Counterfactuals                                    causal effect of grammatical gender in the con-
+                                                                    textual representations—breaking the correlation
+In causal inference literature, the do(·) operator                  between morpho-syntax and semantics.
+represents an intervention on a causal diagram.
+For instance, we might want to intervene on the                      (3) La mujer dio a luz a 6 bebe´s.
+gender of the focus noun (thus using gender G∗                            the.F.SG woman.F.SG gave birth to 6 babies.
+as the morpho-syntactic feature of interest M∗).                          The woman gave birth to 6 babies.
+Concretely, in our example (Figure 2), do(G∗ =
+FEM) means intervening on the causal graph by                        (4) El hombre dio a luz a 6 bebe´s.
+removing all the causal edges going into G∗ from                          the.M.SG man.M.SG gave birth to 6 babies.
+U and L∗ and setting G∗’s value to a specific                             The man gave birth to 6 babies.
+realization FEM. The result of this intervention
+on a sampled sentence f is a new counterfac-                        3.3 Measuring Causal Effects
+tual sentence f . As our causal graph suggests,
+the relationship between words in a sentence is                     In this section, we define the causal effect of a
+complex, occurring at multiple levels of abstrac-                   morpho-syntactic feature. We then present esti-
+tion; swapping the gender of a single word—while                    mators for these values in the following section.
+leaving all other words unchanged—may not re-                       While we focus on grammatical gender here, our
+sult in grammatical text. Consequently, one must                    derivations are similarly applicable to number and
+approach the creation of counterfactuals in natural                 other morpho-syntactic features.
+language with caution. Specifically, we rely on
+syntactic interventions to generate our naturalistic                   Given a specific focus–context pair ( ∗, z), the
+counterfactuals.                                                    causal effect of gender G∗ on the representations
+                                                                    is called the individual treatment effect (ITE;
+Syntactic Intervention. We develop a heuristic                      Rosenbaum and Rubin, 1983) and is defined as:
+algorithm to perform our interventions, shown in
+Appendix B. Given a sentence and its dependency                     Δ( ∗, z) =                       (2)
+tree, the algorithm generates a counterfactual ver-
+sion of the sentence, that is, approximating the                              E tgt(F ) | G∗ = MSC, L∗ = ∗, Z = z
+do(·) operation. This algorithm processes the de-
+pendency tree of each sentence in a depth-first                                    F
+search recursive manner. In each iteration, if the
+node in process is a noun, it is marked as the                              −E tgt(F ) | G∗ = FEM, L∗ = ∗, Z = z
+focus noun7 and a new copy of the sentence is
+created, which will be the base of the counterfac-                                 F
+tual sentence. Then, the intervention is performed,
+altering the focus noun and all dependent tokens                    where tgt(·) is a deterministic function that im-
+in the copied sentence.8 Notably, when we syn-                      plements the model being probed, for example,
+tactically intervene on the grammatical gender or                   a pretrained model like BERT, taking a form F
+number of a noun, we do not alter potentially in-                   as input and outputting R. Since F is itself a
+compatible semantic contexts. Take sentence (3)                     deterministic function of a G∗, L∗, Z triple, we
+as an example, where the focus noun is mujer                        can rewrite this equation as:9
+and we intervene on gender. Its counterfactual
+sentence (4) is semantically odd and unlikely,                      Δ( ∗, z) =                       (3)
+but still meaningful. We can thus estimate the
+                                                                    tgt(MSC, ∗, z) − tgt(FEM, ∗, z)
+    7Specifically, for gender intervention we only mark the
+noun as the focus if it is an animate noun.                         As can be seen from Equation (3), the ITE is
+                                                                    the difference in the representation given that
+    8This is a simplified version of the algorithm where we         the focus noun of the sentence is masculine vs.
+omit the rule-based re-inflection functions for nouns, adjec-       feminine.
+tives, and determiners. We also handle contractions, such as
+a + el → al, which is not mentioned in this pseudo-code.               To get a more general understanding of how
+                                                                    gender affects these representations, however, it
+                                                                    is not enough to just look at individual treatment
+                                                                    effects. It is necessary to consider a holistic metric
+                                                                    across the entire language. The ATE is one such
+                                                                    metric, and is defined as the difference between
+                                                                    the following expectations:
+
+                                                                        ψATE = E tgt(F ) | do(G∗ = MSC) (4)
+
+                                                                                        F
+
+                                                                                −E tgt(F ) | do(G∗ = FEM)
+
+                                                                                        F
+
+                                                                    9We overload tgt(·) to receive either F or G∗, L∗, Z .
+
+                                                               389
+In words, the ATE is the expected causal effect                       of sentences: one with only masculine focus nouns
+of one random variable on another (in this case                       SMSC and the other with feminine ones SFEM. We
+gender on the model’s representations). Comput-                       then compute their difference:
+ing this expectation, however, is not as simple as
+conditioning it on gender. As there are backdoor                      ψna¨ıve =                                           (8)
+paths10 from the treatment (gender) to the effect
+(the representations), we rely on the backdoor                                          1                 tgt(MSC, ∗, z)
+criterion (Pearl, 2009) to compute this expecta-
+tion. Simply put, we first need to find a set of                                        |SMSC|  , ∗,z ∈SMSC
+variables that block every such backdoor path.
+We then condition our expectation on them. As                                           1
+shown in Proposition 1 (in the Appendix), the set                     −                                   tgt(FEM, ∗, z)
+of variables satisfying the backdoor criterion in                       |SFEM|
+our case is {L∗, Z}. Therefore, we can rewrite                                                  , ∗,z ∈SFEM
+Equation (4) by conditioning our expectation over
+{L∗, Z}:                                                              We note, however, that this is a very na¨ıve estima-
+                                                                      tor.11 Since SMSC (and respectively SFEM) includes
+ψATE =                                  (5)                           only the fraction of sentences with masculine fo-
+                                                                      cus nouns, restricting the sample mean to this
+ E E tgt(F ) | G∗ = MSC, L∗, Z                                        set of instances is equivalent to using samples
+                                                                      z, ∗ ∼ p(z, ∗ | MSC), rather than z, ∗ ∼ p(z, ∗)
+L∗,Z F                                                                (as should be done for ATE). Notably, this is
+                                                                      equivalent to ignoring the do operator in Equa-
+       − E E tgt(F ) | G∗ = FEM, L∗, Z                                tion (4). Consequently, Equation (8) introduces
+                                                                      a purely correlational baseline. In the following
+             L∗,Z F                                                   section, we present our (better) causal estimator.
+
+which we can again rewrite as:                                        4.2 Paired Estimator
+
+ψATE =                                  (6)                           We now use our naturalistic counterfactual sen-
+                                                                      tences to approximate the ATE. Specifically, by
+ E [tgt(MSC, L∗, Z) − tgt(FEM, L∗, Z)]                                relying on our syntactic interventions, we can ob-
+                                                                      tain both a feminine and masculine form of each
+L∗,Z                                                                  sentence ( ∗, z) sampled from the corpus. Con-
+                                                                      cretely, we use the following paired estimator:
+Furthermore, plugging Equation (3) into Equa-
+
+tion (6):
+
+           ψATE = E Δ(L∗, Z)            (7)
+           L∗,Z
+
+reveals that Equation (5) is just the ITE in                          ψpaired =                                           (9)
+                                                                       1
+expectation. Thus, the ATE is an appropriate                          |S |              tgt(MSC, ∗, z) − tgt(FEM, ∗, z)
+
+language-wide measure of the effect of gender                                 , ∗,z ∈S
+
+on contextual representations.                                                                  (1)  (2)
+
+4 Approximating the ATE                                               where, depending on g∗, the model’s output tgt(·)
+                                                                      in (1) and (2) will be extracted from a pre-trained
+In this section, we show how to estimate                              model using either the original or counterfactual
+Equation(6) from a finite corpus of sentences S.                      sentences.
+
+4.1 Na¨ıve Estimator                                                  4.3 A Closer Look at our Estimators
+
+Each sentence in our corpus can be written as a                       A closer look at our paired estimator in Equation
+triple g∗, ∗, z . We now discuss how to use such                      (9) shows that it is an unbiased Monte Carlo
+a corpus to estimate Equation (6). Specifically, we                   estimator of the ATE presented in Equation (6).
+first compute the sample mean using two subsets                       In short, if we assume our corpus S was sampled
+                                                                      from the target distribution, we can use this corpus
+   10A backdoor path is a causal path from an analyzed                as samples ∗, z ∼ p( ∗, z). For each ∗, z pair,
+variable to its effect which contains an arrow to the treatment       we can then generate sentences with both MSC and
+(i.e., an arrow going backwards). For instance, consider              FEM grammatical genders to estimate the ATE.
+random variables with a causal structure Y → X → Z and
+Y → Z (where Y causes X, and both X and Y cause Z).                      11This is referred to as the na¨ıve or unadjusted estimator
+X ← Y → Z forms a backdoor path (Definition 3; Pearl,                 in the literature (Herna´n and Robins, 2020).
+2009).
+
+                                                                 390
+   The na¨ıve estimator, on the other hand, will                                   Gender  Number
+not produce an unbiased estimate of the ATE.
+As mentioned above, by considering sentences in                              train dev test MSC FEM SING PLUR
+SMSC or SFEM separately, we implicitly condition on
+the gender when approximating each expectation.                      AnCora  ✓  ✓  ✗ 1,029 203 14,602 6,692
+This estimator instead approximates a value we                               ✗  ✗  ✓ 107 21 1,540 693
+term the average correlational effect (ACE):
+                                                                     GSD     ✓ ✓ ✗ 403 135 9,141 3,993
+
+                                                                          Table 1: Aggregated dataset statistics.
+
+ψACE = E [tgt(MSC, L∗, Z)]    (10)
+
+             L∗ ,Z |G∗ =MSC                                          (AnCora and GSD), morpho-syntactic features
+                                                                     (gender and number), and categories within each
+       − E [tgt(FEM, L∗, Z)]                                         feature (masculine, feminine, singular, and plural).
+                                                                     A native Spanish speaker assessed the gram-
+             L∗ ,Z |G∗ =FEM                                          maticality of sampled sentences. Our syntactic
+                                                                     intervention algorithm was able to accurately gen-
+   On a separate note, template-based approaches                     erate counterfactuals for 73% of the sentences.13
+allow the researcher to investigate causal effects                   The accuracy for the gender and number inter-
+by using minimal pairs of sentences, each of                         ventions are 76% and 70%, respectively. Due to
+which can be used to estimate an ITE (as in Equa-                    the subtleties discussed in disentangling syntax
+tion (3)). And, by averaging them, they provide an                   from semantics and the complex sentence struc-
+estimate of ATE (as in Equation (7)). However,                       tures found in naturalistic data, we believe this
+these minimal pairs are either manually written or                   error is within an acceptable range and leave
+automatically collected using template structures.                   improvements to future work.
+Therefore, they cover a narrow (and potentially
+biased) set of structures, arguably not following                    5.2 Template-Based Dataset
+a naturalistic distribution. In other words, their
+corpus S cannot be assumed to be sampled ac-                         To compare our approach to templated counter-
+cording to the distribution p( ∗, z).12 In practice,                 factuals, we translate two datasets for measuring
+templated counterfactuals approximate the treat-                     gender bias: Winogender (Rudinger et al., 2018)
+ment effect using an approach identical to the                       and WinoBias (Zhao et al., 2018). As shown by
+paired estimators–up to a change of distribution.                    Stanovsky et al. (2019), simply translating these
+This change of distribution, however, may lead to                    templates to Spanish leads to biased translations,
+biased estimates of the ATE..                                        where professions are translated stereotypically
+                                                                     and the context is ignored. Following Stanovsky
+5 Dataset                                                            et al., we thus put either handsome and pretty
+                                                                     before nouns to enforce the gender constraint after
+We use two Spanish UD treebanks (Nivre                               translation. Consider, for instance, the sentence:
+et al., 2020) in our experiments: Spanish-GSD                        ‘‘The developer was unable to communicate with
+(McDonald et al., 2013) and Spanish-AnCora                           the writer because he only understands the code.’’
+(Taule´ et al., 2008). We only analyze gender on                     We rewrite it as ‘‘The handsome developer. . .’’.
+animate nouns and use Open Multilingual Word-                        Similarly, if the pronoun was she, we would write
+Net (Gonzalez-Agirre et al., 2012) to mark the                       ‘‘The pretty developer. . .’’. As an extra constraint,
+animacy. Corpus statistics for the datasets can be                   we want to ensure the gender of the writer stays the
+found in Table 1.                                                    same before and after the intervention. Therefore,
+                                                                     we make two copies of the sentence: One where
+5.1 Evaluating Counterfactual Sentences                              writer is translated as escritora (feminine writer),
+                                                                     enforced by replacing writer with pretty writer,
+To evaluate our syntactic intervention algorithm                     and one where writer is translated as escritor
+(introduced in §3.2), we randomly sample a subset
+of 100 sentences from our datasets. These sam-                          13Approximating our estimate of this accuracy with a
+ples are evenly distributed across the two datasets                  normal distribution, we obtain a 95% confidence interval
+                                                                     (Wald interval) which ranges from 64% to 82% (Brown
+   12This becomes clear when we take a look at the sentences         et al., 2001).
+in one of such template-based datasets. For instance, all sen-
+tences in the Winogender dataset (Rudinger et al., 2018)—
+used by Vig et al. (2020)—have very similar sentential
+structures. Such biases, however, are not necessarily prob-
+lematic and might be imposed by design to analyze specific
+phenomena.
+
+                                                                391
+Figure 4: Cosine similarities of the ATE on BERT                    Figure 5: Cosine similarity of ATE estimators com-
+representations. N. represents ψna¨ıve; P. represents               puted on focus nouns, adjectives, and determiners using
+ψpaired; and T. represents ψpaired estimated on the                 BERT representations.
+template-based dataset.
+                                                                    across treebanks, the correlational effect is more
+(masculine writer), enforced by replacing writer                    susceptible to variations in the datasets, for exam-
+with handsome writer. We translate the result-                      ple, semantic variations due to the domain from
+ing pairs of sentences using the Google Translate                   which treebanks were sampled.
+API and drop the sentences with wrong gender
+translations. In the end, we obtain 2740 minimal                    Templated vs. Naturalistic Counterfactuals.
+pairs.                                                              As an extra baseline, we estimate the ATE using
+                                                                    a paired estimator with the template-based dataset
+6 Insights From ATE Estimators                                      introduced in §5.2. We observe a low cosine sim-
+                                                                    ilarity between our naturalistic ATE estimates
+In the following experiments, we first use the es-                  and the template-based ones. This shows that
+timators introduced in §4 to approximate the ATE                    sentences from template-based datasets are sub-
+of number and grammatical gender on contextual-                     stantially different from naturalistic datasets, thus
+ized representations. We look at how stable these                   fail to provide unbiased estimates in naturalistic
+ATE estimates are across datasets, and whether                      settings.
+they change across words with different parts of
+speech. We then analyze whether the ATE (as an                      Variation Across Part-of-Speech Tags. Using
+expected value) was an accurate description of                      the same approach, we additionally compute the
+how representations actually change in individual                   ATEs on adjectives and determiners. Figure 5
+sentences. Finally, we compute the ATE of gender                    presents our na¨ıve and paired ATE estimates,
+on the probability of predicting specific adjectives                computed on words with different parts of speech.
+in a sentence, thereby measuring the causal effect                  These results suggest that gender and number
+of gender in adjective prediction.                                  do not affect the focus noun or its dependent
+                                                                    words in the same way. While the ATE on focus
+6.1 Variations Across ATEs                                          nouns and adjectives are strongly aligned, the
+                                                                    cosine similarity between ATEs on focus nouns
+Variation Across Datasets. Using our ATE es-                        and determiners is smaller.16
+timators, we compute the average treatment effect
+of both gender and number on BERT’s contex-                         6.2 Masked Language Modeling Predictions
+tualized representations (Devlin et al., 2019) of
+focus nouns.14 We compute ψpaired and ψna¨ıve                       We now analyze the effect of our morpho-
+estimators. Figure 4 presents their cosine similari-                syntactic features on masked language modeling
+ties. We observe high cosine similarities between                   predictions. Specifically, we analyze RoBERTa
+paired estimators across datasets,15 but lower co-                  (Conneau et al., 2020)17 in these experiments, as it
+sine similarities with the na¨ıve estimator. This                   has better performance than BERT in masked pre-
+suggests that, while the causal effect is stable                    diction. We thus look at how grammatical gender
+
+   14More specifically, BERT-BASE-MULTILINGUAL-CASED in the            16Relatedly, Lasri et al. (2022) recently showed BERT
+Transformers library (Wolf et al., 2020).                           encodes number differently on nouns and verbs.
+
+   15To make sure that the imbalance in the dataset before             17More specifically, we use XLM-ROBERTA-BASE.
+intervention doesn’t have a significant effect on results, we
+create a balanced version of the dataset, where we observe
+similar results.
+
+                                                               392
+NUMBER GENDER  ⎧                      MProbs(h )   MProbs(hψna¨ıve )  MProbs(hψpaired )       6.3 Gender Bias in Adjectives
+               ⎨ DET: MProbs(h )
+                                      4.85 ± 2.39     1.09 ± 1.4         0.67 ± 1.14          As shown by Bartl et al. (2020) and Gonen et al.
+               ⎩  ADJ: MProbs(h )  )  2.29 ± 2        1.04 ± 1.05        0.9 ± 1.12           (2022), the results of studies on gender bias
+                  FOCUS: MProbs(h     3.75 ± 2.67     1.74 ± 1.11        1.53 ± 0.93          in English are not completely transferable to
+                                                                                              gender-marking languages. We analyze the causal
+               ⎧                      6.93 ± 2.52     1.92 ± 2.87        2.05 ± 2.64          effect of gender on specific masked adjective
+               ⎨ DET: MProbs(h )      5.63 ± 2.75     2.25 ± 2.2         2.5 ± 2.17           probabilities, predicted by the RoBERTa model.
+                                      5.50 ± 3.02     2.25 ± 2.14        2.41 ± 1.9           To this end, we manually create a list of 30 ad-
+               ⎩  ADJ: MProbs(h )  )                                                          jectives (the complete list is in Appendix A) in
+                  FOCUS: MProbs(h                                                             both masculine and feminine forms. We sample a
+                                                                                              sentence f from a subset of the dataset in which
+Table 2: Mean and standard deviation of Jensen–                                               the focus noun has one dependent adjective a,
+hannon divergence between the masked probabil-                                                and mask this adjective. We then define a new
+ity distributions of focus nouns, determiners, and                                            function, tgt(·), to measure the ATE on adjective
+adjectives over the corpus.                                                                   probabilities. Specifically, we write:
+
+and number affect the probability that RoBERTa                                                            tgta(f ) = ln pθ(a | f )            (13)
+assigns to each word in its output vocabulary.
+                                                                                                             = ln pθ(a | g∗, ∗, z)
+   We start by masking a word in our sentence: ei-
+ther the focus noun, a dependent determiner, or an                                            where a represents an adjective in our list (also
+adjective. We then obtain this word’s contextual                                              exists in RoBERTa’s vocabulary V) and pθ(a |
+representation h. Second, we apply a syntactic                                                f ) is the probability RoBERTa assigns to that
+intervention to this sentence, and, following simi-                                           adjective.18 We plug this new function into our
+lar steps, obtain another representation h . Third,                                           paired ATE estimator in Equation (9). As this
+we use these representations to obtain the prob-                                              prediction is somewhat susceptible to noise, we
+abilities RoBERTa assigns to the words in its                                                 replace the mean in Equation (9) with the median.
+vocabulary MProbs(h) and MProbs(h ). Finally,                                                 Specifically, this is equivalent to computing:
+we obtain these same probability assignments,
+but using ATE to estimate the counterfactual
+representations:
+
+               MProbs(hψpaired ),     hψpaired = h ± ψpaired          (11)                    ψp(aai)red  =  median     ln pθ(a | MSC, ∗, z)  (14)
+               MProbs(hψna¨ıve ),     hψna¨ıve = h ± ψna¨ıve          (12)                                                 pθ(a | FEM, ∗, z)
+                                                                                                              , ∗,z ∈S
+
+   We now look at how probability assignments                                                 In this equation, if ψp(aai)red > 0, the predicted prob-
+change as a function of our interventions. Specifi-                                           ability that the adjective appears in a sentence
+cally, Table 2 shows Jensen–Shannon divergences
+between MProbs(·) computed on top of different                                                where it is dependent on a masculine focus noun
+representations. We can make a number of ob-
+servations based on this table. First, for gender,                                            will be typically higher than in a sentence with a
+these distributions change more when predicting                                               feminine focus noun. Whereas if ψp(aai)red < 0 the
+determiners and focus nouns than adjectives. We                                               reverse will hold. Therefore, we say a is biased
+speculate that this may be because many Span-                                                 towards masculine gender if ψp(aai)red > 0 and it is
+ish adjectives are syncretic, that is, they have                                              biased towards feminine gender if ψp(aai)red < 0. As
+the same inflected form for masculine and femi-                                               shown in Figure 6, rich (rica/rico) and rational
+nine (e.g., inteligente [intelligent], or profesional
+[professional]). Second, the distributions change                                             (racional) are more biased towards masculine
+more after an intervention on number than on gen-
+der. Third, when we use either of our estimators                                              gender, while beautiful (hermosa/hermoso) is
+to approximate the counterfactual representation,
+the divergences are greatly reduced. These results                                            biased towards feminine gender.
+show that the ATE values do describe (at least
+to some extent) the change of representations in                                              7 Insights From Naturalistic
+individual sentences.                                                                             Counterfactuals
+
+                                                                                              In the following experiments, we rely on a
+                                                                                              dataset augmented with naturalistic counterfactu-
+                                                                                              als. We first explore the geometry of the encoded
+
+                                                                                                 18When an adjective in the list has two forms depending on
+                                                                                              the gender (e.g., hermosa/hermoso), we sum the probabilities
+                                                                                              for masculine and feminine forms.
+
+                                                                                         393
+Figure 6: ψp(aai)red values computed using Equation (14) to measure causal gender bias in masked adjective prediction.
+
+Figure 7: (top) Percentage of the gender and number variance explained by the first 10 PCA components. (bottom)
+The projection of 20 pairs of focus noun’s representations on the first principal component.
+
+morpho-syntactic features. We then run a more                       with prior work (e.g., Biasion et al., 2020, on
+classic correlational probing experiment, high-                     Italian word embeddings), and suggests that these
+lighting the importance of a causal framework                       morpho-syntactic features are linearly encoded in
+when analyzing representations.                                     the representations.
+
+7.1 Geometry of Morpho-Syntactic Features                              To further explore the gender and number
+                                                                    subspaces, we project a random sample of 20
+In this experiment, we follow Bolukbasi et al.’s                    sentences (along with their counterfactuals) onto
+(2016) methodology to isolate the subspace cap-                     the first principal component. Figure 7 (bot-
+turing our morpho-syntactic features’ information.                  tom) shows that the three models we probe
+First, we create a matrix with the representations of               can (at least to a large extent) differentiate both
+all focus nouns in our counterfactually augmented                   morpho-syntactic features using a single dimen-
+dataset. Second, we pair each noun’s representa-                    sion. Notably, this first principal component is
+tion with its counterfactual representation (after                  strongly aligned with the estimate ψpaired; they
+the intervention). Third, we center the matrix of                   have a cosine similarity of roughly 0.99 in all
+representations by subtracting each pair’s mean.                    these settings.
+Finally, we perform principal component analysis
+on this new matrix.                                                 7.2 Analysis of Correlational Probing
+
+   As Figure 7 shows, in BERT and RoBERTa, the                      We now use a dataset augmented with naturalistic
+first principal component explains close to 20%                     counterfactuals to empirically evaluate the entan-
+of the variance caused by gender and number. In                     glement of correlation and causation discussed in
+GPT-2 (Radford et al., 2019),19 more than half of                   §2, which arises when using diagnostic probes to
+the variance is captured by the first or the first                  probe the representations. Again, we probe three
+two principal components.20 This result is in line                  contextual representations: BERT, RoBERTa, and
+                                                                    GPT-2. We train logistic regressors (LogReg-
+   19More specifically, we use GPT2-SMALL-SPANISH.                  Probe) and support vector machines (SVMProbe)
+   20These results are not obtained due to the randomness of        to predict either gender or number of the focus
+a finite sample of high dimensional vectors. Neither are they
+due to the structure of the model. To show this, we present         (as green traces) and representations extracted from models
+two random baselines: random vectors of the same size |S|           with randomized weights (as gray traces) in Figure 7.
+
+                                                               394
+Figure 8: Accuracy scores of gender and number probes on the original and augmented datasets.
+
+noun from its contextual representation. Further,                 still a large gap between correlational and causal
+we probe the representations in two positions: the                probes’ accuracies. Together, these results imply
+focus noun and the [CLS] token (or a sentence’s                   that correlational probes are sensitive to spurious
+last token, for GPT-2).21                                         correlations in the data (such as the semantic con-
+                                                                  text in which nouns appear), and do not learn to
+   Accuracy of correlational probes on the original               predict grammatical gender robustly.
+dataset is shown in Figure 8 as green points. Both
+gender and number probes reach a near-perfect                     8 Conclusion
+accuracy on focus nouns’ representations. Fur-
+thermore, all correlational gender probes reach a                 We propose a heuristic algorithm for syntactic
+high accuracy in [CLS] representations, suggest-                  intervention which, when applied to naturalistic
+ing that gender can be reliably recovered from                    data, allows us to create naturalistic counterfactu-
+them.                                                             als. Although similar analyses have been run by
+                                                                  prior work, using either templated or represen-
+   Next, we evaluate trained probes on counter-                   tational counterfactuals (Elazar et al., 2021; Vig
+factually augmented test sets (shown as yellow                    et al., 2020; Bolukbasi et al., 2016, inter alia),
+points in Figure 8). We see that there is a drop in               our syntactic intervention approach allows us to
+performance in all settings, and, more specifically,              run these analyses on naturalistic data. We fur-
+the accuracy of probes on [CLS] representations                   ther discuss how to use these counterfactuals in a
+drops significantly when evaluated on the coun-                   causal setting to probe for morpho-syntax. Exper-
+terfactual test set. This suggest that the previous               imentally, we first showed that ATE estimates are
+results using correlational probes overestimate                   more robust to dataset differences than either our
+the extent to which gender and number can be                      na¨ıve (correlational) estimator, or template-based
+predicted from the representations.                               approaches. Second, we showed that ATE can (at
+                                                                  least partially) predict how representations will
+   Finally, we also train supervised probes on a                  be affected after intervention on gender or num-
+counterfactually augmented dataset in order to                    ber. Third, we employ our ATE framework to
+study whether we can achieve the levels of per-                   study gender bias, finding a list of adjectives that
+formance attested in the literature (shown as gray                are biased towards one or other gender. Fourth,
+points in Figure 8). Since these probes are trained               we find that the variation of gender and number
+on a dataset augmented with counterfactuals, they                 can be captured by a few principal axes in the
+are not as susceptible to spurious correlations; we               nouns’ representations. And, finally, we highlight
+thus call them the causal probes. Although there is               the importance of causal analyses when probing:
+a considerable improvement in accuracy, there is                  When evaluated on counterfactually augmented
+                                                                  data, correlational probe results drop significantly.
+   21BERT and RoBERTa treat [CLS] as a special token
+whose representation is supposed to aggregate information
+from the whole input sentence. In GPT-2, the last token
+in a sentence should also contain information about all its
+previous tokens.
+
+                                                             395
+Ethical Concerns                                           A List of Adjectives
+
+Pretrained models often encode gender bias. The            We use 30 different Spanish adjectives in our
+adjective bias experiments in this work can pro-           experiments: hermoso/hermosa (beautiful), sexy
+vide further insights into the extent to which these       (sexy), molest/molesta (upset), bonito/bonita
+biases are encoded in multilingual pretrained mod-         (pretty), delicado/delicada (delicate), ra´pido
+els. As our paper focuses on (grammatical) gender          /ra´pida (fast), joven (young), inteligente (in-
+as a morpho-syntactic feature, it focuses on a bi-         telligent), divertido/divertida (funny), fuerte
+nary notion of gender, which is not representative         (strong), duro/dura (hard), alegre (cheerful),
+of the full spectrum of human gender expression.           protegido/protegida (protected), excelente (ex-
+Most of the analysis in this paper focuses on mea-         cellent), nuevo/nueva (new), serio/seria (serious),
+suring grammatical gender, not gender bias. We             sensible (sensitive), profesional (professional),
+thus advise caution when interpreting the findings         emocional (emotional), independiente (indepen-
+from this work. Nonetheless, we hope the causal            dent), fanta´stico/fanta´stica (fantastic), brutal
+structure formalized here, together with our anal-         (brutal), malo/mala (bad), bueno/buena (good),
+yses, can be of use to bias mitigation techniques          horrible (horrible), triste (sad), amable (nice),
+in future (e.g., Liang et al., 2020).                      tranquilo/tranquila (quiet), rico/rica (rich),
+                                                           racional (rational).
+
+                                                      396
+B Algorithm for Heuristic Intervention
+
+Algorithm 1
+
+1: procedure REINFLECTTREE(node, parent, state)
+
+2: isFocusNoun ← false
+
+3: if state == NORMAL and node is a valid noun :
+
+4:   REINFLECTNOUN(node) Change the noun and set the morpho-syntactic feature to the desired value
+
+5: isFocusNoun ← true
+
+6: if node is subject :
+
+7:   REINFLECTVERB(parent) Change verb
+
+8:   if state == DIR : Current node is a direct dependent of a focus noun
+
+9:         if node is a determiner :
+
+10:          REINFLECTDET(node) Change determiner
+
+11: if node is an adjective modifier :
+
+12:  REINFLECTADJ(node) Change adjective
+
+13: if node is a nominal subject :
+
+14:  REINFLECTNOUN(node) Change noun
+
+15:  nsubj ← true
+
+16: if node is a copula :
+
+17:  REINFLECTCOP(node) Change copula
+
+18: if state == INDIR and node is an adjective modifier and parent is an adjective modifier : Current node is a
+
+     descendant of a focus noun
+
+19:  REINFLECTADJ(node)
+
+20: for child ∈ children(node) :
+
+21:  if isFocusNoun or nsubj :
+
+22:  REINFLECTTREE(child, node, DIR )
+
+23:  else if state == DIR or state == INDIR :
+
+24:  REINFLECTTREE(child, node, INDIR )
+
+25:  else
+
+26:  REINFLECTTREE(child, node, NORMAL )
+
+                                          397
+C Theory
+
+Proposition 1. In this proposition we show that the average treatment effect is equivalent to the
+difference of two expectations with no do-operator:
+
+E tgt(F ) | do (G∗ = MSC) − E tgt(F ) | do (G∗ = FEM)               (15)
+F                         F
+
+   = E E tgt(F ) | G∗ = MSC, L∗, Z − E E tgt(F ) | G∗ = FEM, L∗, Z
+      L∗,Z F                        L∗,Z F
+
+Proof. First, we note the existence of two backdoor paths in our model Figure 3: M∗ ← U → Z →
+F → R and M∗ ← U → L∗ → F → R. We can easily check that Z blocks the first and L∗ blocks the
+second path, and neither Z nor L∗ are descendants of M∗. Therefore {L∗, Z} satisfies the back-door
+criterion. To make the proof simpler, we show that the first term of the left-hand side of Equation (15)
+
+equals the first term in the right-hand side of Equation (15) and then we obtain the full result by
+
+symmetry. We proceed as follows:
+
+E tgt(F ) |do (G∗ = MSC)                                                               (16)
+                                                              (marginalize ∗ and z)
+F
+                                                                (backdoor criterion)
+   =           E tgt(F ) | do(G∗ = MSC), ∗, z) p( ∗, z)  (rewrite as an expectation)
+               F
+      ∗∈L z∈Z
+
+   =           E tgt(F ) | G∗ = MSC, ∗, z) p( ∗, z)
+               F
+      ∗∈L z∈Z
+
+   = E E tgt(F ) | G∗ = MSC, L∗, Z
+
+       L∗,Z F
+
+                             398
+Acknowledgments                                               Proceedings of the Seventh Italian Confer-
+                                                              ence on Computational Linguistics CLiC-it
+We would like to thank Shauli Ravfogel for feed-              2020: Bologna. https://doi.org/10
+back on a preliminary draft and Damia´n Blasi for             .4000/books.aaccademia.8280
+analyzing the errors made by our naturalistic coun-
+terfactual algorithm. We would also like to thank          Tolga Bolukbasi, Kai-Wei Chang, James Y. Zou,
+the action editor and the the anonymous reviewers             Venkatesh Saligrama, and Adam T. Kalai. 2016.
+for their insightful feedback during the review pro-          Man is to computer programmer as woman is
+cess. Afra Amini is supported by ETH AI Center                to homemaker? Debiasing word embeddings.
+doctoral fellowship. Ryan Cotterell acknowledges              In Advances in Neural Information Processing
+support from the SNSF through the ‘‘The For-                  Systems, volume 29.
+gotten Role of Inductive Bias in Interpretability’’
+project.                                                   Lawrence D. Brown, T. Tony Cai, and
+                                                              Anirban DasGupta. 2001. Interval estimation
+References                                                    for a binomial proportion. Statistical Science,
+                                                              16(2):101–133. https://doi.org/10.1214
+Yossi Adi, Einat Kermany, Yonatan Belinkov,                   /ss/1009213286
+   Ofer Lavi, and Yoav Goldberg. 2017.
+   Fine-grained analysis of sentence embeddings            Tom Brown, Benjamin Mann, Nick Ryder,
+   using auxiliary prediction tasks. In 5th Inter-            Melanie Subbiah, Jared D. Kaplan, Prafulla
+   national Conference on Learning Represen-                  Dhariwal, Arvind Neelakantan, Pranav Shyam,
+   tations (Conference Track). https://doi                    Girish Sastry, Amanda Askell, Sandhini
+   .org/10.1147/JRD.2017.2702858                              Agarwal, Ariel Herbert-Voss, Gretchen
+                                                              Krueger, Tom Henighan, Rewon Child, Aditya
+Guillaume Alain and Yoshua Bengio. 2017. Un-                  Ramesh, Daniel Ziegler, Jeffrey Wu, Clemens
+   derstanding intermediate layers using linear               Winter, Chris Hesse, Mark Chen, Eric
+   classifier probes. In 5th International Confer-            Sigler, Mateusz Litwin, Scott Gray, Benjamin
+   ence on Learning Representations (Workshop                 Chess, Jack Clark, Christopher Berner, Sam
+   Track).                                                    McCandlish, Alec Radford, Ilya Sutskever,
+                                                              and Dario Amodei. 2020. Language models
+Marion Bartl, Malvina Nissim, and Albert Gatt.                are few-shot learners. In Advances in Neural
+   2020. Unmasking contextual stereotypes: Mea-               Information Processing Systems, volume 33,
+   suring and mitigating BERT’s gender bias.                  pages 1877–1901.
+   In Proceedings of the Second Workshop on
+   Gender Bias in Natural Language Process-                Alexis Conneau, Kartikay Khandelwal, Naman
+   ing, pages 1–16, Barcelona, Spain (Online).                Goyal, Vishrav Chaudhary, Guillaume Wenzek,
+   Association for Computational Linguistics.                 Francisco Guzma´n, Edouard Grave, Myle Ott,
+                                                              Luke Zettlemoyer, and Veselin Stoyanov.
+Yonatan Belinkov. 2021. Probing classifiers:                  2020. Unsupervised cross-lingual representa-
+   Promises, shortcomings, and alternatives. arXiv            tion learning at scale. In Proceedings of the
+   preprint arXiv:2102.12452.                                 58th Annual Meeting of the Association for
+                                                              Computational Linguistics, pages 8440–8451,
+Yonatan Belinkov, Llu´ıs Ma`rquez, Hassan Sajjad,             Online. Association for Computational Linguis-
+   Nadir Durrani, Fahim Dalvi, and James Glass.               tics. https://doi.org/10.18653/v1
+   2017. Evaluating layers of representation in               /P18-1198
+   neural machine translation on part-of-speech
+   and semantic tagging tasks. In Proceedings of           Alexis Conneau, German Kruszewski, Guillaume
+   the Eighth International Joint Conference on               Lample, Lo¨ıc Barrault, and Marco Baroni.
+   Natural Language Processing (Volume 1: Long                2018. What you can cram into a single $&!#*
+   Papers), pages 1–10, Taipei, Taiwan. Asian                 vector: Probing sentence embeddings for lin-
+   Federation of Natural Language Processing.                 guistic properties. In Proceedings of the 56th
+                                                              Annual Meeting of the Association for Compu-
+Davide Biasion, Alessandro Fabris, Gianmaria                  tational Linguistics (Volume 1: Long Papers),
+   Silvello, and Gian Antonio Susto. 2020. Gen-               pages 2126–2136, Melbourne, Australia. Asso-
+   der bias in italian word embeddings. In                    ciation for Computational Linguistics.
+
+                                                      399
+Jacob Devlin, Ming-Wei Chang, Kenton Lee, and               https://doi.org/10.18653/v1/W18
+   Kristina Toutanova. 2019. BERT: Pre-training             -5426
+   of deep bidirectional transformers for language
+   understanding. In Proceedings of the 2019             Hila Gonen, Yova Kementchedjhieva, and Yoav
+   Conference of the North American Chapter                 Goldberg. 2019. How does grammatical gender
+   of the Association for Computational Linguis-            affect noun representations in gender-marking
+   tics: Human Language Technologies, Volume 1              languages? In Proceedings of the 23rd
+   (Long and Short Papers), pages 4171–4186,                Conference on Computational Natural Lan-
+   Minneapolis, Minnesota. Association for Com-             guage Learning (CoNLL), pages 463–471,
+   putational Linguistics.                                  Hong Kong, China. Association for Compu-
+                                                            tational Linguistics. https://doi.org/10
+Yanai Elazar, Shauli Ravfogel, Alon Jacovi,                 .18653/v1/K19-1043
+   and Yoav Goldberg. 2021. Amnesic probing:
+   Behavioral explanation with amnesic counter-          Hila Gonen, Shauli Ravfogel, and Yoav
+   factuals. Transactions of the Association for            Goldberg. 2022. Analyzing gender represen-
+   Computational Linguistics. https://doi                   tation in multilingual models. In Proceedings
+   .org/10.1162/tacl_a_00359                                of the 7th Workshop on Representation Learn-
+                                                            ing for NLP, pages 67–77, Dublin, Ireland.
+Allyson Ettinger, Ahmed Elgohary, and Philip                Association for Computational Linguistics.
+   Resnik. 2016. Probing for semantic evidence
+   of composition by means of simple classifica-         Aitor Gonzalez-Agirre, Egoitz Laparra, and
+   tion tasks. In Proceedings of the 1st Workshop           German Rigau. 2012. Multilingual central
+   on Evaluating Vector-Space Representations               repository version 3.0. In Proceedings of
+   for NLP, pages 134–139, Berlin, Germany.                 the Eighth International Conference on Lan-
+   Association for Computational Linguistics.               guage Resources and Evaluation (LREC’12),
+                                                            pages 2525–2529, Istanbul, Turkey. European
+Amir Feder, Nadav Oved, Uri Shalit, and Roi                 Language Resources Association (ELRA).
+   Reichart. 2021. CausaLM: Causal Model
+   Explanation Through Counterfactual Lan-               M. A. Herna´n and J. M. Robins. 2020. Causal
+   guage Models. Computational Linguis-                     inference: What if. Boca Raton, FL: Chapman
+   tics, 47(2):333–386. https://doi.org                     & Hall/CRC.
+   /10.1162/coli_a_00404
+                                                         John Hewitt, Kawin Ethayarajh, Percy Liang,
+Matthew Finlayson, Aaron Mueller, Sebastian                 and Christopher Manning. 2021. Conditional
+   Gehrmann, Stuart Shieber, Tal Linzen, and                probing: Measuring usable information be-
+   Yonatan Belinkov. 2021. Causal analysis                  yond a baseline. In Proceedings of the 2021
+   of syntactic agreement mechanisms in neu-                Conference on Empirical Methods in Natu-
+   ral language models. In Proceedings of the               ral Language Processing, pages 1626–1639,
+   59th Annual Meeting of the Association for               Online and Punta Cana, Dominican Repub-
+   Computational Linguistics and the 11th Inter-            lic. Association for Computational Linguis-
+   national Joint Conference on Natural Lan-                tics. https://doi.org/10.18653/v1
+   guage Processing (Volume 1: Long Papers),                /2021.emnlp-main.122
+   pages 1828–1843, Online. Association for Com-
+   putational Linguistics. https://doi.org               John Hewitt and Percy Liang. 2019. Design-
+   /10.18653/v1/2021.acl-long.144                           ing and interpreting probes with control
+                                                            tasks. In Proceedings of the 2019 Conference
+Mario Giulianelli, Jack Harding, Florian Mohnert,           on Empirical Methods in Natural Language
+   Dieuwke Hupkes, and Willem Zuidema. 2018.                Processing and the 9th International Joint
+   Under the hood: Using diagnostic classifiers to          Conference on Natural Language Processing
+   investigate and improve how language models              (EMNLP-IJCNLP), pages 2733–2743, Hong
+   track agreement information. In Proceedings              Kong, China. Association for Computational
+   of the 2018 EMNLP Workshop BlackboxNLP:                  Linguistics.
+   Analyzing and Interpreting Neural Networks
+   for NLP, pages 240–248, Brussels, Belgium.            Dieuwke Hupkes, Sara Veldhoen, and Willem
+   Association for Computational Linguistics.               Zuidema. 2018. Visualisation and ‘diagnostic
+                                                            classifiers’ reveal how recurrent and re-
+                                                            cursive neural networks process hierarchical
+
+                                                    400
+   structure. Journal of Artificial Intelligence          Joakim Nivre, Marie-Catherine de Marneffe, Filip
+   Research, 61:907–926. https://doi.org                     Ginter, Jan Hajicˇ, Christopher D. Manning,
+   /10.1613/jair.1.11196                                     Sampo Pyysalo, Sebastian Schuster, Francis
+                                                             Tyers, and Daniel Zeman. 2020. Universal
+Mandar Joshi, Omer Levy, Luke Zettlemoyer, and               Dependencies v2: An evergrowing multilin-
+   Daniel Weld. 2019. BERT for coreference res-              gual treebank collection. In Proceedings of the
+   olution: Baselines and analysis. In Proceedings           12th Language Resources and Evaluation Con-
+   of the 2019 Conference on Empirical Meth-                 ference, pages 4034–4043, Marseille, France.
+   ods in Natural Language Processing and the                European Language Resources Association.
+   9th International Joint Conference on Natu-
+   ral Language Processing (EMNLP-IJCNLP),                Judea Pearl. 2009. Causal inference in statistics:
+   pages 5803–5808, Hong Kong, China. Associ-                An overview. Statistics Surveys, 3:96–146.
+   ation for Computational Linguistics. https://             https://doi.org/10.1214/09-SS057
+   doi.org/10.18653/v1/D19-1588
+                                                          Tiago Pimentel and Ryan Cotterell. 2021. A
+Dan Kondratyuk. 2019. Cross-lingual lemmatiza-               Bayesian framework for information-theoretic
+   tion and morphology tagging with two-stage                probing. In Proceedings of the 2021 Conference
+   multilingual BERT fine-tuning. In Proceed-                on Empirical Methods in Natural Language
+   ings of the 16th Workshop on Computational                Processing, pages 2869–2887, Online and
+   Research in Phonetics, Phonology, and Mor-                Punta Cana, Dominican Republic. Association
+   phology, pages 12–18, Florence, Italy. Associa-           for Computational Linguistics.
+   tion for Computational Linguistics. https://
+   doi.org/10.18653/v1/W19-4203                           Tiago Pimentel, Naomi Saphra, Adina Williams,
+                                                             and Ryan Cotterell. 2020a. Pareto probing:
+Karim Lasri, Tiago Pimentel, Alessandro Lenci,               Trading off accuracy for complexity. In Pro-
+   Thierry Poibeau, and Ryan Cotterell. 2022.                ceedings of the 2020 Conference on Empirical
+   Probing for the usage of grammatical number.              Methods in Natural Language Processing
+   In Proceedings of the 60th Annual Meeting of              (EMNLP), pages 3138–3153, Online. Associa-
+   the Association for Computational Linguistics             tion for Computational Linguistics. https://
+   (Volume 1: Long Papers), pages 8818–8831,                 doi.org/10.18653/v1/2020.emnlp
+   Dublin, Ireland. Association for Computa-                 -main.254
+   tional Linguistics. https://doi.org/10
+   .18653/v1/2022.acl-long.603                            Tiago Pimentel, Josef Valvoda, Rowan Hall
+                                                             Maudslay, Ran Zmigrod, Adina Williams, and
+Paul Pu Liang, Irene Mengze Li, Emily Zheng,                 Ryan Cotterell. 2020b. Information-theoretic
+   Yao Chong Lim, Ruslan Salakhutdinov, and                  probing for linguistic structure. In Proceed-
+   Louis-Philippe Morency. 2020. Towards de-                 ings of the 58th Annual Meeting of the
+   biasing sentence representations. In Proceed-             Association for Computational Linguistics,
+   ings of the 58th Annual Meeting of the                    pages 4609–4622, Online. Association for
+   Association for Computational Linguistics,                Computational Linguistics.
+   pages 5502–5515, Online. Association for
+   Computational Linguistics.                             Alec Radford, Jeffrey Wu, Rewon Child, David
+                                                             Luan, Dario Amodei, and Ilya Sutskever. 2019.
+RyanMcDonald, JoakimNivre, Yvonne Quirmbach-                 Language models are unsupervised multitask
+   Brundage, Yoav Goldberg, Dipanjan Das,                    learners. OpenAI blog, 1(8):9.
+   Kuzman Ganchev, Keith Hall, Slav Petrov,
+   Hao Zhang, Oscar Ta¨ckstro¨m, Claudia Bedini,          Shauli Ravfogel, Yanai Elazar, Hila Gonen,
+   Nu´ria Bertomeu Castello´, and Jungmee Lee.               Michael Twiton, and Yoav Goldberg. 2020.
+   2013. Universal Dependency annotation for                 Null it out: Guarding protected attributes by it-
+   multilingual parsing. In Proceedings of the 51st          erative nullspace projection. In Proceedings of
+   Annual Meeting of the Association for Compu-              the 58th Annual Meeting of the Association for
+   tational Linguistics (Volume 2: Short Papers),            Computational Linguistics, pages 7237–7256,
+   pages 92–97, Sofia, Bulgaria. Association for             Online. Association for Computational Linguis-
+   Computational Linguistics.                                tics. https://doi.org/10.18653/v1
+                                                             /2020.acl-main.647
+
+                                                     401
+Shauli Ravfogel, Grusha Prasad, Tal Linzen, and       machine translation. In Proceedings of the
+   Yoav Goldberg. 2021. Counterfactual inter-         57th Annual Meeting of the Association for
+   ventions reveal the causal effect of relative      Computational Linguistics, pages 1679–1684,
+   clause representations on agreement predic-        Florence, Italy. Association for Computational
+   tion. In Proceedings of the 25th Conference        Linguistics.
+   on Computational Natural Language Learn-
+   ing, pages 194–209, Online. Association for     Mariona Taule´, M. Anto`nia Mart´ı, and Marta
+   Computational Linguistics.                         Recasens. 2008. AnCora: Multilevel anno-
+                                                      tated corpora for Catalan and Spanish. In
+Shauli Ravfogel, Michael Twiton, Yoav Goldberg,       Proceedings of the Sixth International Confer-
+   and Ryan Cotterell. 2022a. Linear relaxed          ence on Language Resources and Evaluation
+   adversarial concept erasure.                       (LREC’08), Marrakech, Morocco. European
+                                                      Language Resources Association (ELRA).
+Shauli Ravfogel, FranciscoVargas, Yoav Goldberg,
+   and Ryan Cotterell. 2022b. Adversarial concept  Mycal Tucker, Peng Qian, and Roger Levy. 2021.
+   erasure in kernel space.                           What if this modified that? Syntactic inter-
+                                                      ventions with counterfactual embeddings. In
+Abhilasha Ravichander, Yonatan Belinkov, and          Findings of the Association for Computational
+   Eduard Hovy. 2021. Probing the probing             Linguistics: ACL-IJCNLP 2021, pages 862–875,
+   paradigm: Does probing accuracy entail task        Online. Association for Computational Linguis-
+   relevance? In Proceedings of the 16th Confer-      tics. https://doi.org/10.18653/v1
+   ence of the European Chapter of the Associ-        /2021.findings-acl.76
+   ation for Computational Linguistics: Main
+   Volume, pages 3363–3377, Online. Association    Jesse Vig, Sebastian Gehrmann, Yonatan
+   for Computational Linguistics. https://            Belinkov, Sharon Qian, Daniel Nevo, Yaron
+   doi.org/10.18653/v1/2021.eacl                      Singer, and Stuart Shieber. 2020. Investigating
+   -main.295                                          gender bias in language models using causal
+                                                      mediation analysis. In Advances in Neural
+Paul R. Rosenbaum and Donald B. Rubin.                Information Processing Systems, volume 33,
+   1983. The central role of the propensity           pages 12388–12401.
+   score in observational studies for causal ef-
+   fects. Biometrika, 70(1):41–55. https://        Elena Voita and Ivan Titov. 2020.
+   doi.org/10.1093/biomet/70.1.41                     Information-theoretic probing with minimum
+                                                      description length. In Proceedings of the
+Rachel Rudinger, Jason Naradowsky, Brian              2020 Conference on Empirical Methods
+   Leonard, and Benjamin Van Durme. 2018.             in Natural Language Processing (EMNLP),
+   Gender bias in coreference resolution. In          pages 183–196, Online. Association for Com-
+   Proceedings of the 2018 Conference of the          putational Linguistics.
+   North American Chapter of the Association for
+   Computational Linguistics: Human Language       Thomas Wolf, Lysandre Debut, Victor Sanh,
+   Technologies, Volume 2 (Short Papers),             Julien Chaumond, Clement Delangue, Anthony
+   pages 8–14, New Orleans, Louisiana. Associa-       Moi, Pierric Cistac, Tim Rault, Re´mi Louf,
+   tion for Computational Linguistics. https://       Morgan Funtowicz, Joe Davison, Sam Shleifer,
+   doi.org/10.18653/v1/N18-2002                       Patrick von Platen, Clara Ma, Yacine
+                                                      Jernite, Julien Plu, Canwen Xu, Teven Le Scao,
+Naomi Saphra and Adam Lopez. 2019. Under-             Sylvain Gugger, Mariama Drame, Quentin
+   standing learning dynamics of language models      Lhoest, and Alexander M. Rush. 2020.
+   with SVCCA. In Proceedings of the 2019             Transformers: State-of-the-art natural language
+   Conference of the North American Chapter           processing. In Proceedings of the 2020 Con-
+   of the Association for Computational Linguis-      ference on Empirical Methods in Natural
+   tics: Human Language Technologies, Volume 1        Language Processing: System Demonstrations,
+   (Long and Short Papers), pages 3257–3267,          pages 38–45, Online. Association for Compu-
+   Minneapolis, Minnesota. Association for Com-       tational Linguistics. https://doi.org/10
+   putational Linguistics.                            .18653/v1/2020.emnlp-demos.6
+
+Gabriel Stanovsky, Noah A. Smith, and Luke
+   Zettlemoyer. 2019. Evaluating gender bias in
+
+402
+Rowan Zellers, Ari Holtzman, Yonatan Bisk, Ali             Linguistics: Human Language Technologies,
+   Farhadi, and Yejin Choi. 2019. HellaSwag:               Volume 2 (Short Papers), pages 15–20, New
+   Can a machine really finish your sentence?              Orleans, Louisiana. Association for Computa-
+   In Proceedings of the 57th Annual Meeting of            tional Linguistics. https://doi.org/10
+   the Association for Computational Linguistics,          .18653/v1/N18-2003
+   pages 4791–4800, Florence, Italy. Associa-
+   tion for Computational Linguistics. https://         Ran Zmigrod, Sabrina J. Mielke, Hanna
+   doi.org/10.18653/v1/P19-1472                            Wallach, and Ryan Cotterell. 2019. Counter-
+                                                           factual data augmentation for mitigating gender
+Jieyu Zhao, Tianlu Wang, Mark Yatskar,                     stereotypes in languages with rich morphology.
+   Vicente Ordonez, and Kai-Wei Chang. 2018.               In Proceedings of the 57th Annual Meeting of
+   Gender bias in coreference resolution: Evalu-           the Association for Computational Linguistics,
+   ation and debiasing methods. In Proceedings             pages 1651–1661, Florence, Italy. Associa-
+   of the 2018 Conference of the North American            tion for Computational Linguistics. https://
+   Chapter of the Association for Computational            doi.org/10.18653/v1/P19-1161
+
+                                                   403
+

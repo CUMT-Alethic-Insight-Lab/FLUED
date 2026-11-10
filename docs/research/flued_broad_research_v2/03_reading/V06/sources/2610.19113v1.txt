@@ -1,0 +1,1816 @@
+                                                                       From Copying to Composition:
+                                                         How Language Models Develop In-Context Learning
+
+                                        Minglai Yang1* Xinyu Guo2 Renxiong Wang1 Sunjie Hou1 Daniel Yue Zhang1 Yunzhong He1
+                                                                                1Scale AI 2University of Arizona
+                                                                                    minglai.yang@scale.com
+
+arXiv:2610.19113v1 [cs.CL] 13 Oct 2026                        Abstract                          contextual information throughout training. Know-
+                                                                                                ing when accuracy improves is not enough.
+                                             In-context learning (ICL) allows language mod-
+                                             els to adapt their behavior from instructions and     The same answer can result from different uses
+                                             demonstrations in a prompt, but accuracy alone     of the context: a model may reuse the output pat-
+                                             does not reveal how contextual information con-    tern of a demonstration similar to the query, or
+                                             trols their predictions. We study the acquisition  integrate mappings distributed across the prompt
+                                             and trainability of ICL with a controlled diag-    and apply them to a new combination. In ordinary
+                                             nostic that separates copying a nearby demon-      ICL evaluations these behaviors predict the same
+                                             stration from integrating information across the   output, so correctness shows that the context was
+                                             prompt. Across 17 models, about a third pre-       useful but not how it was used. Studying the acqui-
+                                             fer the copied answer, a few are undecided,        sition of ICL therefore needs a diagnostic in which
+                                             and the rest prefer the rule-consistent answer,    different ways of using the prompt make different
+                                             which goes with higher accuracy and with con-      predictions.
+                                             trol by the requested value rather than the clos-
+                                             est conflicting example. Checkpoint analy-            These observations motivate a developmental
+                                             ses show that models begin prioritizing task-      question that final-answer accuracy alone cannot
+                                             relevant prompt tokens over conflicting exam-      resolve: how does a model’s use of different
+                                             ples long before their accuracy improves be-       sources of contextual information change during
+                                             yond chance level. In matched training experi-     training? We track four aspects of ICL that, as
+                                             ments, synthetic documents that define endings     we show, develop on different schedules: which
+                                             and then query them shift models toward com-       prompt source controls the answer, which answer
+                                             positional responses on the controlled diagnos-    the model prefers, whether it can construct that
+                                             tic, whereas fine-tuning on definition exercises   answer without candidates, and whether a trained
+                                             built from rewritten real documents improves       change transfers to other evaluations.
+                                             accuracy when prompts reassign label mean-
+                                             ings. The results suggest that ICL is not ac-         To make these aspects distinguishable, we con-
+                                             quired as a single, uniform capability. Instead,   struct a controlled task inspired by work on com-
+                                             prompt control, answer preference, construc-       positional generalization and made-up-word tests
+                                             tion without candidates, and transfer can de-      (Hupkes et al., 2020; Berko, 1958). Each prompt
+                                             velop along distinct trajectories.                 defines endings for two binary attributes, demon-
+                                                                                                strates three of the four possible combinations on
+                                        1 Introduction                                          made-up words, and asks for the missing combina-
+                                                                                                tion on a new word (Figure 1). Combining the two
+                                        Language models are increasingly expected to            prompt-defined mappings yields the rule-consistent
+                                        adapt at inference time, from instructions, demon-      (correct) answer, whereas reusing the conflicting
+                                        strations, and temporary conventions in the prompt      ending from the demonstrated combination that
+                                        rather than from parameter updates. This ability is     shares the first requested attribute yields a distinct
+                                        commonly described as in-context learning (ICL).        copied answer. Because the assignments change
+                                        We know much less about how this capacity is ac-        in every prompt, the task cannot be solved using
+                                        quired during training than about how well trained      a fixed word–ending mapping. We measure the
+                                        models display it. Understanding ICL acquisition        copied answer’s probability normalized over these
+                                        requires tracking how models shift their reliance on    two candidates, denoting it by P (copy). Interven-
+                                                                                                tions on the conflicting ending in the closest ex-
+                                            *Corresponding author.
+(a) Copy or apply definitions? (b) Change during training                           (c) Train on definitions
+                                                                                    real documents→ define + use label
+ small dap = dap-il             Δm when           6 closest ending
+ big trum = trum-or               blocked (nats)                                                          made-up labels
+ one fen = fen-um                                 4                                                       exchanged labels
+ many pab = pab-nak                                   requested
+ small one gib = gib-il-um                                                              TREC-6                    +17.6
+ small many vok = vok-il-nak                      2 value                           DBpedia-7                   +12.4
+ big one zud = zud-or-um                                                                                      +17.2
+ big many wug = ?                                                        fit > .25     Yahoo-5         +5.8
+                                                  0                                                      +3.7
+copy closest → wug-or-um                                                                           +5.3
+apply definitions → wug-or-nak                          10B 100B 1T
+                                                        pretraining tokens                      0  20 40 60
+
+                                                                                                   accuracy (%)
+
+Figure 1: Study overview. (a) The task makes copying and applying prompt definitions predict different answers. (b)
+Across pretraining checkpoints (OLMo-2-7B shown), the requested value overtakes the closest ending as the source
+of the answer (star) long before accuracy crosses chance (dashed line). (c) Fine-tuning SmolLM2-1.7B on definition
+exercises rewritten from real documents raises accuracy on three unseen datasets with made-up or exchanged labels
+(pale bars: a matched fine-tune on the original documents, solid extensions: the gain from the exercises).
+
+ample or on the requested value in the question       point series showing that prompt control shifts long
+measure which source controls the candidate-score     before accuracy crosses chance. Third, matched
+difference, and activation patching (Heimersheim      continued-training experiments show that the com-
+and Nanda, 2024) and the disabling of selected at-    positional answer must be built rather than un-
+tention heads (Wang et al., 2023) trace that control  blocked: suppressing copy-favoring heads shifts
+to internal states and heads.                         the balance between candidates, training on syn-
+                                                      thetic documents that define endings and then query
+   Across 17 models, the diagnostic sorts answer      them creates the missing answer, and each signal
+preferences from copying the nearest demonstra-       transfers the use of the prompt it rehearses (Sec-
+tion to producing the correct form, and the compos-   tion 6).
+ing models score higher and generate the form with-
+out candidates. Across pretraining checkpoints,       2 Related work
+sensitivity to the requested value overtakes sensi-
+tivity to the conflicting example hundreds of bil-    In-context learning and composition. Accounts
+lions of tokens before accuracy rises above chance.   of in-context learning include copying through
+Most other checkpoint series that reach composi-      induction-like mechanisms (Olsson et al., 2022;
+tion show the same ordering, OLMo-3 and Comma         Bietti et al., 2023; Reddy, 2024; Akyürek et al.,
+on every criterion (Section 5).                       2024), inference over a latent task, and an update
+                                                      during the forward pass (Xie et al., 2022; von Os-
+   Matched continued-training experiments then        wald et al., 2023). ICL behavior varies with train-
+show which training signals change these behav-       ing distribution and stage (Chan et al., 2022; Singh
+iors and where the improvements transfer. Train-      et al., 2023). Controlled tasks show strategies be-
+ing on synthetic documents that define endings        tween repetition and exact rule use (Niu et al., 2025;
+and then query them reverses the preferred answer     Bhattamishra et al., 2024), and models can recog-
+on the controlled task and lets models generate       nize a task without learning it (Yang et al., 2025b;
+the missing form. Fine-tuning on definition exer-     Kim, 2025). Our task connects this issue to com-
+cises built from rewritten real documents improves    positional generalization and made-up-word tests
+performance on evaluations that assign new mean-      (Hupkes et al., 2020; Lake and Baroni, 2018; Kim
+ings to labels. Each signal transfers the use of the  and Linzen, 2020; Lake and Baroni, 2023; Berko,
+prompt it rewards, so the exercises leave the con-    1958; Weissweiler et al., 2023), and to work on
+trolled task unchanged.                               prompt-defined labels (Wei et al., 2023a,b). Mor-
+                                                      phology offers a long-studied case of the same con-
+   Our work makes three contributions. First, we in-  trast between applying a rule and analogizing to
+troduce a controlled diagnostic in which two ways     stored forms (Pinker and Prince, 1988; Albright
+of using the context predict different answers. Sec-  and Hayes, 2003), and recent work asks which of
+ond, we measure answer preference and prompt
+dependence across 17 models and multiple check-
+the two language models do (Hofmann et al., 2025;        ample, big one zud = zud-or-um, gives wug-or-um.
+Anh et al., 2024; Ismayilzada et al., 2025). Tok-        The words, endings, and mappings are sampled
+enization also shapes what counts as a morpheme          anew for every prompt. A second scheme uses
+for a model (Sennrich et al., 2016; Rust et al., 2021),  short codes without a made-up word, and a reverse-
+which our Quechua results bear out. We make copy-        order version serves as a control (Appendices A
+ing a similar example and applying the supplied          and C).
+mappings predict different answers, then compare
+their scores and intervene on the supporting prompt      Formalization and scores. Let U = {u0, u1}
+tokens. Attention weights provide incomplete ex-         and V = {v0, v1} be the feature domains. Each
+planations of model behavior (Jain and Wallace,          prompt defines a map ϕ : U ⊔ V → E from their
+2019; Serrano and Smith, 2019). Our interventions        four values to four endings, with
+directly test which prompt tokens change the can-
+didate scores.                                           fϕ(s, u, v) = s ∥ ϕ(u) ∥ ϕ(v),               (1)
+
+Mechanisms of context use. Mechanistic stud-             where ∥ denotes concatenation. Equation 1 com-
+ies locate parts of in-context behavior in attention
+heads. Induction and retrieval heads copy from           poses the two prompt-defined endings in feature
+the context (Olsson et al., 2022; Wu et al., 2024),      order. The query requests a held-out pair (u⋆, v⋆)
+a copy-suppression head counteracts them (Mc-            on a new stem s⋆. If v¯⋆ is the other value in V,
+Dougall et al., 2023), token-level and concept-level     the closest example supplies (u⋆, v¯⋆). In Figure 1a,
+copying travel separate routes (Feucht et al., 2025),    u⋆ = big, v⋆ = many, and v¯⋆ = one. The rule-
+and a set of demonstrations can be summarized into
+a task or function vector (Hendel et al., 2023; Todd     consistent and copied candidates are therefore
+et al., 2024). Our interventions follow this tradi-
+tion of patching and ablation (Geiger et al., 2021;      yr = fϕ(s⋆, u⋆, v⋆),          yc = fϕ(s⋆, u⋆, v¯⋆).
+Meng et al., 2022; Goldowsky-Dill et al., 2023; Wu
+et al., 2023), but we ask a different question: which                                                 (2)
+prompt span controls the answer at each stage of
+training.                                                The candidates in Equation 2 share the stem and
+
+Development during training. Checkpoint stud-            first ending and differ only where copying conflicts
+ies usually measure abilities by accuracy gains
+(Chen et al., 2024; Evanson et al., 2023; Tigges         with the requested value.
+et al., 2024; Arora et al., 2024). Work on combined
+abilities finds that they emerge after their compo-      For prompt x, let pr = pθ(yr | x) and pc =
+nents (Liu et al., 2026), while other studies track
+reasoning, arithmetic, grammar, and internal com-        pθ(yc | x). We measure their competition by
+ponents across training (Ye et al., 2025; Zhao et al.,
+2026; Chang and Bergen, 2022; Pan et al., 2026).         m = log pr − log pc,
+We instead track copied-versus-correct scores and
+prompt-token dependence at every checkpoint. We          P (copy) = pc = σ(−m).                       (3)
+extend work that localizes or modifies mechanisms
+for context use (Yin et al., 2024; Prakash et al.,               pc + pr
+2024) to the training trajectory.
+                                                         Positive m, equivalently P (copy) < .5, favors the
+3 Task and measurements                                  correct form. Four-choice accuracy additionally
+                                                         requires yr to outrank all four combinations, while
+Task construction. Figure 1a shows one prompt.           exact generation supplies no candidates.
+Each prompt assigns a fresh ending to each of four
+feature values, shows three of the four value combi-     Blocking and the switch of control. We block
+nations, and asks for the missing combination on a       attention from the answer position to selected to-
+new stem. In the example, applying the definitions       kens without deleting them (Geva et al., 2023) (Fig-
+gives wug-or-nak, whereas copying the closest ex-        ure 5a). Let KS denote this intervention for span
+                                                         S and ∆Sm = mθ(KSx) − mθ(x). For the clos-
+                                                         est ending Se, the conflicting ending in the closest
+                                                         example (-um), and the requested value Sq (many),
+                                                         define
+
+                                                         di,τ = |∆Se mi,τ | − |∆Sq mi,τ |,
+
+                                                         1n                    di,τ .                 (4)
+                                                         Dτ = n
+                                                                 i=1
+
+                                                         Positive Dτ in Equation 4 indicates greater con-
+                                                         trol by the closest ending, and negative Dτ greater
+control by the requested value. Across checkpoints        410M            correct copied                accuracy
+τ1 < · · · < τJ , the switch of control is the first ad-   0.5B   P ≥ .70                                     Pythia
+jacent bracket [τj−1, τj] in which mean D changes          6.9B   6 models                                    OLMo-2
+from positive to negative. Other prompt lines and           12B   between                                     Qwen2.5
+unrelated tokens serve as blocking controls.               1.4B   3 models                                    Qwen3
+                                                           2.8B                                               Gemma-3
+Activation patching at the word naming the re-                1B                               P ≤ .30
+quested value. We run a second prompt that asks            0.6B                             8 models
+for the other value of the same attribute. Follow-         1.5B
+ing activation-patching methods (Heimersheim and              7B
+Nanda, 2024), after layer 4 we replace the original         13B
+run’s internal representation at that word with the           3B
+representation from the second run, then let the re-          4B
+maining layers continue. We score success strictly:        1.7B
+the model must write the full form required by the            7B
+replacement value. Targets shown in the prompt are            4B
+reported separately from never-shown ones, since              8B
+never-shown targets alone require constructing a
+new form (Figure 13; layer choice: Appendices G                   0 .25 .5 .75 0                        .5          1
+and N).
+                                                                       P(copy)                          4-way acc.
+Models. We test released Pythia and OLMo mod-
+els (Biderman et al., 2023; Team OLMo et al.,             Figure 2: Copied-answer probability (left) and four-
+2024) and Qwen and Gemma families (Yang et al.,           choice accuracy (right) for 17 models, grouped by the
+2025a; Qwen et al., 2024; Gemma Team et al.,              .70 and .30 thresholds; marker shape gives the family
+2025). To follow changes during training, we use          (full scores in Table 2).
+released intermediate checkpoints and public train-
+ing trajectories (Groeneveld et al., 2024; Muen-                       closest ending                   requested value
+nighoff et al., 2024; Liu et al., 2023). Continued-                                                                 Pythia
+training experiments restart intermediate check-          12B                                                       OLMo-2
+points of SmolLM2-360M and SmolLM2-1.7B                   1.4B                                                      Qwen2.5
+(Ben Allal et al., 2025) on a public proxy of their       2.8B                                                      Qwen3
+corpus (Appendices L and M). Definition-exercise                                                                    Gemma-3
+fine-tunes use SmolLM2-1.7B and SmolLM3-                    1B
+3B (Hugging Face, 2025) (Appendix N). Low-                0.6B    n/a
+rank adapters are trained on five released 7–
+8B bases (Qwen2.5-7B, OLMo-2-7B, Llama-3.1-                 7B
+8B, Comma-v0.1-1T, RedPajama-INCITE-7B; Fig-              13B
+ure 8). A direct task fine-tune uses Pythia-1.4B
+(Appendix I). Code-trained Qwen variants (Hui               4B
+et al., 2024) serve one control (Appendix C).             1.7B
+
+4 Answer preference reflects prompt                         7B
+    control                                                 4B
+                                                            8B
+Three groups of models. The models spread
+across the copying-to-composition range. Six as-                  0             5                           10
+sign at least .70 of the copied and correct candi-
+dates’ combined probability to the copied answer,                    |Δm| when blocked (nats)
+eight assign at most .30, and three fall between
+these thresholds (Figure 2; Table 2). Candidate           Figure 3: Change in m after blocking the closest ending
+preference tracks the ability to construct the miss-      or the requested value, model by model (all blocked
+ing form: the correct answer rarely ranks first in the    spans: Appendix D).
+
+                                                          high-copy group and usually does in the low-copy
+                                                          group, with exact generation following the same
+                                                          ordering. The grouping is not a size effect: Pythia-
+                                                          12B copies while Qwen3-1.7B and Gemma-3-4B
+                                                          compose (Figure 2).
+
+                                                             Arbitrary codes and a token-aligned Southern
+                                                          Quechua version preserve the model ordering. Re-
+                                                          moving the closest combined example selectively
+                                                          weakens the copied candidate, while deleting un-
+                                                          related lines has little effect (Appendices F and D;
+                                                          Table 4). These controls tie the preference to the
+                                                          competing information in the prompt rather than
+                                                          to wording, suffix inventory, or prompt length (Fig-
+                                                          ure 10).
+
+                                                          The controlling prompt source differs between
+                                                          the groups. Blocking the closest ending has the
+   full prompt closest ending requested value            the model can construct the missing form.
+                  copy favoured correct favoured            Control switches first. Early checkpoints are
+
+Pythia 2.8B                                              governed by the closest ending. Blocking that end-
+                                                         ing changes the copied-versus-correct margin far
+Qwen3 8B                                                 more than blocking the requested value. The bal-
+                                                         ance reverses between 336B and 630B tokens (Fig-
+          −4  0  4  8                                    ure 6; also Figure 1b). At the end of this interval the
+                                                         two candidates receive similar probability and four-
+m: correct − copied log-probability (nats)               choice accuracy has yet to reach chance: prompt
+                                                         control has shifted before the correct answer be-
+Figure 4: Blocking a single prompt span reverses the     comes reliable.
+preferred answer: mean m with the full prompt and
+after blocking each span, for high-copy Pythia-2.8B and     Accuracy follows. Accuracy improves later.
+low-copy Qwen3-8B.                                       The fitted four-choice trajectory crosses chance
+                                                         at about 1.5T tokens on the original items and
+larger effect in high-copy models, whereas block-        1.8T on the re-test items (Table 1; Appendix J),
+ing the requested value has the larger effect in low-    well after the two blocking effects cross. The parts
+copy models (Figure 3). In the high-copy Pythia          of the task are already in place much earlier: the
+models the closest-ending effect is about twice the      model can copy the requested stem, recover each
+requested-value effect. In low-copy models the           feature mapping, and generate combinations shown
+requested-value effect is several times the closest-     in the prompt hundreds of billions of tokens before
+ending effect. Figure 4 shows one model per group        it ranks the missing combination first. The long
+(all blocked spans: Appendix D, Table 3).                middle stage therefore has every part of the task
+                                                         in place, with composition of those parts the last
+   The three models between the probability thresh-      piece to arrive.
+olds behave as an intermediate group: their two
+candidates receive similar probability and, for the         Exact generation of the missing form arrives last,
+models measured, the two effects are much closer         at about 3.6T tokens (Table 1): parts, then control,
+than in either of the two main groups (Table 3), so      then selection, then generation.
+the balance between the candidates and the control-
+ling span both vary continuously.                           Other training series. The ordering recurs
+                                                         in runs from other labs and recipes. Of six-
+Models can read the query without construct-             teen released series, Marin-8B, Comma-v0.1-1T,
+ing the missing answer. Patching the requested-          SmolLM3-3B, and OLMo-3-7B end above the ac-
+value state redirects every model toward the cor-        curacy criterion, Apertus is partial, and eleven stay
+responding combination when that combination             below it. OLMo-3 and Comma satisfy every or-
+already appears in the prompt, but when it requires      dering criterion, shifting hundreds of billions of
+the unshown combination the Pythia models rarely         tokens before their first above-chance checkpoints.
+follow, whereas the other models follow on a sub-        SmolLM3 also shifts before accuracy rises, with
+stantial share of prompts (Figure 13). High-copy         the closest-example effect later regaining strength.
+models thus represent enough of the query to pro-        Within the OLMo family, OLMo-2-13B shifts early
+duce a shown combination but fail to construct the       but briefly reverses, and the older OLMo-7B-0424
+missing one.                                             run changes sign repeatedly and turns negative for
+                                                         good only after its fitted accuracy onset. Runs that
+   Head-level analyses (Figure 5) place the behav-       fail to compose never sustain control by the re-
+ior above the level of single heads. Copy-favoring       quested value and keep the copied answer. In every
+head sets transfer across prompt samples in several      run that reaches composition, D first turns nega-
+models and lower P (copy) when disabled, yet the         tive by the time accuracy crosses chance, and no
+preference survives their removal, and no five-head      below-chance run sustains the switch (Appendix E;
+set accounts for most of the token-blocking effect.      Table 6).
+Blocking, not raw attention weights, tracks the de-
+velopmental change reported next (Appendix K).              The endpoint comparison links this transition to
+                                                         eventual success: trajectories that exceed chance
+5 Prompt control changes before                          finish with much larger requested-value effects than
+    composition                                          those that remain below chance, and in the success-
+                                                         ful runs D falls below zero before or by the time
+The checkpoints confirm what the cross-model con-
+trast predicts: control of the answer changes before
+(a) How we read attention                                            (b) Silencing the selected heads
+                                                                     copy heads correct heads random
+big one zud = zud-or-um conflicting ending → copied                                  toward copied toward correct
+
+big many wug = ?                          requested value → correct  Pythia 1.4B
+                                                                     OLMo-2 7B, final
+                                                                     Qwen3 1.7B
+block mask attention to one span; tokens stay in place                 Qwen3 8B
+
+patch swap in the requested-value state from a                       OLMo-2 7B 168B
+                                                                      336B
+                           prompt asking for the other value          630B
+read out m = log P(correct) − log P(copied); effect = Δm             1049B
+heads direct logit attribution ranks heads by push on m;
+                                                                                       −2  −1  0  +1                  +2
+                           silence  or    vs 20 random sets
+                                                                                           Δm after silencing (nats)
+
+Figure 5: Attention analysis. (a) The answer position reads two prompt spans, the conflicting ending of the closest
+example (favors the copied answer) and the requested value (favors the correct one). We block attention to a span,
+patch the requested-value state from a prompt asking for the other value, and read out the change in m. Direct logit
+attribution picks the five heads pushing hardest toward each answer, which are silenced and compared with random
+sets. (b) Blocking a span moves m far more than silencing either set (Figure 3).
+
+Δm when blocked (nats)closest ending crossing requested value 6 Training teaches what it practices
+
+              OLMo-2 7B closest requested                     The checkpoint results show control of the answer
+                                  ending value                passing from the closest example to the requested
+                                                              value. We next ask which training signal produces
+    6                                                         this change. Synthetic documents that define end-
+                                                              ings and then query them reverse which prompt
+                        4                                     source controls the answer and let models produce
+                                                              the missing form. Exposure to definitions and a
+                        2                                     penalty on the copy-favoring heads do neither, and
+                                                              definition exercises built from rewritten real docu-
+                                          accuracy fit        ments instead teach models to follow the labels a
+                                          crosses .25         prompt assigns.
+                        0
+                                                              6.1 Practice, not exposure or suppression,
+                           10B      100B  1T                        moves control
+
+                                pretraining tokens            Exposure to definitions. Definitions embedded
+                                                              in natural text are not the active ingredient. Af-
+Figure 6: Prompt control across pretraining checkpoints,      ter 1B additional tokens on SmolLM2-1.7B (Ap-
+shown for OLMo-2-7B, the most densely sampled se-             pendix M), continued pretraining on mined pas-
+ries (other series: Appendix E). The requested-value          sages that define and later use a term, on absent-
+effect overtakes the closest-ending effect between 336B       term variants, or on dictionary-prefixed text leaves
+and 630B tokens (star). Four-choice accuracy crosses          D positive and exact generation at the plain-
+chance much later (dashed line; Table 1).                     continuation level. All four conditions remain con-
+                                                              trolled by the closest ending (Figure 16).
+four-choice accuracy exceeds chance, whereas runs
+in which the requested value never gains control                 Penalizing copying. Penalizing the copy-
+do not learn the missing combination within the               favoring heads changes the balance between the
+observed training window (Table 6).                           two candidates without creating the missing answer.
+                                                              At SmolLM2-360M, adding to plain continuation
+The switch shows at the head level and extends                a penalty on attention from the answer position to
+beyond it. The correct-favoring heads overtake                the closest ending, applied to ten heads selected by
+the copy-favoring heads in the same interval (Fig-            direct logit attribution for favoring the copied an-
+ure 14). The change is distributed: five heads                swer, drives those heads’ attention to that ending to
+carry part of the blocking effect, and silencing them         near zero. With the copy route closed, D stays pos-
+moves the balance without creating composition.               itive and exact generation stays at zero, while the
+                                                              same penalty on ten random heads leaves both at
+   The order is a property of pretraining, not of             plain-continuation levels (Figure 15; Appendices N
+the task: under direct task fine-tuning the blocking          and L).
+crossing and the accuracy rise happen together, or
+accuracy moves first on a denser grid (Appendix I).
+The next section asks which training signals pro-
+duce the switch and what transfers once they do.
+                           original text  3% synthetic               base    held out           all shown
+                                          1
+1 (a) P(copy)                                             (a) Exact generation                  (b) Transfer
+
+0                                         0                Qwen2.5           Elemental  +.10               both
+                                                            OLMo-2             change   +.05         improve
+                                                          Llama-3.1
+1 (b) exact generation                    1                  Comma                           0
+
+0                                         0               RedPajama                     −.05
+
+   0  500  1000                              0  50                   0 .5 1                     −.2  0     +.2
+
+      extra training (millions of tokens)                                                       SCAN change
+
+Figure 7: Continued pretraining of SmolLM2-1.7B. The      Figure 8: LoRA takes exact generation to or near ceiling
+right panels zoom on the first 50M tokens. A 3 % syn-     on five bases, while the external SCAN–Elemental pairs
+thetic mixture reverses copying by the first checkpoint,  stay outside the shaded quadrant where both would im-
+whereas mined passages that merely contain definitions    prove: the gain stays with the practiced form.
+do not (Figure 16).
+
+6.2 Synthetic documents reverse copying and               50M tokens, and write the missing form on most
+      transfer what they practice                         prompts by the end of training, while plain con-
+                                                          tinuation stays copy-dominant (Figure 15). The
+Synthetic documents. The synthetic documents re-          all-shown condition matches the held-out condi-
+verse both the preferred answer and which prompt          tion, so learning to resolve queries through tempo-
+source controls it. These documents have the di-          rary mappings does not require practicing an absent
+agnostic’s own dictionary-and-query form: each            cell.
+defines endings for a small feature system, shows
+some combinations, leaves others unshown, and                Full fine-tuning of Pythia-1.4B on prompts that
+writes out their answers, with nonce stems, mark-         show every requested form reproduces the all-
+ers, and templates drawn from pools disjoint from         shown result (Appendix I), so the shift holds under
+the evaluation inventories and no code systems            full fine-tuning as well as continued pretraining.
+(Appendix L). The suffix diagnostic shares the
+training format, so the code and Quechua ver-                Low-rank adapters trained on the same held-out
+sions serve as transfer probes. Replacing 3 % of          or all-shown documents take five released 7–8B
+a continued-pretraining stream with these docu-           bases to or near the ceiling of the diagnostic (Fig-
+ments moves SmolLM2-1.7B from copy-dominant               ure 8): RedPajama-7B, the one copy-dominant
+to query-dominant and lifts exact generation from         base, turns query-dominant, and the four that al-
+near zero to near ceiling (Figure 7; Figure 16). By       ready composed deepen their query dependence.
+50M tokens P (copy) has fallen from .82 to near           The gain stays with the practiced form: the exter-
+zero and exact generation has risen to .56; by the        nal composition tasks register no gain under the
+end of training exact generation is near ceiling,         pre-registered rule, SCAN-ICL falls on OLMo-2
+whereas plain continuation stays copy-dominant.           and Llama-3.1, and OLMo-2’s general-text loss
+                                                          passes the pre-registered bound (Appendix N). The
+   The reversal costs nothing measurable on gen-          one ElementalTask gain arrives with a SCAN loss
+eral text: held-out losses move by less than .001 at      (Figure 8b).
+both scales while D moves by more than twenty
+nats.                                                        Transfer follows what was practiced, not com-
+                                                          position tasks in general. At 1.7B the five external
+   Held-out versus all-shown. The SmolLM2-                evaluations fall outside the pre-registered qualifi-
+360M experiments separate query-resolution prac-          cation rule, so their synthetic-versus-plain differ-
+tice from rehearsal of the missing cell. Two syn-         ences are reported as descriptive (Appendix M).
+thetic variants share format and data order. In the       The boundary of transfer is therefore set by the
+held-out condition each document queries combi-           7–8B adapters, whose bases score well above floor
+nations it does not show. In the all-shown condition      on SCAN-ICL and ElementalTask-ICL and whose
+every queried combination already appears on an-          gains stay with the practiced form under that rule
+other stem in the same document, so the model             (Appendix N).
+never practices an absent cell. Both synthetic con-
+ditions turn to D < 0 by the first checkpoint, after
+6.3 Transfer depends on the supervision                  training (dates: OLMo-2-7B)  control a prompt source gains control
+                                                                                      blocking: D < 0
+Definition exercises. Definition exercises teach                                                               336B–630B
+a different use of the prompt. A language model
+rewrote real passages into short exercises that de-                                   preference the preferred candidate flips
+fine a label, term, or rule and then pose a query                                     P(copy), m
+answerable only from that definition (verified ex-                                                                      about 1.5T
+amples in Table 8). Unlike passive exposure to defi-
+nitions in natural text, every exercise requires an an-                               accuracy sees only this
+swer determined by a local definition. Fine-tuning
+SmolLM2-1.7B on 57M tokens of exercises is com-                                       construction written without choices
+pared with the same schedule on the original docu-
+ments, and both are evaluated on in-context classifi-                                 exact generation                  about 3.6T
+cation whose class names are replaced by made-up
+symbols (made-up labels) or exchanged with one                                        transfer the operation transfers
+another (exchanged labels) (Wei et al., 2023a), so
+that accuracy requires following the prompt’s as-                                     held-out tasks           after training (Sec. 6)
+signment. Made-up-label accuracy rises by 17.6
+points on TREC, 17.2 on DBpedia, and 3.7 on              Figure 9: Four events that accuracy compresses into
+Yahoo (Figure 1c), and exchanged-label accuracy          one, in training order: a prompt source gains control of
+rises on all three. On SmolLM3-3B the gains hold         the answer, the preferred candidate flips (the only event
+on TREC and Yahoo, and no counted evaluation             accuracy registers), the form is written without choices,
+loses. The exercises contain neither these datasets      and the learned skill transfers to held-out tasks (after the
+nor their labels. The transfer is specific to the prac-  training of Section 6).
+ticed use of the prompt: a relational-reasoning suite
+that also draws definitions from the prompt (bAbI-       takes over control from the closest example before
+1, bAbI-15, or CLUTRR) moves down by a few               accuracy leaves chance.
+points and farther tasks move in both directions, so
+the exercises teach following prompt-assigned la-           Copying and composing from the requested
+bels rather than prompt-dependent tasks in general.      value coexist in the same model. High-copy models
+(Appendix N; Figure 17).                                 already use the query to produce a shown combina-
+                                                         tion, direct fine-tuning strengthens the effect of the
+   The morphology diagnostic is untouched by the         requested value without erasing the effect of the
+exercises: P (copy) is unchanged and four-choice         closest example, and penalizing the copy-favoring
+accuracy and exact generation stay near floor (Ap-       heads moves the margin, while the missing form
+pendix N). The exercises make label following            appears only once training supplies a way to build
+reusable across datasets and leave the morphology        it.
+task in place.
+                                                            What the all-shown control shows. In the all-
+The interventions separate suppression, con-             shown control, documents in which every queried
+struction, and transfer. Suppression moves the           combination is already shown on another stem
+margin without producing the missing form. Train-        cross at the same checkpoint and reach comparable
+ing on the synthetic documents turns D negative          exact generation at 360M. The tie places the cause
+and lifts exact generation across model families,        in what both conditions share, repeated resolution
+update methods, and encodings, and its transfer          of queries through temporary mappings, and rules
+follows the practiced form. Definition exercises         out rehearsal of the absent cell (Appendix L).
+improve prompt-defined label use elsewhere while
+leaving the diagnostic unchanged. What mattered             Developmental checkpoints should be read ac-
+was which use of the prompt the training text re-        cordingly: a wrong answer can mark a substan-
+peatedly rewarded.                                       tive transition if its score now depends on the
+                                                         query rather than the closest example, and a cor-
+7 Discussion                                             rect multiple-choice answer need not establish con-
+                                                         struction if the form cannot be generated without
+The results separate four events that accuracy com-      candidates.
+presses into one (Figure 9). The requested value
+                                                         8 Conclusion
+
+                                                         On a diagnostic that separates copying from compo-
+                                                         sition, in-context learning develops as control shifts
+                                                         among competing prompt cues. The requested
+                                                         value takes control of candidate scores before the
+                                                         correct answer wins. Suppressing copying moves
+                                                         the margin, practice at resolving queries writes the
+                                                         missing form, and training transfers the use of the
+                                                         prompt it repeatedly requires. Tracking control,
+                                                         preference, construction, and transfer shows what
+pretraining teaches beyond what accuracy reveals.
+Across models, checkpoint series, and training ex-
+periments, these four aspects develop on different
+schedules, so in-context learning is acquired as sev-
+eral capabilities, each on its own timetable.
+Limitations                                               Aryaman Arora, Dan Jurafsky, and Christopher Potts.
+                                                             2024. CausalGym: Benchmarking causal inter-
+Our diagnostic is a single controlled task that sepa-        pretability methods on linguistic tasks. In Proceed-
+rates copying from composition, and the code and             ings of the 62nd Annual Meeting of the Association
+Quechua versions carry the contrast into two fur-            for Computational Linguistics (Volume 1: Long Pa-
+ther encodings. In-context learning covers many              pers), pages 14638–14663.
+other behaviors, and the four measures used here
+give a way to ask whether they develop in the same        Khuyagbaatar Batsuren, Omer Goldman, Salam Khal-
+order. The training experiments use models up to             ifa, Nizar Habash, Witold Kieras´, Gábor Bella,
+8B parameters and synthetic documents that share             Brian Leonard, Garrett Nicolai, Kyle Gorman, Yusti-
+the diagnostic’s format, so the transfer they pro-           nus Ghanggo Ate, et al. 2022. UniMorph 4.0: Uni-
+duce is the format-bound transfer the design pre-            versal morphology. In Proceedings of the Thir-
+dicts. Larger models and more varied training data           teenth Language Resources and Evaluation Confer-
+are the next tests of this account. The selected             ence (LREC 2022), pages 840–855.
+attention heads carry part of the behavior, so the
+localization rests on the prompt-span interventions.      Loubna Ben Allal, Anton Lozhkov, Elie Bakouch,
+The pre-registered training block, transfer evalua-          Gabriel Martín Blázquez, Guilherme Penedo, Lewis
+tions, and analysis-plan record are in Appendices L,         Tunstall, Andrés Marafioti, Hynek Kydlícˇek, Agustín
+N, and P.                                                    Piqueres Lajarín, Vaibhav Srivastav, Joshua Lochner,
+                                                             Caleb Fahlgren, Xuan-Son Nguyen, Clémentine Four-
+Ethical Considerations                                       rier, Ben Burtenshaw, Hugo Larcher, Haojun Zhao,
+                                                             Cyril Zakka, Mathieu Morlon, and 3 others. 2025.
+The Southern Quechua paradigms used in the mor-              SmolLM2: When smol goes big—data-centric train-
+phology version of the task come from published              ing of a small language model. arXiv preprint
+linguistic resources (Adelaar and Muysken, 2004;             arXiv:2502.02737.
+Kirov et al., 2018; Batsuren et al., 2022).
+                                                          Jean Berko. 1958. The child’s learning of English mor-
+   The mined documents come from public collec-              phology. Word, 14(2-3):150–177.
+tions of web, scientific, mathematical, encyclope-
+dia, forum, and legal text. We applied no addi-           Satwik Bhattamishra, Arkil Patel, Phil Blunsom, and
+tional screening for personal or offensive content           Varun Kanade. 2024. Understanding in-context learn-
+beyond the source collections’ own filtering, so             ing in transformers and LLMs by learning to learn
+these sources may contain such material.                     discrete functions. In The Twelfth International Con-
+                                                             ference on Learning Representations (ICLR).
+   AI assistants were used for writing code and
+editing text.                                             Stella Biderman, Hailey Schoelkopf, Quentin Anthony,
+                                                             Herbie Bradley, Kyle O’Brien, Eric Hallahan, Mo-
+References                                                   hammad Aflah Khan, Shivanshu Purohit, USVSN Sai
+                                                             Prashanth, Edward Raff, Aviya Skowron, Lintang
+Willem F. H. Adelaar and Pieter C. Muysken. 2004.            Sutawika, and Oskar van der Wal. 2023. Pythia:
+   The Languages of the Andes. Cambridge University          A suite for analyzing large language models across
+   Press.                                                    training and scaling. In Proceedings of the 40th Inter-
+                                                             national Conference on Machine Learning (ICML),
+Ekin Akyürek, Bailin Wang, Yoon Kim, and Jacob               volume 202 of Proceedings of Machine Learning
+   Andreas. 2024. In-context language learning: Ar-          Research, pages 2397–2430. PMLR.
+   chitectures and algorithms. In Proceedings of the
+   41st International Conference on Machine Learning      Alberto Bietti, Vivien Cabannes, Diane Bouchacourt,
+   (ICML).                                                   Hervé Jégou, and Léon Bottou. 2023. Birth of a trans-
+                                                             former: A memory viewpoint. In Advances in Neural
+Adam Albright and Bruce Hayes. 2003. Rules                   Information Processing Systems 36 (NeurIPS).
+   vs. analogy in English past tenses: A computa-
+   tional/experimental study. Cognition, 90(2):119–       BigScience Workshop. 2024. BLOOM: A 176b-
+   161.                                                      parameter open-access multilingual language model.
+                                                             Journal of Machine Learning Research, 25(422):1–
+Dang Anh, Limor Raviv, and Lukas Galke. 2024. Mor-           74.
+   phology matters: Probing the cross-linguistic mor-
+   phological generalization abilities of large language  Stephanie C. Y. Chan, Adam Santoro, Andrew K.
+   models through a wug test. In Proceedings of the          Lampinen, Jane X. Wang, Aaditya Singh, Pierre H.
+   Workshop on Cognitive Modeling and Computational          Richemond, James L. McClelland, and Felix Hill.
+   Linguistics (CMCL 2024), pages 177–188.                   2022. Data distributional properties drive emer-
+                                                             gent in-context learning in transformers. In Ad-
+                                                             vances in Neural Information Processing Systems
+                                                             35 (NeurIPS).
+
+                                                          Tyler A. Chang and Benjamin K. Bergen. 2022. Word
+                                                             acquisition in neural language models. Transactions
+   of the Association for Computational Linguistics,       Roee Hendel, Mor Geva, and Amir Globerson. 2023.
+   10:1–16.                                                   In-context learning creates task vectors. In Find-
+                                                              ings of the Association for Computational Linguis-
+Angelica Chen, Ravid Shwartz-Ziv, Kyunghyun Cho,              tics: EMNLP 2023, pages 9318–9333.
+   Matthew L. Leavitt, and Naomi Saphra. 2024. Sud-
+   den drops in the loss: Syntax acquisition, phase tran-  Dan Hendrycks, Collin Burns, Steven Basart, Andy Zou,
+   sitions, and simplicity bias in MLMs. In The Twelfth       Mantas Mazeika, Dawn Song, and Jacob Steinhardt.
+   International Conference on Learning Representa-           2021. Measuring massive multitask language under-
+   tions (ICLR).                                              standing. In International Conference on Learning
+                                                              Representations.
+Linnea Evanson, Yair Lakretz, and Jean-Rémi King.
+   2023. Language acquisition: do children and lan-        Valentin Hofmann, Leonie Weissweiler, David R.
+   guage models follow similar learning stages? In            Mortensen, Hinrich Schütze, and Janet B. Pierre-
+   Findings of the Association for Computational Lin-         humbert. 2025. Derivational morphology reveals
+   guistics: ACL 2023, pages 12205–12218.                     analogical generalization in large language models.
+                                                              Proceedings of the National Academy of Sciences,
+Sheridan Feucht, Eric Todd, Byron C. Wallace, and             122(19):e2423232122.
+   David Bau. 2025. The dual-route model of induc-
+   tion. In Conference on Language Modeling (COLM).        Edward J. Hu, Yelong Shen, Phillip Wallis, Zeyuan
+   ArXiv:2504.03022.                                          Allen-Zhu, Yuanzhi Li, Shean Wang, Lu Wang, and
+                                                              Weizhu Chen. 2022. LoRA: Low-rank adaptation of
+Leo Gao, Stella Biderman, Sid Black, Laurence Gold-           large language models. In International Conference
+   ing, Travis Hoppe, Charles Foster, Jason Phang,            on Learning Representations.
+   Horace He, Anish Thite, Noa Nabeshima, Shawn
+   Presser, and Connor Leahy. 2020. The pile: An           Yiwen Hu, Huatong Song, Jia Deng, Jiapeng Wang, Jie
+   800GB dataset of diverse text for language modeling.       Chen, Kun Zhou, Yutao Zhu, Jinhao Jiang, Zican
+   arXiv preprint arXiv:2101.00027.                           Dong, Wayne Xin Zhao, and Ji-Rong Wen. 2024.
+                                                              YuLan-Mini: An open data-efficient language model.
+Atticus Geiger, Hanson Lu, Thomas Icard, and Christo-         arXiv preprint arXiv:2412.17743.
+   pher Potts. 2021. Causal abstractions of neural net-
+   works. In Advances in Neural Information Process-       Hugging Face. 2024. HuggingFaceFW/ablation-model-
+   ing Systems 34 (NeurIPS 2021).                             fineweb-edu model card. Hugging Face model card.
+
+Gemma Team, Aishwarya Kamath, Johan Ferret, Shreya         Hugging Face. 2025. SmolLM3-3B-Base model card.
+   Pathak, Nino Vieillard, Ramona Merhej, Sarah Perrin,       Hugging Face model card.
+   Tatiana Matejovicova, Alexandre Ramé, Morgane
+   Rivière, et al. 2025. Gemma 3 technical report. arXiv   Binyuan Hui, Jian Yang, Zeyu Cui, Jiaxi Yang, Day-
+   preprint arXiv:2503.19786.                                 iheng Liu, Lei Zhang, Tianyu Liu, Jiajun Zhang,
+                                                              Bowen Yu, Keming Lu, Kai Dang, Yang Fan,
+Mor Geva, Jasmijn Bastings, Katja Filippova, and Amir         Yichang Zhang, An Yang, Rui Men, Fei Huang,
+   Globerson. 2023. Dissecting recall of factual as-          Bo Zheng, Yibo Miao, Shanghaoran Quan, and 5
+   sociations in auto-regressive language models. In          others. 2024. Qwen2.5-coder technical report. arXiv
+   Proceedings of the 2023 Conference on Empirical            preprint arXiv:2409.12186.
+   Methods in Natural Language Processing (EMNLP).
+                                                           Dieuwke Hupkes, Verna Dankers, Mathijs Mul, and Elia
+Nicholas Goldowsky-Dill, Chris MacLeod, Lucas                 Bruni. 2020. Compositionality decomposed: How
+   Sato, and Aryaman Arora. 2023. Localizing                  do neural networks generalise? Journal of Artificial
+   model behavior with path patching. arXiv preprint          Intelligence Research, 67:757–795.
+   arXiv:2304.05969.
+                                                           Mete Ismayilzada, Defne Circi, Jonne Sälevä, Hale
+Dirk Groeneveld, Iz Beltagy, Pete Walsh, Akshita Bha-         Sirin, Abdullatif Köksal, Bhuwan Dhingra, Antoine
+   gia, Rodney Kinney, Oyvind Tafjord, Ananya Harsh           Bosselut, Duygu Ataman, and Lonneke van der Plas.
+   Jha, Hamish Ivison, Ian Magnusson, Yizhong Wang,           2025. Evaluating morphological compositional gen-
+   Shane Arora, David Atkinson, Russell Authur, Khy-          eralization in large language models. In Proceedings
+   athi Raghavi Chandu, Arman Cohan, Jennifer Dumas,          of the 2025 Conference of the Nations of the Amer-
+   Yanai Elazar, Yuling Gu, Jack Hessel, and 24 others.       icas Chapter of the Association for Computational
+   2024. OLMo: Accelerating the science of language           Linguistics (NAACL).
+   models. In Proceedings of the 62nd Annual Meet-
+   ing of the Association for Computational Linguistics    Sami Jaghouar, Jack Min Ong, Manveer Basra, Fares
+   (Volume 1: Long Papers), pages 15789–15809.                Obeid, Jannik Straube, Michael Keiblinger, Elie Bak-
+                                                              ouch, Lucas Atkins, Maziyar Panahi, Charles God-
+Stefan Heimersheim and Neel Nanda. 2024. How to               dard, Max Ryabinin, and Johannes Hagemann. 2024.
+   use and interpret activation patching. arXiv preprint      INTELLECT-1 technical report. arXiv preprint
+   arXiv:2404.15255.                                          arXiv:2412.01152.
+Sarthak Jain and Byron C. Wallace. 2019. Attention       LumiOpen. 2024. Viking-7B model card. Hugging
+   is not explanation. In Proceedings of the 2019 Con-      Face model card.
+   ference of the North American Chapter of the As-
+   sociation for Computational Linguistics: Human        Marin Community. 2025. Marin-8B-Base model card.
+   Language Technologies (NAACL-HLT), pages 3543–           Hugging Face model card.
+   3556.
+                                                         Callum McDougall, Arthur Conmy, Cody Rushing,
+Nikhil Kandpal, Brian Lester, Colin Raffel, Sebastian       Thomas McGrath, and Neel Nanda. 2023. Copy
+   Majstorovic, Stella Biderman, Baber Abbasi, Luca         suppression: Comprehensively understanding an at-
+   Soldaini, Enrico Shippole, A. Feder Cooper, Aviya        tention head. arXiv preprint arXiv:2310.04625.
+   Skowron, Shayne Longpre, Lintang Sutawika, Alon
+   Albalak, Zhenlin Xu, Guilherme Penedo, Loubna         Kevin Meng, David Bau, Alex Andonian, and Yonatan
+   Ben Allal, Elie Bakouch, John Pressman, Honglu           Belinkov. 2022. Locating and editing factual associ-
+   Fan, and 8 others. 2025. The common pile v0.1:           ations in GPT. In Advances in Neural Information
+   An 8tb dataset of public domain and openly licensed      Processing Systems 35 (NeurIPS).
+   text. In Advances in Neural Information Process-
+   ing Systems, volume 38, Main Conference. Curran       Niklas Muennighoff, Luca Soldaini, Dirk Groeneveld,
+   Associates, Inc.                                         Kyle Lo, Jacob Morrison, Sewon Min, Weijia Shi,
+                                                            Pete Walsh, Oyvind Tafjord, Nathan Lambert, Yuling
+Chaeha Kim. 2025. Task Schema and Binding: A Dou-           Gu, Shane Arora, Akshita Bhagia, Dustin Schwenk,
+   ble Dissociation Study of In-Context Learning. arXiv     David Wadden, Alexander Wettig, Binyuan Hui, Tim
+   preprint arXiv:2512.17325.                               Dettmers, Douwe Kiela, and 5 others. 2024. OLMoE:
+                                                            Open mixture-of-experts language models. arXiv
+Najoung Kim and Tal Linzen. 2020. COGS: A compo-            preprint arXiv:2409.02060.
+   sitional generalization challenge based on semantic
+   interpretation. In Proceedings of the 2020 Confer-    Jingcheng Niu, Subhabrata Dutta, Ahmed Elshabrawy,
+   ence on Empirical Methods in Natural Language            Harish Tayyar Madabushi, and Iryna Gurevych. 2025.
+   Processing (EMNLP), pages 9087–9105.                     Illusion or algorithm? investigating memorization,
+                                                            emergence, and symbolic processing in in-context
+Christo Kirov, Ryan Cotterell, John Sylak-Glassman,         learning. Transactions on Machine Learning Re-
+   Géraldine Walther, Ekaterina Vylomova, Patrick Xia,      search.
+   Manaal Faruqui, Sabrina J. Mielke, Arya McCarthy,
+   Sandra Kübler, David Yarowsky, Jason Eisner, and      Catherine Olsson, Nelson Elhage, Neel Nanda, Nicholas
+   Mans Hulden. 2018. UniMorph 2.0: Universal mor-          Joseph, Nova DasSarma, Tom Henighan, Ben Mann,
+   phology. In Proceedings of the Eleventh Interna-         Amanda Askell, Yuntao Bai, Anna Chen, Tom Con-
+   tional Conference on Language Resources and Eval-        erly, Dawn Drain, Deep Ganguli, Zac Hatfield-Dodds,
+   uation (LREC 2018), Miyazaki, Japan. European Lan-       Danny Hernandez, Scott Johnston, Andy Jones, Jack-
+   guage Resources Association (ELRA).                      son Kernion, Liane Lovitt, and 7 others. 2022. In-
+                                                            context learning and induction heads. Transformer
+Brenden M. Lake and Marco Baroni. 2018. General-            Circuits Thread.
+   ization without systematicity: On the compositional
+   skills of sequence-to-sequence recurrent networks.    OpenLLM-France. 2025. Lucie-7B model card. Hug-
+   In Proceedings of the 35th International Conference      ging Face model card.
+   on Machine Learning (ICML).
+                                                         OpenLM Research. 2023. OpenLLaMA-7B-v2 model
+Brenden M. Lake and Marco Baroni. 2023. Human-like          card. Hugging Face model card.
+   systematic generalization through a meta-learning
+   neural network. Nature, 623:115–121.                  Liangming Pan, Jason Liang, Jiaran Ye, Minglai Yang,
+                                                            Xinyuan Lu, and Fengbin Zhu. 2026. Opening the
+Xin Li and Dan Roth. 2002. Learning question clas-          Black Box: A Survey on the Mechanisms of Multi-
+   sifiers. In COLING 2002: The 19th International          Step Reasoning in Large Language Models. arXiv
+   Conference on Computational Linguistics.                 preprint arXiv:2601.14270.
+
+Emmy Liu, Kaiser Sun, Millicent Li, Isabelle Lee,        Denis Paperno, Germán Kruszewski, Angeliki Lazari-
+   Lindia Tjuatja, Jen-tse Huang, and Graham Neubig.        dou, Ngoc Quan Pham, Raffaella Bernardi, Sandro
+   2026. What do language models learn and when?            Pezzelle, Marco Baroni, Gemma Boleda, and Raquel
+   the implicit curriculum hypothesis. arXiv preprint       Fernández. 2016. The LAMBADA dataset: Word
+   arXiv:2604.08510.                                        prediction requiring a broad discourse context. In
+                                                            Proceedings of the 54th Annual Meeting of the Asso-
+Zhengzhong Liu, Aurick Qiao, Willie Neiswanger,             ciation for Computational Linguistics, pages 1525–
+   Hongyi Wang, Bowen Tan, Tianhua Tao, Junbo Li,           1534.
+   Yuqi Wang, Suqi Sun, Omkar Pangarkar, Richard
+   Fan, Yi Gu, Victor Miller, Yonghao Zhuang, Guowei     Guilherme Penedo, Hynek Kydlícˇek, Loubna Ben Allal,
+   He, Haonan Li, Fajri Koto, Liping Tang, Nikhil           Anton Lozhkov, Margaret Mitchell, Colin Raffel, Le-
+   Ranjan, and 9 others. 2023. LLM360: Towards              andro von Werra, and Thomas Wolf. 2024. FineWeb:
+   fully transparent open-source LLMs. arXiv preprint       Decanting the web for the finest text data at scale.
+   arXiv:2312.06550.                                        arXiv preprint arXiv:2406.17557.
+Steven Pinker and Alan Prince. 1988. On language             Aarohi Srivastava et al. 2023. Beyond the imitation
+   and connectionism: Analysis of a parallel distributed        game: Quantifying and extrapolating the capabili-
+   processing model of language acquisition. Cognition,         ties of language models. Transactions on Machine
+   28(1-2):73–193.                                              Learning Research.
+
+Nikhil Prakash, Tamar Rott Shaham, Tal Haklay,               Swiss AI Initiative. 2025. Apertus-8B-2509 model card.
+   Yonatan Belinkov, and David Bau. 2024. Fine-                 Hugging Face model card.
+   tuning enhances existing mechanisms: A case study
+   on entity tracking. In The Twelfth International          Team Olmo. 2026.      Olmo 3.  Preprint,
+   Conference on Learning Representations (ICLR).               arXiv:2512.13961.
+   ArXiv:2402.14811.
+                                                             Team OLMo, Pete Walsh, Luca Soldaini, Dirk Groen-
+Qwen, An Yang, Baosong Yang, Beichen Zhang,                     eveld, Kyle Lo, Shane Arora, Akshita Bhagia, Yuling
+   Binyuan Hui, Bo Zheng, Bowen Yu, Chengyuan Li,               Gu, Shengyi Huang, Matt Jordan, Nathan Lambert,
+   Dayiheng Liu, Fei Huang, Haoran Wei, Huan Lin,               Dustin Schwenk, Oyvind Tafjord, Taira Anderson,
+   Jian Yang, Jianhong Tu, Jianwei Zhang, Jianxin Yang,         David Atkinson, Faeze Brahman, Christopher Clark,
+   Jiaxi Yang, Jingren Zhou, Junyang Lin, and 24 oth-           Pradeep Dasigi, Nouha Dziri, et al. 2024. 2 OLMo 2
+   ers. 2024. Qwen2.5 technical report. arXiv preprint          furious. arXiv preprint arXiv:2501.00656.
+   arXiv:2412.15115.
+                                                             Curt Tigges, Michael Hanna, Qinan Yu, and Stella Bi-
+Gautam Reddy. 2024. The mechanistic basis of data de-           derman. 2024. LLM circuit analyses are consistent
+   pendence and abrupt learning in an in-context classifi-      across training and scale. In Advances in Neural
+   cation task. In The Twelfth International Conference         Information Processing Systems 37 (NeurIPS).
+   on Learning Representations (ICLR).
+                                                             Eric Todd, Millicent L. Li, Arnab Sen Sharma, Aaron
+Phillip Rust, Jonas Pfeiffer, Ivan Vulic´, Sebastian Ruder,     Mueller, Byron C. Wallace, and David Bau. 2024.
+   and Iryna Gurevych. 2021. How good is your tok-              Function vectors in large language models. In The
+   enizer? on the monolingual performance of multilin-          Twelfth International Conference on Learning Repre-
+   gual language models. In Proceedings of the 59th             sentations (ICLR).
+   Annual Meeting of the Association for Computational
+   Linguistics (ACL).                                        Together Computer. 2023. RedPajama-INCITE-7B-
+                                                                Base model card. Hugging Face model card.
+Rico Sennrich, Barry Haddow, and Alexandra Birch.
+   2016. Neural machine translation of rare words with       Johannes von Oswald, Eyvind Niklasson, Ettore Ran-
+   subword units. In Proceedings of the 54th Annual             dazzo, João Sacramento, Alexander Mordvintsev,
+   Meeting of the Association for Computational Lin-            Andrey Zhmoginov, and Max Vladymyrov. 2023.
+   guistics, pages 1715–1725.                                   Transformers learn in-context by gradient descent.
+                                                                In Proceedings of the 40th International Conference
+Sofia Serrano and Noah A. Smith. 2019. Is attention             on Machine Learning (ICML), pages 35151–35174.
+   interpretable? In Proceedings of the 57th Annual
+   Meeting of the Association for Computational Lin-         Kevin Wang, Alexandre Variengien, Arthur Conmy,
+   guistics (ACL), pages 2931–2951.                             Buck Shlegeris, and Jacob Steinhardt. 2023. Inter-
+                                                                pretability in the wild: a circuit for indirect object
+Aaditya K. Singh, Stephanie C. Y. Chan, Ted Moskovitz,          identification in GPT-2 small. In The Eleventh In-
+   Erin Grant, Andrew M. Saxe, and Felix Hill. 2023.            ternational Conference on Learning Representations
+   The transient nature of emergent in-context learning         (ICLR).
+   in transformers. In Advances in Neural Information
+   Processing Systems 36 (NeurIPS).                          Jerry Wei, Le Hou, Andrew Lampinen, Xiangning Chen,
+                                                                Da Huang, Yi Tay, Xinyun Chen, Yifeng Lu, Denny
+Koustuv Sinha, Shagun Sodhani, Jin Dong, Joelle                 Zhou, Tengyu Ma, and Quoc V. Le. 2023a. Sym-
+   Pineau, and William L. Hamilton. 2019. CLUTRR:               bol tuning improves in-context learning in language
+   A diagnostic benchmark for inductive reasoning from          models. In Proceedings of the 2023 Conference on
+   text. In Proceedings of the 2019 Conference on Em-           Empirical Methods in Natural Language Processing
+   pirical Methods in Natural Language Processing and           (EMNLP). ArXiv:2305.08298.
+   the 9th International Joint Conference on Natural
+   Language Processing, pages 4506–4515.                     Jerry Wei, Jason Wei, Yi Tay, Dustin Tran, Albert
+                                                                Webson, Yifeng Lu, Xinyun Chen, Hanxiao Liu,
+Richard Socher, Alex Perelygin, Jean Wu, Jason                  Da Huang, Denny Zhou, and Tengyu Ma. 2023b.
+   Chuang, Christopher D. Manning, Andrew Ng, and               Larger language models do in-context learning dif-
+   Christopher Potts. 2013. Recursive deep models for           ferently. arXiv preprint arXiv:2303.03846.
+   semantic compositionality over a sentiment treebank.
+   In Proceedings of the 2013 Conference on Empiri-          Leonie Weissweiler, Valentin Hofmann, Anjali Kan-
+   cal Methods in Natural Language Processing, pages            tharuban, Anna Cai, Ritam Dutt, Amey Hengle,
+   1631–1642.                                                   Anubha Kabra, Atharva Kulkarni, Abhishek Vi-
+                                                                jayakumar, Haofei Yu, Hinrich Schuetze, Kemal
+                                                                Oflazer, and David Mortensen. 2023. Counting the
+   bugs in ChatGPT’s wugs: A multilingual investiga-
+   tion into the morphological capabilities of a large
+   language model. In Proceedings of the 2023 Con-
+   ference on Empirical Methods in Natural Language
+   Processing, pages 6508–6524, Singapore. Associa-
+   tion for Computational Linguistics.
+
+Jason Weston, Antoine Bordes, Sumit Chopra, Alexan-
+   der M. Rush, Bart van Merriënboer, Armand Joulin,
+   and Tomas Mikolov. 2015. Towards AI-complete
+   question answering: A set of prerequisite toy tasks.
+   arXiv preprint arXiv:1502.05698.
+
+Wenhao Wu, Yizhong Wang, Guangxuan Xiao, Hao
+   Peng, and Yao Fu. 2024. Retrieval head mechanisti-
+   cally explains long-context factuality. arXiv preprint
+   arXiv:2404.15574.
+
+Zhengxuan Wu, Atticus Geiger, Thomas Icard, Christo-
+   pher Potts, and Noah D. Goodman. 2023. Inter-
+   pretability at scale: Identifying causal mechanisms
+   in Alpaca. In Advances in Neural Information Pro-
+   cessing Systems 36 (NeurIPS 2023).
+
+Sang Michael Xie, Aditi Raghunathan, Percy Liang,
+   and Tengyu Ma. 2022. An explanation of in-context
+   learning as implicit bayesian inference. International
+   Conference on Learning Representations (ICLR).
+
+An Yang, Anfeng Li, Baosong Yang, Beichen Zhang,
+   Binyuan Hui, Bo Zheng, Bowen Yu, Chang Gao,
+   Chengen Huang, Chenxu Lv, et al. 2025a. Qwen3
+   technical report. arXiv preprint arXiv:2505.09388.
+
+Haolin Yang, Hakaze Cho, and Naoya Inoue. 2025b.
+   Localizing Task Recognition and Task Learning in
+   In-Context Learning via Attention Head Analysis.
+   arXiv preprint arXiv:2509.24164.
+
+Jiaran Ye, Zijun Yao, Zhidian Huang, Liangming
+   Pan, Jinxin Liu, Yushi Bai, Amy Xin, Weichuan
+   Liu, Xiaoyin Che, Lei Hou, and Juanzi Li. 2025.
+   How do Transformers Learn Implicit Reasoning?
+   In Advances in Neural Information Processing
+   Systems 38 (NeurIPS 2025), pages 73341–73369.
+   ArXiv:2505.23653.
+
+Fangcong Yin, Xi Ye, and Greg Durrett. 2024. LoFiT:
+   Localized fine-tuning on LLM representations. In
+   Advances in Neural Information Processing Systems
+   37 (NeurIPS). ArXiv:2406.01563.
+
+Peiyuan Zhang, Guangtao Zeng, Tianduo Wang, and
+   Wei Lu. 2024. TinyLlama: An open-source small
+   language model. arXiv preprint arXiv:2401.02385.
+
+Xiang Zhang, Junbo Zhao, and Yann LeCun. 2015.
+   Character-level convolutional networks for text clas-
+   sification. In Advances in Neural Information Pro-
+   cessing Systems, volume 28. Curran Associates, Inc.
+
+Xingyu Zhao, Darsh Sharma, Rheeya Uppaal, and
+   Yiqiao Zhong. 2026. Shattered Compositionality:
+   Counterintuitive Learning Dynamics of Transform-
+   ers for Arithmetic. arXiv preprint arXiv:2601.22510.
+Contents of the Appendix                                       many bouz = bouz-dor
+                                                               small one kraix = kraix-ek-lu
+   A Task construction and conventions                         small one plut = plut-ek-lu
+   B Threshold crossings during training                       big stoosh = stoosh-an
+   C Final scores and prompt-variant controls                  big one lask = lask-an-lu
+   D Blocking, deletion, and scoring checks                    big one twix = twix-an-lu
+   E Training trajectories of seventeen runs                   big crood = crood-an
+   F Code and Quechua versions                                 small berb = berb-ek
+   G Activation patching                                       small plaind = plaind-ek
+   H Stage-2 OLMo-2-7B models                                  big many doot = doot-an-dor
+    I Fine-tuning a copying model                              small many glev =
+    J Re-test on new items
+   K Selected attention heads                             The four scored continuations, each pre-
+   L Continued pretraining with synthetic docu-        ceded by a space, are glev-ek-dor (correct),
+                                                       glev-ek-lu (the copy, sharing the first ending
+      ments and attention penalties (360M)             -ek), glev-an-dor and glev-an-lu. These are
+  M Continued pretraining with synthetic docu-         the candidates for four-choice accuracy and the
+                                                       “ranks first” columns.
+      ments and mined passages (1.7B)
+   N Layer sweep, head penalties, adapters, and        Vocabulary. “Correct” is the rule-consistent can-
+                                                       didate of Equation 2 in Section 3, and “copied” is
+      exercises                                        the candidate that repeats the closest example’s sec-
+   O Release                                           ond ending. A generation is labeled by the first
+   P Changes to the analysis plans                     word of its first line, split on hyphens. One ending
+                                                       counts as truncated and a form outside the four com-
+A Task construction and conventions                    binations as malformed. Anything else is correct,
+                                                       copied, or another shown combination. “Closest
+Generator. Every prompt draws fresh stems,             ending” and “requested value” name the blocked
+words, endings and held-out combination, so no         spans.
+fixed stem–ending mapping solves the task. A
+suffix-scheme stem concatenates one of 36 ini-         Intervention conventions. Layers are decoder
+tial strings, one of 9 vowels and one of 22 final      blocks counted from zero. Activation patching
+strings. No stem repeats within a prompt, and the      replaces a block’s output at the position of the
+queried stem never appears in the demonstrations.      requested second-feature value while the prompt
+Endings are drawn without replacement from 30          is processed, before generation. The model then
+strings (il, nak, or, um, esh, oth, ka, tu, ri, mo,    takes the most probable token at each step for up
+lin, dor, sa, ne, po, ta, ku, zi, fen, gor, lu, wa,    to eight new tokens. A blocked span covers every
+ex, an, ir, on, ul, ek, ip, ab), and line order is     tokenizer token that overlaps the named string or
+shuffled. Each prompt draws one first-feature pair     strings, and blocking the closest ending covers the
+from small/big, old/new, red/blue and hot/cold, and    second-ending string in both lines of the closest
+one second-feature pair from one/many, here/there      example.
+and mine/yours. The code scheme keeps the first-
+feature pairs, takes the second from circle/square,    Tokenization. All 30 endings are separate tokens
+north/south or left/right, and uses 20 two-character   after a hyphen in Pythia and Gemma (Biderman
+symbols with the header “Codebook:” and the sep-       et al., 2023; Gemma Team et al., 2025), most are
+arator “=>”.                                           in OLMo-2, and Qwen merges some hyphens with
+                                                       their endings (Yang et al., 2025a; Team OLMo
+   Four fixed prompt sets serve all models and         et al., 2024). An ending can span several tokens,
+checkpoints, two (320 items) for the initial analyses  so the four forms can differ in token count. We
+and two for the re-test on new items (Appendix J).     score the next ending with the correct preceding
+                                                       tokens supplied only where hyphen and ending stay
+A literal prompt. One generated prompt, verba-         separate (scoring checks in Appendix D).
+tim:
+
+In this language:                                      B Threshold crossings during training
+one glon = glon-lu
+many pliv = pliv-dor                                   Table 1 dates when each behavior of Section 5
+one fooz = fooz-lu                                     crosses a fixed threshold. Rows use the original
+big many swoov = swoov-an-dor
+items unless marked as the code scheme. Times               OLMo-2-13B shows the same order, although its
+are crossings of a fitted curve, not first significant      exact-generation fit extrapolates beyond the ob-
+differences. We fit each mean trajectory over log10         served run. Pythia-1.4B reaches three of the six
+tokens (training steps for Pythia) by least squares to      thresholds. In the code scheme, held-out accu-
+a four-parameter logistic curve, with both asymp-           racy and generation cross at 143B and 131B, be-
+totes between 0 and 1, rate at least .05, and mid-          fore shown-combination generation at 815B, so the
+point within two decades of the observed range.             component-before-selection order is established for
+Intervals are the 2.5th to 97.5th percentiles of the fi-    the suffix scheme only. The 1.79T re-test crossing
+nite crossings over 300 resamples of the items with         and the 1,464B crossing come from different items,
+replacement. A resample whose fitted asymptote              and neither alters the 336B–630B blocking interval.
+stays below the threshold is censored.
+                                                            C Final scores and prompt-variant
+measure (threshold)                crossing [95% interval]       controls
+
+OLMo-2-7B                                                   Table 2 lists the scores behind Figure 2. Five
+                                                            changes to the prompt’s surface form test whether
+copy the stem (≥ .85)              11B [10, 12]             Pythia keeps preferring the copied answer and
+                                                            Qwen3-1.7B, Qwen3-8B and OLMo-2-7B the cor-
+first feature correct (≥ .70)      76B [66, 88]             rect one (Figure 10).
+
+second feature correct (≥ .70)     338B [254, 480]             OLMo-2-1B (.58), Qwen3-0.6B (.50) and
+                                                            Qwen2.5-1.5B (.49) lie between the thresholds.
+shown combinations, exact genera-  224B [143, 293]          Qwen2.5-0.5B (.86) is the only non-Pythia high-
+                                                            copy model. The correct form is generated on .00–
+tion (≥ .50)                                                .05 of prompts in the high-copy group and .30–.93
+                                                            in the low-copy group (Table 2).
+held-out, four-choice accuracy (> 1,464B [1,270, 1,675]
+
+.25)
+
+held-out, exact generation (≥ .15) 3,586B [3,286, 4,020]
+
+OLMo-2-13B
+
+first feature correct              34B‡
+
+second feature correct             245B‡
+
+shown combinations, exact genera-  174B [130, 368]
+
+tion
+
+held-out, four-choice accuracy     1,825B [1,480, 2,307]
+
+held-out, exact generation         8.4T†
+
+Pythia-1.4B (training steps)                                                           generations
+copy the stem
+first feature correct              2,037 [2,012, 2,118]                       ranks                 one
+shown combinations, exact genera-  25.9k [20.1k, 31.9k]
+tion                                                        Model        P (copy) first correct copied other ending
+second feature correct                 58.7k [44k, 84k]
+held-out, four-choice accuracy                              Pythia 410M  .91  .03 .01  .13 .30 .56
+held-out, exact generation                     censored∗                      .01 .00  .07 .18 .75
+                                               censored∗    Qwen2.5 0.5B .86  .03 .01  .35 .30 .34
+                                               censored∗                      .07 .03  .47 .16 .33
+                                                            Pythia 6.9B  .83  .05 .01  .19 .42 .38
+                                                                              .12 .05  .36 .14 .42
+                                                            Pythia 12B   .80  .11 .01  .03 .12 .83
+                                                                              .34 .06  .05 .03 .86
+                                                            Pythia 1.4B  .75  .17 .04  .03 .17 .76
+
+                                                            Pythia 2.8B  .73
+
+                                                            OLMo-2 1B    .58
+
+OLMo-2-7B, code scheme                                      Qwen3 0.6B   .50
+held-out, four-choice accuracy
+held-out, exact generation           143B [115, 178]        Qwen2.5 1.5B .49
+shown combinations, exact genera-    131B [103, 169]
+tion                               815B [603, 1,218]        OLMo-2 7B    .21 .69 .30 .04 .03 .63
+                                                            OLMo-2 13B   .16 .79 .33 .02 .01 .62
+Table 1: Fitted threshold crossings. “Copy the stem” is     Qwen2.5 3B   .10 .83 .57 .02 .05 .35
+the share of generations that begin with the requested      Gemma-3 4B   .09 .84 .54 .02 .06 .34
+novel stem, and “first/second feature correct” is the       Qwen3 1.7B   .09 .86 .43 .01 .03 .52
+share of single-feature probes whose ending matches         Qwen2.5 7B   .02 .95 .72 .00 .02 .25
+its prompt definition. Thresholds follow the first block    Qwen3 4B     .01 .99 .80 .00 .00 .17
+unless stated. †Extrapolated beyond 5T tokens, with 8%      Qwen3 8B     .00 1.00 .93 .00 .00 .04
+of resamples censored. ‡Intervals were not retained for
+these two fits. ∗77–100% of resamples are censored.         Table 2: Final-checkpoint suffix-task scores (two item
+The re-test items give a four-choice crossing of 1.79T      sets, 320 items). P (copy) = pcopied/(pcopied +
+for OLMo-2-7B (Appendix J).                                 pcorrect); .5 means equal probability. “Ranks first” is the
+                                                            share of prompts where the correct form leads four can-
+Ordering. In OLMo-2-7B every component be-                  didates (chance .25) under summed log-probabilities;
+havior has crossed by 338B, before or during the            the length-normalized share differs by at most .02 for
+336B–630B interval in which D changes sign,                 every model. Generation columns omit malformed out-
+while the held-out form crosses at 1,464B for four-         puts. OLMo-2 7B is the released stage-2 parameter av-
+choice accuracy and 3,586B for exact generation.            erage (Appendix H). Qwen2.5-Coder-1.5B (P (copy) =
+                                                            .42) and Coder-7B (.02) are omitted.
+
+                                                            Prompt variants. Pythia’s P (copy) stays at .66–
+                                                            .95 under every variant keeping the closest example
+                                                            and falls to .32–.46 with single-feature lines only
+            Pythia 410M  1.4B  2.8B                                      D (−1.36 to −9.44). Single-feature lines affect
+          Qwen3 1.7B                                                     every tested model and unrelated lines change little.
+                         OLMo-2 7B (final)                               Qwen3-4B’s closest-ending block was not run.
+     (a) P(copy)
+      copied             closest combined                                   Blocking the closest ending moves Pythia-2.8B’s
+                          example absent                                 m from −2.1 to +2.6 nats and blocking the re-
+  1                                                                      quested value moves Qwen3-8B’s from +8.9 to
+.75                            336B                                      −1.5, reversing the preferred answer in both (Fig-
+                                                                         ure 4 and Table 7, re-test items in bfloat16).
+ .5                                3.9T
+.25                            8B                                        Deleting lines. Table 4 repeats the test with lines
+                                                                         deleted instead of masked. Deleting the closest ex-
+  0                                                                      ample makes the correct answer preferred in Pythia-
+                                                                         1.4B, Pythia-2.8B and Qwen3-0.6B (+3.20, +3.30
+      correct                                                            and +3.52 nats). The gain shrinks as unblocked m
+                                                                         rises, reaching −0.19 in Qwen3-8B. Deleting the
+     (b) correct ranks first                                             correct-ending lines lowers m everywhere (−0.53
+                                                                         to −1.52). Deleting unrelated lines changes m by
+1                              8B                                        −0.13 and +0.05 in Pythia and by −0.44 to −0.89
+                                                                         in tested low-copy models. Eight of the twelve
+.75                                                                      models in the blocking panel were tested (Table 4).
+
+.5                                         3.9T                          Qwen2.5-0.5B. This model was added after the
+                                                                         model set was fixed and run on independently gen-
+.25                                                                      erated items. It is not part of the directional test.
+                                                                         Blocking the closest ending raises m by +3.25 nats
+0                                                                        and lowers P (copy) from .88 to .42, blocking the
+                                                                         requested value lowers m by .66, and the other
+                                                                   336B  question value and unrelated lines move it by +.6
+                                                                         and +.1. Its bfloat16 D is +2.59 [+2.34, +2.85],
+     order  one three combined single reworded                           positive on 88% of items, and float32 agrees to .02
+      B–A   line lines only only template                                nats. The activation patch of Figure 13 produces
+                                                                         none of the 109 never-shown targets and a shown
+                    prompt variant                                       combination on .36 and .31 in the two item sets.
+
+Figure 10: Prompt-variant controls. (a) P (copy) and                     Scoring variants. Restricting to single-token
+(b) the fraction of prompts where the correct form ranks                 endings, scoring only the first token where the
+first. Series are Pythia-410M, Pythia-1.4B, Pythia-2.8B,                 forms differ, or length-normalizing leaves P (copy)
+Qwen3-1.7B, and released OLMo-2-7B. Qwen3-8B and                         within .01 and changes neither the sign of D nor
+the OLMo-2-7B 336B and 3.9T checkpoints appear only                      any model’s group. Item-level first-token and
+for the reworded template. Variants reverse ending order                 summed scores correlate at .84–1.0 for m and .90–
+(B–A), use one or three example lines per combination,                   .98 for D. All three put OLMo-2-7B’s last positive
+retain only combined-form or single-feature lines, or re-                D at 336B and first negative at 630B, and OLMo-
+word the template. The shaded single-feature-only con-                   2-13B’s first sign change at 168B–336B. Length
+dition has no closest combined example. Guides mark                      normalization moves the correct-ranks-first frac-
+equal copied/correct probability (.5) and four-choice                    tion by at most .02 in final models and at most .05
+chance (.25).                                                            across checkpoints (at 5B, where both scores are
+                                                                         near chance). Two other checkpoints move by .03.
+(Figure 10 and the supplement). Qwen3-1.7B and                           A later analysis that conditions D on full-prompt
+released OLMo-2-7B rank the correct form first                           m moves the OLMo-2-7B sign change to 168B–
+on at least .45 of prompts under every variant but                       336B without replacing the unconditioned series
+combined-form lines only. Qwen3-8B, run only on                          (Appendix P, supplement table).
+the reworded template, ranks it first on 1.00.
+                                                                         Precision. We re-scored P (copy), the blocked-
+D Blocking, deletion, and scoring checks                                 span changes in m, and D in float32 on the re-
+
+Table 3 lists every blocked span per model in
+bfloat16 on the original items. The body and Fig-
+ure 3 use float32 re-test scores (Precision, below).
+Figure 4 shows one model per group.
+
+Blocked spans. Blocking the closest ending
+raises m wherever measured, by +1.00 to +5.34
+nats, and blocking the requested value lowers it
+by −1.59 to −10.51 (Table 3). Pythia’s D is
+positive (+2.77 to +3.75), OLMo-2-1B’s is near
+zero (−0.23 [−0.74, +0.29]), and Qwen3-0.6B
+and all measured low-copy models have negative
+                                closest example question words           controls
+
+                          m            two                               single-feature their
+
+Model          P (copy) (unblocked) ending lines asked     other unrelated lines   endings     D [95% interval]
+
+Qwen2.5 0.5B‡      .88       – +3.25   – −0.66                  –  –            –         – +2.59 [+2.34, +2.85]
+Pythia 12B                                                               −1.99     −2.38 +3.75 [+3.37, +4.09]
+Pythia 1.4B        .84 −3.22 +5.34 +4.87 −1.59 +1.81 −0.00               −1.90     −2.33 +3.44 [+3.05, +3.82]
+Pythia 2.8B                                                              −1.99     −2.60 +2.77 [+2.50, +3.04]
+                   .81 −2.71 +5.34 +4.72 −1.90 +1.26 +0.13
+
+                   .79 −2.15 +4.72 +4.28 −1.95 +1.13 +0.18
+
+OLMo-2 1B          .62    −0.58 +2.94† +3.59 −3.18 +0.89† +0.17          −1.67 −1.93† −0.23 [−0.74, +0.29]
+Qwen3 0.6B                                                               −1.33 −1.78 −1.36 [−1.68, −1.04]
+                   .54 −0.18 +2.94 +3.70 −4.30 +0.85 +0.01
+
+OLMo-2 7B          .24 +2.31 +2.04 +2.35 −5.33 −0.71 +0.06               −1.79     −2.04 −3.29 [−3.72, −2.89]
+OLMo-2 13B                                                               −2.07     −2.44 −5.33 [−5.89, −4.78]
+Gemma-3 4B         .17 +3.55 +1.58 +2.04 −6.91 −1.59 −0.14               −1.65     −2.12 −3.93 [−4.30, −3.54]
+Qwen3 1.7B                                                               −1.58     −1.92 −5.15 [−5.62, −4.73]
+Qwen2.5 7B         .11 +3.72 +2.95 +2.58 −6.88 −1.27 −0.09               −1.19     −1.29 −6.83 [−7.17, −6.52]
+Qwen3 4B                                                                 −1.34
+Qwen3 8B           .11 +3.84 +1.86 +2.18 −7.02 −0.08 −0.11               −1.27            ––
+                                                                                   −1.06 −9.44 [−9.81, −9.08]
+                   .02 +5.44 +1.00 +1.21 −7.84 −1.68 +0.01
+
+                   .01       –    – +1.17 −9.19                 – −0.05
+
+                   .00 +9.00 +1.07 +0.87 −10.51 −2.94 +0.05
+
+Table 3: Blocking selected prompt spans for the held-out form (item sets 0 and 1, 320 items, bfloat16; †one set, 160
+items). The body and Figure 3 quote float32 values on item sets 2 and 3 (supplement table). m (unblocked) is the
+full-prompt correct-minus-copied log-probability in nats; every other entry is the change in m after blocking the
+named span. Closest example: only its ending tokens (ending) or its two whole lines (two lines). Question words:
+the word naming the requested value (asked) or the other value (other). Controls: two unrelated single-feature lines
+(unrelated), the two single-feature lines (single-feature lines) and only their ending tokens (their endings). D is the
+magnitude for ending minus that for asked, with a 95% item-bootstrap interval. – marks a span not run (Qwen3
+4B’s closest-ending block) or not tabulated here. ‡Run added after the model set was fixed; float32 and bfloat16
+agree to .02 nats for this model. Four of the 17 models of Table 2 (Pythia 410M and 6.9B, Qwen2.5 1.5B and 3B)
+were not run.
+
+                   closest correct-ending unrelated        form in bfloat16 (supplement table).
+
+Model       full m example lines       lines               E Training trajectories of seventeen runs
+
+Pythia 1.4B −2.08  +3.20        −0.53  −0.13               The body’s pretraining evidence comes from one
+Pythia 2.8B −1.92  +3.30        −0.92  +0.05               lab (Ai2). Here we follow the eleven older public
+Qwen3 0.6B −0.19   +3.52        −1.28  −0.40               series and six models selected from a screen of
+OLMo-2 7B +2.31    +1.66        −1.18  −0.49               sixteen other released models (Table 5), asking in
+OLMo-2 13B +3.53   +1.59        −0.95  −0.77               each whether D turns negative before four-choice
+Qwen3 1.7B +3.87   +1.51        −1.36  −0.44               accuracy rises. Figure 11 and Table 6 date the
+Gemma-3 4B +3.72   +1.20        −1.33  −0.89               crossings.
+Qwen3 8B +8.98     −0.19        −1.52  −0.50
+                                                           Runs and screen. Seven trajectories end above
+Table 4: Deletion effects on item sets 0 and 1, 160 items  four-choice chance: OLMo-2-7B, OLMo-2-13B,
+each. Full m is the unblocked correct-minus-copied         OLMo-7B-0424, OLMo-3-7B, Marin-8B-Base,
+log-probability in nats. Columns 3–5 give the change in    SmolLM3-3B and Comma-v0.1-1T. The other ten
+m after deleting the closest example’s two lines, the two  end below chance. The screen keeps models whose
+single-feature lines defining the correct second ending,   correct form ranks first on at least 160 of 320 items.
+or two unrelated lines of matched length.                  We follow all four, plus OpenLLaMA-7B-v2 (.17)
+                                                           and SmolLM2-1.7B (.12), the two low-accuracy
+test items and the OLMo-2-7B and OLMo-2-13B                models with the highest correct-ranks-first rates.
+checkpoints, which the body and Figure 3 use. In           Apertus-8B-2509 (.42) clears only the table’s par-
+OLMo, P (copy) changes by at most .005 and D               tial threshold. OLMo-3 is another Ai2 run, so it is
+by at most .25 nats, pooled signs are unchanged,           not independent evidence.
+and item-level signs agree on 94–100%. In Pythia,
+bfloat16 overstates closest-ending changes by 13–          Crossings. Figure 11a dates the first sampled
+62% and D by 12–105% across models and item                crossing of each threshold. In every run ending
+sets. Pooled float32 D for Pythia-1.4B, -2.8B and          above chance, the first negative D comes before
+-12B is +2.4, +2.1 and +1.9, against +3.3, +2.4            or at the sampled accuracy crossing, though a
+and +3.7 in bfloat16. Signs, groups and check-             first crossing need not last. No below-chance run
+point ordering are unchanged. On 50 Pythia-1.4B            reaches a sustained negative D.
+items, padded batches and single sequences differ
+by under .001 nats in float32 and up to 2.6 nats per
+Released model                      correct ranks writes             ∆ closest ending  D source
+                                    first (of 320) correct P (copy)
+
+Marin-8B-Base†                        283 (0.88) .62  .02 +1.52 [1.31, 1.73] −6.19 Marin Community (2025)
+Comma-v0.1-1T†                        277 (0.87) .50  .06 +1.46 [1.23, 1.69] −6.40 Kandpal et al. (2025)
+SmolLM3-3B†                           271 (0.85) .54  .10 +1.74 [1.51, 1.96] −5.10 Hugging Face (2025)
+OLMo-3-7B†                            265 (0.83) .43  .05 +1.63 [1.40, 1.85] −6.24 Team Olmo (2026)
+
+Apertus-8B-2509                       136 (0.42) .15  .23 +2.13 [1.91, 2.36] −3.56 Swiss AI Initiative (2025)
+
+OpenLLaMA-7B-v2†                      55 (0.17) .06   .55 +2.98 [2.78, 3.18] −0.20 OpenLM Research (2023)
+
+SmolLM2-1.7B†                         38 (0.12) .05   .64 +3.92 [3.71, 4.12] +1.13 Ben Allal et al. (2025)
+                                                      .72 +4.51 [4.31, 4.71] +2.22 OpenLLM-France (2025)
+Lucie-7B                              30 (0.09) .03   .68 +4.24 [4.02, 4.45] +0.92 Hu et al. (2024)
+                                                      .64 +3.84 [3.65, 4.04] +1.14 Together Computer (2023)
+YuLan-Mini (2.4B)                     27 (0.08) .06   .61 +3.55 [3.29, 3.78] +0.53 LumiOpen (2024)
+                                                      .76 +2.96 [2.75, 3.17] +0.95 BigScience Workshop (2024)
+RedPajama-INCITE-7B-Base              26 (0.08) .03   .74 +2.83 [2.62, 3.03] +0.77 Jaghouar et al. (2024)
+                                                      .94 +7.35 [7.03, 7.64] +6.48 Hugging Face (2024)
+Viking-7B                             18 (0.06) .02   .90 +4.52 [4.30, 4.76] +3.80 Ben Allal et al. (2025)
+                                                      .90 +4.90 [4.69, 5.11] +4.11 Zhang et al. (2024)
+BLOOM-7b1                             14 (0.04) .02
+
+INTELLECT-1 (10B)                     11 (0.03) .01
+
+FineWeb-Edu ablation model (1.82B)    3 (0.01) .01
+
+SmolLM2-360M                          3 (0.01) .00
+
+TinyLlama-1.1B                        2 (0.01) .01
+
+Table 5: Screen of 16 released models (320 items), sorted by the number of items on which the correct form ranks
+first. Rules separate high (at least 160 correct), partial (Wilson lower bound above .25 but fewer than 160 correct)
+and low (neither). “∆ closest ending” is the change in correct-minus-copied log-probability after blocking that
+ending, with its 95% interval; D subtracts the magnitude after blocking the requested value. †The six runs followed
+across their saved intermediate models: the four high models and two contrast series.
+
+                 Trajectory                                               correct ranks fitted accuracy
+                                      P (copy) < .5 D < 0 first > .25 threshold crossing
+
+                 OLMo-2-7B             630B            630B            1.7T  1.79T
+                 OLMo-2-13B             2.5T           336B            2.5T  2.2T
+                 OLMo-2-1B             never           never          never  –
+                 OLMo-7B (0424)        838B            838B            2.0T  1.6T
+                 Pythia-1.4B           never           never          never  –
+                 Pythia-2.8B           never           never          never  –
+                 Pythia-6.9B           never           never          never  –
+                 Pythia-12B            never           never          never  not reached (last ckpt 300B)
+                 OLMoE-1B-7B           never           never          never  not reached (last ckpt 5T)
+                 Amber-7B (LLM360)     never           never          never  not reached (last ckpt 1.3T)
+                 Pythia-1.4B-deduped   never           never          never  –
+                 OLMo-3-7B              1.3T           600B            1.3T  1.0T
+                 Marin-8B-Base        ≤2.7T           ≤2.7T          ≤2.7T   –
+                 SmolLM3-3B             1.9T            1.9T           4.1T  7.6T
+                 SmolLM2-1.7B          never           never          never  –
+                 Comma-v0.1-1T         818B            545B           818B   660B
+                 OpenLLaMA-7B-v2†
+                                       never            460k          never  –
+
+Table 6: First sampled checkpoint crossing each threshold on 320 independently generated items. The fitted column
+is the logistic crossing for the fraction of prompts on which the correct form ranks first (Appendix B); “not reached”
+marks a fitted crossing beyond the last observed checkpoint. ≤: Marin-8B-Base already exceeds the threshold at its
+first public checkpoint. OLMo-2-7B’s fitted crossing is the re-test value, 1.79T (Appendix J). A series may return
+after its first crossing. †OpenLLaMA positions are optimizer steps rather than tokens. The six ordering criteria per
+run are visible in Figure 11.
+P(copy) < .5                         D<0     correct ranks first > .25                               fitted accuracy crossing
+
+(a) First sampled crossings                               (b) Final effects
+    all six criteria hold
+                                                  123456                                       8     Comma-v0.1-1T
+
+OLMo-2 7B                                                                                                                           Marin-8B-Base
+
+      OLMo-3-7B                                           final requested-value effect (nats)               OLMo-3-7B               SmolLM3-3B
+Comma-v0.1-1T                                                                                        OLMo-7B (0424)
+
+other above-chance runs
+
+OLMo-2 13B                                                                                     6
+                                                                                                                         half peak
+OLMo-7B (0424)
+
+SmolLM3-3B                                                                                           OLMo-2 7B
+
+Marin-8B-Base                             ≤
+
+    below chance                                                                               4     OLMo-2 13B                     OLMoE-1B-7B
+            Pythia 1.4B never
+            Pythia 2.8B never                                                                        OpenLLaMA-7B-v2                SmolLM2-1.7B
+            Pythia 6.9B never
+             Pythia 12B never                                                                        Amber-7B (LLM360)                            Pythia 2.8B
+                                                                                               2                                                  Pythia 1.4B
+Pythia-1.4B-deduped never                                                                                                                          Pythia 12B
+            OLMo-2 1B never                                                                                   Pythia-1.4B-
+                                                                                                                    deduped                       OLMo-2 1B
+        OLMoE-1B-7B never                                                                                                           Pythia 6.9B
+Amber-7B (LLM360) never
+                                                                                               0
+        SmolLM2-1.7B never
+
+10B                            100B  1T      10T                                                  0  .25                     .5     .75            1
+
+                 pretraining tokens                                                                  final closest-ending effect / peak
+
+fitted crossing beyond the observed run           ≤ already past at the first public checkpoint
+
+criteria 1–6: holds fails – undefined; 1 ending below half peak, 2 stays below .8,
+
+3 value more than doubles, 4 one sign change, 5 copy crosses later, 6 accuracy crosses later
+
+Figure 11: Crossing dates and endpoints of the training trajectories. (a) First sampled crossings of P (copy) < .5,
+D < 0, and correct-ranks-first > .25, with fitted accuracy crossings shown separately. “Never marks an unobserved
+sampled crossing. Arrows mark fitted crossings beyond the observed run, and Marin is already above threshold
+at its first public checkpoint. The numbered checks are a closest-ending effect below half its peak, an effect
+that stays below .8 after D < 0, a requested-value effect that more than doubles, at most one sign change, a
+copied-answer probability crossing after the last positive D, and a fitted accuracy crossing after the sign change.
+OpenLLaMA-7B-v2 is measured in optimizer steps: its first negative D occurs at 460k, but it never crosses the
+probability or accuracy thresholds. (b) Final closest-ending effect divided by its peak versus final requested-value
+effect in nats. The groups distinguish runs meeting all ordering criteria, other above-chance runs, and below-chance
+runs. The vertical guide marks half the peak. Exact sampled and fitted dates are in Table 6.
+
+Ordering criteria and exceptions. OLMo-2-7B,              three of the six checks.
+OLMo-3-7B and Comma-v0.1-1T meet all six                     After 1T in OLMo-2-7B, the requested-value ef-
+checks in the figure caption. Their sign-change
+brackets are 336B–630B, 411B–600B and 482B–               fect moves between 2.9 and 5.3 nats across neigh-
+545B. OLMo-2-13B meets five but changes sign              bouring checkpoints, and the closest-ending effect
+three times, first at 168B–336B, back above zero          briefly reaches 3.1 at 1.68T. The two never re-cross,
+at 630B, and again at 630B–839B. SmolLM3-3B               and D stays negative at every later checkpoint (Fig-
+shifts before accuracy rises, but its closest-ending      ure 6).
+effect later climbs back above .8 of its peak. Marin-
+8B-Base is already past both thresholds at its first      Endpoints. The seven above-chance runs finish
+public checkpoint, so its ordering cannot be dated.       with requested-value effects of 4.5–7.7 nats and
+OpenLLaMA-7B-v2’s mean D dips to −0.20 only               closest-ending effects at .28–.56 of their observed
+at its last checkpoint, and SmolLM2-1.7B’s stays          peaks. The ten below-chance runs finish at .9–3.2
+positive.                                                 nats and .44–.72 of peak (Figure 11b). Pythia-1.4B-
+                                                          deduped and Amber-7B do fall below half their
+   OLMo-7B-0424 is the exception. Its first nega-         peaks (.44 and .49), yet keep positive D (+3.1,
+tive D is at 838B, but it hovers around zero until        +1.6) and high P (copy) (.80, .72). The released
+2.3T, while fitted accuracy crosses at 1.6T and sam-      OLMo-2-1B lies outside its stage-1 trajectory, at
+pled accuracy exceeds .25 at 2.0T. The run fails          P (copy) = .57 and D = −0.6 [−1.0, −0.2]. Ap-
+                                                          pendix H covers the same stage-1 versus released
+difference for OLMo-2-7B.                              often fuses the stem-final vowel with the posses-
+                                                       sor suffix, drops eight models to correct-ranks-first
+F Code and Quechua versions                            .01–.10 (Qwen3-4B .31, Qwen3-8B .42) and raises
+                                                       P (copy) to .37–.93, though requested-value block-
+Two further versions test whether the model order-     ing still orders the models (−1.1 to −6.0 nats).
+ing of Section 4 depends on the invented suffixes      Models do not consistently prefer the copy, which
+or on tokenization (Figure 12). One uses code          shares the possessor, over the shown form that
+words and symbols in place of endings. The other       shares the case, so Quechua shows a pull toward
+uses Southern Quechua noun paradigms, scored           shown forms as such.
+with each suffix as its own token and in standard
+spelling.                                              Contamination check. Four-choice accuracy is
+                                                       .21–.31 with only the Quechua header and query,
+Code scheme. The six tested models keep the            and .22–.29 with demonstrations whose possessors
+suffix-scheme ordering and score better. P (copy)      and cases differ from the query’s. All Wilson inter-
+is .55, .38, .17, .06, .01 and .00 for Pythia-1.4B,    vals contain .25 except OLMo-2-13B’s header-only
+Pythia-2.8B, OLMo-2-7B, Qwen3-1.7B, Qwen2.5-           .31 [.26, .37], so we show that model’s Quechua
+7B and Qwen3-8B (Figure 12a). Blocking here            scores but exclude them from the ordering. No
+covers the closest example’s whole line, so its        model generates a correct form on any of the 320
+size is not comparable with suffix-ending block-       header-only items. Training results on the code
+ing. In OLMo-2-7B the requested-value effect first     and Quechua versions are in Appendix M, adapter
+exceeds the closest-example effect at 168B, inside     results in Appendix N.
+the interval of the fitted four-choice crossing, 143B
+[115, 178]. The two events coincide at this reso-      G Activation patching
+lution, whereas in the suffix scheme the blocking
+turn came first (Figure 12b).                          Under the patch of Section 3, never-shown shares
+                                                       in the low-copy group rise as P (copy) falls: .26 for
+Quechua construction. Southern Quechua                 OLMo-2-7B, .33 for OLMo-2-13B, .39 for Qwen3-
+nouns combine possessor and case endings               1.7B, .65 for Qwen2.5-7B and .91 for Qwen3-8B.
+(Adelaar and Muysken, 2004; Kirov et al., 2018;        Shown shares are .85–1.00. Pythia’s shown share
+Batsuren et al., 2022). Of the 494 UniMorph            is .59–.69, but its never-shown share never exceeds
+que noun lemmas we keep the 242 vowel-final,           .08 (Figure 13). Counting only the requested end-
+lower-case ASCII lemmas whose cells are exact          ing, regardless of stem or other ending, Pythia’s
+concatenations of lemma, possessor and case            never-shown shares rise to .11, .31 and .19 while
+(consonant-final lemmas would need epenthesis),        the low-copy models move by at most .03 (supple-
+minus function words, loans and proper names.          ment table). High-copy models can produce the
+Possessor endings are -y, -yki, -n, -nchik, -nku,      requested ending without building the full form.
+and case endings -man, -manta, -pi, -wan, -kama,
+-paq, -rayku. Excluding prefix-related pairs (y/yki,   Why this position and layer? Distributed align-
+n/nchik, n/nku, man/manta) leaves 7 possessor          ment search (Wu et al., 2023) on the final Pythia-
+pairs and 20 case pairs. Each prompt draws one         1.4B fits an 8-dimensional rotated subspace at the
+pair from each pool, and the closest example           requested-value word, the last stem token and “=”.
+shares the possessor. Segmented forms look like        Only the requested-value word responds, most
+tanta-y-pi, standard spelling like tantaypi.           strongly after layer 4, where the greedy ending
+                                                       changes on most items (an approximation) for the
+Tokenization and scores. With suffixes tok-            first feature and about half for the second. Transfer
+enized separately, Pythia has P (copy) = .77–          is .97 on the three fitted word pairs but .04 on the
+.84 and correct-ranks-first .04–.06. Qwen3-1.7B,       held-out pair. The layer-4 success rate rises from
+Qwen2.5-7B, Qwen3-4B and Qwen3-8B have                 .28 at step 2k (about 4B tokens) to .95 at step 143k
+P (copy) = .00–.14 and correct-ranks-first .83–        (300B). Layer 4, the Pythia-1.4B optimum, is used
+1.00, and OLMo-2 lies between. Blocking the            as the shared early layer for every model, although
+requested value lowers m by −1.4 to −8.5 nats,         per-model sweeps peak at layers 0, 1, 9, 11 and 14
+while blocking the closest ending raises it by +.8     (Appendix N).
+to +5.3. Standard spelling, where the tokenizer
+                                                          Both conditions in Figure 13 start from a shown
+base form, and the never-shown base-form con-            step 10 or 20 and passes .9 by step 50, while D
+dition was not run. Position-by-position patch-          turns negative at step 20 in both runs. The closest-
+ing retains most of the change in m through the          ending effect falls from 5.3 to about 3 nats and
+first .33 of layers in Pythia-1.4B and .53–.64 in        then fluctuates between +2.3 and +7.6, while the
+low-copy models. This depth measurement re-              requested-value effect grows from 2 to more than
+places a planned between-group comparison at the         20. The all-shown run also learns the held-out form.
+requested-value word that could not be evaluated         At step 250 it has P (copy) = .83, a closest-ending
+as specified (Appendix P).                               effect near 31 nats and D = +21. By step 500, D
+                                                         is negative and correct-ranks-first is .50, rising to
+H Stage-2 OLMo-2-7B models                               .70–.78 from step 1,000 with closest-ending and
+                                                         requested-value effects near 10 and 30 nats. Nei-
+The released OLMo-2-7B in Table 2 ranks the cor-         ther part of the predicted pretraining order is repro-
+rect form first on .69 of prompts and writes it on       duced. The requested-value effect grows while the
+.30, above the .53 and .17 at 3.9T of the last stage-1   closest-ending effect is still present, instead of after
+checkpoint, which ends the trajectory of Figure 6.       it disappears.
+The release is a parameter average of three stage-2
+runs on different data mixtures (Team OLMo et al.,       J Re-test on new items
+2024). In the one run with public intermediate
+checkpoints, correct-ranks-first rises from .53 to       We repeat the tests of Sections 4 and 5 on 320 new
+.64 and exact generation from .17 to .22 within          prompts per model, generated after those analy-
+5B additional tokens. Over 9B–50B, correct-ranks-        ses were fixed (Table 7). The re-test covers new
+first stays mostly at .63–.68, dipping to .55 at 17B,    prompts from the same generator, not indepen-
+and exact generation ranges over .15–.27. A gain         dently trained models.
+is therefore already present during stage-2 training,
+before averaging. The comparison cannot separate         Criteria. P (copy) must be at least .70 in the
+further training from the change of data mixture.        high-copy group and at most .30 in the low-copy
+                                                         group, D must take the predicted sign in each
+OLMo-2-7B checkpoint               correct form writes   group, and the unrelated-line 95% interval must
+                                    ranks first correct  lie within ±.3 nats. OLMo-2-7B’s sign change
+                                                         must fall in 336B–630B and its fitted four-choice
+end of stage 1 (3.9T)              .53  .17              accuracy must cross chance afterwards. OLMo-2-
+                                                         1B and Qwen3-0.6B have no directional prediction,
+first stage-2 run, 5B more tokens  .64  .22              leaving nine in the sign test.
+
+released model (parameter average) .69  .30              Results. All probability thresholds and all nine
+                                                         signs hold (Table 7). The 336B–630B interval
+I Fine-tuning a copying model                            recurs in .999 of joint item resamples, and the
+                                                         1.79T accuracy crossing follows the sign change
+We ask whether direct fine-tuning of Pythia-1.4B         in every resample. The unrelated-line interval
+reproduces the pretraining order, D changing sign        fails for Pythia-1.4B and Pythia-12B in bfloat16,
+before accuracy rises, and whether the all-shown         with means of only +.24 and +.17, and passes in
+result of Section 6 also holds under fine-tuning.        the float32 re-scores (Appendix D). The six tra-
+                                                         jectory outcomes of Appendix E are unchanged.
+Design. We fully fine-tune released Pythia-1.4B          OLMo-2-13B still shows three sign changes, and
+for 2,000 steps (learning rate 10−5, warm-up, co-        the low-accuracy OLMo-2-1B, OLMoE and stan-
+sine decay, batch size 32). Training uses its own        dard Pythia runs never turn negative.
+prompt template, evaluation the standard one. Two
+seeds target the correct held-out form. A third run      K Selected attention heads
+queries only shown combinations, mirroring the all-
+shown condition of Section 6. We predicted that          Head contributions across training. Across
+the bootstrap interval for D would fall below zero       OLMo-2-7B training (Figure 14), the copy-
+at least 250 steps before the Wilson lower bound         favoring set’s direct contribution peaks at .71 nats
+for four-choice accuracy exceeded .25, in both tar-      at 9B, falls below .10 by 336B, and is about .02–
+get runs, and that neither event would occur in the      .05 at most later checkpoints. The correct-favoring
+all-shown run.
+
+Outcome. Both target runs cross both thresholds
+at the first evaluation, step 250 (supplement fig-
+ure). On a 10-step grid, accuracy clears chance at
+                                                                                                         P (copy)     unrelated 95%
+
+                                               full closest requested other unrelated                    predicted side D sign interval within
+             P (copy) [95% interval] prompt ending value value lines
+Model                                                                                  D [95% interval]  ≥ .70/ ≤ .30 as predicted ±.3 nats
+
+Pythia 1.4B  .81 [.77, .83]  −2.73 +5.33 −2.06 +1.47 +0.24 +3.27 [+2.86, +3.68]                          ✓         ✓  ×
+
+Pythia 2.8B  .77 [.74, .79]  −2.08 +4.63 −2.26 +1.05 +0.16 +2.38 [+2.10, +2.64]                          ✓         ✓  ✓
+
+Pythia 12B   .85 [.82, .87]  −3.20 +5.35 −1.63 +1.83 +0.17 +3.72 [+3.32, +4.08]                          ✓         ✓  ×
+
+OLMo-2 1B    .57 [.53, .60]  −0.43 +2.80 −3.40 +1.00 +0.11 −0.60 [−0.98, −0.23]                          –         –  –
+
+Qwen3 0.6B   .53 [.50, .56]  −0.15 +2.88 −4.39 +0.78 +0.04 −1.52 [−1.85, −1.17]                          –         –  –
+
+OLMo-2 7B    .24 [.21, .27]  +2.54 +2.08 −5.54 −0.77 +0.10 −3.46 [−3.93, −3.02]                          ✓         ✓  ✓
+
+OLMo-2 13B   .16 [.13, .19]  +3.74 +1.55 −7.07 −1.65 −0.13 −5.52 [−6.09, −5.01]                          ✓         ✓  ✓
+
+Qwen3 1.7B   .10 [.08, .12]  +3.97 +1.83 −7.07 −0.15 −0.06 −5.25 [−5.65, −4.81]                          ✓         ✓  ✓
+
+Gemma-3 4B   .11 [.09, .13]  +4.17 +2.64 −7.10 −1.54 −0.08 −4.46 [−4.90, −4.04]                          ✓         ✓  ✓
+
+Qwen2.5 7B   .02 [.01, .02]  +5.75 +0.98 −7.99 −1.74 −0.04 −7.02 [−7.36, −6.64]                          ✓         ✓  ✓
+
+Qwen3 8B     .00 [.00, .00]  +8.89 +0.87 −10.41 −2.96 +0.05 −9.54 [−9.92, −9.16]                         ✓         ✓  ✓
+
+Table 7: Re-test on item sets 2 and 3 (320 items per model, bfloat16). P (copy) and D have 95% item-bootstrap
+intervals, resampling within each set. Blocking columns give changes in m (nats); D is the closest-ending change
+minus the magnitude of the requested-value change. The last columns test the predicted probability side, sign of D,
+and unrelated-line interval. The two intermediate models have no directional prediction. The body quotes float32
+re-scores of these same items: Pythia P (copy) is lower by up to .06 and D by up to 1.8 nats.
+
+set stays near zero until 336B (dipping to −.06        at 168B–1049B, but final OLMo-2-7B and Pythia-
+at 84B–168B), reaches .30 at 630B, dips to .14         1.4B clear it one way only, which the averaged
+at 1049B, and exceeds .6 only after 2.5T (.83 at       points hide. Correct-favoring sets clear it both ways
+3.57T). Heads are re-selected at each checkpoint.      in Pythia-1.4B and OLMo-2-7B and one way in
+Swapping the selection and evaluation item sets        the Qwen3 models.
+moves the crossing from 630B to 1.68T (Figure 14),
+so this timing is less stable than the whole-model     Induction-head control. A separate, task-
+blocking interval.                                     independent control uses Pythia’s 16 heads with the
+                                                       highest induction score on a random 40-token re-
+Stability and contribution. Selected twice, once       peat (Olsson et al., 2022). Replacing their answer-
+on each item set, correct-answer heads overlap (Jac-   position outputs with those from other prompts
+card) at .67–1 in five of six low-copy models and      raises correct-next-ending accuracy, given correct
+.43 in OLMo-2-13B. Copy-answer heads overlap at        preceding tokens, from .02 to .36 in Pythia-1.4B
+.67 except in OLMo-2-13B (.43). Pythia overlaps        at step 4k (.39 and .33 on the two item sets; ran-
+are .25 to .67. In every low-copy model, direct logit  dom controls .02–.03) and from .18 to .49 in final
+attribution (Wang et al., 2023) credits the selected   Pythia-2.8B. Mean replacement gives .44 in Pythia-
+heads with more of the correct-answer contribution     2.8B. In free generation, shown-combination accu-
+than the multilayer-perceptron blocks, and with .14    racy falls from .66 to .26 and .81 to .56, so copying
+to .64 of all head contributions toward that answer.   weakens, but held-out exact generation rises only
+Only Gemma-3-4B reaches half for both sets (.64        from .03 to .07 and .05 to .11.
+and .56), and no model’s five-head sets explain half
+the matching token-blocking effect in both selec-      L Continued pretraining with synthetic
+tion directions (Section 4, Figure 5b).                     documents and attention penalties
+                                                            (360M)
+Silencing selected heads. Figure 5b averages the
+two directions. Silencing the copy-favoring sets       Five conditions continue pretraining SmolLM2-
+raises m by .7–2.0 nats in Pythia-1.4B, Qwen3-         360M for about 1B tokens, two runs each: original
+1.7B and the OLMo-2-7B checkpoints from 168B           documents, two synthetic-document variants and
+to 1049B, but only .06 in Qwen3-8B, within its         two attention penalties (Section 6.1; Figure 15).
+random-set range. Silencing the correct-favoring
+sets lowers m by .4–1.2 nats. The copy-head effect     Design. All conditions share the starting check-
+is as large at 168B as at 1049B, so these heads do     point, compute budget and data order.
+not fall silent when control switches. The threshold
+is twice the 95th percentile of twenty layer-matched      • Base: SmolLM2-360M at step-1600000 (2.52
+random sets in each direction. Copy-favoring sets            trillion tokens), continued on the public proxy
+clear it both ways in Qwen3-1.7B and OLMo-2-7B               corpus smollm-corpus (Ben Allal et al.,
+                                                             2025) for 636 steps, about 1 billion tokens.
+   • Synthetic documents: every 33rd packed se-           the cause, and reducing the selected heads’ atten-
+      quence (3 %, about 30 million tokens) is re-        tion to the closest ending does not create compos-
+      placed by documents that define endings. One-       ing.
+      unshown documents leave one combination
+      unshown and give its answer. All-shown doc-         M Continued pretraining with synthetic
+      uments show every requested combination on               documents and mined passages (1.7B)
+      another stem. Training stems, endings and
+      templates are disjoint from the evaluation in-      Five conditions continue pretraining SmolLM2-
+      ventories, and neither condition contains code      1.7B for 1B tokens: plain continuation, 3% syn-
+      systems.                                            thetic documents, and three mined-passage variants
+                                                          (Sections 6.1–6.2; Figures 16 and 7).
+   • Attention penalties: original documents plus
+      a penalty on attention from the answer posi-        Design. All conditions share the base checkpoint
+      tion to the closest ending, on either the ten       and training schedule.
+      heads with the largest direct contribution to
+      the copied answer in the base model or ten ran-     • Base:  SmolLM2-1.7B-intermediate-
+      dom heads in the same layers (Appendix N).
+                                                          checkpoints at 2.097 trillion tokens
+   • Measures: P (copy), correct-ranks-first, exact
+      generation and D, code and Quechua scores,          (Ben Allal et al., 2025).
+      three external evaluations defined in the sup-
+      plement, FineWeb-Edu and Pile validation            • Schedule: 477 steps of 2.097 million tokens
+      losses, and the penalized attention.                  (1B total) at learning rate 5 × 10−4, identi-
+                                                            cal rows across conditions, every 33rd row
+   • Crossings: a condition’s D turns negative at           (3.03 %) reserved for replacement, and 21
+      the first checkpoint with mean D < 0 and              checkpoints.
+      P (copy) ≤ .55, and it reaches the accuracy
+      criterion at the first with correct-ranks-first at  • Conditions: original documents, the synthetic
+      least .50 and exact generation at least .15.          documents of Appendix L, mined passages
+                                                            that define and later use a term, mined pas-
+Comparisons. An intervention counts as earlier              sages whose term is absent from a fixed refer-
+only if it crosses before its control, or crosses           ence vocabulary, and the same passages with
+when the control never does. Transfer to code and           a dictionary-format prefix. The all-shown con-
+Quechua requires a gain of at least .05 on both             trol was not repeated at this scale for lack of
+measures of both tasks in both runs, each with a            compute (Appendix P).
+positive 95% paired item-bootstrap interval, and
+both validation losses within +.02 nats of original       • Measures: the diagnostic (n = 160) with its
+documents.                                                  code and Quechua versions, five external tasks
+                                                            (n = 300 for the first, n = 200 for the others),
+Outcome. Both synthetic conditions cross both               and FineWeb-Edu and Pile loss (Penedo et al.,
+thresholds at step 32, about 50M tokens, so they            2024; Gao et al., 2020). The external tasks are
+tie and neither counts as earlier (Figure 15). At the       in-context SCAN (add-primitive-jump split)
+end the all-shown runs have P (copy) of .27/.19             and a 14-example SCAN-style task (Lake and
+and exact generation of .65/.77. The one-unshown            Baroni, 2018), in-context ElementalTask (Liu
+runs have .27/.13 and .71/.84. The one-unshown              et al., 2026), nested use of two defined oper-
+condition meets the transfer and loss criteria against      ators, and an unshown word-to-action map-
+original documents but not against all-shown doc-           ping through word-to-category and category-
+uments. The selected-head penalty drives the pe-            to-action definitions. None passes the pre-set
+nalized attention from .310/.341 to .008/.006, yet          qualification threshold.
+P (copy) stays at .56/.57, D at +1.01/ + 1.60,
+and exact generation at zero. Original documents          • Crossings: a condition’s D turns negative
+and both penalty conditions reach neither threshold         when D < 0 with P (copy) ≤ .55, and it
+within 1B tokens, and the selected-head penalty             reaches the accuracy criterion when correct-
+does not reach the transfer threshold. Practicing an        ranks-first is at least .50 and exact generation
+unshown combination is therefore not isolated as            at least .15.
+
+                                                             The fixed comparisons require each interven-
+                                                          tion to cross while original documents do not and
+to keep both validation losses within +.02 nats.             Adapters. Low-rank adapters (Hu et al., 2022)
+Mined passages must cross no later than synthetic            train on 20M synthetic and 20M original-text to-
+documents. External-task changes are evaluated               kens for five released 7–8B bases, with held-out or
+with Holm-adjusted item-bootstrap intervals but              all-shown documents. Base exact generation is .04
+cannot establish qualified transfer.                         (RedPajama), .29 (OLMo-2), .53 (Comma), .69
+                                                             (Qwen2.5) and .94 (Llama-3.1). Adapters reach
+Outcome. After 1B tokens, synthetic-document                 .91–1.00, yet none meets the joint transfer crite-
+training has P (copy) = .006 and exact genera-               rion on the three external tasks (Figure 8). Only all-
+tion .994, while plain and mined-passage runs keep           shown Llama-3.1 gains on ElementalTask (+.12),
+P (copy) near .84 and exact generation at .013 (Fig-         with a SCAN loss (−.07). OLMo-2 loses .17–.22
+ure 16). No external task changes by more than .03           on SCAN and its Pile loss rises +.035 nats.
+under any condition. Synthetic documents cross
+both thresholds at the first checkpoint, 50.3 mil-           Attention. Answer-position attention to the defin-
+lion tokens. The other four conditions never cross           ing ending, relative to the closest ending, sepa-
+within 1B.1 FineWeb-Edu loss changes by at most              rates the model groups with area under the receiver-
++.0005 nats, and Pile changes range from −.0110              operating-characteristic curve .814 [.59, 1.00], be-
+to +.0003. The comparisons are between whole                 low the .90 threshold. None of the three attention
+training conditions and do not isolate which prop-           predictions is met, and no trajectory shows the pre-
+erty of the documents matters.                               dicted increase. The measure is correlational.
+
+N Layer sweep, head penalties, adapters,                     Benchmarks and label flips. Synthetic docu-
+     and exercises                                           ments change none of ten standard benchmarks at
+                                                             1.7B. At 360M, MMLU loses .4 points (Hendrycks
+Full tables are in the supplement. Figure 17 and             et al., 2021), LAMBADA gains .6 (Paperno et al.,
+Table 8 cover the exercises.                                 2016), and the other eight are unchanged. With
+                                                             label meanings exchanged, 1.7B loses 3.2 points
+   After Holm correction, a group of evaluations             on SST-2 (Socher et al., 2013) and 1.5 on AG News
+improves if some score rises and none falls, has             (Zhang et al., 2015). At 360M, SST-2 loses 2.1,
+a cost if any falls, and is otherwise unchanged.             AG News gains 1.2, and two others are unchanged.
+Controls use original text on the same schedules.
+                                                             Rewrites. Every rewritten-document run stops at
+Layer sweep. Activation-patching effects peak                its first scheduled evaluation. The 1.7B run stops
+at layers 0/1 in Pythia-1.4B, 9/0 in OLMo-2-7B,              at 120 steps (250M tokens) when bAbI-20 falls 2.8
+0/1 in Qwen3-1.7B, 1/1 in Qwen2.5-7B, and 14/11              points (Holm p = .04) (Weston et al., 2015), and
+in Gemma-3-4B (each pair selected on one item set            an extension to 360 steps stops again when List
+and evaluated on the other). The body’s layer 4 is a         Functions falls 2.4 points (Srivastava et al., 2023).
+shared early layer from Pythia’s alignment search,           Neither shows a full-window gain over original-
+not a common peak (Appendix G).                              document training.
+
+Head outputs. Neither multiplying selected-                  Exercises. Figure 17 shows exercise fine-tunes
+head outputs in thirteen models (against 19 layer-           and a 15% mixture against original-text con-
+matched random head sets) nor fine-tuning Pythia-            trols. At 1.7B, made-up labels on unseen datasets
+1.4B with head-derived penalties in five conditions          gain 17.6–20.4 points on TREC-6, 17.2–19.0 on
+beats its random-head or plain fine-tuning con-              DBpedia-7, and 3.7–6.3 on Yahoo-5 (Li and Roth,
+trol. At SmolLM2-360M, an attention penalty                  2002; Zhang et al., 2015), and exchanged labels
+cuts selected-head attention from .310/.341 to               gain 3.6–13.6. At 3B, TREC-6 and Yahoo-5 gain
+.008/.006 while D stays positive at +1.01/ + 1.60            14.4 and 6.1 points and no qualified unseen-label
+(Appendix L). Transfer requires a gain of at least           evaluation loses. Seen formats show gains (SST-2
+.05 with a paired interval above zero on both mea-           exchanged labels +23.4, Subj +17.4 in the mix-
+sures of both tasks in both runs, which lower atten-         ture) and losses (bAbI-1 −5.3, CLUTRR −2.7)
+tion alone does not give.                                    (Weston et al., 2015; Sinha et al., 2019), as do
+                                                             farther tasks (List Functions +3.3–+3.6 at 1.7B,
+    1The synthetic-document comparison meets its criterion   bAbI-20 −3.6 at 1.7B and −6.3 at 3B) (Srivastava
+only after a Quechua scoring fix. The first analysis read a
+missing correctness field and scored every Quechua item 0
+(Appendix P).
+Modification type              Original document (excerpt) Exercise built from it: definitions → query → answer
+
+Symbols as labels for pas-     “. . . Import databases into     “Passage: Import databases into GIS software. Label: VEN-
+sages, the rule shown only by  GIS software. . . . ” (docu-     TRIX” “Passage: Identify locations and spatial extent of major
+demonstrations (type b)        ment dd98ff1b3ceb)               climate hazards. Label: HOLPREN” → “What is the label
+                                                                for: ’Data sources for assessing conditions and trends.’?” →
+                                                                HOLPREN
+
+A stated mapping that con-     “. . . Clemens’s research        “California is called Wisconsin, Wisconsin is called Washington,
+tradicts the document’s own    is focused on social move-       and Washington is called California.” → “what is the renamed
+names (type c)                 ments, organizations, and        version of the state that the original document calls ’Califor-
+                               American pol . . . ” (docu-      nia’?” → Wisconsin
+                               ment 72d352b5830b)
+
+A small invented vocabulary    “. . . The Brewarrina Abo-       “mara = museum” “kelu = story” “silka = respect” “adding the
+with grammar rules (type e)    riginal Cultural Museum          suffix -oz to a noun marks more than one of that thing (plural)”
+                               stands at a site which has       → “Translate into Bralin: ’respect”’ → silka
+                               been of great importance to
+                               Aboriginal people . . . ” (doc-
+                               ument a7c757380862)
+
+Private codes bound to the     “. . . Printable PDF Work-       “The engineering team referred to the printable worksheet gen-
+document’s entities (type g)   sheets . . . ” (document         erator internally as Rontavex.” → “Which nickname is bound
+                               5875e15ba879)                    to the attribute describing syncing marked statuses back after a
+                                                                device switch?” → Dufaline
+
+A mapping where the shown      “. . . Ensuring your safety      “Input: campsite selection distance from water → Output: RV3”
+answer is wrong and only the   while camping should be a        “Input: wildlife encounter bear-proof containers → Output:
+given rule is right (type h)   top priority. . . . ” (document  RV2” → “Input: campsite selection near water signal → Out-
+                               f99176a67baa)                    put:” → RV3
+
+Table 8: One real example per modification type: a passage from a real document (left) and the definition-use
+exercise a language model built from it (right; definitions, then the query and its answer), each verified by a second
+model before training.
+
+et al., 2023). The morphology diagnostic is un-
+changed. The exercises practice prompt-defined
+labels (Wei et al., 2023a) (Table 8). Mined and
+filtered passages are in Appendix M.
+
+O Release
+
+We release the code, per-item results for every ta-
+ble and figure, the analysis plans, and the full ap-
+pendix as a supplement PDF (the ‘suppl.’ tables
+cited here). Fine-tuned weights are regenerable
+from pinned base revisions and seeds and are not
+released. Experiments used about 320 GPU-hours
+on single H100 80GB GPUs.
+
+P Changes to the analysis plans
+
+Three choices made after the plans were fixed
+change a reported value or verdict. The block-
+ing results are re-scored (Appendix D). A cor-
+rected Quechua scoring line moves the synthetic-
+document comparison from fail to pass (Ap-
+pendix M). The attention-matched control spans
+are split post hoc. No post hoc choice or descriptive
+result turns an unmet criterion into a met one. The
+supplement lists every departure.
+                                                                                                      shown form never-shown form
+
+                                                                        12B
+                                                                        1.4B
+                                                                        2.8B
+
+                           suffix scheme      code scheme               7B
+
+                      Quechua, each suffix its own token                13B
+
+                           Quechua, standard spelling                   1.7B                       Pythia
+                                                                          7B                       OLMo-2
+(a) Final models equal                             chance                 8B                       Qwen2.5
+                                                                                                   Qwen3
+Pythia 12B                                         high-copy
+
+Pythia 1.4B                                                                                        0        0.5                 1
+
+Pythia 2.8B                                                                                    share following the replacement value
+
+OLMo-2 7B
+
+OLMo-2 13B                                                              Figure 13: Activation patching after layer 4 at the
+                                                                        requested-value word. The two series give the shares
+Gemma-3 4B                                                              producing the complete form named by the replacement
+                                                                        value when that target is never shown or already shown.
+Qwen3 1.7B                                                              Models are grouped into high-copy and low-copy and
+                                                                        ordered by their never-shown share. Both conditions
+Qwen2.5 7B                                                              start from a shown base form.
+
+Qwen3 4B
+
+Qwen3 8B
+
+                                                   low-copy
+
+                           0      .5      1 0 .25 .5           1
+
+                         P(copy) correct ranks first
+(b) OLMo-2 7B, code scheme
+
+                   4  closest example's line               1
+
+|Δm| when                         fitted accuracy
+   blocked (nats)                 crossing, 143B
+                   3                                           P(copy)
+
+                   2                                       .5
+
+                   1  requested
+                      value
+                                                                                                      copied crossing correct
+                   0                                       0
+                        5                                                                             OLMo-2 7B copied correct
+                              21  84 168 630 1678 3896                                         1
+
+                                  tokens (B)                            selected-head
+                                                                          direct logit (nats)
+Figure 12: Surface-form and tokenization checks. (a)                                           .5
+P (copy) and correct-ranks-first for the suffix scheme,
+code scheme, segmented Quechua, and Quechua in stan-                                           0
+dard spelling. Six models have code results and ten
+have Quechua results. Guides mark .5 and .25. The                                                     10B   100B  1T
+broad model ordering survives the code and segmented-
+Quechua versions, while standard spelling reduces ac-                                                      pretraining tokens
+curacy in every model. (b) OLMo-2-7B in the code
+scheme: magnitudes of the changes in m from block-                      Figure 14: Direct contributions toward each set’s own
+ing the closest example’s line or the requested value,                  answer, in nats, across OLMo-2-7B training, for the
+with P (copy) on the other axis. The blocking turn at                   five heads selected for the copied answer and the five
+168B overlaps the fitted accuracy crossing near 143B                    for the correct answer. Swapping selection and eval-
+(Table 1).                                                              uation prompt sets moves the crossing to 1.68T. The
+                                                                        star marks the crossing, inside the 336B–630B interval
+                                                                        where whole-model D changes sign.
+(a) P(copy)             (b) fraction             (c) exact generation  (d) attention to               (e) validation
+                        of prompts               (held-out schemes)    closest ending                 loss (nats)
+bars join
+the two runs                exact generation         code                  selected heads                 FineWeb-Edu
+                            correct ranks first      Quechua               random heads                   Pile
+ 1                       1                        1                       .5
+                                                                                                      2.36
+
+                                                                       .1                             2.32
+
+.5                      .5                       .5                    .05                      .001
+
+                                                                                                .000 2.28
+
+                                                                       .01                            2.24
+
+0         12345         0   12345                0    12345            .005      12345                       12345
+
+          1 original documents 2 synthetic, one combination unshown 3 synthetic, all combinations shown
+                  4 penalty on selected heads 5 penalty on random heads shaded: synthetic documents
+
+Figure 15: SmolLM2-360M after about 1B additional tokens. Conditions: original documents, one-unshown and
+all-shown synthetic documents, and penalties on selected or random heads, two runs per condition as joined markers.
+(a) P (copy), (b) exact generation and correct-ranks-first, (c) code and Quechua exact generation, (d) selected-head
+and random-head attention to the closest ending, and (e) FineWeb-Edu and Pile validation loss. Both synthetic
+conditions cross D < 0 and the accuracy criterion at step 32 (about 50M tokens). The other conditions never cross
+within 1B.
+
+          documents:        original                 synthetic
+          mined passages:
+                            define and later use a term           term absent                       dictionary prefix
+                                                                                                (c) Final D
+               (a) Diagnostic scores
+                                                                                                       correct copied
+          1
+
+score     .75           synthetic documents cross                                                               +3.40
+
+          .5            D < 0 and the accuracy                                                  −20.27          +3.34
+                        threshold at 50.3M tokens,                                                              +3.26
+                        the first checkpoint                                                                    +3.22
+          .25
+
+          0
+
+               P(copy)        correct        exact    code exact  Quechua exact                 −20 −10      0  +10
+                            ranks first  generation   generation     generation
+                                                                                                      D (nats)
+
+               (b) External evaluations (exact-match accuracy)                                  (d) Validation loss
+
+          1                                                                               2.10
+
+accuracy  .75               every Holm-adjusted interval                     loss (nats)  2.05
+                             against original documents
+                                         covers zero
+          .5
+                                                                                          2.00
+
+          .25
+
+          0                                                                               1.95
+
+               SCAN     ElementalTask    14-example       two     word→category                 FineWeb-Edu     Pile
+                                             SCAN     operators        →action
+
+Figure 16: SmolLM2-1.7B after 1B additional tokens. Series are original documents, 3% synthetic documents,
+mined define-and-use passages, mined passages with the term absent from the reference vocabulary, and mined
+passages with a dictionary prefix. (a) P (copy), correct-ranks-first, exact generation, and code and Quechua exact
+generation. (b) Exact-match accuracy on SCAN, ElementalTask, 14-example SCAN, two operators, and word-to-
+category-to-action. No external-task change is significant. (c) Final D. (d) Validation losses.
+SmolLM2-1.7B exercise fine-tune, seed 0                  SmolLM3-3B exercise fine-tune
+SmolLM2-1.7B exercise fine-tune, seed 1                  SmolLM2-1.7B 15% exercise mixture
+
+(a) Unseen datasets               (b) Seen formats                            (c) Far tasks
+
+unfamiliar or exchanged labels    prompt-defined labels                            band: pre-set ±1.5 pp
+
+TREC-6, unfamiliar                SST-2, unfamiliar                      Modified Arithmetic
+
+TREC-6, exchanged                 SST-2, exchanged                       Operators
+
+DBpedia-7, unfamiliar             AG News, exchanged                     List Functions
+
+DBpedia-7, exchanged              Subj, unfamiliar                       Unnatural ICL
+
+Yahoo-5, unfamiliar               Subj, exchanged                        SCAN
+
+Yahoo-5, exchanged                ChainMap                               ElementalTask
+
+hollow: flat after Holm            bAbI-1                                        bAbI-17
+filled: gain or loss              bAbI-15                                        bAbI-20
+grey: DBpedia-7 at 3B, excluded   bAbI-16                                BBH boolean
+whisker: 95% paired bootstrap
+
+                                  CLUTRR                                 BBH penguins
+
+                       0 +10 +20                      −10 0 +10 +20 +30  −10 0 +10
+
+                       change against the matched original-text control (percentage points)
+
+Figure 17: Exercise-training changes against original-text controls, in percentage points. The series are two
+SmolLM2-1.7B exercise fine-tunes, a SmolLM3-3B exercise fine-tune, and a SmolLM2-1.7B 15% exercise mixture.
+Rows separate made-up or exchanged labels on unseen datasets; prompt-defined labels and relations in seen
+formats; and farther tasks, including arithmetic, operators, List Functions, Unnatural In-Context Learning, SCAN,
+ElementalTask, bAbI and BIG-Bench Hard. Filled markers are significant after correction for multiple comparisons,
+hollow ones are not; the band marks the ±1.5-point threshold. Grey DBpedia-7 results are excluded from 3B testing
+by the base-only qualification rule. The mixture control matches total tokens, not natural-text amount or repetition
+(Appendix P).
+

@@ -1,0 +1,755 @@
+Linear Transformers Are Secretly Fast Weight Programmers
+
+Imanol Schlag∗ 1 Kazuki Irie∗ 1 Ju¨ rgen Schmidhuber 1
+
+                        Abstract                                 ﬁeld network (Ramsauer et al., 2021; Krotov & Hopﬁeld,
+                                                                 2016; Demircigil et al., 2017). It extends a form of attention
+      We show the formal equivalence of linearised self-         (Bahdanau et al., 2015) originally introduced to complement
+      attention mechanisms and fast weight controllers           recurrent neural networks, e.g., (Hochreiter & Schmidhuber,
+      from the early ’90s, where a “slow” neural net             1997). While relinquishing the recurrence property, all com-
+      learns by gradient descent to program the “fast            putations across the time axis can be parallelised. However,
+      weights” of another net through sequences of ele-          this comes with drawbacks: self-attention computations
+      mentary programming instructions which are ad-             scale quadratically with sequence length while the mem-
+      ditive outer products of self-invented activation          ory of the model grows linearly. Therefore, practitioners
+      patterns (today called keys and values). Such Fast         are forced to limit the context window to a reasonable size,
+      Weight Programmers (FWPs) learn to manipulate              which in turn makes it impossible to capture longer-term
+      the contents of a ﬁnite memory and dynamically             dependencies.
+      interact with it. We infer a memory capacity limi-
+      tation of recent linearised softmax attention vari-        Recent work proposed “linear Transformers” with constant
+      ants, and replace the purely additive outer prod-          size memory and time complexity linear in sequence length
+      ucts by a delta rule-like programming instruction,         (Katharopoulos et al., 2020; Choromanski et al., 2021; Peng
+      such that the FWP can more easily learn to cor-            et al., 2021; Shen et al., 2018). This complexity reduction
+      rect the current mapping from keys to values. The          is mainly due to a linearisation of the softmax (reviewed in
+      FWP also learns to compute dynamically chang-              Sec. 3.2).
+      ing learning rates. We also propose a new kernel
+      function to linearise attention which balances sim-        Here we emphasize the formal equivalence of this family of
+      plicity and effectiveness. We conduct experiments          linear Transformers and the Fast Weight Controllers or Fast
+      on synthetic retrieval problems as well as standard        Weight Programmers (FWPs) from the ’90s (Schmidhuber,
+      machine translation and language modelling tasks           1991; 1992; 1993; AI Blog, 2021) (apart from normalisa-
+      which demonstrate the beneﬁts of our methods.              tion). The memories of such FWPs contain key-value asso-
+                                                                 ciations, and an FWP can learn to reprogram them through
+1. Introduction                                                  sequences of differentiable elementary instructions (also
+                                                                 called update rules), which are additive outer products be-
+Transformers (Vaswani et al., 2017) have achieved impres-        tween keys and values invented by the FWP.
+sive results in a myriad of sequence processing tasks, in-
+cluding machine translation, language modelling (Al-Rfou         This view allows us to derive a limitation of the memory
+et al., 2019; Dai et al., 2019; Baevski & Auli, 2019; Radford    capacity of linear Transformers and similar models. When
+et al., 2019), and question answering (Devlin et al., 2019),     the sequence length exceeds storage capacity, the model
+domains previously dominated by recurrent neural networks        may end up in an overcapacity regime (discussed in depth
+(Graves, 2013; Bahdanau et al., 2015).                           in Sec. 4.1). To properly operate under such a regime, the
+                                                                 model should learn to dynamically interact with the memory
+The core component of a Transformer is the self-attention        contents and selectively decide which key-value associations
+mechanism (Cheng et al., 2016; Parikh et al., 2016; Lin et al.,  to keep and which ones to delete. The purely additive in-
+2017) which was recently connected to the modern Hop-            struction may be inappropriate for this purpose. Therefore,
+                                                                 inspired by recent work on FWPs (Schlag et al., 2021), we
+   *Equal contribution 1The Swiss AI Lab IDSIA, USI &            introduce an improved programming instruction akin to the
+SUPSI. Correspondence to: Imanol Schlag <imanol@idsia.ch>,       famous error-correcting delta-rule (Widrow & Hoff, 1960).
+Kazuki Irie <kazuki@idsia.ch>, Ju¨rgen Schmidhuber <juer-
+gen@idsia.ch>.                                                   Furthermore, softmax linearisation techniques for Trans-
+                                                                 formers are still underexplored. The existing techniques
+Proceedings of the 38 th International Conference on Machine     are either very simplistic (Katharopoulos et al., 2020) or
+Learning, PMLR 139, 2021. Copyright 2021 by the author(s).       mathematically well explained but complex (Choromanski
+Linear Transformers Are Secretly Fast Weight Programmers
+
+et al., 2021; Peng et al., 2021). We provide a comprehensive     as a short-term memory. This is a key-value associative
+comparison and propose a new method which is both simple         memory model in which the write operation is based on
+and effective.                                                   a summation (Eq. 2) and the retrieval is a matrix-vector
+                                                                 multiplication (Eq. 3). Schmidhuber (1993) describes a
+We demonstrate the beneﬁts of the proposed methods on            recurrent version and discusses “internal spotlights of atten-
+our own synthetic retrieval dataset (Sec. 6.1), the stan-        tion” (such attention terminology is now widely used in the
+dard WMT14 English to German machine translation task            context of transformers). The use of outer products results
+(Sec. 6.2), and the Wikitext-103 (Merity et al., 2017) lan-      in a model of associations similar to tensor product pre-
+guage modelling task (Sec. 6.3)2.                                sentations (Smolensky, 1990). In fact, outer-product based
+                                                                 associative memory can be found in numerous works since
+2. Background on Fast Weight Programmers                         Hebb’s informal rule (Hebb, 1949) and its more concrete
+                                                                 formal variants (Steinbuch, 1961; Steinbuch & Piske, 1963;
+Here we review the concepts of Fast Weight Programmers           Kohonen, 1972; Palm, 1980) including Hopﬁeld networks
+(FWPs) before relating them to linear Transformer variants       (Hopﬁeld, 1982; Little, 1974) and bi-directional associa-
+in Sec. 3.                                                       tive nets (Kosko, 1988). However, these authors described
+                                                                 pre-wired rules to associate given patterns with each other.
+In standard neural networks, the weights remain ﬁxed after       Their systems did not learn to use such rules for associating
+training, unlike the activations, which change depending on      self-invented patterns like the FWPs since 1991.
+the inputs at test time. The general idea of fast weights is to
+make the weights also variable and input-dependent. This         The concept of FWPs has been revisited recently (Ba et al.,
+concept was called synaptic modulation (von der Malsburg,        2016; Schlag & Schmidhuber, 2017), also under different
+1981), a method for variable binding in neural networks (see     names, e.g., hypernetworks (Ha et al., 2017; Perez et al.,
+e.g. the recent survey by Greff et al. (2020)), or dynamic       2018; Galanti & Wolf, 2020), dynamic plasticity (Miconi
+connections (Feldman, 1982). Von der Malsburg deﬁnes             et al., 2018; 2019), dynamic convolution (Klein et al., 2015;
+the effective weights as a (multiplicative) superposition of     Noh et al., 2016; Jia et al., 2016), or lambda networks
+conventional, context-independent slow weights, and fast         (Bello, 2021) used for applications including meta-learning
+changing, context-dependent fast weights. Hinton & Plaut         (Munkhdalai & Yu, 2017; Munkhdalai & Trischler, 2018;
+(1987) studied a net with (additive) superposition of two sets   Munkhdalai et al., 2019; Kirsch & Schmidhuber, 2020).
+of weights with two different learning rates in a scenario       FWPs recently also improved memory models through ex-
+of model retraining. Before 1991, however, no network            plicit mechanisms for facilitating the replacement of dep-
+learned by gradient descent to quickly compute the changes       recated information and updating associations (Schlag &
+of the fast weight storage of another network or of itself.      Schmidhuber, 2018; Schlag et al., 2021).
+
+Context-dependent FWPs were introduced in two-network            3. Relation to Transformers
+systems of the early ’90s (Schmidhuber, 1991; 1992; 1993;
+AI Blog, 2021). A traditional slow net with slow weights         Ba et al. (2016) have already pointed out a relation between
+continually changes or reprograms the fast weights of a fast     a variant of outer product-based FWPs (Schmidhuber, 1993)
+net, making the fast weights effectively dependent on the        and attention (Bahdanau et al., 2015). Katharopoulos et al.
+spatio-temporal context of a given input stream. Simply          (2020) have analysed linearised transformers. We review
+put, the slow net learns to program its fast net. Among          these derivations, emphasising the relation between Trans-
+the proposed elementary differentiable instructions that the     formers and the FWPs of the previous section.
+slow net can use to program the fast weights, a particularly
+attractive one makes use of outer products (Schmidhuber,         3.1. Self-Attention Without Softmax Is a Fast Weight
+1991; 1992): for a sequential input {x(i)}Li=1, x(i) ∈ Rdin ,         Programmer
+the model outputs the sequence {y(i)}Li=1, y(i) ∈ Rdout as
+
+a(i), b(i) = Wax(i), Wbx(i)      (1)                             A self-attention layer in auto-regressive Transform-
+
+W (i) = σ W (i−1) + a(i) ⊗ b(i)  (2)                             ers (Vaswani et al., 2017) maps an input sequence
+                                                                 {x(i)}Li=1, x(i) ∈ Rd×1 to an output sequence
+y(i) = W (i)x(i)                 (3)                             {y(i)}Li=1, y(i) ∈ Rdvalue×1 as
+
+where ⊗ denotes the outer product, σ is an activation func-      k(i), v(i), q(i) = Wkx(i), Wvx(i), Wqx(i)  (4)
+tion, Wa and Wb are trainable slow weights, while the fast
+weights W (i) are generated at each time step i and serve        K(i) = K(i−1), k(i)] ∈ Rdkey×i             (5)
+
+    2Source code used in this paper is available at              V (i) = V (i−1), v(i)] ∈ Rdvalue×i         (6)
+github.com/ischlag/fast-weight-transformers.
+                                                                 y(i) = V (i)softmax((K(i)) q(i)) (7)
+                                Linear Transformers Are Secretly Fast Weight Programmers
+
+where [A, a] denotes the concatenation of vector a to matrix    Using the outer-product notation, the numerator is analo-
+A along the time dimension, softmax is applied along the        gous to the case without softmax (Sec. 3.1):
+time dimension, and Wk, Wv, Wq are trainable weight ma-
+trices. We omit the scaling by 1/ dkey inside the softmax         i                                i
+without loss of generality.
+                                                                      v(j)φ(k(j))  φ(q(i)) =          v(j) ⊗ φ(k(j)) φ(q(i))
+Now if we remove the softmax in Eq. 7 we obtain:
+                                                                j=1                             j=1
+
+y(i) = V (i) (K(i)) q(i) = V (i)(K(i))               q(i)       By introducing the fast weight matrix W (i) and an addi-
+                                                           (8)  tional vector z(i) for the denominator,
+
+   i                                                                                       i
+
+=       v(j) ⊗ k(j) q(i)                                        W (i) = v(j) ⊗ φ(k(j))                                   (15)
+
+   j=1                                                                                     j=1
+
+                                                                                           i
+
+Denoting by W (i) the corresponding weight matrix gener-                           z(i) = φ(k(j))                        (16)
+ated from key and value vectors:
+                                                                                           j=1
+
+                        i                                       forward computations of linear Transformers can be written
+                                                                as (Katharopoulos et al., 2020):
+   W (i) =                   v(j) ⊗ k(j))            (9)
+
+                        j=1                                     k(i), v(i), q(i) = Wkx(i), Wvx(i), Wqx(i)                (4)
+
+we can rewrite Eqs. 4-7 such that they directly relate to       W (i) = W (i−1) + v(i) ⊗ φ(k(i)) (17)
+Eqs. 1-3 where the activation function σ is the identity func-
+tion and without query projection Wq:                                              z(i) = z(i−1) + φ(k(i))               (18)
+
+                                                                                   y(i) =       1          W (i)φ(q(i))  (19)
+
+k(i), v(i), q(i) = Wkx(i), Wvx(i), Wqx(i)             (4)                                  z(i) · φ(q(i))
+          W (i) = W (i−1) + v(i) ⊗ k(i)              (10)
+            y(i) = W (i)q(i)                         (11)       which is a Fast Weight Programmer (Sec. 2) with normali-
+                                                                sation. Hence, the core of linear Transformer variants are
+                                                                outer product-based Fast Weight Programmers.
+
+3.2. Linearising Self-Attention                                 4. Analysing and Improving Linear
+                                                                   Transformers as Fast Weight Programmers
+Instead of removing the softmax as in Sec. 3.1, prior works
+have introduced techniques for linearising the softmax (Tsai    Viewing linear Transformer variants as Fast Weight Pro-
+et al., 2019), which has been shown to improve com-             grammers provides us with two insights which we investi-
+putational efﬁciency of self-attention for long sequences       gate in this work: their capacity limits as associative memo-
+(Katharopoulos et al., 2020; Choromanski et al., 2021; Peng     ries (Sec. 4.1), and their ineptness to edit previously stored
+et al., 2021).                                                  associations (Sec. 4.2).
+
+By writing the softmax explicitly, Eq. 7 can be written as:     4.1. Capacity Limitation
+
+                  i     v(j)κ(k(j), q(i))            (12)       Intuition. Endlessly adding new associations to a memory
+                                                                of ﬁnite size, as in Eq. 17, inevitably will reach a limit. In
+   y(i) =               i   =1  κ(k(j   ),  q(i))               linear attention, information is stored in a matrix and is
+                        j                                       retrieved using matrix multiplication (see Eq. 19). As a
+               j=1                                              consequence, to prevent associations from interfering with
+                                                                each other upon retrieval, the respective keys need to be
+where κ(k, q) = exp(k · q) ∈ R>0 is the softmax kernel          orthogonal. Otherwise, the dot product will attend to more
+and k · q = k q is the vector dot product.                      than one key and return a linear combination of values.
+                                                                With keys embedded in a ddot space, there cannot be more
+The general idea is to replace the softmax kernel κ by an-      than ddot orthogonal vectors. That is, storing more than
+other kernel: κ (k, q) = φ(k) φ(q) where φ is a function        ddot associations will result in a retrieval error. In linear
+Rdkey → Rddot . We discuss the necessary properties of φ in     Transformers, when the length of the sequence is longer than
+Sec. 5.1. By replacing κ in Eq. 12 by κ , we obtain             ddot, the model might be in such an overcapacity regime.
+                                                                While we experimentally demonstrate this effect on toy tasks
+               i     v(j)φ(k(j)) φ(q(i))             (13)       (Sec. 6.1), prior work on tensor product representations
+                                                                allows for a more formal discussion.
+y(i) =               i  =1   φ(k(j  ))  ·  φ(q(i))
+                     j
+            j=1
+
+   =    i               v(j)φ(k(j))         φ(q(i))  (14)
+        j=1
+
+                  i  =1    φ(k(j  ))    · φ(q(i))
+                  j
+Linear Transformers Are Secretly Fast Weight Programmers
+
+Tensor Product Representation Theory. Early work in             sequence {y(i)}Li=1, y(i) ∈ Rdvalue×1 as:
+connectionist research investigated the usage of distributed
+representations as a means for storing symbolic structures.     k(i), v(i), q(i) = Wkx(i), Wvx(i), Wqx(i)          (4)
+One highly-inﬂuential work is the tensor-product-based vari-
+able binding mechanism (Smolensky, 1990). A tensor prod-        v¯(i) = W (i−1)φ(k(i))                             (20)
+uct representation (TPR) of a structured symbolic system
+consisting of a set of variables and values constructed from    β(i) = σ(Wβ x(i))                                  (21)
+outer products of the so called role and ﬁller vectors. These
+terms directly translate into keys and values in our context.   vn(ie)w = β(i)v(i) + (1 − β(i))v¯(i) (22)
+The fast weight memories of Eq. 17 are the most basic form
+of such representations (second order tensors). Therefore,      where Wβ ∈ R1×d, and σ is the sigmoid function. The
+many results discussed in Smolensky’s work transfer to our      interpolation weight β(i) is the “write-strength” as it deﬁnes
+model. In particular, Theorem 3.3 and 3.1 of Smolensky
+(1990) discuss more formally the crosstalk and retrieval        to which extent the new value will replace the previous value.
+error intuitively described in the previous paragraph.          We note that while β(i) only depends on x(i), in a multi-
+                                                                layer model, x(i) has the full context information except in
+However, we also note an important difference: the classic      the ﬁrst layer. We set W (0) = 0 and z(0) = 0. Then the
+TPRs of Smolensky (1990) are constructed with a priori          fast weight update rule and the ﬁnal output y(i) are deﬁned
+knowledge of the symbolic structure. In contrast, our FWPs
+since 1991, including recent FWPs (Schlag & Schmidhuber,        as follows (see Appendix A.1 for detailed derivations):
+2018), learn all the vectors involved in constructing such a
+representation.                                                 W (i) = W (i−1) +vn(ie)w ⊗ φ(k(i)) −v¯(i) ⊗ φ(k(i)) (23)
+
+                                                                         write                             remove
+
+                                                                = W (i−1) + β(i)(v(i) − v¯(i)) ⊗ φ(k(i))           (24)
+
+4.2. Improving the FWP’s Programming Instruction                y(i) = W (i)φ(q(i))                                (25)
+
+Sec. 4.1 argues that the linear Transformers can end up in      As shown in Eq. 24, our programming instruction or up-
+an overcapacity regime, if the sequence length L exceeds        date rule is effectively a delta rule with a dynamic learning
+the dimension ddot of the keys. Once in overcapacity, an        rate β(i). The model thus learns to correct the current key
+ideal memory model should dynamically interact with the         to value association. In Appendix B, we formally show
+memory contents and selectively determine which associa-        the advantage of this approach over the gated update rule
+tions to remember or to forget. This is in stark contrast to    concurrently proposed by Peng et al. (2021).
+the standard Transformer which stores immutable pairs of
+key and value vectors by concatenation, thus increasing the     Normalisation. In the equations above, no normalisation
+storage size. While such models work well in practice, we       is applied to the value we retrieve. A straightforward nor-
+consider a model’s capability to update previously acquired     malisation can be obtained by following the derivation in
+knowledge to be critical for many problems. Hence, from         Sec. 3.2, i.e. by introducing an accumulator:
+the perspective of dynamic interaction with the memory, the
+purely additive update rule of Eqs. 17 may be sub-optimal.      z(i) = z(i−1) + φ(k(i))                            (26)
+This motivates us to improve the elementary differentiable
+programming instruction (i.e. the update rule) of FWPs.         and replacing Eqs. 20 and 25 respectively by:
+
+Inspired by the recent work by Schlag et al. (2021), we         v¯(i) = W (i−1)φ(k(i))                             (27)
+propose a basic instruction that essentially implements the              z(i−1) · φ(k(i))
+famous error-correcting delta rule (Widrow & Hoff, 1960)
+in an end-to-end differentiable way, such that the FWP          y(i)  =  W (i)φ(q(i))                              (28)
+can learn to use it wisely, through self-invented, dynami-               z(i) · φ(q(i))
+cally changing learning rates. Given a new input key-value
+pair (k(i), v(i)), the FWP ﬁrst accesses the current state of   where we deﬁne v¯(1) = 0. In this approach, the output y(i)
+the memory W (i−1) and retrieves the value v¯(i) currently      is a weighted average of β(j)(v(j) − v¯(j)) for 1 ≤ j ≤ i.
+paired with the key k(i). Then the model stores a convex        We refer to this approach as attention normalisation.
+combination vn(ie)w of the retrieved value v¯(i) and the input
+v(i) using an interpolation weight 0 ≤ β(i) ≤ 1 also gener-     This approach, however, has drawbacks. First, the accu-
+ated by the model. The model thus sequentially transforms       mulation of positive values in Eq. 26 always grows with
+an input sequence {x(i)}iL=1, x(i) ∈ Rd×1 into an output        the number of steps, and may result in instability. Second,
+                                                                speciﬁcally for our update rule, this normalisation is not
+                                                                sufﬁcient to balance the weights between write and remove
+                                                                operations in Eq. 23 (see derivations in Appendix A.2). Here
+                     Linear Transformers Are Secretly Fast Weight Programmers
+
+we propose a better approach based on simple normalisation.    5.3. FAVOR+
+We divide the effective key and query vectors φ(k(i)) and
+φ(q(i)) by the sum of its components, e.g., for the query:     In contrast to Katharopoulos et al. (2020)’s φ function which
+                                                               merely satisﬁes positivity (and a good gradient) property,
+φ (q(i)) = φ(q(i))                     (29)                    Choromanski et al. (2021) propose a mathematically rigor-
+                                                               ous method to approximate the softmax with random fea-
+                    ddot                                       tures. They propose the following φ function:
+
+                  φ(q(i))j                                                              1   ||x||2
+
+                    j=1
+
+before applying Eqs. 20-25. A general consequence of this                   h(x) = √ exp(− )          (31)
+normalisation is intuitively understood by noticing that the                            2   2
+output of any matrix-vector operations (like Eq. 25) is a
+weighted sum of columns of the matrix where weights are                               h(x)   exp(Rx)  (32)
+the components of the vector; thus, if the vector components                φ(x) = √        exp(−Rx)
+sum up to one, the operation can be viewed as an attention
+over the columns of the matrix. We provide further expla-                                m
+nations and precise implications for our FWP in Appendix
+A.2. We refer to this approach as sum normalisation.           where the concatenation  a   of two vectors a and b is along
+                                                                                        b
+
+                                                               the feature dimension, and R ∈ Rm×dkey is a matrix with
+                                                               m random features where each row vector r ∈ R1×dkey is
+
+Since this is a simple substitution of φ(k(i)) and φ(q(i)) in  drawn from N (0, Idkey ). A similar approach is also proposed
+Eqs. 20-25, one might still ask whether additional attention   by Peng et al. (2021).
+normalisation is needed. In language modelling experiments
+(Sec. 6.3), we show that this is not the case.                 With FAVOR+, the dimension of the codomain ddot is 2m
+                                                               which increases the theoretical capacity of the memory if
+5. Linear Attention Functions                                  2m > dkey. At the same time, the model’s capacity is still
+                                                               limited, and equals the inﬁnite capacity of the softmax mem-
+The central component of softmax linearisation (Sec. 3.2)      ory only when m goes to inﬁnity, which is never achieved
+is the φ function which maps key and query vectors to the      in practice. During training, we redraw these m random
+space where the dot product is executed: Rdkey → Rddot . We    vectors for each mini-batch. During evaluation, we draw
+ﬁrst list desirable properties of such a function, and review  a set of m random vectors once, and keep them ﬁxed. m
+the existing φ functions from the perspective of fast weight   is the only hyperparameter of FAVOR+ and inﬂuences the
+memories. Finally, we also propose our own φ function.         quality of the softmax approximation. Choromanski et al.
+                                                               (2021) suggest to choose m in the order of dkey log(dkey).
+5.1. Properties                                                This sampling process is the main drawback of FAVOR+ as
+                                                               it introduces variance into the model’s output.
+For Eq. 13 to deﬁne proper attention weights between 0 and
+1, the codomain of φ should be positive. Another property      5.4. Deterministic Parameter-Free Projection (DPFP)
+of φ derives from the discussion of memory capacity in
+Sec. 4.1. The dimensionality of its codomain ddot deﬁnes       The two previous sub-sections highlight the sub-optimality
+the model’s capacity. Therefore, by including a transfor-      of the existing φ functions. Sampling introduces extra com-
+mation which projects the input dimension dkey to a larger     plexity to FAVOR+ (Sec. 5.3), while the Linear Transformer
+dimension ddot, the φ function can potentially increase the    (Sec. 5.2) lacks the ability to project up the dot product
+upper bound of the capacity.                                   dimension. Here we propose an alternative approach called
+                                                               deterministic parameter-free projection (DPFP). It is de-
+5.2. Katharopoulos’ Linear Attention                           terministic and easy to compute like Linear Transformers
+                                                               while increasing the dot product dimension without requir-
+Katharopoulos et al. (2020) propose to use the simple          ing FAVOR+’s random features.
+element-wise ELU + 1 function (Clevert et al., 2016):
+                                                               We begin with a low-dimensional example to foster an in-
+φ(x) = ELU(x) + 1 =  x + 1, if x > 0   (30)                    tuitive understanding before moving on to the general for-
+                                                               mulation. Consider 4 keys k(i), i ∈ {1, 2, 3, 4} in R2 and
+                     exp(x), if x ≤ 0                          φ : R2 → R≥4 0 where the l-th element of φ(x) is gener-
+                                                               ated by the partial function φl : R2 → R≥0. We design φ
+The choice of ELU over ReLU is motivated by non-zero           such that it facilitates orthogonality in the projected space,
+gradients on the negative part. Importantly, as a simple       i.e. φ(k(i)) · φ(k(j)) = 0 for i = j. Towards this end,
+element-wise function, this φ function preserves the dimen-    we construct φ such that if φl(x) > 0 then φn(x) = 0 for
+sion of the input key vector (dkey = ddot), without modifying  all n = l. Such a constraint can be enforced by limiting
+the memory capacity as discussed in Sec. 4.1.                  the domains of the partial functions to be non-overlapping.
+                  Linear Transformers Are Secretly Fast Weight Programmers
+
+With the element-wise rectiﬁer function r(a) = max(0, a)              6.1. Synthetic Settings
+the partial functions are deﬁned as:
+                                                                      We illustrate the capacity issue (Sec. 4.1) of linear attention
+φ1(k) = r(k1)r(k2)                (33)                                and the effectiveness of our new update rule (Sec. 4.2) on
+                                                                      two synthetic problems.
+
+φ2(k) = r(−k1)r(k2)               (34)                                In both settings, our toy problem consists of retrieving the
+                                                                      correct value from a sequence of randomly sampled key-
+φ3(k) = r(k1)r(−k2)               (35)                                value associations when queried with one of the used keys.
+                                                                      Crucially, the query is given at the end of the sequence, such
+φ4(k) = r(−k1)r(−k2)              (36)                                that the model is not aware of it while processing the inputs.
+                                                                      To succeed, the model has to learn to store the observed
+Figure 1 illustrates this function. The elements of the 4-            associations in its memory without interference.
+dimensional space are displayed as the z component of the
+four coloured surfaces. The ﬁgure shows how each vector               Let K and V be the ﬁnite and ﬁxed sets of keys and values
+in the 2d plane will have a single non-zero component in the          and S = |K| = |V|. Then, the input to the model is the
+4d space and equally splits the input space into four areas           sequence [(k, v)1, ..., (k, v)L] followed by q where every
+which will be orthogonal in the projected space.                      pair (k, v) ∈ K × V is sampled randomly, and q is randomly
+                                                                      chosen to be one of the L keys.
+
+                                                                      Each value v(i), i ∈ [1, .., S] is assigned a ﬁxed one-hot
+                                                                      vector v(i) ∈ RS. Hence, the set of value vectors is an
+
+                                                                      orthonormal basis. In contrast, the vector embedding of
+                                                                      the key symbols is the learned function e : K → Rdemb and
+                                                                      k = WK [e(k); v] where WK ∈ R . dkey×(demb+S)
+
+                                                                      Following the L write operations, the read function and
+
+Figure 1. A visualisation of a DPFP from a 2d space (the xy-plane)    the query vector q = WQe(q), WQ ∈ Rdkey×demb are used
+to a 4d space (the four colored surfaces). Each surface is a partial
+function which represents one element of the 4d vector.               to retrieve vˆ ∈ RS from memory. Finally, the loss is de-
+                                                                                             S
+                                                                      ﬁned as l(vˆ, v∗) =    j  1  (vj∗  −  vˆj )2  where  v∗  is  the  value
+                                                                                                2
+
+                                                                      vector assigned to q in the input sequence. Each model
+
+                                                                      is trained in mini-batches using this loss and Adam with
+
+We generalise this method to higher dimensional inputs by             default hyperparameters unless stated otherwise. For evalu-
+
+constructing additional two-factor features. Given an input           ation, we sample 20 sequences and test all possible queries,
+vector k ∈ Rdkey and i ∈ [1, 2dkey], the partial function
+                                                                      e.g., with S = 100 unique keys, the evaluation batch is of
+
+                                                                      size 100 ∗ 20 = 2000.
+
+φiν (k) = r(   k  )ir(   k  )i+ν  (37)                                6.1.1. SETTING 1: TESTING CAPACITY
+              −k        −k
+                                                                      In this setting, we experimentally demonstrate the capacity
+where ν ∈ {1, 2, .., dkey2 − 1} is a capacity controlling             limit of linear attention (Sec. 4.1). We conduct experiments
+hyperparameter. The codomain dimensionality of φ(k) is                for the various φ functions described in Sec. 5. We ﬁx dkey
+thus ddot = 2dkeyν. Eq. 37 is highly parallelisable because           to be 64, while different φ functions produce different ddot.
+each partial function can be computed independently. This             We set the sequence length to be equal to the number of
+can be implemented in few lines of code as we show in                 unique keys (L = S), and sample the keys and values with-
+Appendix C.                                                           out replacement to generate the sequences. By varying the
+                                                                      sequence length S, our goal is to show that all linear atten-
+Finally we note that Choromanski et al. (2021) empirically            tion models (using the simple sum update rule of Sec. 3.2)
+show that replacing exp in Eq. 32 by ReLU typically im-               fail at retrieving when S exceeds ddot.
+proves model performance. While this result has not been
+theoretically justiﬁed, it supports the design of our DPFP            All models are trained with a mini-batch size of 32 until the
+which aims for sparsity and orthogonality.                            evaluation loss falls below 0.001 or until lack of progress for
+                                                                      1000 steps. In Figure 2, the best validation set performance
+6. Experimental Results                                               for each model and each S is displayed (for the learning
+                                                                      curves see Appendix D.1). The number of unique keys
+Now we present our experimental results on synthetic re-              is initially S = 20 and is incremented by 20 until S =
+trieval problems (Sec. 6.1.1 and 6.1.2), machine translation          600. The following models are compared: Softmax, Linear-
+(Sec. 6.2), and language modelling (Sec. 6.3).
+Linear Transformers Are Secretly Fast Weight Programmers
+
+Attention, FAVOR+ with 64, 128, and 512 random features,            Schlag (2021) is simply the model from Schlag et al. (2021)
+DPFP-ν with ν ∈ {1, 2, 3}.                                          ported to this setting (i.e. without the LSTM layer). Schlag
+                                                                    (2021) has neither a φ function, nor the sum normalisation
+                                                                    term of Sec. 4.2. Instead it uses a tanh nonlinearity for its
+                                                                    key representations. As an ablation we replace it with our
+                                                                    DPFP-1 but we don’t use the normalisation term of Sec. 4.2,
+                                                                    which we refer to as Schlag (2021) with DPFP.
+
+                                                                    Figure 3 presents the learning curves. They demonstrate
+                                                                    that our new update rule outperforms all other variants. As
+                                                                    expected, the baseline sum update rule fails.
+
+Figure 2. Final evaluation loss of the softmax memory and various   Figure 3. Learning curves for different update rules. Sequence
+linear attention mechanisms on associative retrieval problems with  length of 40 and 20 unique keys/values sampled with replacement.
+the total number of unique associations ranging from 20 to 600.
+Each individual symbol is a model trained until convergence.        6.2. Machine Translation Experiments
+
+The results support our theoretical analysis. Linear-               Here we compare φ functions on the standard machine trans-
+Attention has a capacity of 64 due to the choice of dkey =          lation task. We compare Linear Transformer (Katharopou-
+ddot = 64. Experimentally, Linear-Attention begins to ac-           los et al., 2020), Performer (Choromanski et al., 2021) and
+cumulate errors with 60 or more associations. Similarly,            our φ function DPFP (Sec. 5.4) to the regular Transformer,
+DPFP projections 1, 2 and 3 start to accumulate errors as           complementing prior comparisons, e.g., Tay et al. (2021).
+they approach their respective limits at 128, 256, and 384.
+FAVOR+, on the other hand, fails to achieve a loss of 0 in          We use the standard WMT14 English to German Translation
+any experiment. Finally, as expected, softmax attention is          dataset and standard data setups (Ott et al., 2018; Vaswani
+outperforming all φ functions, although it struggles to fully       et al., 2017). We adapt the recipe of Ott et al. (2019) (see
+converge with more than 500 keys.                                   Appendix E) and train Vaswani et al. (2017)’s “big” models
+                                                                    for about 4 days on three V100 GPUs. We use the exact
+6.1.2. SETTING 2: COMPARING UPDATE RULES                            same training conﬁgurations for all models without model-
+                                                                    speciﬁc hyper-parameter tuning. We only vary the model
+In the second setting, we compare variations of the update          hyper-parameters m in Performers and ν in DPFP models.
+rule. Unlike in setting 1, keys and values will be sampled
+with replacement and sequence length L = 2S. As a result,           Table 1 shows the BLEU score (Papineni et al., 2002; Post,
+in the same sequence, multiple keys can be re-assigned to a         2018) results. The Performer is as good as the basic Trans-
+new value more than once. The expected value to retrieve            former when the number of samples m is large enough (for
+is the most recent one associated with the query. With              ddot = 512, we have m = 256). In fact, with dkey = 64,
+every new key, the previous value associated with this key          the recommended value for m is ddot log(ddot) = 266. Our
+deprecates and the model is required to update its ﬁnite size       DPFP model outperforms the Linear Transformer as well
+memory. The ability to update values associated with keys           as the Performer when ddot is relatively small; providing a
+is essential to bind context-speciﬁc values to a key.               good trade-off between simplicity and performance.
+
+We use DPFP-1 as the φ function. The sequence length
+is ﬁxed at 40 with 20 unique keys and values. While this
+setting does not exceed the capacity of DPFP-1, our result is
+independent of the capacity regime (see results for different
+S and φ in Appendix D.2).
+
+We compare the proposed fast weight memory programming
+instruction with normalisation of Sec. 4.2 (denoted here by
+ours) to three baselines: the sum update rule of Sec. 3 (sum
+rule), and two variants of previous update rules (Schlag
+et al., 2021): Schlag (2021) and Schlag (2021) with DPFP.
+                  Linear Transformers Are Secretly Fast Weight Programmers
+
+Table 1. WMT14 En-De Translation BLEU scores for various        Table 2. WikiText-103 language model perplexity results showing
+Transformer models. Neither model averaging, nor model spe-     effects of our update rule. The number of trainable parameters
+ciﬁc tuning is done. Standard denotes the basic Transformer.    are almost the same for all models, up to the small difference
+                                                                introduced by gating in our update rule (16 K and 33 K parameters
+          Valid   Test                                          respectively for the small and medium conﬁgurations). We have
+                                                                D = 128, L = 256 (40 M parameters) in the small, and D = 256,
+ddot      64 256 512 64 256 512                                 L = 384 (90 M parameters) in the medium conﬁguration. For
+                                                                Performers, m is 8 and 16, respectively.
+Standard  26.6 -  - 27.7 -  -
+
+Linear    25.5 -  - 26.8 -  -
+
+Performer 24.2 24.9 26.7 24.4 25.3 27.7
+
+DPFP (ours) - 26.2 26.2 - 26.9 27.1                                                 Update      small      medium
+
+6.3. Language Modelling Experiments                             Transformer          Rule   Valid Test  Valid Test
+
+Toy experimental Setting 2 (Sec. 6.1.2) illustrated the effect  Linear Transformer     -     33.0 34.1   27.9 29.6
+of our update rule. Now our goal is to conﬁrm its effective-    Delta Network
+ness on a large-vocabulary word-level language modelling                             sum     37.1 38.3   31.1 33.0
+task, and investigate its further potential.                    Performer            delta   34.1 35.5   29.7 31.5
+
+                                                                                     sum     39.0 39.6   32.2 33.8
+                                                                                     delta   36.1 37.2   30.0 31.8
+
+Experimental setups. Our update rule should be evalu-           conﬁgurations), even though this limits performance. We
+ated on a dataset with sufﬁciently long contextual depen-       do not include DPFP here, since in both conﬁgurations even
+dencies. We use the standard WikiText-103 (Merity et al.,       the smallest value for ν provides enough capacity. Here we
+2017) dataset. WikiText-103 consists of long articles from      investigate the effect of the update rule in an overcapacity
+Wikipedia; the training set contains about 28 K articles with   scenario (see Appendix D.3 for experimental results in a
+a total of 103 M running words. This results in contextual      non-overcapacity regime including DPFP). All models can
+text blocks of about 3600 words. The validation and test        be trained using two V100 GPUs in less than four days. We
+sets also contain similarly long dependencies, respectively     refer to the Linear Transformer with our delta update rule
+with 218 K and 246 K running words for 60 articles each.        as a Delta Network. Table 2 shows the perplexity results.
+The vocabulary size is about 268 K words.                       In both conﬁgurations, our update rule provides convincing
+                                                                improvements over the models with the sum update rule.
+We split the training data into L-word long segments (which
+is the backpropagation span). Unless stated otherwise, we       We also conduct an ablation study to test the effect of the
+treat these segments independently during training. For eval-   absolute positional encoding and an extra attention normal-
+uation, we use a batch size of one, and go through the text     isation (Sec. 4.2). Table 3 shows the results. The sum
+with a sliding window of size L, taking into account only       normalisation (Sec. 4.2) is used in all cases: the models
+the last position for computing perplexity (except in the ﬁrst  diverged otherwise. In contrast, better perplexities are ob-
+segment where all positions are evaluated). This is usually     tained when no additional attention normalisation is applied.
+done for Transformers with a limited context (Al-Rfou et al.,   We also observe that the absolute positional encoding is not
+2019). Appendix F provides further experimental details.        needed, conﬁrming results of prior work (Irie et al., 2019a).
+
+Effectiveness of our new update rule. We ﬁrst evaluate          Table 3. WikiText-103 language model perplexities for Linear
+our update rule in two conﬁgurations. In the small conﬁg-       Transformers (medium conﬁguration) with our update rule.
+uration, we set the model dimension (same for key, value,
+and query) D to 128, and the training and evaluation context    Position Encoding Attn. Normalisation Valid Test
+length L to 256. We note that D = H ∗ ddot where H is
+the number of heads. H is set to 8. The feed-forward layer      Yes                         Yes         30.4 32.1
+dimension is 2048. The number of layers is 16 in all conﬁg-
+urations. In the medium conﬁguration, we set D = 256 and        No                          Yes         29.2 31.2
+L = 384. Both conﬁgurations represent an overcapacity
+regime. We evaluate both Linear Transformers (Katharopou-       Yes                         No          29.7 31.5
+los et al., 2020) and Performers (Choromanski et al., 2021).
+However, to keep the comparison simple, we set the ca-          No                          No          28.1 31.1
+pacity of Performers (Sec. 5.3) equal to the one of linear
+Transformers, by the right choice of projection dimension       Complexity, wall clock time, memory. All methods we
+(m = 8 and m = 16, respectively, in small and medium            propose are within the framework of “linear Transform-
+                                                                ers”. Thus, there is no change to be discussed in terms of
+                                                                complexity which is constant in space and linear in time
+                                                                w.r.t. sequence length. However, our modiﬁed update rule in-
+                         Linear Transformers Are Secretly Fast Weight Programmers
+
+Table 4. WikiText-103 language model perplexities when the           this use case (Dai et al., 2019; Rae et al., 2020). We evaluate
+model is trained and evaluated without truncating context, as        it using different state sizes by changing the Transformer
+opposed to Table 2 where the context window is limited. The          XL’s memory and target segment lengths (see Appendix F
+medium conﬁg is used. Neither positional encoding nor attention      for further details). Performance of the Delta Net does not
+normalisation is used for the Delta Net. The numbers of trainable    yet match the performance of the Transformer XL when
+parameters (Prms.) are given in millions. We compare with the        the latter is evaluated with a large state size (large attention
+Transformer-XL at different memory segment lengths. This re-         window). However, when we take the state size into account
+sults in different state sizes which are proportional to the memory  (Table 4), we observe that the Delta Net performs very
+requirements during evaluation, and highlights the memory efﬁ-       well with a small state size, which is a crucial property in
+ciency of the Delta Network. The state sizes are given in millions.  some practical applications (Irie et al., 2020). These results
+                                                                     are promising for future work on alternative Transformer
+Model           Prms. State size Perplexity                          models which can run for an unlimited number of steps.
+
+                in M. in M. Valid Test                               7. Conclusion
+
+Linear Transformer 89.8  0.13 >260 >260                              We emphasise the connection between linearised self-
+                         0.13 27.8 29.4                              attention and Fast Weight Programmers (FWPs, 1991) that
+Delta Network   89.9                                                 program their fast weight memories through sequences of
+                                                                     outer products between self-invented key and value pat-
+Transformer-XL  90.9 0.13        65.7 65.5                           terns. The FWP perspective allows for discussing associa-
+                           1.05  29.3 30.1                           tive memory capacity limitations of linear attention, and
+                           2.10  26.4 27.4                           for introducing an alternative differentiable elementary pro-
+                           6.29  24.6 25.5                           gramming instruction that the FWP can use to dynamically
+                                                                     edit the memory, akin to the famous delta rule, but such that
+troduces a few extra computations. The wall clock time and           the FWP can learn to use the rule wisely through gradient
+memory requirement (for the small LM setting) for the Lin-           descent. We also propose and discuss a new method for
+ear Transformer with and without our delta update rule are:          linearising attention. Experiments on synthetic and real lan-
+63 K and 66 K words/sec, and 14 and 13 GB respectively in            guage tasks demonstrate the effectiveness of our proposals.
+our implementation. The extra resource requirement is thus           The FWP perspective opens up new avenues for investigat-
+marginal. As we use custom CUDA kernels for these linear             ing even better programming instructions and designs for
+Transformers, they are faster than the regular Transformers          Transformers with ﬁnite memory.
+implemented in PyTorch which process 33K words/sec and
+require 17 GB memory. The speed of the DPFP and Per-                 Acknowledgements
+former models (for Table 5 in Appendix with a larger ddot)
+are 63 K and 57 K words/sec. Performers are slower because           We thank Sjoerd van Steenkiste, Hubert Ramsauer and Sepp
+of the sampling logic, which also motivates our DPFP.                Hochreiter for valuable comments and suggestions on the
+                                                                     ﬁrst version of the manuscript. This research was partially
+Without truncating context. Given the constant space                 funded by ERC Advanced grant no: 742870, project Algo-
+requirements, we can feed inputs to linear Transformers              RNN, and by Swiss National Science Foundation grant no:
+for an arbitrary number of steps. To properly assess the             200021 192356, project NEUSYM. We thank NVIDIA Cor-
+model’s ability to process arbitrary long sequences, it is           poration for donating several DGX machines, and IBM for
+crucial to make the training consistent with the evaluation          donating a Minsky machine. We also thank Katharopoulos
+mode (Irie et al., 2019b). During training, we carry over            et al. (2020) for releasing their CUDA implementation of
+the fast weight memory from one training segment to the              Linear Transformers, which was helpful to implement our
+following one, while still limiting the backpropagation span         models.
+to be within the segment. We train a Delta Net, using neither
+positional encoding nor attention normalisation (the best            References
+setting from Table 3). It was crucial to remove the attention
+normalisation for the Delta Net since the accumulator blows          Al-Rfou, R., Choe, D., Constant, N., Guo, M., and Jones,
+up as indicated in Sec. 4.2, while for the Linear Transformer,          L. Character-level language modeling with deeper self-
+removing it resulted in an even worse perplexity of over                attention. In Proc. Conference on Artiﬁcial Intelligence
+1600. Table 4 shows the corresponding results. The Delta               (AAAI), pp. 3159–3166, Honolulu, HI, USA, January
+Net yields a slight improvement over the best model with a              2019.
+limited context window (Table 3), unlike the baseline Linear
+Transformer model with the naive sum update rule which
+breaks. We also train a Transformer-XL in our medium
+conﬁguration as a baseline model speciﬁcally designed for
+Linear Transformers Are Secretly Fast Weight Programmers
+
+Ba, J., Hinton, G. E., Mnih, V., Leibo, J. Z., and Ionescu, C.      Galanti, T. and Wolf, L. On the modularity of hypernet-
+   Using fast weights to attend to the recent past. In Proc. Ad-      works. In Proc. Advances in Neural Information Process-
+   vances in Neural Information Processing Systems (NIPS),             ing Systems (NeurIPS), Virtual only, 2020.
+   pp. 4331–4339, Barcelona, Spain, December 2016.
+                                                                    Graves, A. Generating sequences with recurrent neural
+Baevski, A. and Auli, M. Adaptive input representations                networks. Preprint arXiv:1308.0850, 2013.
+   for neural language modeling. In Int. Conf. on Learning
+  Representations (ICLR), New Orleans, LA, USA, May                 Greff, K., van Steenkiste, S., and Schmidhuber, J. On the
+   2019.                                                               binding problem in artiﬁcial neural networks. Preprint
+                                                                       arXiv:2012.05208, 2020.
+Bahdanau, D., Cho, K., and Bengio, Y. Neural machine
+   translation by jointly learning to align and translate. In Int.  Ha, D., Dai, A., and Le, Q. V. Hypernetworks. In Int. Conf.
+  Conf. on Learning Representations (ICLR), San Diego,                 on Learning Representations (ICLR), Toulon, France,
+   CA, USA, May 2015.                                                 April 2017.
+
+Bello, I. Lambdanetworks: Modeling long-range interac-              Hanson, S. J. A stochastic version of the delta rule. Physica
+   tions without attention. In Int. Conf. on Learning Repre-          D: Nonlinear Phenomena, 42(1-3):265–272, 1990.
+   sentations (ICLR), Virtual only, May 2021.
+                                                                    Hebb, D. O. The organization of behavior: a neuropsy-
+Cheng, J., Dong, L., and Lapata, M. Long short-term                    cholocigal theory. A Wiley Book in Clinical Psychology,
+   memory-networks for machine reading. In Proc. Conf.                 62:78, 1949.
+   on Empirical Methods in Natural Language Processing
+  (EMNLP), pp. 551–561, Austin, TX, USA, November                   Hinton, G. E. and Plaut, D. C. Using fast weights to de-
+   2016.                                                               blur old memories. In Proc. Conf. of Cognitive Science
+                                                                      Society, pp. 177–186, Seatle, WA, USA, July 1987.
+Choromanski, K., Likhosherstov, V., Dohan, D., Song, X.,
+   Gane, A., Sarlos, T., Hawkins, P., Davis, J., Mohiuddin,         Hochreiter, S. and Schmidhuber, J. Long short-term memory.
+  A., Kaiser, L., et al. Rethinking attention with performers.        Neural computation, 9(8):1735–1780, 1997.
+   In Int. Conf. on Learning Representations (ICLR), Virtual
+   only, 2021.                                                      Hopﬁeld, J. J. Neural networks and physical systems with
+                                                                       emergent collective computational abilities. Proc. of the
+Clevert, D.-A., Unterthiner, T., and Hochreiter, S. Fast               national academy of sciences, 79(8):2554–2558, 1982.
+   and accurate deep network learning by exponential linear
+   units (ELUs). In Int. Conf. on Learning Representations          Irie, K., Zeyer, A., Schlu¨ter, R., and Ney, H. Language
+  (ICLR), San Juan, Puerto Rico, May 2016.                             modeling with deep Transformers. In Proc. Interspeech,
+                                                                       pp. 3905–3909, Graz, Austria, September 2019a.
+Dai, Z., Yang, Z., Yang, Y., Cohen, W. W., Carbonell, J.,
+   Le, Q. V., and Salakhutdinov, R. Transformer-XL: Atten-          Irie, K., Zeyer, A., Schlu¨ter, R., and Ney, H. Training lan-
+   tive language models beyond a ﬁxed-length context. In               guage models for long-span cross-sentence evaluation. In
+  Proc. Association for Computational Linguistics (ACL),              Proc. IEEE Automatic Speech Recog. and Understand-
+   pp. 2978–2988, Florence, Italy, July 2019.                          ing Workshop (ASRU), pp. 419–426, Sentosa, Singapore,
+                                                                       December 2019b.
+Demircigil, M., Heusel, J., Lo¨we, M., Upgang, S., and
+  Vermet, F. On a model of associative memory with huge             Irie, K., Gerstenberger, A., Schlu¨ter, R., and Ney, H. How
+   storage capacity. Journal of Statistical Physics, 168(2):           much self-attention do we need? Trading attention for
+   288–299, 2017.                                                      feed-forward layers. In Proc. IEEE Int. Conf. on Acous-
+                                                                       tics, Speech and Signal Processing (ICASSP), pp. 6154–
+Devlin, J., Chang, M., Lee, K., and Toutanova, K. BERT:                6158, Virtual only, May 2020.
+   pre-training of deep bidirectional transformers for lan-
+   guage understanding. In Proc. North American Chapter             Jia, X., De Brabandere, B., Tuytelaars, T., and Gool, L. V.
+   of the Association for Computational Linguistics on Hu-             Dynamic ﬁlter networks. In Proc. Advances in Neural
+   man Language Technologies (NAACL-HLT), pp. 4171–                   Information Processing Systems (NIPS), pp. 667–675,
+  4186, Minneapolis, MN, USA, June 2019.                               Barcelona, Spain, 2016.
+
+Feldman, J. A. Dynamic connections in neural networks.              Katharopoulos, A., Vyas, A., Pappas, N., and Fleuret, F.
+  Biological cybernetics, 46(1):27–39, 1982.                          Transformers are rnns: Fast autoregressive transformers
+                                                                      with linear attention. In Proc. Int. Conf. on Machine
+                                                                      Learning (ICML), Virtual only, July 2020.
+Linear Transformers Are Secretly Fast Weight Programmers
+
+Kingma, D. P. and Ba, J. Adam: A method for stochastic          Noh, H., Seo, P. H., and Han, B. Image question answering
+   optimization. Preprint arXiv:1412.6980, 2014.                   using convolutional neural network with dynamic param-
+                                                                   eter prediction. In Proc. IEEE Conf. on Computer Vision
+Kirsch, L. and Schmidhuber, J. Meta learning backprop-             and Pattern Recognition (CVPR), pp. 30–38, Las Vegas,
+   agation and improving it. NeurIPS Workshop on Meta-             NV, USA, 2016.
+  Learning, 2020.
+                                                                Ott, M., Edunov, S., Grangier, D., and Auli, M. Scaling
+Klein, B., Wolf, L., and Afek, Y. A dynamic convolu-               neural machine translation. In Proc. Conf. on Machine
+   tional layer for short rangeweather prediction. In Proc.       Translation: Research Papers, pp. 1–9, Brussels, Bel-
+  IEEE Conf. on Computer Vision and Pattern Recognition            gium, October 2018.
+  (CVPR), pp. 4840–4848, Boston, MA, USA, June 2015.
+                                                                Ott, M., Edunov, S., Baevski, A., Fan, A., Gross, S., Ng,
+Kohonen, T. Correlation matrix memories. IEEE Transac-             N., Grangier, D., and Auli, M. fairseq: A fast, extensible
+   tions on Computers, 21(4):353–359, 1972.                        toolkit for sequence modeling. In Proc. North American
+                                                                  Chapter of the Association for Computational Linguis-
+Kosko, B. Bidirectional associative memories. IEEE Trans-          tics on Human Language Technologies (NAACL-HLT),
+   actions on Systems, Man, and Cybernetics, 18(1):49–60,         Demonstrations, pp. 48–53, Minneapolis, MN, USA,
+  1988.                                                           June 2019.
+
+Krotov, D. and Hopﬁeld, J. J. Dense associative memory          Palm, G. On associative memory. Biological cybernetics,
+   for pattern recognition. In Proc. Advances in Neural            36(1):19–31, 1980.
+  Information Processing Systems (NIPS), pp. 1172–1180,
+   Barcelona, Spain, December 2016.                             Papineni, K., Roukos, S., Ward, T., and Zhu, W.-J. Bleu:
+                                                                   a method for automatic evaluation of machine transla-
+Lin, Z., Feng, M., Santos, C. N. d., Yu, M., Xiang, B., Zhou,      tion. In Proc. Association for Computational Linguistics
+   B., and Bengio, Y. A structured self-attentive sentence        (ACL), pp. 311–318, Philadelphia, PA, USA, July 2002.
+   embedding. In Int. Conf. on Learning Representations
+  (ICLR), Toulon, France, April 2017.                           Parikh, A. P., Ta¨ckstro¨m, O., Das, D., and Uszkoreit, J. A
+                                                                   decomposable attention model for natural language infer-
+Little, W. A. The existence of persistent states in the brain.     ence. In Proc. Conf. on Empirical Methods in Natural
+  Mathematical biosciences, 19(1-2):101–120, 1974.                Language Processing (EMNLP), pp. 2249–2255, Austin,
+                                                                  TX, USA, November 2016.
+Merity, S., Xiong, C., Bradbury, J., and Socher, R. Pointer
+   sentinel mixture models. In Int. Conf. on Learning Rep-      Paszke, A. et al. Pytorch: An imperative style, high-
+   resentations (ICLR), Toulon, France, April 2017.                performance deep learning library. In Proc. Advances in
+                                                                  Neural Information Processing Systems (NeurIPS), pp.
+Miconi, T., Stanley, K., and Clune, J. Differentiable plastic-     8026–8037, Vancouver, Canada, December 2019.
+   ity: training plastic neural networks with backpropaga-
+   tion. In Proc. Int. Conf. on Machine Learning (ICML),        Peng, H., Pappas, N., Yogatama, D., Schwartz, R., Smith,
+   pp. 3559–3568, Stockholm, Sweden, July 2018.                    N. A., and Kong, L. Random feature attention. In Int.
+                                                                  Conf. on Learning Representations (ICLR), Virtual only,
+Miconi, T., Rawal, A., Clune, J., and Stanley, K. O. Back-         2021.
+   propamine: training self-modifying neural networks with
+   differentiable neuromodulated plasticity. In Int. Conf.      Perez, E., Strub, F., De Vries, H., Dumoulin, V., and
+   on Learning Representations (ICLR), New Orleans, LA,            Courville, A. FiLM: Visual reasoning with a general
+   USA, May 2019.                                                  conditioning layer. In Proc. AAAI Conf. on Artiﬁcial
+                                                                  Intelligence, pp. 3942–3951, New Orleans, LA, USA,
+Munkhdalai, T. and Trischler, A. Metalearning with hebbian         February 2018.
+   fast weights. Preprint arXiv:1807.05076, 2018.
+                                                                Post, M. A call for clarity in reporting BLEU scores. In Proc.
+Munkhdalai, T. and Yu, H. Meta networks. In Proc. Int.            Conf. on Machine Translation, pp. 186–191, Brussels,
+  Conf. on Machine Learning (ICML), pp. 2554–2563, Syd-            Belgium, October 2018.
+   ney, Australia, August 2017.
+                                                                Radford, A., Wu, J., Child, R., Luan, D., Amodei, D., and
+Munkhdalai, T., Sordoni, A., Wang, T., and Trischler, A.           Sutskever, I. Language models are unsupervised multi-
+   Metalearned neural memory. In Proc. Advances in Neural          task learners. [Online]. : https://blog.openai.com/better-
+  Information Processing Systems (NeurIPS), pp. 13310–             language-models/, 2019.
+  13321, Vancouver, Canada, December 2019.
+Linear Transformers Are Secretly Fast Weight Programmers
+
+Rae, J. W., Potapenko, A., Jayakumar, S. M., Hillier, C.,      Srivastava, N., Hinton, G., Krizhevsky, A., Sutskever, I.,
+   and Lillicrap, T. P. Compressive transformers for long-        and Salakhutdinov, R. Dropout: a simple way to prevent
+   range sequence modelling. In Int. Conf. on Learning            neural networks from overﬁtting. The Journal of Machine
+  Representations (ICLR), Virtual only, April 2020.              Learning Research, 15(1):1929–1958, 2014.
+
+Ramsauer, H., Scha¨ﬂ, B., Lehner, J., Seidl, P., Widrich, M.,  Steinbuch, K. Die lernmatrix. Kybernetik, 1(1):36–45, 1961.
+   Gruber, L., Holzleitner, M., Adler, T., Kreil, D., Kopp,
+   M. K., Klambauer, G., Brandstetter, J., and Hochreiter, S.  Steinbuch, K. and Piske, U. A. W. Learning matrices and
+   Hopﬁeld networks is all you need. In Int. Conf. on Learn-      their applications. IEEE Transactions on Electronic Com-
+   ing Representations (ICLR), Virtual only, May 2021.            puters, 12(6):846–862, 1963.
+
+Schlag, I. and Schmidhuber, J. Gated fast weights for on-      Tay, Y., Dehghani, M., Abnar, S., Shen, Y., Bahri, D., Pham,
+   the-ﬂy neural program generation. In NIPS Metalearning         P., Rao, J., Yang, L., Ruder, S., and Metzler, D. Long
+  Workshop, Long Beach, CA, USA, December 2017.                   range arena: A benchmark for efﬁcient transformers. In
+                                                                 Int. Conf. on Learning Representations (ICLR), Virtual
+Schlag, I. and Schmidhuber, J. Learning to reason with            only, May 2021.
+   third order tensor products. In Proc. Advances in Neural
+  Information Processing Systems (NIPS), pp. 9981–9993,        Tsai, Y.-H. H., Bai, S., Yamada, M., Morency, L.-P., and
+   Montre´al, Canada, December 2018.                              Salakhutdinov, R. Transformer dissection: An uniﬁed
+                                                                  understanding for transformer’s attention via the lens of
+Schlag, I., Munkhdalai, T., and Schmidhuber, J. Learning          kernel. In Proc. Conf. on Empirical Methods in Natural
+   associative inference using fast weight memory. In Int.       Language Processing (EMNLP), pp. 4344–4353, Hong
+  Conf. on Learning Representations (ICLR), Virtual only,         Kong, China, November 2019.
+   May 2021.
+                                                               Vaswani, A., Shazeer, N., Parmar, N., Uszkoreit, J., Jones,
+Schmidhuber, J. Learning to control fast-weight memories:         L., Gomez, A. N., Kaiser, Ł., and Polosukhin, I. Attention
+  An alternative to recurrent nets. Technical Report FKI-         is all you need. In Proc. Advances in Neural Information
+  147-91, Institut fu¨r Informatik, Technische Universita¨t      Processing Systems (NIPS), pp. 5998–6008, Long Beach,
+   Mu¨nchen, March 1991.                                          CA, USA, December 2017.
+
+Schmidhuber, J. Learning to control fast-weight memories:      von der Malsburg, C. The correlation theory of brain func-
+  An alternative to dynamic recurrent networks. Neural            tion. Internal Report 81-2, Go¨ttingen: Department of Neu-
+  Computation, 4(1):131–139, 1992.                                robiology, Max Planck Intitute for Biophysical Chemistry,
+                                                                 1981.
+Schmidhuber, J. Reducing the ratio between learning com-
+   plexity and number of time varying variables in fully       Widrow, B. and Hoff, M. E. Adaptive switching circuits.
+   recurrent nets. In International Conference on Artiﬁcial       In Proc. IRE WESCON Convention Record, pp. 96–104,
+  Neural Networks (ICANN), pp. 460–463, Amsterdam,                Los Angeles, CA, USA, August 1960.
+   Netherlands, September 1993.
+
+Schmidhuber, J. 26 March 1991: Neural nets learn to
+   program neural nets with fast weights—like today’s
+  Transformer variants. 2021: New stuff!, AI Blog, 2021.
+   URL https://people.idsia.ch/˜juergen/
+   fast-weight-programmer-1991-transformer.
+   html.
+
+Sennrich, R., Haddow, B., and Birch, A. Neural machine
+   translation of rare words with subword units. In Proc. As-
+   sociation for Computational Linguistics (ACL), pp. 1715–
+  1725, Berlin, Germany, August 2016.
+
+Shen, Z., Zhang, M., Zhao, H., Yi, S., and Li, H. Efﬁcient
+   attention: Attention with linear complexities. Preprint
+   arXiv:1812.01243, 2018.
+
+Smolensky, P. Tensor product variable binding and the
+   representation of symbolic structures in connectionist
+   systems. Artiﬁcial intelligence, 46(1-2):159–216, 1990.
+

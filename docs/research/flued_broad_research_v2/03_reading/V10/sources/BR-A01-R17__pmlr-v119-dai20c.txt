@@ -1,0 +1,698 @@
+                The Usual Suspects?
+Reassessing Blame for VAE Posterior Collapse
+
+Bin Dai 1 Ziyu Wang 2 David Wipf 3
+
+                        Abstract                                through the conditional distribution pθ(x|z). The latter is
+                                                                controlled by parameters θ that can, at least conceptually
+      In narrow asymptotic settings Gaussian VAE mod-           speaking, be optimized by maximum likelihood over pθ(x)
+      els of continuous data have been shown to possess         given available training examples.
+      global optima aligned with ground-truth distribu-
+      tions. Even so, it is well known that poor solutions      In particular, assuming n observable points X =
+      whereby the latent posterior collapses to an unin-
+      formative prior are sometimes obtained in prac-           [x(1), . . . , x(n)], maximum likelihood estimation is tanta-
+      tice. However, contrary to conventional wisdom
+      that largely assigns blame for this phenomena on          mount to minimizing the negative log-likelihood expres-
+      the undue inﬂuence of KL-divergence regulariza-
+      tion, we will argue that posterior collapse is, at        sion  1  i − log pθ x(i) . Proceeding further, because
+      least in part, a direct consequence of bad local                n
+      minima inherent to the loss surface of deep au-
+      toencoder networks. In particular, we prove that          computing pθ(x) generally entails the intractable marginal-
+      even small nonlinear perturbations of afﬁne VAE
+      decoder models can produce such minima, and in            ization over z, the VAE instead minimizes a convenient
+      deeper models, analogous minima can force the
+      VAE to behave like an aggressive truncation oper-         variational upper bound given by
+      ator, provably discarding information along all la-
+      tent dimensions in certain circumstances. Regard-                     n
+      less, the underlying message here is not meant to
+      undercut valuable existing explanations of posteri-       L(θ, φ)  1       − Eqφ(z x| (i)) log pθ x(i)|z  (1)
+      or collapse, but rather, to reﬁne the discussion and               n
+      elucidate alternative risk factors that may have
+      been previously underappreciated.                                     i=1
+
+1. Introduction                                                                                      n
+
+The variational autoencoder (VAE) (Kingma & Welling,            + KL qφ(z|x(i)||p(z)  ≥           1       − log pθ x(i) ,
+2014; Rezende et al., 2014) represents a powerful generative                                      n
+model of data points that are assumed to possess some
+complex yet unknown latent structure. This assumption                                                i=1
+is instantiated via the marginalized distribution pθ(x) =
+                                                                with equality iff qφ(z|x(i)) = pθ(z|x(i)) for all i. The
+  pθ(x|z)p(z)dz, which forms the basis of prevailing VAE        additional parameters φ govern the shape of the variational
+models. Here z ∈ Rκ is a collection of unobservable latent      distribution qφ(z|x) that is designed to approximate the true
+factors of variation that, when drawn from the prior p(z), are  but often intractable latent posterior pθ(z|x).
+colloquially said to generate an observed data point x ∈ Rd
+                                                                The VAE energy from (1) is composed of two terms, a
+     1Samsung Research China-Beijing 2Tsinghua University       data-ﬁtting loss that borrows the basic structure of an au-
+3AWS Shanghai AI Lab. Correspondence to: Bin Dai                toencoder (AE), and a KL-divergence-based regularization
+<bin2.dai@samsung.com>, Ziyu Wang <wzy196@gmail.com>,           factor. The former incentivizes assigning high probability
+David Wipf <davidwipf@gmail.com>.                               to latent codes z that facilitate accurate reconstructions of
+                                                                each x(i). In fact, if qφ(z|x) is a Dirac delta function, this
+Proceedings of the 37 th International Conference on Machine    term is exactly equivalent to a deterministic AE with data
+Learning, Online, PMLR 119, 2020. Copyright 2020 by the au-     reconstruction loss deﬁned by − log pθ (x|z). Overall, it
+thor(s).                                                        is because of this association that qφ(z|x) is generally re-
+                                                                ferred to as the encoder distribution, while pθ (x|z) denotes
+                                                                the decoder distribution. Additionally, the KL regularizer
+                                                                KL [qφ(z|x)||p(z)] pushes the encoder distribution towards
+                                                                the prior without violating the variational bound.
+
+                                                                For continuous data, which will be our primary focus herein,
+                                                                it is typical to assume that
+
+                                                                                 p(z) = N (z|0, I),
+
+                                                                                 pθ (x|z) = N (x|µx, γI),
+
+                                                                                 qφ (z|x) = N (z|µz, Σz),       (2)
+
+                                                                where γ > 0 is a scalar variance parameter, while the
+                                                                Gaussian moments µx ≡ µx (z; θ), µz ≡ µz (x; φ), and
+                          The Usual Suspects? Reassessing Blame for VAE Posterior Collapse
+
+Σz ≡ diag[σz (x; φ)]2 are computed via feedforward neu-         bounds the effective VAE trade-off parameter γ such that
+ral network layers. The encoder network parameterized by        posterior collapse is essentially inevitable. Collectively
+                                                                then, we provide convincing evidence that posterior col-
+φ takes x as an input and outputs µz and Σz. Similarly          lapse is, at least in certain settings, the fault of deep AE
+the decoder network parameterized by θ converts a latent        local minima, and need not be exclusively a consequence
+                                                                of usual suspects such as the KL-divergence term.
+code z into µx. Given these assumptions, the generic VAE
+objective from (1) can be reﬁned to L(θ, φ) =
+
+   n                                                            We conclude in Section 7 with practical take-home mes-
+                                                                sages, and motivate the search for improved AE architec-
+1       Eqφ(z x| (i))  1  x(i) − µx (z; θ)  2  + d log γ        tures and training regimes that might be leveraged by analo-
+n                      γ                    2                   gous VAE models.
+
+   i=1                                                          2. Recent Work and the Usual Suspects for
+                                                                   Instigating Collapse
+              2                                2
++ σz x(i); φ − log diag σz x(i); φ                              Posterior collapse under various guises is one of the most
+              2                                                 frequently addressed topics related to VAE performance.
+                                                                Depending on the context, arguably the most common and
++ µz x(i); φ  2                                                 seemingly transparent suspect for causing collapse is the
+                                                                KL regularization factor that is obviously minimized by
+                       ,                          (3)           qφ(z|x) = p(z). This perception has inspired various
+                                                                countermeasures, including heuristic annealing of the K-
+              2                                                 L penalty or KL warm-start (Bowman et al., 2015; Huang
+                                                                et al., 2018; Sønderby et al., 2016), tighter bounds on the
+excluding an inconsequential factor of 1/2. This expression     log-likelihood (Burda et al., 2015; Rezende & Mohamed,
+can be optimized over using SGD and a simple reparam-           2015), more complex priors (Bauer & Mnih, 2018; Tomczak
+eterization strategy (Kingma & Welling, 2014; Rezende           & Welling, 2018), modiﬁed decoder architectures (Cai et al.,
+et al., 2014) to produce parameter estimates {θ∗, φ∗}. A-       2017; Dieng et al., 2018; Yeung et al., 2017), or efforts to
+mong other things, new samples approximating the train-         explicitly disallow the prior from ever equaling the varia-
+ing data can then be generated via the ancestral process        tional distribution (Razavi et al., 2019). Thus far though,
+znew ∼ N (z|0, I) and xnew ∼ pθ∗ (x|znew).                      most published results do not indicate success generating
+                                                                high-resolution images, and in the majority of cases, evalua-
+Although it has been argued that global minima of (3) may       tions are limited to small images and/or relatively shallow
+correspond with the optimal recovery of ground truth distri-    networks. This suggests that there may be more nuance
+butions in certain asymptotic settings (Dai & Wipf, 2019),      involved in pinpointing the causes and potential remedies
+it is well known that in practice, VAE models are at risk of    of posterior collapse. One notable exception though is the
+converging to degenerate solutions where, for example, it       BIVA model from (Maaløe et al., 2019), which employs a
+may be that qφ (z|x) = p(z). This phenomena, commonly           bidirectional hierarchy of latent variables, in part to com-
+referred to as VAE posterior collapse (He et al., 2019; Raza-   bat posterior collapse. While improvements in NLL scores
+vi et al., 2019), has been acknowledged and analyzed from       have been demonstrated with BIVA using relatively deep
+a variety of different perspectives as we detail in Section 2.  encoder/decoders, this model is signiﬁcantly more complex
+That being said, we would argue that there remains lingering    and difﬁcult to analyze.
+ambiguity regarding the different types and respective caus-
+es of posterior collapse. Consequently, Section 3 provides a    On the analysis side, there have been various efforts to ex-
+useful taxonomy that will serve to contextualize our main       plicitly characterize posterior collapse in restricted settings.
+technical contributions. These include the following:           For example, Lucas et al. (2019) demonstrate that if γ is
+                                                                ﬁxed to a sufﬁciently large value, then a VAE energy func-
+• Building upon existing analysis of afﬁne VAE decoder          tion with an afﬁne decoder mean will have minima that
+   models, in Section 4 we prove that even arbitrarily smal-    overprune latent dimensions. A related linearized approxi-
+   l nonlinear activations can introduce suboptimal local       mation to the VAE objective is analyzed in (Rolinek et al.,
+   minima exhibiting posterior collapse.                        2019); however, collapsed latent dimensions are excluded
+                                                                and it remains somewhat unclear how the surrogate objec-
+• We demonstrate in Section 5 that if the encoder/decoder       tive relates to the original. Posterior collapse has also been
+   networks are incapable of sufﬁciently reducing the VAE       associated with data-dependent decoder covariance network-
+   reconstruction errors, even in a deterministic setting with  s Σx(z; θ) = γI (Mattei & Frellsen, 2018), which allows
+   no KL-divergence regularizer, there will exist an implicit
+   lower bound on the optimal value of γ. Moreover, we
+   prove that if this γ is sufﬁciently large, the VAE will be-
+   have like an aggressive thresholding operator, enforcing
+   exact posterior collapse, i.e., qφ (z|x) = p(z).
+
+• Based on these observations, we present experiments in
+   Section 6 establishing that as network depth/capacity is
+   increased, even for deterministic AE models with no reg-
+   ularization, reconstruction errors become worse. This
+The Usual Suspects? Reassessing Blame for VAE Posterior Collapse
+
+for degenerate solutions assigning inﬁnite density to a single             tributions regardless of the value of z (e.g., PixelCNN-
+data point and a diffuse, collapsed density everywhere else.               based (Van den Oord et al., 2016)), it is possible for
+Finally, from the perspective of training dynamics, (He et al.,            the VAE to assign high-probability to the training data
+2019) argue that a lagging inference network can also lead                 even if qφ(z|x) = p(z) (Alemi et al., 2017; Bowman
+to posterior collapse.                                                     et al., 2015; Chen et al., 2016). This category of pos-
+                                                                           terior collapse is quite distinct from categories (ii)
+3. Taxonomy of Posterior Collapse                                          and (iii) above in that, although the reconstructions
+                                                                           are similarly poor, the associated NLL scores can still
+Although there is now a vast literature on the various poten-              be good.
+tial causes of posterior collapse, there remains ambiguity
+as to exactly what this phenomena is referring to. In this            (v) The previous four categories of posterior collapse can
+regard, we believe that it is critical to differentiate ﬁve subtle         all be directly associated with emergent properties
+yet quite distinct scenarios that could reasonably fall under              of the VAE global minimum under various model-
+the generic rubric of posterior collapse:                                  ing conditions. In contrast, a ﬁfth type of collapse
+                                                                           exists that is the explicit progeny of bad VAE local
+   (i) Latent dimensions of z that are not needed for provid-              minima. More speciﬁcally, as we will argue shortly,
+       ing good reconstructions of the training data are set               when deeper encoder/decoder networks are used, the
+       to the prior, meaning qφ(zj|x) ≈ p(zj) = N (0, 1) at                risk of converging to bad, overregularized solutions
+       any superﬂuous dimension j. Along other dimension-                  increases.
+       s σ2z will be near zero and µz will provide a usable
+       predictive signal leading to accurate reconstructions        The remainder of this paper will primarily focus on category
+       of the training data. This case can actually be viewed       (v), with brief mention of the other types for comparison
+       as a desirable form of selective posterior collapse that,    purposes where appropriate. Our rationale for this selec-
+       as argued in (Dai & Wipf, 2019), is a necessary (albeit      tion bias is that, unlike the others, category (i) collapse is
+       not sufﬁcient) condition for generating good samples.        actually advantageous and hence need not be mitigated. In
+                                                                    contrast, while category (ii) is undesirable, it be can be
+  (ii) The decoder variance γ is not learned but ﬁxed to a          avoided by learning γ. As for category (iii), this represents
+       large value1 such that the KL term from (1) is over-         an unavoidable consequence of models with ﬂexible decoder
+       ly dominant, forcing most or all dimensions of z to          covariances capable of detecting outliers (Dai et al., 2019).
+       follow the prior N (0, 1). In this scenario, the actual      In fact, even simpler inlier/outlier decomposition models
+       global optimum of the VAE energy (conditioned on γ           such as robust PCA are inevitably at risk for this phenome-
+       being ﬁxed) will lead to deleterious posterior collapse      na (Cande`s et al., 2011). Regardless, when Σz(x; θ) = γI
+       and the model reconstructions of the training data           this problem goes away. And ﬁnally, we do not address
+       will be poor. In fact, even the original marginal log-       category (iv) in depth simply because it is unrelated to the
+       likelihood can potentially default to a trivial/useless      canonical Gaussian VAE models of continuous data that we
+       solution if γ is ﬁxed too large, assigning a small           have chosen to examine herein. Regardless, it is still worth-
+       marginal likelihood to the training data, provably so        while to explicitly differentiate these ﬁve types and bare
+       in the afﬁne case (Lucas et al., 2019).                      them in mind when considering attempts to both explain
+                                                                    and improve VAE models.
+ (iii) As mentioned previously, if the Gaussian decoder co-
+       variance is learned as a separate network structure          4. Insights from Simpliﬁed Cases
+       (instead of simply Σx(z; θ) = γI), there can exist
+       degenerate solutions that assign inﬁnite density to a s-     Because different categories of posterior collapse can be im-
+       ingle data point and a diffuse, isotropic Gaussian else-     pacted by different global/local minima structures, a useful
+       where (Mattei & Frellsen, 2018). This implies that           starting point is a restricted setting whereby we can compre-
+       (3) can be unbounded from below at what amounts to           hensively characterize all such minima. For this purpose,
+       a posterior collapsed solution and bad reconstructions       we ﬁrst consider a VAE model with the decoder network
+       almost everywhere.2                                          set to an afﬁne function. As is often assumed in practice,
+                                                                    we choose Σx = γI, where γ > 0 is a scalar parameter
+ (iv) When powerful non-Gaussian decoders are used, and             within the parameter set θ. In contrast, for the mean function
+       in particular those that can parameterize complex dis-       we choose µx = W xz + bx for some weight matrix W x
+                                                                    and bias vector bx. The encoder can be arbitrarily complex
+    1Or equivalently, a KL scaling parameter such as used by the    (although the optimal structure can be shown to be afﬁne as
+β-VAE (Higgins et al., 2017) is set too large.                      well).
+
+    2As a side note, category (iii) posterior collapse can also be
+reinterpreted as an extreme form of mode collapse, a phenomena
+often ascribed to GAN models but that VAEs can also sometimes
+experience (Richardson & Weiss, 2018).
+The Usual Suspects? Reassessing Blame for VAE Posterior Collapse
+
+Given these simpliﬁcations, and assuming the training data      Collectively, these speciﬁcations lead to the parameteriza-
+has r ≥ κ nonzero singular values, it has been demonstrated     tion θ = {W x, bx, γ} and φ = {µ(zi), σz(i)}in=1 and energy
+that at any global optima, the columns of W x will corre-       (excluding irrelevant scale factors and constants) given by
+spond with the ﬁrst κ principal components of X provided
+that we simultaneously learn γ or set it to the optimal value   L(θ, φ) =
+(which is available in closed form) (Dai et al., 2019; Lucas
+et al., 2019; Tipping & Bishop, 1999). Additionally, it has     n                                                 2
+also be shown that no spurious, suboptimal local minima
+will exist. Note also that if r < κ the same basic conclu-               Eqφ(z|x(i))  1  x(i) − πα (W xz) − bx                            (5)
+sions still apply; however, W x will only have r nonzero                              γ
+columns, each corresponding with a different principal com-                                                                         2
+ponent of the data. The unused latent dimensions will satisfy   i=1
+qφ(z|x) = N (0, I), which represents the canonical form
+of the benign category (i) posterior collapse. Collectively,                          2                    2                           2
+these results imply that if we converge to any local minima                  σz(i)                  σ(zi)      + µz(i) 2 ,
+of the VAE energy, we will obtain the best possible linear      + d log γ +             − log diag
+approximation to the data using a minimal number of latent
+dimensions, and malignant posterior collapse is not an issue,                         2
+i.e., categories (ii)-(v) will not arise.
+                                                                where µ(zi) and σ(zi) denote arbitrary encoder moments for
+
+                                                                data point i (this is consistent with the assumption of an
+
+                                                                arbitrarily complex encoder as used in previous analysis of
+
+                                                                afﬁne decoder models). Now deﬁne γ¯         1  i  x(i) −x¯                2  ,
+                                                                                                           nd                             2
+
+                                                                with x¯  1   i x(i). We then have the following result (all
+                                                                         n
+
+                                                                proofs are deferred to the supplementary ﬁle):
+
+Even so, if instead of learning γ, we choose a ﬁxed value that  Proposition 1 For any α > 0, there will always exist data
+is larger than any of the signiﬁcant singular values of XX ,    sets X such that (5) has a global minimum that perfectly
+then category (ii) posterior collapse can be inadvertently      reconstructs the training data, but also a bad local minimum
+introduced. More speciﬁcally, let r˜γ denote the number of      characterized by
+such singular values that are smaller than some ﬁxed γ value.
+Then along κ − r˜γ latent dimensions qφ(z|x) = N (0, I),        qφ(z|x) = N (z|0, I) and pθ(x) = N (x|x¯, γ¯I). (6)
+and the corresponding columns of W x will be set to zero at
+the global optima (conditioned on this ﬁxed γ), regardless of   Hence the moment we allow for nonlinear (or more precise-
+whether or not these dimensions are necessary for accurately    ly, non-afﬁne) decoders there can exist a poor local min-
+reconstructing the data. And it has been argued that the risk   imum, across all parameters including a learnable γ, that
+of this type of posterior collapse at a conditionally-optimal   exhibits category (v) posterior collapse.3 In other words,
+global minimum will likely be inherited by deeper models as     no predictive information about x passes through the latent
+well (Lucas et al., 2019), although learning γ can ameliorate   space, and a useless/non-informative distribution pθ(x) e-
+this problem.                                                   merges that is incapable of assigning high probability to the
+                                                                data (except obviously in the trivial degenerate case where
+Of course when we move to more complex architectures,           all the data points are equal to the empirical mean x¯). We
+the risk of bad local minima or other suboptimal stationary     will next investigate the degree to which such concerns can
+points becomes a new potential concern, and it is not clear     inﬂuence behavior in arbitrarily deep architectures.
+that the afﬁne case described above contributes to reliable,
+predictive intuitions. To illustrate this point, we will now    5. Extrapolating to Practical Deep
+demonstrate that the introduction of an arbitrarily small          Architectures
+nonlinearity can nonetheless produce a pernicious local min-
+imum that exhibits category (v) posterior collapse. For this    Previously we have demonstrated the possibility of local
+purpose, we assume the decoder mean function                    minima aligned with category (v) posterior collapse the mo-
+                                                                ment we allow for decoders that deviate ever so slightly from
+µx = πα (W xz) + bx,                    (4)                     an afﬁne model. But nuanced counterexamples designed for
+                                                                proving technical results notwithstanding, it is reasonable
+with πα(u) sign(u) (|u| − α)+ , α ≥ 0.                          to examine what realistic factors are largely responsible for
+                                                                leading optimization trajectories towards such potential bad
+The function πα is nothing more than a soft-threshold op-       local solutions. For example, is it merely the strength of
+erator as is commonly used in neural network architectures      the KL regularization term, and if so, why can we not just
+designed to reﬂect unfolded iterative algorithms for repre-
+sentation learning (Gregor & LeCun, 2010; Sprechmann                3This result mirrors related efforts examining linear DNNs,
+et al., 2015). In the present context though, we choose this    where it has been previously demonstrated that under certain con-
+nonlinearity largely because it allows (4) to reﬂect arbitrar-  ditions, all local minima are globally optimal (Kawaguchi, 2016),
+ily small perturbations away from a strictly afﬁne model,       while small nonlinearities can induce bad local optima (Yun et al.,
+and indeed if α = 0 the exact afﬁne model is recovered.         2019). However, the loss surface of these models is complete-
+                                                                ly different from a VAE, and hence we view Proposition 1 as a
+                                                                complementary result.
+                                  The Usual Suspects? Reassessing Blame for VAE Posterior Collapse
+
+use KL warm-start to navigate around such points? In this                             meaning that the deterministic AE reconstruction error will
+section we will elucidate a deceptively simple, alternative
+risk factor that will be corroborated empirically in Section                          generally be smaller than the stochastic VAE version. Note
+6.                                                                                    that if σz2 → 0, the VAE defaults to the same deterministic
+                                                                                      encoder as the AE and hence will have identical representa-
+From the outset, we should mention that with deep en-
+coder/decoder architectures commonly used in practice, a                              tional capacity; however, the KL regularization prevents this
+stationary point can more-or-less always exist at solutions
+exhibiting posterior collapse. As a representative and ubiq-                          from happening, and any σ2z > 0 can only make the recon-
+uitous example, please see Section 4 of the supplementary                             structions worse.4 Likewise, the KL penalty factor       µz2  2
+ﬁle. But of course without further details, this type of sta-                                                                                       2
+tionary point could conceivably manifest as a saddle point
+(stable or unstable), a local maximum, or a local minimum.                            can further restrict the effective capacity and increase the
+For the strictly afﬁne decoder model mentioned in Section
+4, there will only be a harmless unstable saddle point at any                         reconstruction error of the training data. Beyond these in-
+collapsed solution (the Hessian has negative eigenvalues).
+In contrast, for the special nonlinear case elucidated via                            tuitive arguments, we have never empirically found a case
+Proposition 1 we can instead have a bad local minima. We
+will now argue that as the depth of common feedforward                                where (7) does not hold (see Section 6 for examples).
+architectures increases, the risk of converging to category
+(v)-like solutions with most or all latent dimensions stuck at                        We next deﬁne the set
+bad stationary points can also increase.
+                                                                                                                      n                  2
+Somewhat orthogonal to existing explanations of posterior
+collapse, our basis for this argument is not directly relat-                              Sε   θ, φ  :             1       x(i) − xˆ(i)    ≤ε  (8)
+ed to the VAE KL-divergence term. Instead, we consider                                                            nd
+a deceptively simple yet potentially inﬂuential alternative:                                                                             2
+Unregularized, deterministic AE models can have bad local                                                             i=1
+solutions with high reconstruction errors when sufﬁciently
+deep. This in turn can directly translate to category (v) pos-                        for any > 0. Now suppose that the chosen en-
+terior collapse when training a corresponding VAE model
+with a matching deep architecture. Moreover, to the extent                            coder/decoder architecture is such that with high prob-
+that this is true, KL warm-start or related countermeasures
+will likely be ineffective in avoiding such suboptimal min-                           ability, achievable optimization trajectories (e.g., via S-
+ima. We will next examine these claims in greater depth                               GD or related) lead to parameters {θae, φae} ∈/ Sε, i.e.,
+followed by a discussion of practical implications.                                   Prob ({θae, φae} ∈ Sε) ≈ 0. It then follows that the opti-
+                                                                                      mal VAE noise variance denoted γ∗, when conditioned on
+
+                                                                                      practically-achievable values for other network parameters,
+                                                                                      will satisfy γ∗ =
+
+                                                                                          n
+
+                                                                                       1       Eqφvae (z x| (i))      x(i) − µx (z; θvae)   2  ≥ ε.
+                                                                                      nd                                                    2      (9)
+
+                                                                                          i=1
+
+                                                                                      The equality in (9) can be conﬁrmed by simply differenti-
+
+                                                                                      ating the VAE cost w.r.t. γ and equating to zero, while the
+
+                                                                                      inequality comes from (7) and the fact that {θae, φae} ∈/ Sε.
+
+5.1. From Deeper Architectures to Inevitable Posterior                                From inspection of the VAE energy from (3), it is readily
+     Collapse                                                                         apparent that larger values of γ will discount the data-ﬁtting
+                                                                                      term and therefore place greater emphasis on the KL di-
+Consider the deterministic AE model formed by compos-                                 vergence. Since the latter is minimized when the latent
+                                                                                      posterior equals the prior, we might expect that whenever
+ing the encoder mean µx ≡ µx (·; θ) and decoder mean                                  ε and therefore γ∗ is increased per (9), we are at a greater
+                                                                                      risk of nearing collapsed solutions. But the nature of this
+µz ≡ µz (·; φ) networks from a VAE model, i.e., re-                                   approach is not at all transparent, and yet this subtlety has
+                                                                                      important implications for understanding the VAE loss sur-
+                                                                                      face in regions at risk of posterior collapse.
+
+constructions xˆ are computed via xˆ = µx [µz (x; φ) ; θ].                            For example, one plausible hypothesis is that only as
+                                                                                      γ∗ → ∞ do we risk full category (v) collapse. If this
+We then train this AE to minimize the squared-error loss                              were the case, we might have less cause for alarm since the
+                                                                                      reconstruction error and by association γ∗ will typically be
+ 1     n     x(i) − xˆ(i)  2                                                          bounded from above at any local minimizer. However, we
+nd     i=1                                                                            will now demonstrate that even ﬁnite values can exactly col-
+                            , producing parameters {θae, φae}.                        lapse the posterior. In formally showing this, it is helpful to
+                                                                                      introduce a slightly narrower but nonetheless representative
+                           2                                                          class of VAE models.
+Analogously, the corresponding VAE trained to minimize
+                                                                                          4This is provably true in many simple cases, although in con-
+(3) arrives at a parameter set denoted {θvae, φvae}. In this                          trived adversarial conditions (outside of practical regimes of inter-
+                                                                                      est) it is challenging to formally show that there are no possible
+scenario, it will typically follow that                                               exceptions.
+
+        n                                2
+
+     1          x(i) − µx µz x(i); φae ; θae                                     (7)
+    nd
+                                                                           2
+        i=1
+
+             n
+
+    ≤    1       Eqφvae (z|x(i))  x(i) − µx (z; θvae)                         2  ,
+        nd                                                                    2
+
+            i=1
+                             The Usual Suspects? Reassessing Blame for VAE Posterior Collapse
+
+Speciﬁcally,   let        f µz, σz, θ, x(i)                      least bad stable stationary points) as the depth increases;
+                                                                 and this difﬁculty can persist even with counter-measures
+Eqφ(z x| (i))  x(i) − µx (z; θ)  2  , i.e., the VAE data term    such as skip connections. Therefore, from this vantage point
+                                 2                               we would argue that, although not previously emphasized
+                                                                 in the literature, the AE base architecture itself is effective-
+evaluated at a single data point without the 1/γ scale factor.   ly a guilty party when it comes to category (v) posterior
+                                                                 collapse.
+We then deﬁne a well-behaved VAE as a model with energy
+function (3) designed such that ∇µz f µz, σz, θ, x(i) and        The perspective described above also helps to explain why
+∇σz f µz, σz, θ, x(i) are Lipschitz continuous gradients         heuristics like KL warm-start are not always useful for im-
+for all i. Furthermore, we specify a non-degenerate decoder      proving VAE performance. With the standard Gaussian
+as any µx(z; θ = θ˜) with θ set to a θ˜ value such that          model (3) considered herein, KL warm-start amounts to
+                                                                 adopting a pre-deﬁned schedule for incrementally increas-
+∇σz f µz, σz, θ˜, x(i) ≥ c for some constant c > 0               ing γ starting from a small initial value, the motivation being
+                                                                 that a small γ will steer optimization trajectories away from
+that can be arbitrarily small. This ensures that f is an         overregularized solutions and posterior collapse.
+
+increasing function of σz, a quite natural stipulation given     However, regardless of how arbitrarily small γ may be ﬁxed
+                                                                 at any point during this process, the VAE reconstructions
+that increasing the encoder variance will generally only         are not likely to be better than the analogous deterministic
+                                                                 AE (which is roughly equivalent to forcing γ = 0 within the
+serve to corrupt the reconstruction, unless of course the        present context). This implies that there can exist an implicit
+                                                                 γ∗ as computed by (9) that can be signiﬁcantly larger such
+decoder is completely blocking the signal from the encoder.      that, even if KL warm-start is used, the optimization trajec-
+                                                                 tory may well lead to a collapsed posterior stationary point
+In the latter degenerate situation, it would follow that         that has this γ∗ as the optimal value in terms of minimizing
+∇µz f µz, σz, θ, x(i) = ∇σz f µz, σz, θ, x(i) = 0,               the VAE cost with other parameters ﬁxed. Note that if full
+which is more-or-less tantamount to category (v) posterior       posterior collapse does occur, the gradient from the KL term
+                                                                 will equal zero and hence, to be at a stationary point it must
+collapse.                                                        be that the data term gradient is also zero. In such situations,
+                                                                 varying γ manually will not impact the gradient balance
+Based on these deﬁnitions, we now present the following:         anyway.
+
+Proposition 2 For any well-behaved VAE with arbitrary,           6. Empirical Assessments
+non-degenerate decoder µx(z; θ = θ˜), there will always
+exist a γ < ∞ such that the trivial solution µx(z; θ =           In this section we empirically demonstrate the existence
+θ˜) = x¯ and qφ(z|x) = p(z) will have lower cost.                of bad AE local minima with high reconstruction errors at
+                                                                 increasing depth, as well as the association between these
+Around any evaluation point, the sufﬁcient condition we          bad minima and imminent VAE posterior collapse. For this
+applied to demonstrate posterior collapse (see proof details)    purpose, we ﬁrst train fully connected AE and VAE models
+can also be achieved with some γ < γ if we allow for             with 1, 2, 4, 6, 8 and 10 hidden layers on the Fashion-
+partial collapse, i.e., qφ∗ (zj|x) = p(zj) along some but not    MNIST dataset (Xiao et al., 2017). Each hidden layer is
+all latent dimensions j ∈ {1, . . . , κ}. Overall, the analysis  512-dimensional and followed by ReLU activations (see the
+loosely suggests that the number of dimensions vulnerable        supplementary ﬁle for further details). The reconstruction
+to exact collapse will increase monotonically with γ.            error is shown in Figure 1(top) (see supplementary for re-
+                                                                 peated trials and error bars, as well as complementary FID
+Proposition 2 also provides evidence that the VAE behaves        scores).
+
+like a strict thresholding operator, completely shutting off     As the depth of the network increases, the reconstruction er-
+                                                                 ror of the AE model ﬁrst decreases because of the increased
+latent dimensions using a ﬁnite value for γ. This is analo-      capacity. However, when the network becomes too deep, the
+                                                                 error starts to increase, indicating convergence to a bad local
+gous to the distinction between using the 1 versus 2 norm        minima (or at least stable stationary point/plateau) that is
+                                                                 unrelated to KL-divergence regularization. The reconstruc-
+for solving regularized regression problems of the standard      tion error of a VAE model is always worse than that of the
+                                                                 corresponding AE model as expected. Moreover, while KL
+form  minu     x − Au  2  +  γ   η(u),  where  A  is  a  design
+                       2
+
+matrix and η is a penalty function. When η is the 1 norm,
+
+some or all elements of u can be pruned to exactly zero
+
+with a sufﬁciently large but ﬁnite γ (Zhao & Yu, 2006). In
+
+contrast, when the 2 norm is applied, the coefﬁcients will
+
+be shrunk to smaller values but never pushed all the way to
+
+zero unless γ → ∞.
+
+5.2. Practical Implications
+
+In aggregate then, if the AE base model displays unavoid-
+ably high reconstruction errors, this implicitly constrains the
+corresponding VAE model to have a large optimal γ value,
+which can potentially lead to undesirable posterior collapse
+per Proposition 2. In Section 6 we will demonstrate empir-
+ically that training unregularized AE models can become
+increasingly difﬁcult and prone to bad local minima (or at
+The Usual Suspects? Reassessing Blame for VAE Posterior Collapse
+
+warm-start/annealing can help to improve the VAE recon-          Figure 1. Reconstruction errors for various encoder/decoder mod-
+structions to some extent, performance is still worse than       els of varying complexity. Top: Fully connected networks with
+the AE as expected.                                              different depths trained on Fashion-MNIST. Middle: Convolu-
+                                                                 tion networks with increasing depth/# of spatial scales trained on
+We next train AE and VAE models using a more complex             Cifar100. Bottom: Averaged AE results from residual networks
+convolutional network on Cifar100 data (Krizhevsky & Hin-        with varying number of residual blocks and block depth trained
+ton, 2009). At each spatial scale, we use 1 to 5 convolution     on SVHN, Cifar10, Cifar100 and CelebA. In all plots, once the
+layers followed by ReLU activations. We also apply 2 × 2         encoder/decoder complexity is sufﬁciently high, the reconstruction
+max pooling to downsample the feature maps to a smaller          errors begin to increase.
+spatial scale in the encoder and use a transposed convolution
+layer to upscale the feature map in the decoder. The recon-      The corresponding dimensions will encode no information
+struction errors are shown in Figure 1(middle). Again, the       and become completely useless.
+trend is similar to the fully-connected network results. See
+the supplementary ﬁle for an additional ImageNet example.        To help corroborate this association between bad AE local
+                                                                 minima and VAE posterior collapse, we plot histograms of
+It has been argued in the past that skip connections can         VAE σz values as network depth is varied in Figure 2. The
+increase the mutual information between observations x(i)        models are trained on CelebA and the number of convolution
+and the inferred latent variables z (Dieng et al., 2018), re-    layers in each spatial scale is 2, 4 and 5 from top to bottom.
+ducing the risk of posterior collapse. And it is well-known      As the depth increases, the reconstruction error becomes
+that ResNet architectures based on skip connections can          larger and there are more σz near 1.
+improve performance on numerous recognition tasks (He
+et al., 2016). To this end, we train a number of AE model-
+s using ResNet-inspired encoder/decoder architectures on
+multiple datasets including Cifar10, Cifar100, SVHN and
+CelebA. Similar to the convolution network structure from
+above, we use 1, 2, and 4 residual blocks within each spa-
+tial scale. Inside each block, we apply 2 to 5 convolution
+layers. For aggregate comparison purposes, we normalize
+the reconstruction error obtained on each dataset by divid-
+ing it with the corresponding error produced by the most
+shallow network structure (1 residual block with 2 convolu-
+tion layers). We then average the normalized reconstruction
+errors over all four datasets. The average normalized er-
+rors are shown in Figure 1(bottom), where we observe that
+adding more convolution layers inside each residual block
+can increase the reconstruction error when the network is
+too deep. Moreover, adding more residual blocks can also
+lead to higher reconstruction errors. And empirical results
+obtained using different datasets and networks architectures,
+beyond the conditions of Figure 1, also show a general trend
+of increased reconstruction error once the effective depth is
+sufﬁciently deep.
+
+We emphasize that in all these models, as the network com-
+plexity/depth increases, the simpler models are always con-
+tained within the capacity of the larger ones. Therefore,
+because the reconstruction error on the training data is be-
+coming worse, it must be the case that the AE is becoming
+stuck at bad local minima or plateaus. Again since the AE re-
+construction error serves as a probable lower bound for that
+of the VAE model, a deeper VAE model will likely suffer the
+same problem, only exacerbated by the KL-divergence term
+in the form of posterior collapse. This implies that there will
+be more σz values moving closer to 1 as the VAE model
+becomes deeper; similarly µz values will push towards 0.
+                           The Usual Suspects? Reassessing Blame for VAE Posterior Collapse
+
+       2.5 #105       Recon. Error = 35.85                          2. At any such bad local minima, the value of γ will nec-
+                                                                       essarily be large, i.e., if it is not large, we cannot be at a
+       2                                                               local minimum.
+
+Count  1.5                                                          3. But because of the thresholding behavior of the VAE as
+                                                                       quantiﬁed by Proposition 2, as γ becomes larger there
+       1                                                               is an increased risk of exact posterior collapse along ex-
+                                                                       cessive latent dimensions. And complete collapse along
+       0.5                                                             all dimensions will occur for some ﬁnite γ sufﬁciently
+                                                                       large. Furthermore, explicitly forcing γ to be small does
+       0                                                               not ﬁx this problem, since in some sense the implicit γ∗
+                                                                       is still large as discussed in Section 5.2.
+            0    0.2  0.4  0.6  0.8         1  1.2
+                                                                    While we believe that this message is interesting in and
+       2.5 #105                    <z                               of itself, there are nonetheless several practically-relevant
+                      Recon. Error = 50.32                          implications. For example, complex hierarchical VAEs like
+                                                                    BIVA notwithstanding, skip connections and KL warm-start
+       2                                                            have modest ability to steer optimization trajectories towards
+                                                                    good solutions; however, this underappreciated limitation
+Count  1.5                                                          will not generally manifest until networks are sufﬁciently
+                                                                    deep as we have considered. Fortunately, any advances
+       1                                                            or insights gleaned from developing deeper unregularized
+                                                                    AEs, e.g., better AE architectures, training procedures, or
+       0.5                                                          initializations (Li & Nguyen, 2019), could likely be adapted
+                                                                    to reduce the risk of posterior collapse in corresponding
+       0                                                            VAE models.
+
+            0    0.2  0.4  0.6  0.8         1  1.2                  In closing, we should also mention that, although this work
+                                                                    has focused on Gaussian VAE models, many of the insights
+       2.5 #105                    <z                               nonetheless translate into broader non-Gaussian regimes.
+                      Recon. Error = 67.31                          For example, a variety of recent VAE enhancements involve
+                                                                    replacing the posterior qφ(z|x) and/or the ﬁxed prior p(z)
+       2                                                            with parameterized non-Gaussian alternatives, e.g., (Bauer
+                                                                    & Mnih, 2019; Burda et al., 2015; Tomczak & Welling,
+Count  1.5                                                          2018; van den Berg et al., 2018). These types of modiﬁca-
+                                                                    tion provide greater ﬂexibility in modeling the aggregated
+       1                                                            posterior in the latent space, which is useful for generating
+                                                                    better samples (Makhzani et al., 2016). However, it does not
+       0.5                                                          immunize VAEs against the bad local minima introduced
+                                                                    by deep decoders, and good reconstructions are required by
+       0                                                            models using Gaussian or non-Gaussian latent priors and
+                                                                    posteriors alike.
+            0    0.2  0.4  0.6  0.8         1  1.2
+                                                                    Note that to support this claim, we have rerun the exper-
+                           <z                                       iments from Figure 1(top) using two more ﬂexible, non-
+                                                                    Gaussian VAE variants, namely, the importance weighted
+Figure 2. Histogram of σz values as VAE encoder/decoder net-        autoencoder (IWAE) (Burda et al., 2015) and a VAE with
+work depth is varied. There are 2, 4 and 5 convolution layers in    Sylvestor normalizing ﬂows (van den Berg et al., 2018). In
+each spatial scale aligned from top to bottom in the ﬁgure. As      both cases the basic trend is the same (please see the supple-
+depth increases, the reconstruction error grows and more σz values  mentary), indicating that our analysis herein still applies in
+are near 1, indicative of impending posterior collapse.             much the same way outside of purely Gaussian VAE models
+                                                                    as expected.
+7. Discussion
+
+In this work we have emphasized the previously-
+underappreciated role of bad local minima in trapping VAE
+models at posterior collapsed solutions. Unlike afﬁne de-
+coder models whereby all local minima are provably global,
+Proposition 1 stipulates that even inﬁnitesimal nonlinear
+perturbations can introduce suboptimal local minima char-
+acterized by deleterious posterior collapse. Furthermore,
+we have demonstrated that the risk of converging to such a
+suboptimal minima increases with decoder depth. In partic-
+ular, we outline the following practically-likely pathway to
+posterior collapse:
+
+1. Deeper AE architectures are essential for modeling high-
+   ﬁdelity images or similar, and yet counter-intuitively,
+   increasing AE depth can actually produce larger recon-
+   struction errors on the training data because of bad local
+   minima (with or without skip connections). An analo-
+   gous VAE model with the same architecture will likely
+   produce even worse reconstructions because of the ad-
+   ditional KL regularization term, which is not designed
+   to steer optimization trajectories away from poor recon-
+   structions.
+The Usual Suspects? Reassessing Blame for VAE Posterior Collapse
+
+Acknowledgements                                               He, K., Zhang, X., Ren, S., and Sun, J. Deep residual
+                                                                  learning for image recognition. CVPR, 2016.
+This work was largely conducted while all authors were at
+Microsoft Research in Beijing. Bin Dai and Ziyu Wang           Higgins, I., Matthey, L., Pal, A., Burgess, C., Glorot, X.,
+were interns while David Wipf was a full time employee at         Botvinick, M., Mohamed, S., , and Lerchner, A. β-vae:
+Microsoft Research.                                               Learning basic visual concepts with a constrained varia-
+                                                                  tional framework. International Conference on Learning
+References                                                       Representations, 2017.
+
+Alemi, A., Poole, B., Fischer, I., Dillon, J., Saurous, R.,    Huang, C., Tan, S., Lacoste, A., and Courville, A. Improv-
+   and Murphy, K. Fixing a broken ELBO. arXiv preprint            ing explorability in variational inference with annealed
+   arXiv:1711.00464, 2017.                                       variational objectives. Advances in Neural Information
+                                                                 Processing Systems, 2018.
+Bauer, M. and Mnih, A. Resampled priors for variational
+   autoencoders. arXiv preprint arXiv:1810.11428, 2018.        Kawaguchi, K. Deep learning without poor local mini-
+                                                                  ma. Advances in Neural Information Processing Systems,
+Bauer, M. and Mnih, A. Resampled priors for variation-            2016.
+   al autoencoders. International Conference on Artiﬁcial
+   Intelligence and Statistics, 2019.                          Kingma, D. and Welling, M. Auto-encoding variational
+                                                                  Bayes. International Conference on Learning Represen-
+Bowman, S., Vilnis, L., Vinyals, O., Dai, A., Jozefowicz, R.,     tations, 2014.
+   and Bengio, S. Generating sentences from a continuous
+   space. arXiv preprint arXiv:1511.06349, 2015.               Krizhevsky, A. and Hinton, G. Learning multiple layers
+                                                                  of features from tiny images. Technical report, Citeseer,
+Burda, Y., Grosse, R., and Salakhutdinov, R. Importance           2009.
+   weighted autoencoders. arXiv preprint arXiv:1509.00519,
+   2015.                                                       Li, P. and Nguyen, P. On random deep weight-tied autoen-
+                                                                  coders: Exact asymptotic analysis, phase transitions, and
+Cai, L., Gao, H., and Ji, S. Multi-stage variational auto-        implications to training. International Conference on
+   encoders for coarse-to-ﬁne image generation. arXiv            Learning Representations, 2019.
+   preprint arXiv:1705.07202, 2017.
+                                                               Lucas, J., Tucker, G., Grosse, R., and Norouzi, M. Under-
+Cande`s, E., Li, X., Ma, Y., and Wright, J. Robust principal      standing posterior collapse in generative latent variable
+   component analysis? J. ACM, 58(2), 2011.                       models. International Conference on Learning Represen-
+                                                                  tations, Workshop Paper, 2019.
+Chen, X., Kingma, D., Salimans, T., Duan, Y., Dhariwal,
+   P., Schulman, J., Sutskever, I., and Abbeel, P. Variation-  Maaløe, L., Fraccaro, M., Lie´vin, V., and Winther, O. BIVA:
+   al lossy autoencoder. arXiv preprint arXiv:1611.02731,        A very deep hierarchy of latent variables for generative
+   2016.                                                          modeling. arXiv preprint arXiv:1902.02102, 2019.
+
+Dai, B. and Wipf, D. Diagnosing and enhancing VAE model-       Makhzani, A., Shlens, J., Jaitly, N., Goodfellow, I., and
+   s. International Conference on Learning Representations,       Frey, B. Adversarial autoencoders. arXiv preprint arX-
+   2019.                                                          iv:1511.05644, 2016.
+
+Dai, B., Wang, Y., Aston, J., Hua, G., and Wipf, D. Hidden     Mattei, P. and Frellsen, J. Leveraging the exact likelihood
+   talents of the variational autoencoder. arXiv preprint         of deep latent variable models. Advances in Neural Infor-
+   arXiv:1706.05148, 2019.                                        mation Processing Systems, 2018.
+
+Dieng, A., Kim, Y., Rush, A., and Blei, D. Avoiding latent     Razavi, A., Oord, A., Poole, B., and Vinyals, O. Preventing
+   variable collapse with generative skip models. arXiv           posterior collapse with δ-VAEs. International Conference
+   preprint arXiv:1807.04863, 2018.                               on Learning Representations, 2019.
+
+Gregor, K. and LeCun, Y. Learning fast approximations          Rezende, D. and Mohamed, S. Variational inference with
+   of sparse coding. International Conference on Machine          normalizing ﬂows. arXiv preprint arXiv:1505.05770,
+   Learning, 2010.                                                2015.
+
+He, J., Spokoyny, D., Neubig, G., and Berg-Kirkpatrick,        Rezende, D., Mohamed, S., and Wierstra, D. Stochastic
+   T. Lagging inference networks and posterior collapse in        backpropagation and approximate inference in deep gen-
+   variational autoencoders. International Conference on          erative models. International Conference on Machine
+   Learning Representations, 2019.                               Learning, 2014.
+                                      The Usual Suspects? Reassessing Blame for VAE Posterior Collapse
+
+Richardson, E. and Weiss, Y. On GANs and GMMs. Ad-
+   vances in Neural Information Processing Systems, 2018.
+
+Rolinek, M., Zietlow, D., and Martius, G. Variational au-
+   toencoders pursue PCA directions (by accident). 2019.
+
+Sønderby, C., Raiko, T., Maaløe, L., Sønderby, S., and
+  Winther, O. How to train deep variational autoencoders
+   and probabilistic ladder networks. arXiv preprint arX-
+   iv:1602.02282, 2016.
+
+Sprechmann, P., Bronstein, A., and Sapiro, G. Learning
+   efﬁcient sparse and low rank models. IEEE Trans. Pattern
+  Analysis and Machine Intelligence, 37(9), 2015.
+
+Tipping, M. and Bishop, C. Probabilistic principal compo-
+   nent analysis. J. Royal Statistical Society, Series B, 61(3):
+   611–622, 1999.
+
+Tomczak, J. and Welling, M. VAE with a VampPrior. Inter-
+   national Conference on Artiﬁcial Intelligence and Statis-
+   tics, 2018.
+
+van den Berg, R., Hasenclever, L., Tomczak, J. M., and
+  Welling, M. Sylvester normalizing ﬂows for variational
+   inference. In Uncertainty in Artiﬁcial Intelligence, 2018.
+
+Van den Oord, A., Kalchbrenner, N., Espeholt, L., Vinyals,
+   O., Graves, A., and Kavukcuoglu, K. Conditional image
+   generation with PixelCNN decoders. Advances in Neural
+  Information Processing Systems, 2016.
+
+Xiao, H., Rasul, K., and Vollgraf, R. Fashion-mnist: a
+   novel image dataset for benchmarking machine learning
+   algorithms. arXiv preprint arXiv:1708.07747, 2017.
+
+Yeung, S., Kannan, A., Dauphin, Y., and Fei-Fei, L. Tack-
+   ling over-pruning in variational autoencoders. arXiv
+   preprint arXiv:1706.03643, 2017.
+
+Yun, C., Sra, S., and Jadbabaie, A. Small nonlinearities
+   in activation functions create bad local minima in neural
+   networks. International Conference on Learning Repre-
+   sentations, 2019.
+
+Zhao, P. and Yu, B. On model selection consistency of
+   Lasso. Journal of Machine learning research, 7:2541–
+   2563, 2006.
+

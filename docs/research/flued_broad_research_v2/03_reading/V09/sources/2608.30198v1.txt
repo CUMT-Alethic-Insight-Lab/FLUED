@@ -1,0 +1,591 @@
+arXiv:2608.30198v1 [cs.CL] 31 Aug 2026  When Errors Become Memories: Causal Pathway Tracing
+                                                  in Multi-Turn Memory-Augmented LLMs
+
+                                              Shuyao Xiao1,2 ∗, Shengling Wang1†, Xuan Chen2, Ke Chao1,
+                                                 Ming Cui2, Feifei Qian1, Fanlin Meng2, Chaoyang Mei2,
+                                                         Chaoyong Jiang1, Qi Ouyang3, Junxi Yin2,
+
+                                               1College of Artificial Intelligence, Beijing Normal University, Beijing, China
+                                                               2Beike Language and Intelligence, Beijing, China
+
+                                                    3Center for Data Science, New York University, New York, NY, USA
+                                           xiaoshuyao@mail.bnu.edu.cn, wangshengling@bnu.edu.cn, chenxuan046@ke.com
+
+                                                                      Abstract                                2024), MemBench (Tan et al. 2025), and MemoryAgent-
+                                                                                                              Bench (Hu, Wang, and McAuley 2025) evaluate memory
+                                           Long-term memory enables large language models (LLMs)              systems in terms of information retrieval, knowledge up-
+                                           to preserve and reuse information across interactions, but it      dating, long-range understanding, selective forgetting, and
+                                           can also turn localized errors into persistent risks. Existing     overall memory capability.
+                                           work mainly evaluates whether memory systems store and
+                                           retrieve information correctly, leaving limited understanding         Long-term memory, however, also changes the nature of
+                                           of how errors propagate across responses, memory states,           model errors. In conventional single-turn interactions, an in-
+                                           and future interactions. We propose a structural causal model      correct response typically constitutes a localized output fail-
+                                           (SCM)-based framework for cross-turn error propagation in          ure. In memory-augmented systems, by contrast, the same
+                                           memory-augmented LLMs. We model user questions, model              error may be incorporated into subsequent memory states
+                                           responses, and memory states as a dynamic causal process,          and repeatedly retrieved and reused, thereby influencing re-
+                                           and identify two entry pathways: internal memory updating          sponses across future interactions (Xiong et al. 2025; Zhang
+                                           and external question feedback. By intervening on these path-      et al. 2023; Kwan et al. 2024). In high-stakes settings that
+                                           ways, we construct four counterfactual trajectories and quan-      rely on persistent information, such as health management,
+                                           tify their downstream effects and interaction. Error influence is  financial planning, and task execution, these enduring effects
+                                           evaluated at four levels: memory retention, natural responses,     may further shape user decisions or agent actions (Dash et al.
+                                           targeted diagnostic probing, and probability-level error prefer-   2026; Qian 2026). Prior studies have shown that erroneous
+                                           ence. Experiments show that error influence generally decays       or contaminated information may persist once incorporated
+                                           with interaction distance, while the memory-update pathway         into long-term memory and continue to affect subsequent
+                                           contributes more persistent effects than question feedback; la-    responses, plans, and behaviors when retrieved (Xiong et al.
+                                           tent errors may remain even after disappearing from natural        2025; Deng et al. 2026). Consequently, an initially isolated
+                                           responses. Propagation patterns also vary across memory cat-       error may propagate over time, evolving into a long-term risk
+                                           egories and memory mechanisms. Pathway-guided restoration          that affects both system states and real-world outcomes.
+                                           further validates this decomposition: Question Repair reduces
+                                           residual error by 27.5%, Memory Repair by 70.2%, and Joint            Existing research has primarily focused on the construc-
+                                           Repair by 98.3%, nearly eliminating residual propagation.          tion, management, and evaluation of long-term memory, typ-
+                                                                                                              ically assessing whether a model can correctly retain and use
+                                                           1 Introduction                                     historical information through final-answer quality or aggre-
+                                                                                                              gate task performance (Wu et al. 2024; Tan et al. 2025; Hu,
+                                        As large language models (LLMs) are increasingly deployed             Wang, and McAuley 2025). However, long-term memory is
+                                        in long-term conversational settings, personalized assistants,        not just a static storage component; it is part of a dynamic
+                                        and persistent interactive systems, external long-term mem-           system where user questions, model responses, and mem-
+                                        ory has become an important mechanism for preserving and              ory states evolve together. At the system level, an error may
+                                        reusing information across sessions (Zhang et al. 2025).              initially affect future behavior through both internal mem-
+                                        Memory systems such as MemoryBank (Zhong et al. 2024),                ory states and external interaction dynamics. Internally, an
+                                        Generative Agents (Park et al. 2023), and MemGPT (Packer              erroneous response may be written into long-term memory,
+                                        et al. 2023) enable models to move beyond the limitations             affecting subsequent generation (Xiong et al. 2025; Zhang
+                                        of the context window through continuous memory updates,              et al. 2026; Deng et al. 2026). Externally, it may reshape
+                                        dynamic retrieval, and hierarchical memory management.                the user’s follow-up questions, causing the conversation to
+                                        Meanwhile, benchmarks such as LongMemEval (Wu et al.                  proceed from an incorrect premise (Kwan et al. 2024). These
+                                                                                                              pathways may later interact, prolonging the influence of the
+                                            ∗This work was conducted during an internship at Beike Lan-       original error. Existing approaches provide limited insight
+                                        guage and Intelligence.
+
+                                            †Corresponding author.
+into how errors propagate dynamically across responses,         storage, thereby enabling multi-session dialogue and long-
+memory states, and subsequent questions, and how the path-      document processing. LongMem (Wang et al. 2023) adopts a
+way through which an error enters the system shapes its         decoupled architecture for memory encoding, retrieval, and
+downstream influence.                                           reading, allowing language models to cache and utilize in-
+                                                                formation from extended historical contexts.
+   To address this gap, we introduce a structural causal model
+(SCM)-based framework (Pearl 2009) for analyzing cross-            These studies improve the storage, updating, retrieval, and
+turn error propagation dynamics. The framework integrates       management of historical information. Their primary objec-
+the joint evolution of user questions, model responses, and     tive, however, is to develop more effective memory architec-
+memory states within a unified causal formulation and em-       tures or improve downstream performance, with compara-
+ploys counterfactual interventions to control whether an error  tively limited attention paid to how information propagates
+enters through internal memory, external question feedback,     across multiple rounds of interaction.
+or both. We use error influence to refer to the measurable
+downstream effects of an injected error on memory states        Memory Evaluation in LLM Systems. As long-term
+and subsequent behavior, including memory retention, oc-        memory mechanisms have evolved, recent work has begun to
+currence in natural responses, re-elicitation under targeted    systematically evaluate memory capabilities in persistent in-
+probes, and shifts in generation probabilities. By tracing      teractions. LongMemEval (Wu et al. 2024) assesses whether
+these manifestations, our framework reveals how errors per-     conversational assistants can retrieve and integrate historical
+sist, decay, and re-emerge across long-term interactions, pro-  information through tasks involving information extraction,
+viding a unified perspective for understanding and mitigating   cross-session reasoning, temporal reasoning, knowledge up-
+systematic error propagation in memory-augmented LLMs.          dating, and abstention. MemBench (Tan et al. 2025) eval-
+Our main contributions are as follows:                          uates memory systems along dimensions such as factual
+                                                                and reflective memory, participatory and observational in-
+ • We develop a dynamic structural causal model and a four-     teraction, effectiveness, efficiency, and capacity. MemoryA-
+   trajectory counterfactual intervention framework that es-    gentBench (Hu, Wang, and McAuley 2025) transforms long-
+   timates the downstream effects of introducing an error       context data into incremental, multi-turn interactions and
+   through memory updating and question feedback, along         evaluates four core capabilities: accurate retrieval, test-time
+   with their interaction.                                      learning, long-range understanding, and selective forgetting.
+
+ • Our experiments show that error influence generally de-         These benchmarks have advanced memory evaluation
+   creases with interaction distance, while errors introduced   from static long-context question answering to incremental
+   through the internal memory pathway have more persis-        and interactive settings. However, they primarily evaluate a
+   tent downstream effects than those from the question-        system’s ability to retain, update, and utilize historical infor-
+   feedback pathway. Even after an error disappears from        mation, usually based on final-answer quality or aggregate
+   natural responses, it may remain as a latent memory trace    task performance.
+   or a shift in generation preference.
+                                                                Causal Analysis of LLM Behavior. Causal intervention
+ • Error propagation varies across memory categories and        has become an important approach for understanding the
+   mechanisms, showing how memory organization shapes           generation mechanisms of large language models. Causal
+   error persistence. We perform pathway-guided restora-        tracing perturbs and restores intermediate activations to iden-
+   tion to update the internal memory state and the exter-      tify internal computations that causally contribute to factual
+   nal question-feedback trajectory. Restoring the corrupted    predictions (Meng et al. 2022). ROME (Meng et al. 2022),
+   memory state suppresses error propagation more effec-        activation patching, and interchange interventions (Zhang
+   tively than correcting the error-affected question trajec-   and Nanda 2023) further localize and manipulate specific
+   tory alone, while restoring both components nearly elim-     layers, token positions, or model components, while causal
+   inates the residual effect.                                  mediation analysis decomposes input–output effects trans-
+                                                                mitted through selected intermediate representations (Vig
+                  2 Related Work                                et al. 2020). Recent work has examined how the causal influ-
+                                                                ence of input questions and generated prefixes evolves during
+Long-Term Memory-Augmented LLMs. To support                     autoregressive generation (Xiao, Wang, and Chao 2026), but
+long-term dialogue, personalized interaction, and informa-      its analysis remains confined to a single generation trajectory.
+tion reuse across sessions, prior studies have augmented
+large language models with external memory. Memory-                Existing causal studies focus on internal variables within a
+Bank (Zhong et al. 2024) maintains continuously updated         single generation process, leaving cross-turn system dynam-
+user memories and incorporates reinforcement and forget-        ics underexplored. In memory-augmented LLMs, however,
+ting mechanisms based on recency and importance. Gen-           questions, responses, and memory states evolve jointly, al-
+erative Agents (Park et al. 2023) organize experiences into     lowing errors to persist and spread across multiple pathways.
+a natural-language memory stream and combine retrieval          The contribution of these pathways to long-term error prop-
+with reflection to support planning and temporally coherent     agation remains poorly understood.
+behavior. MemGPT (Packer et al. 2023) draws inspiration
+from virtual memory in operating systems and dynamically                 3 Structural Causal Modeling
+manages information between the active context and external
+                                                                To characterize the dynamic causal relationships among user
+                                                                questions, model responses, and memory updates in an LLM
+Figure 1: Dynamic structural causal graph of a long-term        affect subsequent interactions: the memory-update pathway
+memory-augmented LLM agent. The memory-update path              Ar−1 → M r → Ar and the question-feedback pathway
+Ar−1 → M r → Ar and question-feedback path Ar−1 →               Ar−1 → Qr → Ar.
+Qr → Ar represent two mechanisms through which an erro-
+neous response can affect subsequent interactions.              Memory-update path. This path describes how erro-
+                                                                neous information enters subsequent interactions through the
+agent, we abstract the interaction and memory-update pro-       agent’s internal memory. Information from an erroneous re-
+cesses common to long-term memory systems and formulate         sponse may be extracted and stored by the memory module
+the multi-turn interaction as a structural causal model in-     through Ar−1 → M r. Because Ar depends on M r, the
+dexed by interaction round (Pearl 2009). As illustrated in      corrupted memory may bias generation toward the same er-
+Figure 1, at round r, Qr, Ar, and M r denote the user ques-     ror (Xiong et al. 2025; Zhang et al. 2026; Deng et al. 2026).
+tion, generated response, and memory state available before
+response generation, respectively.                              Question-feedback path. This path describes how an error
+                                                                enters subsequent interactions by shaping the user’s next
+   We adopt a first-order Markov assumption to model the        question. An erroneous response may affect the next question
+temporal evolution of the memory system. Variables at round     through Ar−1 → Qr. For example, a user may continue the
+r depend only on those from round r − 1 and the current         conversation based on an incorrect premise introduced by the
+round, while information from earlier rounds may still influ-   model, causing subsequent responses to follow a trajectory
+ence the current interaction through intermediate states. This  shaped by the original error (Laban et al. 2025).
+assumption provides a tractable abstraction while preserving
+question evolution, response generation, and memory updat-         The two entry pathways affect different components of
+ing. Under this assumption, the causal graph includes four      the causal system. The memory-update pathway changes the
+main types of relationships.                                    agent’s internal state, whereas the question-feedback pathway
+                                                                changes the external interaction context. Over long-term in-
+Memory persistence. The edge M r−1 → M r repre-                 teractions, these mechanisms may interact: an erroneous re-
+sents the persistence of long-term memory across interaction    sponse may alter future questions, trigger additional errors,
+rounds, capturing the retention and transmission of stored in-  and cause further incorrect information to be written into
+formation (Zhong et al. 2024; Packer et al. 2023).              memory. Thus, the two pathways represent distinct mecha-
+                                                                nisms through which an error enters the system at the inter-
+Memory update. The edges Qr−1 → M r and Ar−1 →                  vention turn and propagates across subsequent interactions.
+M r describe memory updating. The former indicates that
+user queries influence retained information, while the latter      To quantify the downstream effects of each entry mech-
+captures how model responses may be written into memory         anism, we introduce controlled causal interventions in the
+and become part of the future internal state (Zhong et al.      following section.
+2024; Packer et al. 2023; Xiong et al. 2025).
+                                                                 4 Causal Intervention and Pathway Effects
+Question continuation. The edge Ar−1 → Qr captures
+how the assistant’s previous response influences the user’s     Let t denote the error-injection round. Following the two
+subsequent question. Users may pose follow-up questions,        outgoing causal edges from the injected response At to the
+request corrections, or seek elaboration based on previous      next-round memory state M t+1 and user question Qt+1 in
+responses, causing the dialogue trajectory to depend on his-
+torical outputs (Kwan et al. 2024; Laban et al. 2025).          Figure 1, we intervene on the inputs to the memory updater
+
+Response generation. The edges Qr → Ar and M r →                and the next-question generator. These two successor mech-
+Ar represent response generation, in which the current re-
+sponse is conditioned jointly on the current question and the   anisms define a 2 × 2 joint intervention design.
+memory state available at that round (Zhong et al. 2024).
+                                                                   At round t, we replace the naturally generated response
+   Although the causal graph characterizes the normal evo-      with a matched correct response Act or erroneous response
+lution of a memory agent, an erroneous response may in-         Aet to the same question. The two responses differ only in the
+troduce incorrect information into subsequent interactions.     target proposition, while the remaining content and wording
+Based on the system dynamics, we identify two primary
+pathways through which an erroneous response Ar−1 can           are preserved as closely as possible. Passing them separately
+                                                                to the memory updater produces a clean memory state Mct+1
+                                                                and an erroneous memory state Met+1, respectively. Com-
+                                                                bining the correct and erroneous response variants as inputs
+
+                                                                to the two mechanisms yields four counterfactual trajecto-
+
+                                                                ries (Shpitser and Tchetgen 2014):
+
+                                                                Tcc = Mct+1, Atc ,  Tec = Met+1, Act ,  (1)
+                                                                Tce = Mct+1, Aet ,  Tee = Met+1, Aet .
+
+                                                                   The first component specifies the memory state available
+                                                                at round t + 1, while the second specifies the response sup-
+                                                                plied to the next-question generator. Accordingly, the first
+                                                                subscript denotes the intervention on the memory-update
+                                                                mechanism, and the second denotes the intervention on the
+                                                                question-feedback mechanism; c and e indicate correct and
+erroneous inputs, respectively. Thus, Tcc is the fully clean              4.2 Pathway Effects
+trajectory, Tec introduces the error through memory updat-
+ing only, Tce introduces it through question feedback only,               Motivated by causal contrasts for pathway and joint inter-
+and Tee introduces it through both mechanisms.                            ventions (Avin, Shpitser, and Pearl 2005; Shpitser and Tch-
+                                                                          etgen 2014), we define trajectory-level effects according to
+   After the intervention at round t, the four trajectories               the mechanism through which the error initially enters the
+evolve independently according to their respective memory                 system. For any outcome Y ∈ {YM , YA, YC , YP }, let Yxz(k)
+states, dialogue histories, and previous responses. Their dif-            denote its value under trajectory Txz at interaction distance
+ferences therefore identify the downstream causal contrasts               k, where x, z ∈ {c, e}, and let E[·] denote the average over
+induced by the assigned error-entry interventions, while sub-             experimental instances.
+sequent memory updating, question evolution, and response
+generation unfold naturally within each trajectory.                       Definition 1 (Total Propagation Effect). The total propa-
+                                                                          gation effect at interaction distance k is defined as
+
+4.1 Error-Propagation Outcomes                                            TPEY (k) = E[Yee(k)] − E[Ycc(k)].   (6)
+
+Let k denote the interaction distance from the error-injection               It measures the overall downstream effect of introducing
+round, where k = 1 corresponds to the first post-intervention             the error through both entry mechanisms relative to the fully
+round. We measure the downstream influence of the injected                clean trajectory.
+error at four complementary levels: memory retention, nat-
+ural responses, targeted diagnostic probing, and generation               Definition 2 (Memory-Update Pathway Effect). The
+preference. Within a given trajectory, let M (k) denote the               memory-update pathway effect at interaction distance k is
+memory state available immediately before response gener-                 defined as
+ation at interaction distance k. The memory-state outcome is
+defined as                                                                PEM,Y (k) = E[Yec(k)] − E[Ycc(k)].  (7)
+
+    YM (k) = I [the target error is detected in M (k)] , (2)                 It measures the downstream effect associated with intro-
+                                                                          ducing the error only through the memory updater.
+where YM (k) = 1 indicates that the target error remains in
+the current memory state. The natural-response outcome is                 Definition 3 (Question-Feedback Pathway Effect). The
+defined as                                                                question-feedback pathway effect at interaction distance k
+                                                                          is defined as
+ YA(k) = I [the natural response contains the target error] .
+                                                                     (3)  PEQ,Y (k) = E[Yce(k)] − E[Ycc(k)].  (8)
+
+Here, YA(k) = 1 when the response explicitly states, neces-                  It measures the downstream effect associated with intro-
+sarily assumes, or directly relies on the target error.                   ducing the error only through the next-question generator.
+
+   Because natural follow-up questions may not directly con-              Definition 4 (Pathway Interaction Effect). The pathway
+cern the target fact, we also use a targeted diagnostic question          interaction effect is defined as
+qk that asks about it directly. At each interaction distance k,
+the same probe qk is used across all four trajectories to ensure           PIEY (k) = TPEY (k) − PEM,Y (k) − PEQ,Y (k)
+comparability. The controlled-probe outcome is defined as
+                                                                                        = E[Yee(k)] − E[Yec(k)] − E[Yce(k)] + E[Ycc(k)].
+  YC (k) = I [the response to qk contains the target error] ,                                                                                          (9)
+                                                                     (4)
+                                                                             These estimands capture the downstream effects associ-
+where YC(k) = 1 indicates that the target error can be di-                ated with the pathway through which the error is introduced at
+rectly elicited from the current trajectory state. The outcomes           the injection turn, while each trajectory subsequently evolves
+YM (k), YA(k), and YC (k) are determined by a proposition-                according to its own states and dialogue history. The interac-
+level evaluator. A text is labeled erroneous only if it explicitly        tion effect measures non-additivity between the two pathway
+states, necessarily assumes, or directly relies on the complete           interventions, with positive and negative values indicating
+target error; merely quoting, negating, or correcting the er-             super-additive and sub-additive effects, respectively. For ex-
+roneous proposition does not count as propagation.                        ample, TPEYM (k), PEM,YA (k), and PEQ,YC (k) denote the
+                                                                          total effect on memory retention, the memory-update path-
+   To capture latent shifts that may not appear in the final              way effect on natural responses, and the question-feedback
+decoded response, we construct a matched erroneous target                 pathway effect on controlled elicitation, respectively. All tra-
+answer aerr and correct target answer acor for qk, and define             jectories share the same pre-intervention history, and the
+the probability-level error preference as                                 same diagnostic question is used across all four trajectories
+                                                                          for controlled-probe and probability-level evaluation.
+YP (k)  =   1    − log P (aerr|qk,M (k))  log P (acor|qk,M (k))  , (5)
+           ln 2                                      |acor |
+                            |aerr |
+
+where |a| denotes the number of tokens in answer a, and                              5 Experimental Evaluation
+the factor 1/ ln 2 converts the difference in natural log-
+likelihoods into bits. A positive YP (k) indicates a preference           Dataset Construction. Existing multi-turn dialogue
+for the erroneous target, whereas a negative value indicates              datasets typically use fixed interaction trajectories and do
+a preference for the correct target. The four outcomes cap-               not support the pathway-specific interventions required by
+ture, respectively, error retention in memory, explicit error             our causal design. Therefore, we construct 144 multi-turn
+occurrence in natural responses, error re-elicitation through             interactions across six memory categories, with 24 instances
+targeted probing, and latent shifts in generation preference.
+                                                 TPEYA (k)                                          PEM, YA(k)                           PEQ, YA(k)                  PIEYA (k)
+                                                                                         Memory State
+                0.8      Natural Answer                      1.0                                                                         Controlled Probe                                                                Probability
+                0.6                                          0.8
+                0.4                                          0.6                                                                    1.0                                               3
+                0.2                                          0.4
+Effect on YA(k) 0.0                                          0.2Effect on YM(k)                                    Effect on YC(k)  0.8                              Effect on YP(k)
+               −0.2                                          0.0
+                                                            −0.2                                                                    0.6                                               2
+                      1
+                                                                                                                                    0.4
+
+                                                                                                                                                                                                                      1
+                                                                                                                                    0.2
+
+                                                                                                                                   0.0                                               0
+                                                                                                                                  −0.2
+                                                                                                                                                                                    −1
+                         2 3 4 5 6 7 8 9 10 11 12                                     1  2 3 4 5 6 7 8 9 10 11 12                        1 2 3 4 5 6 7 8 9 10 11 12                      1 2 3 4 5 6 7 8 9 10 11 12
+
+                         Interaction distance k                                          Interaction distance k                          Interaction distance k                             Interaction distance k
+
+                                                                                         (a) Qwen2.5-7B-Instruct
+
+                0.8                                                              1.0                                                1.0                                              3
+                0.6
+Effect on YA(k) 0.4                                Effect on YM(k)               0.8                               Effect on YC(k)  0.8                              Effect on YP(k) 2
+                0.2
+                0.0                                                              0.6                                                0.6                                              1
+               −0.2
+                                                                                 0.4                                                0.4                                              0
+                      1 2 3 4 5 6 7 8 9 10 11 12
+                                                                                 0.2                                                0.2                                             −1
+                        Interaction distance k                                                                                                                                           1 2 3 4 5 6 7 8 9 10 11 12
+                                                                                 0.0                                                0.0
+                                                                                                                                                                                            Interaction distance k
+                                                                −0.2                                                              −0.2
+
+                                                                                      1 2 3 4 5 6 7 8 9 10 11 12                         1 2 3 4 5 6 7 8 9 10 11 12
+
+                                                                                         Interaction distance k                          Interaction distance k
+
+                                                                                         (b) OLMo3-7B-Instruct
+
+Figure 2: Pathway effects of an injected error across interaction distances for two models. The first and second rows show results
+
+for Qwen2.5-7B-Instruct and OLMo3-7B-Instruct, respectively. From left to right, the columns correspond to YA(k), YM (k),
+YC(k), and YP (k). The curves show the total propagation effect TPE, memory-update pathway effect PEM , question-feedback
+pathway effect PEQ, and pathway interaction effect PIE; shaded regions indicate 95% bootstrap confidence intervals.
+
+each. Each interaction contains 15 turns; one target error is in-                                                                   Valid Instances and Statistical Reporting. We retain in-
+jected at turn 3 and traced over the following 12 turns, where                                                                      stances where the correct response yields a clean memory
+k ∈ {1, . . . , 12} denotes the interaction distance. Construc-                                                                     state and the erroneous response successfully writes the tar-
+tion details are provided in the supplementary material.                                                                            get error, resulting in 125 valid instances for Qwen2.5-7B-
+                                                                                                                                    Instruct and 120 for OLMo3-7B-Instruct. Each valid instance
+Memory Mechanisms and Models. The main setting fol-                                                                                 is executed under each of the four counterfactual trajectories,
+lows a MemoryBank-style mechanism (Zhong et al. 2024)                                                                               and reported effects are averaged over instances. Shaded re-
+where the memory state is updated after each interaction                                                                            gions denote 95% percentile bootstrap confidence intervals
+round. We additionally evaluate an episodic-retrieval vari-                                                                         computed from 5,000 instance-level resamples. All experi-
+ant inspired by prior retrieval-based memory systems (Park                                                                          ments use 8 NVIDIA H200 GPUs.
+et al. 2023; Packer et al. 2023). This variant stores each
+interaction as an independent memory entry and retrieves                                                                            5.1 Error Propagation and Pathway Effects
+the three most relevant entries using a deterministic, length-
+normalized lexical-overlap score, with recency used to break                                                                        We evaluate error propagation using four complementary
+ties. We use Qwen2.5-7B-Instruct (Qwen et al. 2025) and                                                                             outcomes defined in Section 4.1: the natural-response out-
+OLMo3-7B-Instruct (Olmo et al. 2026) as answer models,                                                                              come YA, memory-state outcome YM , controlled-probe out-
+while Qwen2.5-32B-Instruct (Qwen et al. 2025) is used                                                                               come YC , and probability-level error preference YP . To as-
+for question simulation, counterfactual construction, and                                                                           sess cross-model robustness, we repeat the experiment with
+proposition-level evaluation.                                                                                                       Qwen2.5-7B-Instruct and OLMo3-7B-Instruct under identi-
+                                                                                                                                    cal data, memory, intervention, and evaluation settings.
+Experimental Settings. Natural responses, memory up-
+dates, controlled-probe questions and responses, and                                                                                   As shown in Figure 2, both models exhibit strong short-
+proposition-level evaluator outputs use greedy decoding.                                                                            range propagation followed by gradual decay across all
+Subsequent questions are sampled with temperature 0.7 and                                                                           four outcomes. The natural-response effect decreases most
+top-p = 0.9; failed answer-pair validations are retried with                                                                        rapidly: for Qwen2.5-7B-Instruct and OLMo3-7B-Instruct,
+temperature 0.7 and top-p = 0.95, for at most five attempts.                                                                        the total effect falls from 0.584 and 0.642 at k = 1 to 0.040
+Maximum generation lengths are 96, 128, 256, 256, and 192                                                                           and 0.067 at k = 12, respectively. In contrast, memory-state
+tokens for questions, answers, memory updates, answer pairs,                                                                        and controlled-probe outcomes reveal longer-lasting traces.
+and evaluator outputs, respectively.                                                                                                At k = 1, the memory-state total effect reaches 1.0 for both
+                                                                                                                                    models, while the controlled-probe effect reaches 0.944 and
+                                                                                                                                    0.767, showing that, among valid injections, the error re-
+                                                                                                                                    mains present in the next-round memory state and can be
+Memory type                         Total Effect TPEYC(k)                                      Memory Path PEM, YC(k)                                          Question Path PEQ, YC(k)                                1.0   Estimated causal effect
+             Constraint 0.92 0.50 0.50 0.33 0.08 0.25 0.25 0.08 0.25 0.17 0.08 0.00                                                                                                                                    0.8
+                                                                                       0.92 0.42 0.33 0.00 0.00 0.08 0.17 0.00 0.00 -0.17-0.08-0.17    0.00 0.08 0.08 0.08 -0.08 0.00 0.08 0.08 0.00 -0.17-0.08-0.25   0.6
+               Decision 0.96 0.46 0.42 0.21 0.17 0.17 0.12 0.08 0.04 0.04 0.00 0.00    0.96 0.42 0.25 0.17 0.08 0.29 0.29 0.38 0.29 0.12 0.12 0.04                                                                     0.4
+                    Plan 0.96 0.78 0.57 0.61 0.39 0.48 0.35 0.17 0.17 0.17 0.22 0.09   0.96 0.57 0.35 0.17 0.04 0.13 0.17 0.09 0.13 0.04 0.09 0.04     0.04 0.17 0.17 0.17 0.08 0.08 0.17 0.12 0.21 0.08 0.04 0.04     0.2
+                                                                                       1.00 0.90 0.76 0.62 0.71 0.43 0.29 0.29 0.24 0.24 0.24 0.24                                                                     0.0
+             Preference 1.00 0.90 0.86 0.67 0.62 0.48 0.43 0.43 0.43 0.29 0.24 0.24    0.86 0.52 0.33 0.19 0.29 0.19 0.10 0.10 0.19 0.19 0.05 -0.10    0.00 0.30 0.22 0.35 0.26 0.26 0.26 0.17 0.17 0.09 0.22 0.13
+                 Profile 0.86 0.52 0.43 0.29 0.29 0.19 0.19 0.14 0.19 0.14 0.00 -0.10  0.96 0.54 0.29 0.33 0.17 0.25 0.21 0.08 0.08 0.12 0.00 0.17                                                                     −0.2
+                Routine 0.96 0.67 0.54 0.50 0.46 0.42 0.21 0.17 0.17 0.04 0.08 0.17                                                                    0.00 0.00 0.10 0.00 0.05 0.05 0.05 0.00 -0.05-0.05-0.05 0.05
+                            1 2 3 4 5 6 7 8 9 10 11 12                                  1 2 3 4 5 6 7 8 9 10 11 12
+                                     Interaction distance k                                      Interaction distance k                                0.00 0.05 0.19 0.05 0.19 0.00 -0.05-0.05 0.05 0.00 -0.05-0.05
+
+                                                                                            (a) Qwen2.5-7B-Instruct                                    0.00 0.17 0.38 0.29 0.33 0.25 0.08 0.08 0.08 0.04 0.04 0.17
+
+                                                                                                                                                        1 2 3 4 5 6 7 8 9 10 11 12
+                                                                                                                                                                 Interaction distance k
+
+Memory type  Constraint 0.80 0.35 0.25 0.10 0.20 0.10 0.10 0.05 0.10 0.20 0.15 0.20    0.75 0.40 0.20 0.00 0.15 0.05 0.10 0.15 0.20 0.20 0.00 0.25     0.00 0.15 0.15 0.00 0.05 0.10 0.10 0.05 0.20 0.15 0.05 0.05
+               Decision 0.67 0.57 0.62 0.33 0.19 -0.10 0.19 0.19 0.19 0.05 -0.10 0.05  0.67 0.48 0.24 0.10 0.10 -0.29-0.05 0.00 -0.19 0.10 -0.14 0.00  0.00 0.14 0.33 0.19 0.14 -0.05 0.19 0.00 -0.10 0.10 -0.10 0.19
+                    Plan 0.83 0.75 0.62 0.38 0.33 0.29 0.12 0.08 0.04 0.21 0.25 0.04   0.83 0.46 0.42 0.33 0.12 0.12 0.21 0.21 0.04 0.12 0.17 -0.04    0.00 0.33 0.50 0.38 0.21 0.33 0.21 0.17 0.04 0.12 0.21 0.04
+                                                                                       0.88 0.75 0.38 0.19 0.12 0.12 0.00 -0.06-0.06-0.12-0.12-0.06    0.00 0.06 0.19 -0.12-0.12 0.06 0.00 -0.06 0.00 -0.06-0.06-0.06
+             Preference 0.88 0.75 0.38 0.19 0.19 0.38 0.25 0.12 0.12 0.00 0.19 0.12    0.58 0.37 0.26 0.16 0.16 -0.05 0.05 -0.11 0.05 0.05 0.00 0.00   0.00 0.05 0.00 0.26 0.21 0.16 0.00 0.00 0.16 0.00 0.21 0.05
+                 Profile 0.63 0.37 0.26 0.21 0.16 0.21 0.26 0.00 0.26 0.11 0.05 0.11   0.80 0.40 0.40 0.15 0.15 -0.10 0.00 -0.05-0.15-0.05-0.10-0.10   0.00 0.25 0.35 0.15 0.20 -0.10-0.10 0.00 -0.05 0.05 0.00 0.00
+                Routine 0.80 0.65 0.40 0.35 0.35 0.10 0.00 0.10 -0.10 0.20 0.10 0.15
+                            1 2 3 4 5 6 7 8 9 10 11 12                                  1 2 3 4 5 6 7 8 9 10 11 12                                      1 2 3 4 5 6 7 8 9 10 11 12
+                                     Interaction distance k                                      Interaction distance k                                          Interaction distance k
+
+                                                                                            (b) OLMo3-7B-Instruct
+
+Figure 3: Error propagation across six memory categories for (a) Qwen2.5-7B-Instruct and (b) OLMo3-7B-Instruct. From left
+
+to right, the columns show the total propagation effect TPEYC (k), memory-update pathway effect PEM,YC (k), and question-
+feedback pathway effect PEQ,YC (k). Colors indicate effect magnitude under a shared scale.
+
+             Comparison Evaluation Set Agreement κ                                            Table 1, Qwen agrees strongly with both external judges.
+                                                                                              Although GLM yields lower absolute error rates than the
+             Qwen–GLM Full (35,280)     91.9%                                          0.709  primary evaluator, re-judging preserves the direction of all
+             Qwen–GPT Stratified (900)  89.3%                                          0.591  72 TPE estimates and yields temporal-curve correlations of
+             GLM–GPT Stratified (900)   96.1%                                          0.805  r = .975–.996. The stronger contribution of the memory-
+                                                                                              update pathway and the negative or near-zero interactions
+Table 1: Binary agreement among proposition-level evalua-                                     also remain unchanged. Thus, evaluator calibration affects
+tors. GPT results are post-stratified to the full experiment.                                 effect magnitude but not our temporal or pathway-level con-
+                                                                                              clusions.
+reliably re-elicited.
+                                                                                              5.2 Propagation Patterns across Memory Types
+   The probability-level outcome provides a more fine-
+grained view of latent propagation. At k = 1, the total effects                               We further compare error propagation across six memory
+are 2.726 for Qwen2.5-7B-Instruct and 1.646 for OLMo3-                                        categories: Constraint, Decision, Plan, Preference, Profile,
+7B-Instruct, indicating a substantial shift in relative prefer-                               and Routine. To reduce variation caused by natural follow-up
+ence toward the erroneous target. Thus, an error may disap-                                   questions, we use a fixed diagnostic question that directly
+pear from natural responses while remaining stored in mem-                                    probes the target fact.
+ory, recoverable under targeted probing, or reflected in the
+underlying generation distribution.                                                              As shown in Figure 3, propagation varies across mem-
+                                                                                              ory categories and answer models. For Qwen2.5-7B-Instruct,
+   The pathway analysis shows that the memory-update path-                                    preference errors are the most persistent and receive larger
+way contributes more strongly to YM , YC , and YP . The                                       contributions from the memory-update pathway, while plan
+question-feedback pathway is generally weaker and relies                                      and routine errors receive greater contributions from question
+more on whether later questions reactivate error-related in-                                  feedback. For OLMo3-7B-Instruct, plan errors are the most
+formation. The interaction effects are mostly negative or near                                persistent and are sustained by both memory retention and
+zero. This may happen because the two pathways have over-                                     changes in subsequent questions. Across both models, prefer-
+lapping downstream influences: once one pathway induces                                       ence errors are primarily associated with persistent memory
+the error, redundancy or outcome saturation limits the effect                                 retention, while plan errors significantly alter later interaction
+of activating the other. These patterns hold across both an-                                  trajectories. Routine errors receive contributions from both
+swer models, though controlled-probe and probability-level                                    pathways, while constraint, decision, and profile errors gen-
+traces generally last longer for Qwen2.5-7B-Instruct, while                                   erally decay faster or fluctuate more across rounds. Overall,
+OLMo3-7B-Instruct shows faster attenuation.                                                   memory category affects both the duration and mechanism
+                                                                                              of error propagation, and cross-model differences indicate
+Evaluator robustness. We assess judge dependence by re-                                       that these patterns also depend on how each model stores
+evaluating all 35,280 proposition-level outcomes with GLM-                                    and utilizes long-term information.
+5.2 (GLM-5-Team et al. 2026) and a stratified sample of
+900 outcomes with GPT-5.5 (OpenAI 2026). As shown in
+                 1.0                MemoryBank        Episodic Retrieval                   Strategy         Residual MRE ↓  Reduction ↑
+
+Effect on YM(k)  0.8                                                                       No Repair               0.178          –
+                                                                       Total Effect (TPE)  Question Repair         0.129       27.5%
+                                                                                           Memory Repair           0.053       70.2%
+                 0.6                                  Memory PE (PEM)                      Joint Repair            0.003       98.3%
+
+                 0.4                                  Question PE (PEQ)
+
+                 0.2                                                                       Table 2: Pathway-guided state-restoration results on con-
+                                                                                           trolled probes. Lower mean residual effect (MRE) indicates
+                 0.0                                                                       more effective restoration.
+                                 2
+                                    4           6  8           10  12
+
+                                       Interaction distance k                                 Using fixed controlled probes, we define the residual ef-
+                                                                                           fect of strategy s at post-restoration distance j as Rs(j) =
+Figure 4: Effects of the injected error on the memory-state                                Ys(j) − Yclean(j), where Ys(j) and Yclean(j) denote the
+outcome YM (k) under different memory mechanisms. Red                                      controlled-probe outcomes under strategy s and the clean
+and blue curves denote MemoryBank and episodic retrieval,                                  trajectory. We summarize the remaining propagation using
+respectively. Line styles indicate the total propagation effect                            the mean residual effect:
+TPE, memory-update pathway effect PEM , and question-
+feedback pathway effect PEQ.                                                                                1 J−1
+
+                                                                                           MRE(s) =                Rs(j),
+                                                                                                          J
+                                                                                                             j=0
+
+5.3 Propagation Patterns across Memory                                                     where J is the number of post-restoration distances. Lower
+      Mechanisms                                                                           MRE indicates more effective restoration. We also report the
+                                                                                           relative reduction compared with No Repair:
+To examine whether the identified propagation patterns gen-
+eralize across memory mechanisms, we compare two long-                                     Reduction(s) =  MRE(NoRepair) − MRE(s)  × 100%.
+term memory architectures: continuously updated Memory-
+Bank (Zhong et al. 2024) and episodic retrieval with indepen-                                               MRE(NoRepair)
+dent entries and Top-3 retrieval (Park et al. 2023; Packer et al.
+2023). MemoryBank consolidates historical interactions into                                   As shown in Table 2, Memory Repair reduces residual
+a dynamic memory state, whereas episodic retrieval pre-                                    MRE by 70.2%, compared with 27.5% for Question Re-
+serves interactions as independent entries and retrieves those                             pair, consistent with the stronger memory-update pathway
+most relevant to the current query.                                                        effects identified in our causal analysis. On held-out in-
+                                                                                           stances, larger question-feedback pathway effects are associ-
+   As shown in Figure 4, the two mechanisms exhibit dif-                                   ated with greater gains from Question Repair on controlled
+ferent error-persistence patterns. Under MemoryBank, both                                  probes (ρ = 0.335, 95% CI [0.158, 0.493]). Joint Repair fur-
+TPE and PEM decrease steadily as the memory state is                                       ther reduces residual propagation by 98.3%, demonstrating
+updated. In contrast, episodic retrieval retains the erroneous                             that coordinated correction of the memory state and dialogue
+entry in memory, resulting in persistently high memory-state                               context is most effective. Overall, pathway effects quantify
+effects over long interaction distances. Despite the difference                            error propagation and indicate which components are more
+in persistence, both mechanisms exhibit the same pathway-                                  likely to benefit from intervention.
+level pattern: PEM accounts for most of the memory-state
+effect, whereas PEQ remains comparatively small. Thus,                                                         6 Conclusion
+memory-state error persistence depends both on the error-
+entry pathway and the subsequent memory mechanism.                                         We present a dynamic structural causal framework for
+                                                                                           characterizing cross-turn error propagation in long-term
+5.4 Can Pathway Effects Guide Error                                                        memory-augmented LLMs and decomposing its total ef-
+      Restoration?                                                                         fect into memory-update, question-feedback, and interac-
+                                                                                           tion components. Experiments across models, memory cate-
+To examine whether pathway effects can guide effective in-                                 gories, and memory mechanisms show that errors can persist
+terventions, we conduct a pathway-guided state-restoration                                 across multiple turns, with the memory-update pathway typ-
+experiment. The error is injected at turn 3, and a one-time                                ically contributing more strongly and latent errors remain-
+restoration is applied before the turn at interaction distance                             ing beyond observable responses. Pathway-guided restora-
+k = 3. We then evaluate the remaining propagation over                                     tion further shows that repairing the memory-update pathway
+subsequent interactions. We conduct this experiment using                                  is more effective than repairing the error-affected question-
+Qwen2.5-7B-Instruct with the MemoryBank-style mecha-                                       feedback pathway alone, while jointly repairing both path-
+nism. We consider four strategies: No Repair, Question Re-                                 ways nearly eliminates residual propagation.
+pair, Memory Repair, and Joint Repair. Question Repair
+restores the dialogue history and previous response while re-                                                     References
+taining the error-affected memory. Memory Repair restores
+the memory state while retaining the error-affected dialogue                               Avin, C.; Shpitser, I.; and Pearl, J. 2005. Identifiability of
+context. Joint Repair restores both components.                                            path-specific effects.
+Dash, P.; Ge, T.; Jain, A.; Shah, T.; and Shang, Z. 2026.          P.; Dasigi, P.; Berry, R.; Malik, S.; Shah, S.; Geng, S.; Arora,
+From Untrusted Input to Trusted Memory: A System-                  S.; Gupta, S.; Anderson, T.; Xiao, T.; Murray, T.; Romero, T.;
+atic Study of Memory Poisoning Attacks in LLM Agents.              Graf, V.; Asai, A.; Bhagia, A.; Wettig, A.; Liu, A.; Rangapur,
+arXiv:2606.04329.                                                  A.; Anastasiades, C.; Huang, C.; Schwenk, D.; Trivedi, H.;
+                                                                   Magnusson, I.; Lochner, J.; Liu, J.; Miranda, L. J. V.; Sap, M.;
+Deng, X.; Zhong, R.; Peng, H.; Lu, X.; Wu, Y.; Li, G.; Xu, B.;     Morgan, M.; Schmitz, M.; Guerquin, M.; Wilson, M.; Huff,
+Yao, Y.; Fang, J.; Cao, H.; et al. 2026. MemTrace: Tracing         R.; Bras, R. L.; Xin, R.; Shao, R.; Skjonsberg, S.; Shen, S. Z.;
+and Attributing Errors in Large Language Model Memory              Li, S. S.; Wilde, T.; Pyatkin, V.; Merrill, W.; Chang, Y.; Gu,
+Systems. arXiv preprint arXiv:2605.28732.                          Y.; Zeng, Z.; Sabharwal, A.; Zettlemoyer, L.; Koh, P. W.;
+                                                                   Farhadi, A.; Smith, N. A.; and Hajishirzi, H. 2026. Olmo 3.
+GLM-5-Team; Zeng, A.; Lv, X.; Hou, Z.; Du, Z.; Zheng,              arXiv:2512.13961.
+Q.; Chen, B.; Yin, D.; Ge, C.; Huang, C.; Xie, C.; Zhu, C.;
+Yin, C.; Wang, C.; Pan, G.; Zeng, H.; Zhang, H.; Wang, H.;         OpenAI. 2026. GPT-5.5 Model. https://developers.openai.
+Chen, H.; Zhang, J.; Jiao, J.; Guo, J.; Wang, J.; Du, J.; Wu,      com/api/docs/models/gpt-5.5.
+J.; Wang, K.; Li, L.; Fan, L.; Zhong, L.; Liu, M.; Zhao, M.;
+Du, P.; Dong, Q.; Lu, R.; Shuang-Li; Cao, S.; Liu, S.; Jiang,      Packer, C.; Fang, V.; Patil, S.; Lin, K.; Wooders, S.; and
+T.; Chen, X.; Zhang, X.; Huang, X.; Dong, X.; Xu, Y.; Wei,         Gonzalez, J. 2023. MemGPT: towards LLMs as operating
+Y.; An, Y.; Niu, Y.; Zhu, Y.; Wen, Y.; Cen, Y.; Bai, Y.; Qiao,     systems.
+Z.; Wang, Z.; Wang, Z.; Zhu, Z.; Liu, Z.; Li, Z.; Wang, B.;
+Wen, B.; Huang, C.; Cai, C.; Yu, C.; Li, C.; Hu, C.; Zhang,        Park, J. S.; O’Brien, J.; Cai, C. J.; Morris, M. R.; Liang,
+C.; Zhang, D.; Lin, D.; Yang, D.; Wang, D.; Ai, D.; Zhu, E.;       P.; and Bernstein, M. S. 2023. Generative agents: Interac-
+Yi, F.; Chen, F.; Wen, G.; Sun, H.; Zhao, H.; Hu, H.; Zhang,       tive simulacra of human behavior. In Proceedings of the
+H.; Liu, H.; Zhang, H.; Peng, H.; Tai, H.; Zhang, H.; Liu, H.;     36th annual acm symposium on user interface software and
+Wang, H.; Yan, H.; Ge, H.; Liu, H.; Chu, H.; Zhao, J.; Wang,       technology, 1–22.
+J.; Zhao, J.; Ren, J.; Wang, J.; Zhang, J.; Gui, J.; Zhao, J.;
+Li, J.; An, J.; Li, J.; Yuan, J.; Du, J.; Liu, J.; Zhi, J.; Duan,  Pearl, J. 2009. Causal inference in statistics: An overview.
+J.; Zhou, K.; Wei, K.; Wang, K.; Luo, K.; Zhang, L.; Sha,
+L.; Xu, L.; Wu, L.; Ding, L.; Chen, L.; Li, M.; Lin, N.; Ta,       Qian, J. 2026. Visual Inception: Compromising Long-term
+P.; Zou, Q.; Song, R.; Yang, R.; Tu, S.; Yang, S.; Wu, S.;         Planning in Agentic Recommenders via Multimodal Mem-
+Zhang, S.; Li, S.; Li, S.; Fan, S.; Qin, W.; Tian, W.; Zhang,      ory Poisoning. In Liakata, M.; Moreira, V. P.; Zhang, J.; and
+W.; Yu, W.; Liang, W.; Kuang, X.; Cheng, X.; Li, X.; Yan,          Jurgens, D., eds., Proceedings of the 64th Annual Meeting
+X.; Hu, X.; Ling, X.; Fan, X.; Xia, X.; Zhang, X.; Zhang, X.;      of the Association for Computational Linguistics (Volume 1:
+Pan, X.; Zou, X.; Zhang, X.; Liu, Y.; Wu, Y.; Li, Y.; Wang,        Long Papers), 20846–20862. San Diego, California, United
+Y.; Zhu, Y.; Tan, Y.; Zhou, Y.; Pan, Y.; Zhang, Y.; Su, Y.;        States: Association for Computational Linguistics. ISBN
+Geng, Y.; Yan, Y.; Tan, Y.; Bi, Y.; Shen, Y.; Yang, Y.; Li,        979-8-89176-390-6.
+Y.; Liu, Y.; Wang, Y.; Li, Y.; Wu, Y.; Zhang, Y.; Duan, Y.;
+Zhang, Y.; Liu, Z.; Jiang, Z.; Yan, Z.; Zhang, Z.; Wei, Z.;        Qwen; Yang, A.; Yang, B.; Zhang, B.; Hui, B.; Zheng, B.;
+Chen, Z.; Feng, Z.; Yao, Z.; Chai, Z.; Wang, Z.; Zhang, Z.;        Yu, B.; Li, C.; Liu, D.; Huang, F.; Wei, H.; Lin, H.; Yang,
+Xu, B.; Huang, M.; Wang, H.; Li, J.; Dong, Y.; and Tang, J.        J.; Tu, J.; Zhang, J.; Yang, J.; Yang, J.; Zhou, J.; Lin, J.;
+2026. GLM-5: from Vibe Coding to Agentic Engineering.              Dang, K.; Lu, K.; Bao, K.; Yang, K.; Yu, L.; Li, M.; Xue,
+arXiv:2602.15763.                                                  M.; Zhang, P.; Zhu, Q.; Men, R.; Lin, R.; Li, T.; Tang, T.;
+                                                                   Xia, T.; Ren, X.; Ren, X.; Fan, Y.; Su, Y.; Zhang, Y.; Wan,
+Hu, Y.; Wang, Y.; and McAuley, J. 2025. Evaluating memory          Y.; Liu, Y.; Cui, Z.; Zhang, Z.; and Qiu, Z. 2025. Qwen2.5
+in llm agents via incremental multi-turn interactions. arXiv       Technical Report. arXiv:2412.15115.
+preprint arXiv:2507.05257.
+                                                                   Shpitser, I.; and Tchetgen, E. T. 2014. Causal inference
+Kwan, W.-C.; Zeng, X.; Jiang, Y.; Wang, Y.; Li, L.; Shang, L.;     with a graphical hierarchy of interventions. arXiv preprint
+Jiang, X.; Liu, Q.; and Wong, K.-F. 2024. Mt-eval: A multi-        arXiv:1411.2127.
+turn capabilities evaluation benchmark for large language
+models. In Proceedings of the 2024 Conference on Empirical         Tan, H.; Zhang, Z.; Ma, C.; Chen, X.; Dai, Q.; and Dong,
+Methods in Natural Language Processing, 20153–20177.               Z. 2025. Membench: Towards more comprehensive evalu-
+                                                                   ation on the memory of llm-based agents. In Findings of
+Laban, P.; Hayashi, H.; Zhou, Y.; and Neville, J. 2025.            the Association for Computational Linguistics: ACL 2025,
+Llms get lost in multi-turn conversation. arXiv preprint           19336–19352.
+arXiv:2505.06120.
+                                                                   Vig, J.; Gehrmann, S.; Belinkov, Y.; Qian, S.; Nevo, D.;
+Meng, K.; Bau, D.; Andonian, A. J.; and Belinkov, Y. 2022.         Singer, Y.; and Shieber, S. 2020. Investigating gender bias in
+Locating and editing factual associations in gpt. In Advances      language models using causal mediation analysis. Advances
+in neural information processing systems.                          in neural information processing systems, 33: 12388–12401.
+
+Olmo, T.; Ettinger, A.; Bertsch, A.; Kuehl, B.; Graham, D.;        Wang, W.; Dong, L.; Cheng, H.; Liu, X.; Yan, X.; Gao, J.;
+Heineman, D.; Groeneveld, D.; Brahman, F.; Timbers, F.;            and Wei, F. 2023. Augmenting language models with long-
+Ivison, H.; Morrison, J.; Poznanski, J.; Lo, K.; Soldaini, L.;     term memory. Advances in Neural Information Processing
+Jordan, M.; Chen, M.; Noukhovitch, M.; Lambert, N.; Walsh,         Systems, 36: 74530–74543.
+
+                                                                   Wu, D.; Wang, H.; Yu, W.; Zhang, Y.; Chang, K.-W.;
+                                                                   and Yu, D. 2024. Longmemeval: Benchmarking chat as-
+sistants on long-term interactive memory. arXiv preprint
+arXiv:2410.10813.
+
+Xiao, S.; Wang, S.; and Chao, K. 2026. Bridging Internal
+Consistency and External Alignment: A Causal and Dynamic
+Interpretability Framework for LLM Generation. In Pro-
+ceedings of the 64th Annual Meeting of the Association for
+Computational Linguistics (Volume 1: Long Papers), 20378–
+20392.
+
+Xiong, Z.; Lin, Y.; Xie, W.; He, P.; Liu, Z.; Tang, J.;
+Lakkaraju, H.; and Xiang, Z. 2025. How memory manage-
+ment impacts llm agents: An empirical study of experience-
+following behavior. arXiv preprint arXiv:2505.16067.
+
+Zhang, D.; Lin, Y.; Wu, Z.; Sun, Y.; Li, B.; Li, D.; and Peng,
+H. 2026. Useful memories become faulty when continuously
+updated by llms. arXiv preprint arXiv:2605.12978.
+
+Zhang, F.; and Nanda, N. 2023. Towards best practices of ac-
+tivation patching in language models: Metrics and methods.
+arXiv preprint arXiv:2309.16042.
+
+Zhang, M.; Press, O.; Merrill, W.; Liu, A.; and Smith, N. A.
+2023. How language model hallucinations can snowball.
+arXiv preprint arXiv:2305.13534.
+
+Zhang, Z.; Dai, Q.; Bo, X.; Ma, C.; Li, R.; Chen, X.; Zhu,
+J.; Dong, Z.; and Wen, J.-R. 2025. A survey on the memory
+mechanism of large language model-based agents. ACM
+Transactions on Information Systems, 43(6): 1–47.
+
+Zhong, W.; Guo, L.; Gao, Q.; Ye, H.; and Wang, Y. 2024.
+Memorybank: Enhancing large language models with long-
+term memory. In Proceedings of the AAAI conference on
+artificial intelligence, volume 38, 19724–19731.
+

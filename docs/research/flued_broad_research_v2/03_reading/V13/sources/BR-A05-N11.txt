@@ -1,0 +1,827 @@
+                                        Directions of Curvature as an Explanation for Loss of Plasticity
+
+                                        Alex Lewandowski 1 Haruto Tanaka 1 Dale Schuurmans 1 2 3 Marlos C. Machado 1 3
+
+arXiv:2312.00246v2 [cs.LG] 17 Feb 2024                          Abstract                                    The concept of plasticity has been receiving growing atten-
+                                                                                                            tion in the continual learning literature, where the loss of
+                                              Loss of plasticity is a phenomenon in which neu-              plasticity—a reduction in the ability to learn new things (Do-
+                                              ral networks lose their ability to learn from new             hare et al., 2023a; Lyle et al., 2023)—has been noted as a
+                                              experience. Despite being empirically observed in             critical shortcoming in current learning algorithms. That is,
+                                              several problem settings, little is understood about          learning algorithms that are performant in the non-continual
+                                              the mechanisms that lead to loss of plasticity. In            learning setting, and more specifically neural networks, of-
+                                              this paper, we offer a consistent explanation for             ten struggle when applied to continual learning problems,
+                                              loss of plasticity: Neural networks lose directions           exhibiting a striking loss of plasticity such that learning
+                                              of curvature during training and that loss of                 slows down or even halts after successive changes in the
+                                              plasticity can be attributed to this reduction in             learning distribution. Such a loss of plasticity can be readily
+                                              curvature. To support such a claim, we provide                observed in settings where a neural network must continue
+                                              a systematic investigation of loss of plasticity              to learn after changes occur in the observations or targets.
+                                              across continual learning tasks using MNIST,
+                                              CIFAR-10 and ImageNet. Our findings illustrate                Several aspects of a learning algorithm have been found
+                                              that loss of curvature directions coincides with              to contribute to, or mitigate, loss of plasticity. Examples
+                                              loss of plasticity, while also showing that previous          include the optimizer (Dohare et al., 2023a), the step-size
+                                              explanations are insufficient to explain loss of              (Ash & Adams, 2020; Berariu et al., 2021), the number of
+                                              plasticity in all settings. Lastly, we show that              updates (Lyle et al., 2023), the activation function (Abbas
+                                              regularizers which mitigate loss of plasticity also           et al., 2023), and the use of specific regularizers (Dohare
+                                              preserve curvature, motivating a simple distri-               et al., 2021; Kumar et al., 2023; Lyle et al., 2021). Such fac-
+                                              butional regularizer that proves to be effective              tors hint that there might be simpler underlying mechanisms
+                                              across the problem settings we considered.                    mechanisms for loss of plasticity. For example, the success
+                                                                                                            of several methods that regularize neural networks towards
+                                        1. Introduction                                                     properties of the initialization suggests that some property of
+                                                                                                            the initialization mitigates loss of plasticity. Unfortunately,
+                                        A longstanding goal of machine learning research is to de-          no such property has yet been identified. Some factors that
+                                        velop algorithms that can learn continually and cope with un-       have been found to correlate with loss of plasticity include, a
+                                        foreseen changes in the data distribution (Ring, 1994; Thrun,       decrease in the gradient or update norm (Abbas et al., 2023),
+                                        1998). Current learning algorithms, however, struggle to            neuron dormancy (Sokar et al., 2023), and an increase in
+                                        learn from dynamically changing targets and are unable to           the norm of the parameters (Nikishin et al., 2022).
+                                        adapt gracefully to unforeseen changes in the distribution
+                                        during the learning process (Zilly et al., 2021; Abbas et al.,      In this paper, we propose that loss of plasticity can be ex-
+                                        2023; Lyle et al., 2023; Dohare et al., 2023a). Such limita-        plained by a loss of curvature directions. Our work con-
+                                        tions can be seen to be a byproduct of assuming, one way or         tributes to a growing literature on the importance of cur-
+                                        another, the problem is stationary. Recently, there has been        vature for understanding neural network dynamics (Cohen
+                                        growing recognition of the fact that there are limitations to       et al., 2021; Hochreiter & Schmidhuber, 1997; Fort & Gan-
+                                        what can be learned from a fixed and unchanging dataset             guli, 2019). Within the continual learning and plasticity
+                                        (Hoffmann et al., 2022) and that there are implicit non-            literature, the assertion that curvature is related to plastic-
+                                        stationarities in many problems of interest (Igl et al., 2021).     ity is relatively new (Lyle et al., 2023). In contrast to the
+                                                                                                            general assertion that curvature is related to plasticity, our
+                                             1Department of Computing Science, University of Al-            work specifically posits that loss of curvature directions ex-
+                                        berta, Edmonton, Canada 2Google DeepMind 3Canada CI-                plains loss of plasticity. In particular, we provide empirical
+                                        FAR AI Chair. Correspondence to: Alex Lewandowski                   evidence that supports the claim that loss of plasticity co-
+                                        <lewandowski@ualberta.ca>.                                          occurs with a reduction in the rank of the Hessian of the
+                                                                                                            training objective at the beginning of a new task.
+
+                                                                                                         1
+Directions of Curvature as an Explanation for Loss of Plasticity
+
+More specifically, this work improves the understanding of               task. If we were to consider the large initial error, we might
+loss of plasticity in continual supervised learning by:                  infer loss of plasticity in the average online error even if the
+                                                                         error at the end of a task is constant (see Appendix C.1).
+  1. Surveying previous explanations for loss of plastic-                Because the error at the end of a task increases as more tasks
+      ity. We provide counterexamples showing that existing              are seen, this means that the neural network is struggling to
+      explanations are not consistent, that is, they do not              learn from the new experience given by the subsequent task.
+      explain loss of plasticity in all situations it occurs.
+                                                                         2.1. Factors That Can Contribute to Loss of Plasticity
+  2. Proposing that loss of curvature directions, measured
+      as the reduction in the rank of the Hessian of the train-          Given a concrete notion of plasticity, we reiterate that the
+      ing objective, is a consistent explanation for loss of             underlying mechanisms leading to loss of plasticity have
+      plasticity. We demonstrate that loss of curvature direc-           been so-far elusive. This is partly because multiple factors
+      tions coincides with loss of plasticity across all factors         can potentially contribute to, or mitigate, loss of plasticity.
+      and benchmarks that we consider.                                   In this section, we summarize some of these potential factors
+                                                                         before surveying previous explanations for the underlying
+  3. Introducing a Wasserstein regularizer that keeps the                mechanism behind loss of plasticity.
+      distribution of weights close to the initialization distri-
+      bution. This Wasserstein regularizer allows the param-             Optimizer Optimizers that were designed and tuned for
+      eters to move further from initialization while preserv-           stationary distributions can exacerbate loss of plasticity in
+      ing curvature for successive tasks. Learning with the              non-stationary settings. For instance, the work by Lyle et al.
+      Wasserstein regularizer requires fewer iterations and              (2023) showed empirically that Adam (Kingma & Ba, 2015)
+      achieves a lower error compared to other regularizers.             can be unstable on a subsequent task due to its momentum
+                                                                         and scaling from a previous task.
+2. Factors and Explanations for Loss of
+   Plasticity                                                            Step-size In addition to the optimizer, the step-size is a cru-
+                                                                         cial factor in both contributing to and mitigating loss of plas-
+Before defining what we mean by loss of plasticity, we                   ticity. The study by Berariu et al. (2021), for example, sug-
+outline the continual supervised learning problem setting                gests that loss of plasticity is preventable by amplifying the
+we study. We assume the learning algorithm operates in a                 randomness of gradients with a larger step-size. These find-
+minibatch setting, processing M observation-target pairs,                ings extend to other hyper-parameters of the optimizer. Prop-
+{xi, yi}iM=1, and updating the neural network parameters,                erly tuned hyper-parameters for Adam, for example, can mit-
+θ, after each minibatch. In continual supervised learning,               igate loss of plasticity which leads to policy collapse in rein-
+there is a periodic and regular change every U updates to                forcement learning (Dohare et al., 2023b; Lyle et al., 2023).
+the distribution generating the observations or targets. For
+every U updates, the neural network must minimize an                     Update budget Continual supervised learning experi-
+objective defined over a new distribution—we refer to this               ments, including those below, use a fixed number of update
+new distribution as a task. The problem setting is designed              steps per task (e.g., Abbas et al., 2023; Elsayed & Mah-
+so that the task at any point in time has the same difficulty.1          mood, 2023; Javed & White, 2019). Despite the fact that the
+We are primarily interested in the error at the the end of               individual tasks themselves are of the same difficulty, the
+task K averaged across all observations in that task, JK =               neural network might not be able to escape its task-specific
+J (θUK ) = EpK ℓ(fθUK (x), y) , for some loss function ℓ,                initialization within the pre-determined update budget. Lyle
+and task specific data distribution pK.                                  et al. (2023) show that, as the number of update steps in-
+                                                                         crease in a first task, learning slows down on a subsequent
+Although loss of plasticity is an empirically observed phe-              task, requiring even more update steps on the subsequent
+nomenon, the way it is measured in the literature can vary.              task to reach the same training error.
+In this paper, we use loss of plasticity to refer to the phe-
+nomenon that JK increases rather than decreases as a func-               Activation function One major factor that can contribute
+tion of K. Some works evaluate learning and plasticity with              or mitigate loss of plasticity is the activation function. Work
+the average online error over the learning trajectory within a           by Abbas et al. (2023) suggests that, in the reinforcement
+task (e.g., Elsayed & Mahmood, 2023; Dohare et al., 2023a;               learning setting, loss of plasticity occurs because of an in-
+Kumar et al., 2023). While the two are related, we focus on              creasing portion of hidden units being set to zero by ReLU
+the error at the end of the task to remove the effect of the             activations (Fukushima, 1975; Nair & Hinton, 2010). The
+unavoidable error increase at the beginning of a subsequent              authors then show that CReLU (Shang et al., 2016) prevents
+                                                                         saturation, mitigating loss of plasticity almost entirely. How-
+    1A suitably initialized neural network should be able to equally     ever, other works have shown that loss of plasticity can still
+minimize the objective for any of the tasks we consider.                 occur with non-saturating activation functions (Dohare et al.,
+
+                                                                      2
+                                         Directions of Curvature as an Explanation for Loss of Plasticity
+
+2021; 2023a) such as leaky-ReLU (Xu et al., 2015).
+
+Properties of the objective function and the regularizer
+The objective function being optimized greatly influences
+the optimization landscape and, hence, plasticity (Lyle et al.,
+2021; 2023; Ziyin, 2023). Regularization is one modifi-
+cation to the objective function that helps mitigate loss of
+plasticity. For example, when weight decay is properly
+tuned, it can help mitigate loss of plasticity (Dohare et al.,
+2023a). Another regularizer that mitigates loss of plasticity
+is regenerative regularization, which regularizes towards the
+parameter initialization (Kumar et al., 2023).
+
+2.2. Previous Explanations for Loss of Plasticity                     Figure 1. Inconsistencies of previous explanations for loss of
+                                                                      plasticity on Random Label MNIST (subset). The expla-
+Not only are there several factors that could possibly con-           nations on the left are not consistent because both ReLU and
+tribute to loss of plasticity, there are also several explana-        leaky-ReLU suffer from loss of plasticity. On the right, there is
+tions for this phenomenon. We survey the recent explana-              no loss of plasticity for tanh and identity but the correspond-
+tions of loss of plasticity below. In the next section, we            ing explanations predict that they do. All results have a shaded
+present results showing that none of these explanations are           region corresponding to a 95% confidence interval of the mean
+sufficient to explain loss of plasticity across all problem           over 30 runs.
+settings we consider.
+                                                                      amples for them, showing that they fail to fully explain loss
+Decreasing update/gradient norm The simplest explana-                 of plasticity. To do so, we use a linearly separable subset of
+tion for loss of plasticity is that the update norm goes to zero.     the MNIST dataset (LeCun et al., 2010), in which the labels
+This would mean that the parameters of the neural network             of each image are periodically shuffled. While MNIST is a
+stop changing, eliminating all plasticity. This tends to occur        simple classification problem, label shuffling highlights the
+with a decrease in the norm of the features for particular            difficulties associated with preserving plasticity (see Lyle
+layers (Abbas et al., 2023; Nikishin et al., 2022).                   et al., 2023; Kumar et al., 2023). We focus on this prob-
+                                                                      lem for its simplicity, showing that even in a setting where
+Dormant Neurons Another explanation for loss of plas-                 linear function approximation is sufficient, one can find
+ticity is a steady decrease in the proportion of active neu-          counterexamples to the previous explanations in the litera-
+rons, namely, the dormant neuron phenomenon (Sokar et al.,            ture for loss of plasticity. We emphasize that the goal here is
+2023). It is hypothesized that a decrease in the number of ac-        merely to uncover simple counterexamples that refute pro-
+tive neurons also decreases a neural network’s expressivity,          posed explanations for loss of plasticity, not to investigate
+potentially leading to loss of plasticity.                            the phenomenon more broadly. In Section 6, we extend our
+                                                                      investigation of loss of plasticity to larger scale benchmarks.
+Decreasing representation rank Related to the effective
+capacity of a neural network, lower representation rank               Methods In this experiment, we vary only the activa-
+suggests that fewer features are being represented by the             tion function between ReLU, leaky-ReLU, tanh and
+neural network (Kumar et al., 2021). It has been observed             the identity. As noted in Section 2.1, previous work has
+that decreasing representation rank is sometimes correlated           found that the activation function has a significant effect on
+with loss of plasticity (Lyle et al., 2023; Kumar et al., 2023;       the plasticity of the neural network. We measure the error
+Dohare et al., 2023a).                                                across all observations at the end of each task. Each task
+                                                                      lasts 200 epochs, which is sufficient for neural networks
+Increasing parameter norm An increasing parameter                     with any of the considered activation functions to achieve
+norm is sometimes associated with loss of plasticity in both          low error on the first few tasks using a random initialization.
+continual supervised and continual reinforcement learning
+(Nikishin et al., 2022; Dohare et al., 2023a), but it is not
+necessarily a cause (Lyle et al., 2023). It is not clear why the
+parameter norms increase and lead to loss of plasticity, per-
+haps suggesting a slow divergence in the training dynamics.
+
+3. Counterexamples for Previous Explanations                          Results The main result of this experiment can be
+                                                                      found in Figure 1. Our findings show that none of the
+In this section, we investigate the explanations for loss of          aforementioned explanations of loss of plasticity explain
+plasticity described in Section 2 and we provide counterex-           the phenomenon. All non-linear activation functions can
+
+                                                                   3
+Directions of Curvature as an Explanation for Loss of Plasticity
+
+achieve low error on the first few tasks, but for ReLU and                Figure 2. Effect of feature rank regularization is maintaining
+leaky-ReLU, the error increases and eventually becomes                    plasticity. Loss of plasticity still occurs with leaky-ReLU and
+worse than the neural network with identity activation                    feature rank regularization, despite the fact that the feature rank
+(which is incapable of feature learning).2 Despite some non-              remains high. All results have a shaded region corresponding to a
+linear activation functions losing plasticity, the explanations           95% confidence interval of the mean over 30 runs.
+on the left side of Figure 1 fail to predict loss of plasticity
+consistently. A decreasing update norm, for example, may                  4. Measuring the Curvature of a Changing
+seem like an intuitive explanation of loss of plasticity.                    Optimization Landscape
+However, in the top-left plot, we see that the update norm
+consistently increases for the leaky-ReLU activation                      A missing piece in the previously proposed explanations is
+function, making the explanation inconsistent. For the right              the curvature of the optimization landscape. While previous
+side of Figure 1, the corresponding explanation predicts loss             work pointed out that curvature is connected to plasticity
+of plasticity for tanh and identity but we see it does                    (Lyle et al., 2023), our work specifically posits that a reduc-
+not actually occur. The rank of the representation (plotted as            tion in the number of curvature directions coincides with
+a negative for uniformity with other explanations), another               loss of plasticity. In Section 6 we show that loss of plasticity
+popular candidate explanation, decreases for the tanh                     occurs when, at the start of a new task, the optimization
+activation despite no loss of plasticity in this problem.                 landscape has a diminishing number of curvature directions.
+
+Because feature rank is such a predominant explanation for                The optimization landscape in continual learning is not easy
+loss of plasticity, we provide an additional counter-example              to characterize because it can change without the parame-
+showing that the feature rank is also not a sufficient explana-           ters changing. Unlike supervised learning, where the data
+tion; rather, it is a symptom of a deeper problem. We re-run              distribution is stationary, the data distribution underlying
+the previous experiment using a regularizer, Jfeature-reg(Φ) =            the observations and targets will change in the continual
+σ12(Φ) − σd2(Φ), that encourages the feature representation               learning setting. Thus there can be changes in the objective,
+to be full rank (Kumar et al., 2021). The results, in Figure 2,           gradient and Hessian that is due to the data changing and
+show that regularization increases the feature rank, but that             not due to parameter changes.
+this is not sufficient to prevent loss of plasticity. For ex-
+ample, take the rank of the feature representation between                Before presenting empirical evidence of the relationship
+tasks 5 and 10; although it increases in that period, the error           between plasticity and curvature, we note that there are
+increases, which means plasticity is still being lost.                    several notions of curvature in the literature. The local cur-
+                                                                          vature of the optimization landscape at a particular parame-
+Summary The previous explanations are not consistent                      ter θ is expressed by the Hessian of the objective function,
+because there exists at least one activation such that the                Ht(θ) = ∇θ2Jt(θ) θ=θt .3 Different measures of curvature
+trend in the training error does not agree with the trend in              correspond to different functions of this Hessian matrix.
+the explanation (see Appendix A for additional analysis). A               One common measure of curvature is the sharpness, given
+maybe surprising finding is that the deep linear network (a               by the maximum eigenvalue of the Hessian (Keskar et al.,
+neural network with an identity activation function) is                   2016; Cohen et al., 2021). Sharpness is coarse-grained, it
+able to maintain a low training error across all tasks for this           only gives the magnitude of the vector of maximal curva-
+problem. A deep linear network has more parameters than                   ture and it fails to characterize other directions. Another
+a linear function, but it can only represent linear functions.            measure, and the one that this paper investigates, is the effec-
+This is sufficient to solve each task because the number of               tive rank of the Hessian matrix, which counts the effective
+data points (1280) is smaller than the effective dimension-               number of directions of curvature.
+ality of the network (din × dout = 7840). The deep linear
+network’s ability to preserve plasticity is surprising because                3We omit the dependence on data in the training objective and
+the training dynamics of a deep linear network are non-                   the Hessian, instead indexing both by time.
+linear and similar to a deep non-linear network (Saxe et al.,
+2014). The fact that loss of plasticity only occurs with non-
+linear activations suggests that the curvature introduced by
+the non-linearities is crucial in explaining loss of plasticity.
+
+    2While the neural network with tanh activations does not lose
+plasticity in this experiment, in Section 6 we show that it does lose
+plasticity when we consider the full MNIST dataset.
+
+                                                                       4
+                               Directions of Curvature as an Explanation for Loss of Plasticity
+
+We are interested in how the curvature of the optimization             proximation Hˆ =  M    gigi⊺  =  GG⊺, where G  =
+                                                                                         i=1
+                                                                       [g1, . . . , gm] ∈ Rd×M is the matrix of per-sample gradi-
+landscape changes when the task changes. Of particular
+
+interest is the rank of the Hessian after a task change. If it         ents. Then, because Hˆ is a Gram matrix, we have that
+
+is decreasing, then there are fewer directions of curvature            rank(GG⊺) = rank(G⊺G). This is useful because
+
+to explore the parameter space and to learn on the new task.           G⊺G ∈ RM×M and M is much smaller than d.
+
+For simplicity, and in alignment with our experiments, we              Another name for this approximation is the empirical Fisher
+                                                                       information matrix, and it has been argued that it should not
+assume that each task has an update budget of U iterations.            be used as a replacement for the Hessian as a pre-conditioner
+                                                                       in second-order optimization because it is not guaranteed
+Thus, the training objective on the K-th task is stationary for        to capture the curvature information of the Hessian (Kun-
+                                                                       stner et al., 2019). Recent work studying neural network
+U steps. When the task changes, at t = U K +1, the Hessian             generalization, however, argues that the inner product of the
+                                                                       per-example gradients can be useful in understanding neural
+changes due to changes in the data—and not due to changes              network generalization and learning dynamics (Fort et al.,
+                                                                       2019; Lyle et al., 2022). The matrix of gradient inner prod-
+in the parameters. We measure the rank at the beginning of             ucts, equivalently G⊺G, was also used to assess gradient
+                                                                       covariance in continual learning (Lyle et al., 2023). Thus,
+the task by the effective rank, erank (HUK+1(θ)), where                the relative rank of the gradient outer-products provides a
+                                                                       reasonable approximation to the relative rank of the Hessian,
+erank(M ) = min j :            j    σi(M )  >  0.99  is the effec-     which we demonstrate empirically in the next section.
+                               i=1
+
+                               d    σi(M )
+                               i=1
+
+tive rank and {σi(M )}id=1 are the singular values arranged
+
+in decreasing order. The effective rank specifies the number
+
+of basis vectors needed to represent 99% of image of the
+
+matrix M (Yang et al., 2019; Kumar et al., 2021).
+
+4.1. Approximating the Hessian Rank
+
+Neural networks typically have a large number of param-                4.2. Validating the Hessian Rank Approximation
+eters, requiring approximations to the Hessian due to the
+massive computational overhead for producing the matrix.               We evaluate the approximation to the Hessian rank in a
+Diagonal approximations are employed to capture curvature              simple problem where we can efficiently calculate the full
+information relevant for optimization (Elsayed & Mahmood,              Hessian and its rank. The problem is similar to the ex-
+2022; LeCun et al., 1989), but are full rank unless the                periments in Section 3, except we also apply a stochastic
+parameter gradients become zero, which typically does not              projection matrix to the MNIST images to reduce the input
+occur in classification. There are low-rank approximations             dimension and overall parameter count.
+of the Hessian (Le Roux et al., 2007), these too are prob-
+lematic for our analysis because we aim to measure the rank            We compare the approximation quality of the Hessian rank
+of the Hessian and cannot presuppose that it is low-rank.              using three different methods: 1) Empirical Fisher (our ap-
+Lastly, stochastic Lanzcos methods are able to efficiently             proach), 2) Fisher, and, 3) Gauss-Newton. We measure
+approximate the smallest and largest eigenvalues (Ghorbani             the rank of the exact Hessian and the rank of the Hessian
+et al., 2019), but they cannot efficiently estimate the middle         approximation at the beginning of each new task. Next, we
+bulk of eigenvalues which can determine the rank.                      normalize each rank by its corresponding maximum possi-
+                                                                       ble rank. To measure the approximation quality, we plot the
+To approximate the Hessian rank, we use the an outer-                  absolute difference between the relative effective Hessian
+                                                                       ranks. Our results in Figure 3 show that the proposed empir-
+product approximation of m per-sample gradients, H ≈                   ical Fisher approximation to the Hessian rank is particularly
+                                                                       accurate in estimating the rank in the first few tasks, which
+Hˆ =  m  gigi⊺,  where  gi  =  ∇θJ (θ, xi, yi)  is   the  gradient     is when loss of plasticity occurs. As plasticity degrades
+      i                                                                in later tasks, the approximation quality worsens but still
+                                                                       accurately represents the overall trend of the true Hessian
+with respect to a single datapoint (xi, yi). This approxi-             rank.
+
+mation is useful for estimating the rank because if v is in            Comparisons for other neural networks, further details, and
+the nullspace of the Hessian, Hˆ v = 0, then it is a direc-            figures demonstrating the dynamics of the Hessian approxi-
+                                                                       mation can be found in Appendix C.2. We use this Hessian
+tion of zero curvature and orthogonal to the per-sample                rank approximation to explain loss of plasticity in continual
+                                                                       supervised learning in the rest of our experiments.
+gradients, gi⊺v = 0. Thus, the vector is in the nullspace of
+the outer-product approximation and Hˆ v = 0. Of course,
+rank(Hˆ ) ≤ M and M << d means that the approxi-
+
+mation will underestimate the rank. Our interest is in the
+
+relative decrease in the rank. We will report the effective
+
+rank divided by the maximum rank because the exact num-
+
+ber of curvature directions is not relevant for our results.
+
+The outer-product approximation also avoids the computa-
+tional demands of the singular value decomposition needed
+to compute the effective rank. First, we rewrite the ap-
+
+                                                                    5
+Directions of Curvature as an Explanation for Loss of Plasticity
+
+Figure 3. Comparison between different methods for approxi-              of the randomly initialized parameters. At initialization,
+mating the Hessian rank. The empirical Fisher approximation              the parameters at layer l are sampled i.i.d. θi,j ∼ p(l,0)(θ)
+to the Hessian rank is highly accurate in the first few tasks, which     according to some pre-determined distribution, such as the
+is when loss of plasticity occurs. When plasticity worsens in later      Glorot initialization (Glorot & Bengio, 2010). The distri-
+tasks, the approximation quality marginally worsens. Overall, the        bution of parameters at iteration t during training and for
+empirical Fisher is an accurate and efficient approximation to the       any particular layer, denoted by p(l,t), is no longer known
+Hessian rank.                                                            (the parameters may not be independent nor identically dis-
+                                                                         tributed). However, it is still possible to regularize the em-
+5. Preserving Curvature with Regularization                              pirical distribution towards the initialization distribution by
+                                                                         using the empirical Wasserstein metric (Bobkov & Ledoux,
+In the previous section, we claimed that loss of curvature               2019). We denote the flattened parameter matrix for layer
+may explain loss of plasticity. Regularization is commonly               l at time t by θ¯(l,t). The squared Wasserstein-2 distance
+used to improving the conditioning of matrices (Benning                  between the distribution of parameters at initialization and
+& Burger, 2018). This does not immediately imply that                    the current parameter distribution is defined as,
+regularization preserves plasticity because we are interested
+in minimizing the unregularized objective, and preserving                                                                d  θ¯((il),t) − θ¯((il),0)  2
+the rank of the Hessian with respect to the unregularized
+objective. Our central claim is that regularization also pre-                     W22 p(l,0), p(l,t) =                                                .
+serves the rank of the unregularized Hessian, and allows
+neural networks to preserve plasticity.4                                                                        i=1
+
+If curvature is lost over the course of learning, then one so-           The order statistics of the parameter is denoted by θ((il),t) and
+lution to this problem is to regularize towards the curvature            represents the i-th smallest parameter at time t for layer
+present at initialization. While explicit Hessian regulariza-            l. In the above equation, we are taking the L2 difference
+tion would be computationally costly, previous work has                  between the order statistics of each layer’s parameters at
+found that even weight decay can mitigate loss of plastic-               initialization and at iteration t during training. The Wasser-
+ity (Dohare et al., 2021; Lyle et al., 2021; Kumar et al.,               stein regularizer uses the empirical Wasserstein distance for
+2023), without attributing this benefit to preserving direc-             each layer of the neural network.
+tions of curvature. These methods, however, do more than
+just prevent loss of curvature, they also prevent parameters             A recent alternative, regenerative regularization, regularizes
+from growing large (subject to the regularization parame-
+ter’s strength). Weight decay, for example, mitigate loss of             the neural network parameters towards their initialization
+plasticity but also prevent the parameters from deviating far
+from the origin. The restriction that weight decay imposes               (Kumar et al., 2023). The regenerative regularizer miti-
+on the update requires careful tuning of the regularization
+strength as we show in Section 6 and Appendix C.6.                       gates loss of plasticity, but it also prevents the neural net-
+
+We propose a new regularizer that is simple and that gives               work parameters from deviating far from the initialization.
+the parameters more leeway for moving from the initializa-
+tion, while preserving the desirable plasticity and curvature            Unlike the regenerative regularizer, the Wasserstein regu-
+properties of the initialization. Our regularizer penalizes the
+distribution of parameters if it is far from the distribution            larizer takes the difference of the order statistics. Thus,
+
+    4All measurements of the Hessian rank are with respect to the        the regenerative regularizer is always larger because the
+unregularized objective.
+                                                                         Wasserstein regularizer takes the difference in the sorted
+
+                                                                         values,  d    θ¯((il),t) − θ¯((il),0)  2           d    θ¯i(l,t) − θ¯i(l,0)     2
+                                                                                  i=1                                       i=1
+                                                                                                                  <                                       .
+
+                                                                         As we show in Appendix C.5, the Wasserstein regularizer
+
+                                                                         allows the network parameters to deviate further from the
+
+                                                                         initialization. This means that learning with the Wasserstein
+
+                                                                         regularizer requires fewer iterations while achieving a lower
+
+                                                                         error compare to other regularizers (see inter-task learning
+
+                                                                         curves, Appendix C.8).
+
+                                                                         6. Experiments: Effect of Curvature and
+                                                                            Regularization in Plasticity Benchmarks
+
+                                                                         We now validate our claim that loss of curvature, as mea-
+                                                                         sured by the reduction in the rank of the Hessian, explains
+                                                                         loss of plasticity. Our experiments use the four most com-
+                                                                         mon continual learning benchmarks in which loss of plastic-
+                                                                         ity has been reported (see Appendix B for further details):
+
+                                                                            • Permuted MNIST: A commonly used benchmark
+                                                                               across continual learning where the pixels are peri-
+
+                                                                      6
+Directions of Curvature as an Explanation for Loss of Plasticity
+
+Figure 4. Validating that a reduction in the directions of curva-          Figure 5. Curvature explains why the average update norm
+ture is a consistent explanation for loss of plasticity. A reduc-          increases when using leaky-ReLU despite loss of plasticity.
+tion in the directions of curvature co-occurs with loss of plasticity.     Left: leaky-ReLU has an increasing average update norm de-
+leaky-ReLU preserves plasticity for longer but is unable to re-            spite a decrease in the gradient norm at the beginning of a task.
+cover its directions of curvature.                                         Right: gradients with leaky-ReLU have less overlap with the
+                                                                           low-rank Hessian, meaning that updates occur in more directions
+      odically permuted (Goodfellow et al., 2013; Zenke                    than with ReLU.
+      et al., 2017; Kumar et al., 2023; Dohare et al., 2023a;
+      Elsayed & Mahmood, 2023).                                            6.1. Does Loss of Curvature Explain Loss of Plasticity?
+
+   • Random Label MNIST: A more difficult task change                      We present the results on the four problem settings in Fig-
+      where all labels are randomized (Kumar et al., 2023;                 ure 4. This is the same setting as the results in Section 3,
+      Lyle et al., 2023; Elsayed & Mahmood, 2023). This                    but with the full MNIST dataset (see Appendix C.3 for re-
+      problem was used in Section 3, but in this section we                sults on all activation functions). Loss of curvature tends
+      use the entire MNIST dataset.                                        to co-occur with loss of plasticity for the non-linear activa-
+                                                                           tions, providing a consistent explanation of the phenomenon
+   • Random Label CIFAR-10 (Krizhevsky, 2009): An in-                      compared to previous explanations.
+      creasingly common problem setting for studying the
+      plasticity of convolutional neural networks due to the               6.2. How Does Loss of Curvature Affect Learning?
+      relative complexity of images in CIFAR (Kumar et al.,
+      2023; Lyle et al., 2023; Sokar et al., 2023).                        Having demonstrated that loss of curvature co-occurs with
+
+   • Continual ImageNet (Dohare et al., 2023a): A se-                      loss of plasticity, we now investigate how loss of curvature
+      quence of 500 binary classification tasks from the Ima-
+      geNet dataset (Russakovsky et al., 2015) where none                  affects the gradients and learning. Our goal is to explain why
+      of the classes are shared between tasks.
+                                                                           the update norms can be increasing for leaky-ReLU de-
+To provide evidence for the claim that curvature explains
+loss of plasticity, we conduct an in-depth analysis of the                 spite loss of plasticity. In Figure 5 (Left), we see that the gra-
+change of curvature in continual supervised learning. We
+first show that curvature is a consistent explanation across               dient norm at the beginning of each task is decreasing, which
+different problem settings. Afterwards, we investigate the
+role of curvature on learning to find that the gradient tends              neither explains loss of plasticity nor the increasing update
+to overlap with the shrinking top-subspace of the Hessian
+(to a degree depending on the activation function). Lastly,                norm. In the right plot, we measure the overlap between the
+we show that regularization, which has been demonstrated
+to be effective in mitigating loss of plasticity, also mitigates           gradient and the (top subspace) Hessian-gradient product at
+loss of curvature.
+                                                                           the  beginning  of  a  task  given  by    gT Hg   .5  This  measures
+                                                                                                                   ∥g∥∥H g∥
+
+                                                                           whether the gradient is contained in the top subspace of
+
+                                                                           the Hessian (Gur-Ari et al., 2018). For leaky-ReLU, the
+
+                                                                           gradient has less overlap with the top subspace of its Hes-
+
+                                                                           sian. This means that updates with leaky-ReLU explore
+
+                                                                           a higher dimensional space than than either tanh or ReLU,
+
+                                                                           explaining why its average update norm is higher.
+
+                                                                           6.3. Can Regularization Preserve Curvature?
+
+                                                                           We now investigate whether regularization prevents loss of
+                                                                           plasticity and, if it does, whether it also preserves directions
+                                                                           of curvature. Our results for the four problem settings are
+                                                                           summarized in Figures 6. We see that the Wasserstein is
+                                                                           able to preserve plasticity, achieving similar error to the
+                                                                           regenerative regularizer on the easier MNIST problems and
+
+                                                                               5We zero out singular values smaller than the effective rank to
+                                                                           ensure that the gradient overlaps with the top-subspace Hessian.
+
+                                                                        7
+Directions of Curvature as an Explanation for Loss of Plasticity
+
+Figure 6. Regularization preserves plasticity and directions of        Figure 7. Effect of width and depth on loss of plasticity. In-
+curvature. Wasserstein and regenerative regularizers are effective     creasing either the width of the hidden layer or the depth (number
+at preserving plasticity and curvature. On harder problems (bot-       of hidden layers) in a neural network delays loss of plasticity, and
+tom), the Wasserstein regularizer achieves a lower error.              marginally lowers the error plateau, but does not eliminate loss of
+                                                                       plasticity. Right: Varying the width, while keeping the depth fixed
+achieving the lowest error on Random Label CIFAR and                   at 4. Left: Varying the depth, while keeping the width fixed at 800.
+Continual ImageNet. The success of the Wasserstein reg-
+ularizer can be seen from two perspectives: 1) parameters              of the Hessian is enough to capture changes in the number
+can move further from initialization (see Appendix C.5)                of curvature directions, but more insight may be found from
+and 2) reduced sensitivity to the regularization strength (see         theoretical study of the entire Hessian. Another limitation is
+Appendix C.6). The inter-task learning curves reveal that              that it is not clear what drives neural networks to lose curva-
+learning with the Wasserstein regularizer not only achieves            ture directions during training. Understanding the dynamics
+a lower error, but that learning can require fewer iterations          of training neural networks with gradient descent, however,
+(see Appendix C.8). Lastly, we find that the feature rank is           is an active research area even in supervised learning. It will
+often decreasing for the regularized neural networks, which            be increasingly pertinent to understand what drives neural
+further demonstrates its inconsistency as an explanation for           network training dynamics to lose curvature directions so
+loss of plasticity (see Appendix C.4).                                 as to develop principled algorithms for continual learning.
+
+6.4. Does Scale Help Preserve Plasticity & Curvature?                  Our experimental evidence demonstrates that, when loss
+                                                                       of plasticity occurs, there is a reduction in curvature as
+To investigate the role of neural network scale, we ablate             measured by the rank of the Hessian at the beginning of
+different neural network widths and depths. The results                subsequent tasks. When loss of plasticity does not occur,
+in Figure 7 show that increasing both the depth and                    curvature remains relatively constant. Unlike previous ex-
+width of the neural network only delays loss of plasticity.            planations, this phenomenon is consistent across different
+In Figure 8, we test whether loss of plasticity occurs                 datasets, non-stationarities, step-sizes, and activation func-
+in CIFAR-10 using a much larger network with batch                     tions. Lastly, we investigated the effect of regularization
+normalization, ResNet18 (He et al., 2016). Unlike the                  on plasticity, finding that regularization tends to preserve
+previously considered convolutional networks, the ResNet               curvature but can be sensitive to the regularization strength.
+is able to decrease the error on the first few tasks despite           We proposed a simple distributional regularizer that proves
+training for only 20 epochs. However, loss of plasticity               effective in maintaining plasticity across the problem set-
+still occurs without regularization. With regularization, the          tings we consider, while maintaining curvature and being
+ResNet is able to achieve an error level slightly higher than          less hyperparameter sensitive.
+the best error that the unregularized version can achieve.
+
+7. Discussion                                                          Figure 8. ResNet18 without regularization still suffers from
+                                                                       loss of plasticity. Despite a much higher higher parameter count
+We have demonstrated how loss of curvature directions is a             and batch normalization, the ResNet is not able to maintain its
+consistent explanation for loss of plasticity when compared            initial error without regularization due to a reduction in the number
+to previous explanations offered in the literature. One lim-           of curvature directions, as measured by the rank of the Hessian.
+itation of our work is that we study an approximation to the
+Hessian. Our experiments suggest that this approximation
+
+                                                                    8
+Directions of Curvature as an Explanation for Loss of Plasticity
+
+Acknowledgments                                                    Elsayed, M. and Mahmood, A. R. Hesscale: Scalable com-
+                                                                      putation of hessian diagonals. CoRR, abs/2210.11639v2,
+We thank Shibhansh Dohare, Khurram Javed, Farzane Amin-               2022.
+mansour and Mohamed Elsayed for early discussions about
+loss of plasticity. The research is supported in part by           Elsayed, M. and Mahmood, A. R. Utility-based perturbed
+the Natural Sciences and Engineering Research Council                 gradient descent: An optimizer for continual learning.
+of Canada (NSERC), the Canada CIFAR AI Chair Program,                CoRR, abs/2302.03281v2, 2023.
+the Digital Research Alliance of Canada and Alberta Inno-
+vates Graduate Student Scholarship.                                Fort, S. and Ganguli, S. Emergent properties of the local ge-
+                                                                      ometry of neural loss landscapes. CoRR, abs/1910.05929,
+Impact Statement                                                      2019.
+
+This paper presents work whose goal is to advance the field        Fort, S., Nowak, P. K., Jastrzebski, S., and Narayanan, S.
+of Machine Learning. There are many potential societal                Stiffness: A new perspective on generalization in neural
+consequences of our work, none which we feel must be                  networks. CoRR, abs/1901.09491v3, 2019.
+specifically highlighted here.
+                                                                   Fukushima, K. Cognitron: A self-organizing multilayered
+References                                                            neural network. Biological cybernetics, 20(3-4):121–136,
+                                                                     1975.
+Abbas, Z., Zhao, R., Modayil, J., White, A., and Machado,
+   M. C. Loss of plasticity in continual deep reinforcement        Ghorbani, B., Krishnan, S., and Xiao, Y. An investigation
+   learning. In Conference on Lifelong Learning Agents,               into neural net optimization via hessian eigenvalue den-
+   2023.                                                              sity. In International Conference on Machine Learning,
+                                                                      2019.
+Ash, J. T. and Adams, R. P. On warm-starting neural net-
+   work training. In Advances in Neural Information Pro-           Glorot, X. and Bengio, Y. Understanding the difficulty of
+   cessing Systems, 2020.                                             training deep feedforward neural networks. In Interna-
+                                                                      tional Conference on Artificial Intelligence and Statistics,
+Benning, M. and Burger, M. Modern regularization methods              2010.
+   for inverse problems. Acta numerica, 27:1–111, 2018.
+                                                                   Goodfellow, I. J., Mirza, M., Xiao, D., Courville, A., and
+Berariu, T., Czarnecki, W., De, S., Bornschein, J., Smith, S.,        Bengio, Y. An empirical investigation of catastrophic
+   Pascanu, R., and Clopath, C. A study on the plasticity of          forgetting in gradient-based neural networks. CoRR,
+   neural networks. CoRR, abs/2106.00042, 2021.                       abs/1312.6211, 2013.
+
+Bobkov, S. and Ledoux, M. One-dimensional empirical                Gur-Ari, G., Roberts, D. A., and Dyer, E. Gradient descent
+   measures, order statistics, and Kantorovich transport              happens in a tiny subspace. CoRR, abs/1812.04754v1,
+   distances, volume 261. American Mathematical Society,              2018.
+   2019.
+                                                                   He, K., Zhang, X., Ren, S., and Sun, J. Deep residual learn-
+Cohen, J., Kaur, S., Li, Y., Kolter, J. Z., and Talwalkar,            ing for image recognition. In Conference on Computer
+   A. Gradient descent on neural networks typically occurs           Vision and Pattern Recognition, 2016.
+   at the edge of stability. In International Conference on
+   Learning Representations, 2021.                                 Hochreiter, S. and Schmidhuber, J. Flat minima. Neural
+                                                                      computation, 9(1):1–42, 1997.
+Dohare, S., Sutton, R. S., and Mahmood, A. R. Continual
+   backprop: Stochastic gradient descent with persistent           Hoffmann, J., Borgeaud, S., Mensch, A., Buchatskaya, E.,
+   randomness. CoRR, abs/2108.06325v3, 2021.                          Cai, T., Rutherford, E., de las Casas, D., Hendricks, L. A.,
+                                                                     Welbl, J., Clark, A., Hennigan, T., Noland, E., Millican,
+Dohare, S., Hernandez-Garcia, J. F., Rahman, P., Sutton,              K., van den Driessche, G., Damoc, B., Guy, A., Osindero,
+   R. S., and Mahmood, A. R. Maintaining plasticity in deep           S., Simonyan, K., Elsen, E., Vinyals, O., Rae, J. W., and
+   continual learning. CoRR, abs/2306.13812, 2023a.                   Sifre, L. An empirical analysis of compute-optimal large
+                                                                      language model training. Advances in Neural Information
+Dohare, S., Lan, Q., and Mahmood, A. R. Overcoming pol-              Processing Systems, 2022.
+   icy collapse in deep reinforcement learning. In Sixteenth
+   European Workshop on Reinforcement Learning, 2023b.             Igl, M., Farquhar, G., Luketina, J., Boehmer, W., and White-
+                                                                      son, S. Transient non-stationarity and generalisation in
+                                                                      deep reinforcement learning. In International Conference
+                                                                      on Learning Representations, 2021.
+
+                                                                9
+Directions of Curvature as an Explanation for Loss of Plasticity
+
+Javed, K. and White, M. Meta-learning representations              Nair, V. and Hinton, G. E. Rectified linear units improve
+   for continual learning. Advances in Neural Information             restricted Boltzmann machines. In International Confer-
+  Processing Systems, 2019.                                           ence on Machine Learning, 2010.
+
+Keskar, N. S., Mudigere, D., Nocedal, J., Smelyanskiy,             Nikishin, E., Schwarzer, M., D’Oro, P., Bacon, P.-L., and
+   M., and Tang, P. T. P. On large-batch training for deep            Courville, A. The primacy bias in deep reinforcement
+   learning: Generalization gap and sharp minima. CoRR,               learning. CoRR, abs/2205.07802v1, 2022.
+   abs/1609.04836, 2016.
+                                                                   Ring, M. B. Continual learning in reinforcement environ-
+Kingma, D. P. and Ba, J. Adam: A method for stochastic                ments. The University of Texas at Austin, 1994.
+   optimization. In International Conference on Learning
+  Representations, 2015.                                           Russakovsky, O., Deng, J., Su, H., Krause, J., Satheesh, S.,
+                                                                      Ma, S., Huang, Z., Karpathy, A., Khosla, A., Bernstein,
+Krizhevsky, A. Learning multiple layers of features from              M., Berg, A. C., and Fei-Fei, L. ImageNet large scale
+   tiny images. Technical report, University of Toronto,             visual recognition challenge. International Journal of
+   2009.                                                             Computer Vision, 2015.
+
+Kumar, A., Agarwal, R., Ghosh, D., and Levine, S. Im-              Saxe, A., McClelland, J., and Ganguli, S. Exact solutions
+   plicit under-parameterization inhibits data-efficient deep         to the nonlinear dynamics of learning in deep linear neu-
+   reinforcement learning. In International Conference on             ral networks. In International Conference on Learning
+  Learning Representations, 2021.                                    Represenatations, 2014.
+
+Kumar, S., Marklund, H., and Roy, B. V. Maintain-                  Shang, W., Sohn, K., Almeida, D., and Lee, H. Under-
+   ing plasticity via regenerative regularization. CoRR,              standing and improving convolutional neural networks
+   abs/2308.11958v1, 2023.                                           via concatenated rectified linear units. In international
+                                                                     Conference on Machine Learning, 2016.
+Kunstner, F., Hennig, P., and Balles, L. Limitations of
+   the empirical fisher approximation for natural gradient         Sokar, G., Agarwal, R., Castro, P. S., and Evci, U. The dor-
+   descent. In Advances in Neural Information Processing              mant neuron phenomenon in deep reinforcement learning.
+  Systems, 2019.                                                      In International Conference on Machine Learning, 2023.
+
+Le Roux, N., Manzagol, P.-A., and Bengio, Y. Top-                  Thrun, S. Lifelong learning algorithms. In Learning to
+   moumoute online natural gradient algorithm. Advances              Learn, pp. 181–209. Springer, 1998.
+   in Neural Information Processing Systems, 2007.
+                                                                   Xu, B., Wang, N., Chen, T., and Li, M. Empirical evaluation
+LeCun, Y., Denker, J., and Solla, S. Optimal brain dam-               of rectified activations in convolutional network. CoRR,
+   age. Advances in Neural Information Processing Systems,            abs/1505.00853, 2015.
+  1989.
+                                                                   Yang, Y., Zhang, G., Xu, Z., and Katabi, D. Harnessing
+LeCun, Y., Cortes, C., and Burges, C. MNIST hand-                     structures for value-based planning and reinforcement
+  written digit database. ATT Labs [Online]. Available:               learning. In International Conference on Learning Rep-
+   http://yann.lecun.com/exdb/mnist, 2010.                            resentations, 2019.
+
+Lyle, C., Rowland, M., and Dabney, W. Understanding and            Zenke, F., Poole, B., and Ganguli, S. Continual learning
+   preventing capacity loss in reinforcement learning. In             through synaptic intelligence. In International Confer-
+  International Conference on Learning Representations,               ence on Machine Learning, 2017.
+   2021.
+                                                                   Zilly, J., Achille, A., Censi, A., and Frazzoli, E. On plastic-
+Lyle, C., Rowland, M., Dabney, W., Kwiatkowska, M., and               ity, invariance, and mutually frozen weights in sequential
+   Gal, Y. Learning dynamics and generalization in deep               task learning. Advances in Neural Information Processing
+   reinforcement learning. In International Conference on            Systems, 2021.
+  Machine Learning, 2022.
+                                                                   Ziyin, L. Symmetry leads to structured constraint of learn-
+Lyle, C., Zheng, Z., Nikishin, E., Avila Pires, B., Pascanu,          ing. CoRR, abs/2309.16932v1, 2023.
+   R., and Dabney, W. Understanding plasticity in neural net-
+  works. In International Conference on Machine Learning,
+   2023.
+
+                                                               10
+Directions of Curvature as an Explanation for Loss of Plasticity
+
+Appendix                                                                      norm increases seemingly indefinitely and yet, loss of
+                                                                              plasticity does not occur. Hence, the weight norm is an
+A. Additional analysis on counter-examples                                    inconsistent explanation for loss of plasticity.
+
+In the body of paper, we provided a high-level analysis of              B. Experimental Details
+Figure 1, and concluded that none of the previous explana-
+tions for loss of plasticity (i.e. increasing error) is consistent      B.1. Random Label MNIST
+amongst the different activation fucntions. Here, we aim to
+compliment that high-level analysis by providing detailed               Non-stationary variant of the ordinary (stationary) super-
+explanation on how each metric is inconsistent with the                 vised classification problem on MNIST dataset. The source
+batch error.                                                            of non-stationarity in this problem is the periodical random
+                                                                        shuffling of labels, irrespective of the original class labels.
+  1. Average Update Norm (top-left): The plot measures                  The dataset consists of 51200 uniformly sampled MNIST
+      the average L1 norm of the parameter updates, and it              image-label pairs. We iterate over the dataset for 200 epochs
+      is predicted that a decrease in the update norm leads             in the experiments in the main paper, but ablate for different
+      to loss of plasticity. Both Leaky-ReLU and ReLU                   number of epochs in Section C.9. After 200 epochs, the
+      exhibit the opposite trend in their update norm: the              labels will be reshuffled within the same dataset, producing
+      former is increasing its average update norm and the              the new task. Each gradient updates are performed with the
+      latter is decreasing. But, both activation functions              batch of 256 datapoints, hence the update number of updates
+      have an increasing error and thus suffer from loss of             per epoch is 200 and the number of updates in the task is
+      plasticity. Hence, the update norm is an inconsistent             40000. The architecture is a 3 hidden layer feed-forward
+      explanation for loss of plasticity                                neural network with widths (256, 256, 256). We use the
+                                                                        Adam optimizer with default hyperparameters. We average
+  2. Effective Rank of Representation (top-right): The                  over 30 seeds for the unregularized experiments and aver-
+      plot measures the normalized effective rank of the rep-           age over 30 seeds for the regularized experiments. For the
+      resentation (the last hidden layer that is mapped lin-            regularized experiments, we sweep over the regularization
+      early to the output space), and it is predicted that a            strength of {0.005, 0.001, 0.0005}. We use leaky-ReLU
+      decrease in the feature rank leads to loss of plastic-            for all regularized experiments (except with the ResNet)
+      ity. For ReLU, the representation rank decreases along            due to its increased effectiveness in the continual learning
+     with the error increasing, which is what the effective             setting.
+      rank explanation of plasticity predicts. The representa-
+      tion rank is inconsistent because tanh has an initial             B.2. Permuted MNIST
+      drop of its representation rank despite the error re-
+      maining constant. Hence, the representation rank is an            The overall problem framework is identical to the Random
+      inconsistent explanation for loss of plasticity.                  Label MNIST, except for the source of non-stationarity. The
+                                                                        non-stationarity is introduced by reordering the positions
+  3. Dormant Neurons (bottom-left): The plot measures                   of pixels in each input image, while label remains the same
+      neuron dormancy by the negative of the entropy of                 throughout the experiment. At the beginning of each task,
+      the normalized absolute value of the features for each            the permutation of pixels are shuffled, and each input im-
+      task, which captures the notion of dormancy that acti-            ages are uniformly shuffled according to that permutation.
+     vations can concentrate on a small subset of features.             For the regularized experiments, we sweep over the regu-
+      It is predicted that an increase in neuron dormancy will          larization strength of {0.01, 0.005, 0.001, 0.0005}. Other
+      lead to loss of plasticity The plot shows that the ReLU           components of experiment do not vary from Random Label
+      activation has an increase in neuron dormancy and an              MNIST problem.
+      increasing error, which is what neuron dormancy pre-
+      dicts. But, leaky-ReLU experiences plasticity loss                B.3. Random Label CIFAR-10
+      and the neuron dormancy is non-decreasing. Hence,
+      the dormant neuron phenomenon is an inconsistent                  A non-stationary supervised classification problem us-
+      explanation for loss of plasticity.                               ing the CIFAR-10 dataset, similar to the Random Label
+                                                                        MNIST problem. Similarly in the label-shuffled MNIST
+  4. Weight Norm (bottom-right): The plot presents the                  problem, this problem uniformly samples 38400 data-
+      L1 norm of the weights at the end of each task, and               points from CIFAR-10. The architecture uses 4 convo-
+      it is predicted that an increasing norm leads to loss of          lutional layers with stride 2 and (16, 32, 64, 128) filters,
+      plasticity Both ReLU and identity provide coun-                   before flattening and using a single layer feed-forward
+      terexamples. For ReLU, the weight norm plateaus but               neural network with width (512). For the regularized ex-
+      loss of plasticity occurs. For identity, the weight
+
+                                                                    11
+Directions of Curvature as an Explanation for Loss of Plasticity
+
+periments, we sweep over the regularization strength of                    tive distribution induced by the classifier, and we use only
+{0.01, 0.005, 0.001, 0.0005}. Other components of exper-                   1 sample per datapoint. Sampling additional times would
+iment do not vary from Random Label MNIST problem.                         be more effective but less efficient. The Gauss-Newton ap-
+The ResNet18 architecture (He et al., 2016) is unchanged,                  proximation is H ≈ JfT HzJf , where Jf is the Jacobian
+using ReLU and batch normalization. We train the network                   of the neural network output and Hz is the Hessian of the
+for a reduced number of epochs (20) to demonstrate that the                loss function with respect to the prediction. we cannot in-
+ResNet can initially improve its plasticity before losing plas-            terchange the inner and outerproduct because of the middle
+ticity. The regularized ResNet uses a regularization strength              Hessian matrix. Thus, calculating the svd cannot be made
+of 0.005 which was the best regularization strength found                  efficient.
+on the smaller convolutional neural network.
+
+B.4. Continual ImageNet
+
+We use the Continual ImageNet environment introduced by
+(Dohare et al., 2023a). We train the same convolutional neu-
+ral network as before, but for 250 epochs. For the regular-
+ized experiments, we sweep over the regularization strength
+of {0.01, 0.005, 0.001, 0.0005}. Other components of ex-
+periment do not vary from Random Label CIFAR problem.
+
+C. Additional Results                                                      Figure 10. Neural networks suffer from loss of plasticity with both
+                                                                           activations on low-dimensional projected MNIST.
+C.1. Average Online Error Can Suggest Loss of
+      Plasticity Even in Its Absence
+
+Average online error is another metric for studying loss of
+plasticity, but it can misdiagnose the phenomenon. Even
+if a neural network maintains a consistent error at the end
+of a task, its online error can increase due to an increase
+in its error at the beginning of a task. But the error at the
+beginning of a task is not controllable, because it is due to
+a non-stationarity in the experience. Thus, we focus on the
+batch error at task end alone.
+
+                                                                           Figure 11. With ReLU, the empirical Fisher approximation ac-
+                                                                           curately approximates the normalized rank throughout continual
+                                                                           learning.
+
+Figure 9. Regularization prevents loss of plasticity, in the sense
+that the error at the end of the task is constant. The average online
+error increases, because the error at the start increases.
+
+C.2. Further Discussion and Results on Hessian                             Figure 12. With leaky-ReLU, the empirical Fisher approxima-
+      Approximation                                                        tion accurately approximates the normalized rank when plasticity
+                                                                           is being lost, which is sufficient as an indicator for loss of plastic-
+We use a stochastic projection matrix to reduce the dimen-                 ity.
+sionality of the MNIST images to 36, then use a neural
+network with 3 hidden layers with 32 neurons. While the
+scale of this problem is small, its results with respect to plas-
+ticity remain strikingly similar to the larger scale problems
+in the main experiments.
+
+The Fisher approximation differs from the empirical fisher
+approximation because it requires sampling from the predic-
+
+                                                                       12
+Directions of Curvature as an Explanation for Loss of Plasticity
+
+C.3. Results on All Activation Functions                                    C.5. Distances from Initialization With and Without
+                                                                                 Regularization
+
+Figure 13. If we run the experiment in Section 3 for more tasks,
+tanh eventually loses plasticity and the Hessian rank accurately
+predicts this whereas the feature rank remains constant.
+
+Figure 14. On the full dataset, the deep linear network does not            Figure 16. Regularization generally prevents neural network pa-
+have enough capacity to learn and it’s error remains high but               rameters from deviating from initialization compared to the un-
+constant. All non-linear activation functions lose plasticity, which        regularized setting. But, the Wasserstein regularizer minimizes a
+the Hessian rank correctly explains.                                        distributional distance that allows it to travel further from its ini-
+                                                                            tialization. Weight decay, although further from the initialization,
+                                                                            is closer to the initialization distribution which can also lead to
+                                                                            loss of plasticity (Zilly et al., 2021).
+
+C.4. Parameter Regularization Preserves Plasticity But
+     Does Not Always Control Feature Rank
+
+Figure 15. With regularization, the feature rank sometimes still
+decreases. The decrease is problem dependent, and only in the
+CIFAR problem does the feature rank increase.
+
+                                                                        13
+                                         Directions of Curvature as an Explanation for Loss of Plasticity
+C.6. Regularizer Hyperparameter Sensitivity
+The plots below show the batch error at the end of a task
+for different regularization strengths. Compared to weight
+decay and regenerative regularization, the Wasserstein reg-
+ularizer is able to reach and maintain a lower error across
+most problems and activation functions.
+
+                                                                                     Figure 19. Learning curves on Random Label CIFAR with differ-
+                                                                                     ent regularizers and different regularization strengths. The Wasser-
+                                                                                     stein regularizer is less sensitive to the regularization strength
+
+Figure 17. Learning curves on Random Label MNIST with differ-
+ent regularizers and different regularization strengths. The Wasser-
+stein regularizer is less sensitive to the regularization strength
+
+Figure 18. Learning curves on Permuted MNIST with different               Figure 20. Learning curves on Continual Imagenet with different
+regularizers and different regularization strengths. The Wasserstein      regularizers and different regularization strengths. The Wasserstein
+regularizer is less sensitive to the regularization strength              regularizer is less sensitive to the regularization strength
+
+                                                                      14
+Directions of Curvature as an Explanation for Loss of Plasticity
+
+C.7. Inter-task Online Learning Curves Without             C.8. Inter-task Online Learning Curves With
+     Regularization                                             Regularization
+
+Figure 21. Intertask online learning curves on Random Label Figure 22. Intertask online learning curves on Random Label
+
+MNIST and Random Label CIFAR, without regularization.      MNIST and Random Label CIFAR, with different regularizers.
+
+                                                       15
+                                         Directions of Curvature as an Explanation for Loss of Plasticity
+C.9. Update Budget Effect on Plasticity
+By varying the number of epochs in a task, the neural net-
+work is able to learn more on a task, perhaps allowing the
+neural network to escape from loss of plasticity. Unfortu-
+nately, the results in Figure 23 shows that increasing the
+number of epochs only marginally delays the onset of loss
+of plasticity. Plasticity loss still occurs, but reduction in
+curvature is a consistent predictor of this phenomenon.
+
+Figure 23. Ablating the number of epochs per task on Random
+Label MNIST. Loss of plasticity occurs when the number of epochs
+is small (25), despite not overfitting to the first few task. Loss of
+plasticity eventually also occurs when the number of epochs is
+large (400), but reduces the final error plateau.
+
+                                                                        16
+

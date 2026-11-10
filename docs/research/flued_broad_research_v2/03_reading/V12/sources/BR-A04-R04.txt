@@ -1,0 +1,993 @@
+ERASER : A Benchmark to Evaluate Rationalized NLP Models
+
+  Jay DeYoung⋆Ψ, Sarthak Jain⋆Ψ, Nazneen Fatema Rajani⋆Φ, Eric LehmanΨ,
+             Caiming XiongΦ, Richard SocherΦ, and Byron C. WallaceΨ
+
+                                       ⋆Equal contribution.
+           ΨKhoury College of Computer Sciences, Northeastern University
+
+                        ΦSalesforce Research, Palo Alto, CA, 94301
+
+                      Abstract                                                                  Movie Reviews
+
+     State-of-the-art models in NLP are now pre-                              In this movie, … Plots to take over the world. The acting is
+     dominantly based on deep neural networks                                 great! The soundtrack is run-of-the-mill, but the action more
+     that are opaque in terms of how they come                                than makes up for it
+     to make predictions. This limitation has
+     increased interest in designing more inter-                                                    (a) Positive (b) Negative
+     pretable deep models for NLP that reveal the
+    ‘reasoning’ behind model outputs. But work                                                      e-SNLI
+     in this direction has been conducted on dif-
+     ferent datasets and tasks with correspondingly                           H A man in an orange vest leans over a pickup truck
+     unique aims and metrics; this makes it difﬁcult                          P A man is touching a truck
+     to track progress. We propose the Evaluating
+     Rationales And Simple English Reasoning                                          (a) Entailment (b) Contradiction (c) Neutral
+     (ERASER ) benchmark to advance research
+     on interpretable models in NLP. This bench-                               Commonsense Explanations (CoS-E)
+     mark comprises multiple datasets and tasks for
+     which human annotations of “rationales” (sup-                                         Where do you ﬁnd the most amount of leafs?
+     porting evidence) have been collected. We pro-
+     pose several metrics that aim to capture how                         (a) Compost pile (b) Flowers (c) Forest (d) Field (e) Ground
+     well the rationales provided by models align
+     with human rationales, and also how faithful                                          Evidence Inference
+     these rationales are (i.e., the degree to which
+     provided rationales inﬂuenced the correspond-                            Article Patients for this trial were recruited … Compared with
+     ing predictions). Our hope is that releasing this                        0.9% saline, 120 mg of inhaled nebulized furosemide had no
+     benchmark facilitates progress on designing                              eﬀect on breathlessness during exercise.
+     more interpretable NLP systems. The bench-                               Prompt With respect to breathlessness, what is the reported
+     mark, code, and documentation are available                              diﬀerence between patients receiving placebo and those
+     at https://www.eraserbenchmark.com/                                      receiving furosemide?
+                                                                            (a) Sig. decreased (b) No sig. diﬀerence (c) Sig. increased
+1 Introduction
+                                                        Figure 1: Examples of instances, labels, and rationales
+Interest has recently grown in designing NLP sys-       illustrative of four (out of seven) datasets included in
+tems that can reveal why models make speciﬁc            ERASER. The ‘erased’ snippets are rationales.
+predictions. But work in this direction has been
+conducted on different datasets and using different        In curating and releasing ERASER we take in-
+metrics to quantify performance; this has made it       spiration from the stickiness of the GLUE (Wang
+difﬁcult to compare methods and track progress.         et al., 2019b) and SuperGLUE (Wang et al., 2019a)
+We aim to address this issue by releasing a stan-       benchmarks for evaluating progress in natural lan-
+dardized benchmark of datasets — repurposed and         guage understanding tasks, which have driven rapid
+augmented from pre-existing corpora, spanning a         progress on models for general language repre-
+range of NLP tasks — and associated metrics for         sentation learning. We believe the still somewhat
+measuring different properties of rationales. We re-    nascent subﬁeld of interpretable NLP stands to ben-
+fer to this as the Evaluating Rationales And Simple     eﬁt similarly from an analogous collection of stan-
+English Reasoning (ERASER ) benchmark.                  dardized datasets and tasks; we hope these will
+                                                        aid the design of standardized metrics to measure
+                                                        different properties of ‘interpretability’, and we
+                                                        propose a set of such metrics as a starting point.
+
+                                                           Interpretability is a broad topic with many possi-
+                                                        ble realizations (Doshi-Velez and Kim, 2017; Lip-
+                                                        ton, 2016). In ERASER we focus speciﬁcally on
+                                                        rationales, i.e., snippets that support outputs. All
+                                                        datasets in ERASER include such rationales, ex-
+                                                        plicitly marked by human annotators. By deﬁnition,
+                                                        rationales should be sufﬁcient to make predictions,
+
+                                                   4443
+
+Proceedings of the 58th Annual Meeting of the Association for Computational Linguistics, pages 4443–4458
+                       July 5 - 10, 2020. c 2020 Association for Computational Linguistics
+but they may not be comprehensive. Therefore, for                 rationales (marked by humans) are provided during
+some datasets, we have also collected comprehen-                  training. However, such direct supervision will not
+sive rationales (in which all evidence supporting                 always be available, motivating work on methods
+an output has been marked) on test instances.                     that can explain (or “rationalize”) model predic-
+                                                                  tions using only instance-level supervision.
+   The ‘quality’ of extracted rationales will depend
+on their intended use. Therefore, we propose an                      In the context of modern neural models for text
+initial set of metrics to evaluate rationales that                classiﬁcation, one might use variants of attention
+are meant to measure different varieties of ‘inter-               (Bahdanau et al., 2015) to extract rationales. At-
+pretability’. Broadly, this includes measures of                  tention mechanisms learn to assign soft weights to
+agreement with human-provided rationales, and as-                 (usually contextualized) token representations, and
+sessments of faithfulness. The latter aim to capture              so one can extract highly weighted tokens as ratio-
+the extent to which rationales provided by a model                nales. However, attention weights do not in gen-
+in fact informed its predictions. We believe these                eral provide faithful explanations for predictions
+provide a reasonable start, but view the problem of               (Jain and Wallace, 2019; Serrano and Smith, 2019;
+designing metrics for evaluating rationales — espe-               Wiegreffe and Pinter, 2019; Zhong et al., 2019;
+cially for measuring faithfulness — as a topic for                Pruthi et al., 2020; Brunner et al., 2020; Moradi
+further research that ERASER can facilitate. And                  et al., 2019; Vashishth et al., 2019). This likely
+while we will provide a ‘leaderboard’, this is better             owes to encoders entangling inputs, complicating
+viewed as a ‘results board’; we do not privilege                  the interpretation of attention weights on inputs
+any one metric. Instead, ERASER permits compar-                   over contextualized representations of the same.2
+ison between models that provide rationales with
+respect to different criteria of interest.                           By contrast, hard attention mechanisms dis-
+                                                                  cretely extract snippets from the input to pass to the
+   We implement baseline models and report their                  classiﬁer, by construction providing faithful expla-
+performance across the corpora in ERASER. We                      nations. Recent work has proposed hard attention
+ﬁnd that no single ‘off-the-shelf’ architecture is                mechanisms as a means of providing explanations.
+readily adaptable to datasets with very different                 Lei et al. (2016) proposed instantiating two models
+instance lengths and associated rationale snippets                with their own parameters; one to extract rationales,
+(Section 3). This highlights a need for new models                and one that consumes these to make a prediction.
+that can consume potentially lengthy inputs and                   They trained these models jointly via REINFORCE
+adaptively provide rationales at a task-appropriate               (Williams, 1992) style optimization.
+level of granularity. ERASER provides a resource
+to develop such models.                                              Recently, Jain et al. (2020) proposed a variant
+                                                                  of this two-model setup that uses heuristic feature
+   In sum, we introduce the ERASER benchmark                      scores to derive pseudo-labels on tokens compris-
+(www.eraserbenchmark.com), a uniﬁed set of di-                    ing rationales; one model can then be used to per-
+verse NLP datasets (these are repurposed and aug-                 form hard extraction in this way, while a second
+mented from existing corpora,1 including senti-                   (independent) model can make predictions on the
+ment analysis, Natural Language Inference, and                    basis of these. Elsewhere, Chang et al. (2019)
+QA tasks, among others) in a standardized for-                    introduced the notion of classwise rationales that
+mat featuring human rationales for decisions, along               explains support for different output classes using
+with starter code and tools, baseline models, and                 a game theoretic framework. Finally, other recent
+standardized (initial) metrics for rationales.                    work has proposed using a differentiable binary
+                                                                  mask over inputs, which also avoids recourse to
+2 Related Work                                                    REINFORCE (Bastings et al., 2019).
+
+Interpretability in NLP is a large, fast-growing                  Post-hoc explanation. Another strand of inter-
+area; we do not attempt to provide a comprehensive                pretability work considers post-hoc explanation
+overview here. Instead we focus on directions par-                methods, which seek to explain why a model made
+ticularly relevant to ERASER, i.e., prior work on                 a speciﬁc prediction for a given input. Commonly
+models that provide rationales for their predictions.
+                                                                       2Interestingly, Zhong et al. (2019) ﬁnd that attention some-
+Learning to explain. In ERASER we assume that                     times provides plausible but not faithful rationales. Elsewhere,
+                                                                  Pruthi et al. (2020) show that one can easily learn to deceive
+     1We ask users of the benchmark to cite all original papers,  via attention weights. These ﬁndings highlight that one should
+and provide a BibTeX entry for doing so on the website.           be mindful of the criteria one wants rationales to fulﬁll.
+
+4444
+these take the form of token-level importance            Name                 Size (train/dev/test)  Tokens  Comp?
+scores. Gradient-based explanations are a standard       Evidence Inference      7958 / 972 / 959     4761      ◇
+example (Sundararajan et al., 2017; Smilkov et al.,      BoolQ                  6363 / 1491 / 2817    3583      ◇
+2017). These enjoy a clear semantics (describing         Movie Reviews           1600 / 200 / 200      774
+how perturbing inputs locally affects outputs), but      FEVER                                         327    !◆
+may nonetheless exhibit counterintuitive behaviors       MultiRC               97957 / 6122 / 6111     303    !
+(Feng et al., 2018).                                     CoS-E                 24029 / 3214 / 4848      28    !
+                                                         e-SNLI                 8733 / 1092 / 1092      16    !
+   Gradients of course assume model differentia-                             911938 / 16449 / 16429
+bility. Other methods do not require any model
+properties. Examples include LIME (Ribeiro et al.,       Table 1: Overview of datasets in the ERASER bench-
+2016) and Alvarez-Melis and Jaakkola (2017);             mark. Tokens is the average number of tokens in each
+these methods approximate model behavior lo-
+cally by having it repeatedly make predictions over      ! document. Comprehensive rationales mean that all sup-
+perturbed inputs and ﬁtting a simple, explainable
+model over the outputs.                                  porting evidence is marked; denotes cases where this
+                                                         is (more or less) true by default; ◇, ◆ are datasets for
+Acquiring rationales. Aside from interpretability        which we have collected comprehensive rationales for
+considerations, collecting rationales from annota-       either a subset or all of the test datasets, respectively.
+tors may afford greater efﬁciency in terms of model      Additional information can be found in Appendix A.
+performance realized given a ﬁxed amount of anno-
+tator effort (Zaidan and Eisner, 2008). In particular,                                                 .
+recent work by McDonnell et al. (2017, 2016) has
+observed that at least for some tasks, asking anno-      explicit training data is available for the former.
+tators to provide rationales justifying their catego-       Rajani et al. (2019) ﬁne-tuned a Transformer-
+rizations does not impose much additional effort.
+Combining rationale annotation with active learn-        based language model (Radford et al., 2018) on
+ing (Settles, 2012) is another promising direction       free-text rationales provided by humans, with an
+(Wallace et al., 2010; Sharma et al., 2015).             objective of generating open-ended explanations to
+                                                         improve performance on downstream tasks.
+Learning from rationales. Work on learning from
+rationales marked by annotators for text classiﬁca-      Evaluating rationales. Work on evaluating ratio-
+tion dates back over a decade (Zaidan et al., 2007).     nales has often compared these to human judg-
+Earlier efforts proposed extending standard dis-         ments (Strout et al., 2019; Doshi-Velez and Kim,
+criminative models like Support Vector Machines          2017), or elicited other human evaluations of ex-
+(SVMs) with regularization terms that penalized          planations (Ribeiro et al., 2016; Lundberg and Lee,
+parameter estimates which disagreed with provided        2017; Nguyen, 2018). There has also been work on
+rationales (Zaidan et al., 2007; Small et al., 2011).    visual evaluations of saliency maps (Li et al., 2016;
+Other efforts have attempted to specify generative       Ding et al., 2017; Sundararajan et al., 2017).
+models of rationales (Zaidan and Eisner, 2008).
+                                                            Measuring agreement between extracted and
+   More recent work has aimed to exploit ratio-          human rationales (or collecting subjective assess-
+nales in training neural text classiﬁers. Zhang et al.   ments of them) assesses the plausibility of ratio-
+(2016) proposed a rationale-augmented Convolu-           nales, but such approaches do not establish whether
+tional Neural Network (CNN) for text classiﬁca-          the model actually relied on these particular ratio-
+tion, explicitly trained to identify sentences support-  nales to make a prediction. We refer to rationales
+ing categorizations. Strout et al. (2019) showed that    that correspond to the inputs most relied upon to
+providing this model with rationales during train-       come to a disposition as faithful.
+ing yields predicted rationales that are preferred
+by humans (compared to rationales produced with-            Most automatic evaluations of faithfulness mea-
+out explicit supervision). Other work has proposed       sure the impact of perturbing or erasing words or
+‘pipeline’ approaches in which independent mod-          tokens identiﬁed as important on model output (Ar-
+els are trained to perform rationale extraction and      ras et al., 2017; Montavon et al., 2017; Serrano and
+classiﬁcation on the basis of these, respectively        Smith, 2019; Samek et al., 2016; Jain and Wallace,
+(Lehman et al., 2019; Chen et al., 2019), assuming       2019). We build upon these methods in Section
+                                                         4. Finally, we note that a recent article urges the
+                                                         community to evaluate faithfulness on a continuous
+                                                         scale of acceptability, rather than viewing this as a
+                                                         binary proposition (Jacovi and Goldberg, 2020).
+
+                                                         3 Datasets in ERASER
+
+                                                         For all datasets in ERASER we distribute both ref-
+                                                         erence labels and rationales marked by humans
+                                                         as supporting these in a standardized format. We
+
+4445
+delineate train, validation, and test splits for all                texts. We take a subset of this dataset, including
+corpora (see Appendix A for processing details).                    only supported and refuted claims.
+We ensure that these splits comprise disjoint sets
+of source documents to avoid contamination.3 We                     MultiRC (Khashabi et al., 2018). A reading com-
+have made the decision to distribute the test sets                  prehension dataset composed of questions with
+publicly,4 in part because we do not view the ‘cor-                 multiple correct answers that by construction de-
+rect’ metrics to use as settled. We plan to acquire                 pend on information from multiple sentences. Here
+additional human annotations on held-out portions                   each rationale is associated with a question, while
+of some of the included corpora so as to offer hid-                 answers are independent of one another. We con-
+den test set evaluation opportunities in the future.                vert each rationale/question/answer triplet into an
+                                                                    instance within our dataset. Each answer candidate
+Evidence inference (Lehman et al., 2019). A                         then has a label of True or False.
+dataset of full-text articles describing randomized
+controlled trials (RCTs). The task is to infer                      Commonsense Explanations (CoS-E) (Rajani
+whether a given intervention is reported to either                  et al., 2019). This corpus comprises multiple-
+signiﬁcantly increase, signiﬁcantly decrease, or                    choice questions and answers from (Talmor et al.,
+have no signiﬁcant effect on a speciﬁed outcome, as                 2019) along with supporting rationales. The ratio-
+compared to a comparator of interest. Rationales                    nales in this case come in the form both of high-
+have been marked as supporting these inferences.                    lighted (extracted) supporting snippets and free-
+As the original annotations are not necessarily ex-                 text, open-ended descriptions of reasoning. Given
+haustive, we collected exhaustive rationale annota-                 our focus on extractive rationales, ERASER in-
+tions on a subset of the validation and test data.5                 cludes only the former for now. Following Talmor
+                                                                    et al. (2019), we repartition the training and valida-
+BoolQ (Clark et al., 2019). This corpus consists                    tion sets to provide a canonical test split.
+of passages selected from Wikipedia, and yes/no
+questions generated from these passages. As the                     e-SNLI (Camburu et al., 2018). This dataset aug-
+original Wikipedia article versions used were not                   ments the SNLI corpus (Bowman et al., 2015) with
+maintained, we have made a best-effort attempt to                   rationales marked in the premise and/or hypothesis
+recover these, and then ﬁnd within them the pas-                    (and natural language explanations, which we do
+sages answering the corresponding questions. For                    not use). For entailment pairs, annotators were re-
+public release, we acquired comprehensive annota-                   quired to highlight at least one word in the premise.
+tions on a subset of documents in our test set.5                    For contradiction pairs, annotators had to highlight
+                                                                    at least one word in both the premise and the hy-
+Movie Reviews (Zaidan and Eisner, 2008). In-                        pothesis; for neutral pairs, they were only allowed
+cludes positive/negative sentiment labels on movie                  to highlight words in the hypothesis.
+reviews. Original rationale annotations were not
+necessarily comprehensive; we thus collected com-                   Human Agreement We report human agreement
+prehensive rationales on the ﬁnal two folds of the                  over extracted rationales for multiple annotators
+original dataset (Pang and Lee, 2004).5 In contrast                 and documents in Table 2. All datasets have a high
+to most other datasets, the rationale annotations                   Cohen κ (Cohen, 1960); with substantial or better
+here are span level as opposed to sentence level.                   agreement.
+
+FEVER (Thorne et al., 2018). Short for Fact Ex-                     4 Metrics
+traction and VERiﬁcation; entails verifying claims
+from textual sources. Speciﬁcally, each claim is to                 In ERASER models are evaluated both for their
+be classiﬁed as supported, refuted or not enough                    predictive performance and with respect to the ra-
+information with reference to a collection of source                tionales that they extract. For the former, we rely
+                                                                    on the established metrics for the respective tasks.
+     3Except for BoolQ, wherein source documents in the orig-       Here we describe the metrics we propose to eval-
+inal train and validation set were not disjoint and we preserve     uate the quality of extracted rationales. We do
+this structure in our dataset. Questions, of course, are disjoint.  not claim that these are necessarily the best met-
+                                                                    rics for evaluating rationales, however. Indeed, we
+     4Consequently, for datasets that have been part of previ-      hope the release of ERASER will spur additional
+ous benchmarks with other aims (namely, GLUE/superGLUE)             research into how best to measure the quality of
+but which we have re-purposed for work on rationales in             model explanations in the context of NLP.
+ERASER, e.g., BoolQ (Clark et al., 2019), we have carved out
+for release test sets from the original validation sets.
+
+     5Annotation details are in Appendix B.
+
+4446
+Dataset                Cohen κ           F1              P              R       #Annotators/doc  #Documents
+Evidence Inference          -              -              -              -               -              -
+BoolQ                              0.617 ± 0.227  0.647 ± 0.260  0.726 ± 0.217           3
+Movie Reviews       0.618 ± 0.194  0.799 ± 0.138  0.693 ± 0.153  0.989 ± 0.102           2            199
+FEVER               0.712 ± 0.135  0.871 ± 0.197  0.931 ± 0.205  0.855 ± 0.198           2             96
+MultiRC             0.854 ± 0.196  0.749 ± 0.265  0.695 ± 0.284  0.910 ± 0.259           2             24
+CoS-E               0.728 ± 0.268  0.654 ± 0.317  0.626 ± 0.319  0.792 ± 0.371           2             99
+e-SNLI              0.619 ± 0.308  0.799 ± 0.130  0.812 ± 0.154  0.853 ± 0.124           3            100
+                    0.743 ± 0.162                                                                    9807
+
+Table 2: Human agreement with respect to rationales. For Movie Reviews and BoolQ we calculate the mean
+agreement of individual annotators with the majority vote per token, over the two-three annotators we hired via
+Upwork and Amazon Turk, respectively. The e-SNLI dataset already comprised three annotators; for this we
+calculate mean agreement between individuals and the majority. For CoS-E, MultiRC, and FEVER, members of
+our team annotated a subset to use a comparison to the (majority of, where appropriate) existing rationales. We
+collected comprehensive rationales for Evidence Inference from Medical Doctors; as they have a high amount of
+expertise, we would expect agreement to be high, but have not collected redundant comprehensive annotations.
+
+4.1 Agreement with human rationales                            We highlight which corpora contain comprehensive
+                                                               rationales in the test set in Table 3.
+The simplest means of evaluating extracted ratio-
+nales is to measure how well they agree with those             4.2 Measuring faithfulness
+marked by humans. We consider two classes of
+metrics, appropriate for models that perform dis-              As discussed above, a model may provide ratio-
+crete and ‘soft’ selection, respectively.                      nales that are plausible (agreeable to humans) but
+                                                               that it did not rely on for its output. In many set-
+   For the discrete case, measuring exact matches              tings one may want rationales that actually explain
+between predicted and reference rationales is likely           model predictions, i.e., rationales extracted for an
+too harsh.6 We thus consider more relaxed mea-                 instance in this case ought to have meaningfully in-
+sures. These include Intersection-Over-Union                   ﬂuenced its prediction for the same. We call these
+(IOU), borrowed from computer vision (Evering-                 faithful rationales. How best to measure rationale
+ham et al., 2010), which permits credit assignment             faithfulness is an open question. In this ﬁrst version
+for partial matches. We deﬁne IOU on a token level:            of ERASER we propose simple metrics motivated
+for two spans, it is the size of the overlap of the            by prior work (Zaidan et al., 2007; Yu et al., 2019).
+tokens they cover divided by the size of their union.          In particular, following Yu et al. (2019) we deﬁne
+We count a prediction as a match if it overlaps with           metrics intended to measure the comprehensiveness
+any of the ground truth rationales by more than                (were all features needed to make a prediction se-
+some threshold (here, 0.5). We use these partial               lected?) and sufﬁciency (do the extracted rationales
+matches to calculate an F1 score. We also measure              contain enough signal to come to a disposition?) of
+token-level precision and recall, and use these to             rationales, respectively.
+derive token-level F1 scores.
+                                                                  Comprehensiveness. To calculate rationale
+   Metrics for continuous or soft token scoring                comprehensiveness we create contrast exam-
+models consider token rankings, rewarding models               ples (Zaidan et al., 2007): We construct a con-
+for assigning higher scores to marked tokens. In               trast example for xi, x˜i, which is xi with the pre-
+particular, we take the Area Under the Precision-              dicted rationales ri removed. Assuming a classiﬁ-
+Recall curve (AUPRC) constructed by sweeping a                 cation setting, let m(xi)j be the original prediction
+threshold over token scores. We deﬁne additional               provided by a model m for the predicted class j.
+metrics for soft scoring models below.                         Then we consider the predicted probability from
+                                                               the model for the same class once the supporting
+   In general, the rationales we have for tasks are            rationales are stripped. Intuitively, the model ought
+sufﬁcient to make judgments, but not necessarily               to be less conﬁdent in its prediction once rationales
+comprehensive. However, for some datasets we                   are removed from xi. We can measure this as:
+have explicitly collected comprehensive rationales
+for at least a subset of the test set. Therefore, on             comprehensiveness = m(xi)j − m(xi ri)j (1)
+these datasets recall evaluates comprehensiveness
+directly (it does so only noisily on other datasets).          A high score here implies that the rationales were
+                                                               indeed inﬂuential in the prediction, while a low
+     6Consider that an extra token destroys the match but not  score suggests that they were not. A negative value
+usually the meaning
+
+                                                  4447
+pˆ(Forest|xi)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   Comprehensiveness
+
+<latexit sha1_base64="ougnmb+NiPKI2tlw1oMyZAtvk8c=">AAACBXicbVDJSgNBEO2JW4xb1KMeBoMQL2EmCnoMCuIxglkgM4SeTiVp0rPQXSMJ41y8+CtePCji1X/w5t/YWQ6a+KDg8V4VVfW8SHCFlvVtZJaWV1bXsuu5jc2t7Z387l5dhbFkUGOhCGXTowoED6CGHAU0IwnU9wQ0vMHV2G/cg1Q8DO5wFIHr017Au5xR1FI7f+j0KSZRWkwchCEm16EEhWn6MGzzk3a+YJWsCcxFYs9IgcxQbee/nE7IYh8CZIIq1bKtCN2ESuRMQJpzYgURZQPag5amAfVBucnki9Q81krH7IZSV4DmRP09kVBfqZHv6U6fYl/Ne2PxP68VY/fCTXgQxQgBmy7qxsLE0BxHYna4BIZipAllkutbTdankjLUweV0CPb8y4ukXi7Zp6Xy7VmhcjmLI0sOyBEpEpuckwq5IVVSI4w8kmfySt6MJ+PFeDc+pq0ZYzazT/7A+PwBuOKZWQ==</latexit>
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               Suﬃency
+
+                                                                                                                                                                      (e) Ground
+                                                                                                                                                              (d) Field
+                                                                                                                                                      (c) Forest
+                                                                                                                                               (b) Flowers
+                                                                                                                                      (a) Compost pile
+
+                                                                                                   (e) Ground
+                                                                                           (d) Field
+                                                                                   (c) Forest
+                                                                            (b) Flowers
+                                                                    (a) Compost pile
+
+                               (e) Ground
+                       (d) Field
+               (c) Forest
+        (b) Flowers
+(a) Compost pile
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            …                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            …                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             …
+
+Where do you ﬁnd the most amount of leafs?                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      Where do you ﬁnd the most amount of leafs?                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        Where do you ﬁnd the most amount of leafs?
+
+xi                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   x˜i                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   ri
+<latexit sha1_base64="HYbfjgGaRCmI8j+M0Errr+OmJEA=">AAAB6nicbVBNS8NAEJ34WetX1aOXxSJ4KkkV9Fj04rGi/YA2lM120i7dbMLuRiyhP8GLB0W8+ou8+W/ctjlo64OBx3szzMwLEsG1cd1vZ2V1bX1js7BV3N7Z3dsvHRw2dZwqhg0Wi1i1A6pRcIkNw43AdqKQRoHAVjC6mfqtR1Sax/LBjBP0IzqQPOSMGivdP/V4r1R2K+4MZJl4OSlDjnqv9NXtxyyNUBomqNYdz02Mn1FlOBM4KXZTjQllIzrAjqWSRqj9bHbqhJxapU/CWNmShszU3xMZjbQeR4HtjKgZ6kVvKv7ndVITXvkZl0lqULL5ojAVxMRk+jfpc4XMiLEllClubyVsSBVlxqZTtCF4iy8vk2a14p1XqncX5dp1HkcBjuEEzsCDS6jBLdShAQwG8Ayv8OYI58V5dz7mrStOPnMEf+B8/gBh3o3c</latexit>                                           <latexit sha1_base64="5TrbQcGQm9R0QLC9WtTvOnnHQdk=">AAAB8nicbVBNS8NAEN3Ur1q/qh69LBbBU0mqoMeiF48V7AekoWw2m3bpZjfsTsQS+jO8eFDEq7/Gm//GbZuDtj4YeLw3w8y8MBXcgOt+O6W19Y3NrfJ2ZWd3b/+genjUMSrTlLWpEkr3QmKY4JK1gYNgvVQzkoSCdcPx7czvPjJtuJIPMElZkJCh5DGnBKzk94GLiOVP0wEfVGtu3Z0DrxKvIDVUoDWofvUjRbOESaCCGON7bgpBTjRwKti00s8MSwkdkyHzLZUkYSbI5ydP8ZlVIhwrbUsCnqu/J3KSGDNJQtuZEBiZZW8m/uf5GcTXQc5lmgGTdLEozgQGhWf/44hrRkFMLCFUc3srpiOiCQWbUsWG4C2/vEo6jbp3UW/cX9aaN0UcZXSCTtE58tAVaqI71EJtRJFCz+gVvTngvDjvzseiteQUM8foD5zPH8XfkZI=</latexit>                    <latexit sha1_base64="6zdNEORaRuNf4q408y762r5g5fM=">AAAB6nicbVBNS8NAEJ3Ur1q/qh69LBbBU0mqoMeiF48V7Qe0oWy2k3bpZhN2N0IJ/QlePCji1V/kzX/jts1BWx8MPN6bYWZekAiujet+O4W19Y3NreJ2aWd3b/+gfHjU0nGqGDZZLGLVCahGwSU2DTcCO4lCGgUC28H4dua3n1BpHstHM0nQj+hQ8pAzaqz0oPq8X664VXcOskq8nFQgR6Nf/uoNYpZGKA0TVOuu5ybGz6gynAmclnqpxoSyMR1i11JJI9R+Nj91Ss6sMiBhrGxJQ+bq74mMRlpPosB2RtSM9LI3E//zuqkJr/2MyyQ1KNliUZgKYmIy+5sMuEJmxMQSyhS3txI2oooyY9Mp2RC85ZdXSatW9S6qtfvLSv0mj6MIJ3AK5+DBFdThDhrQBAZDeIZXeHOE8+K8Ox+L1oKTzxzDHzifP1i6jdY=</latexit>
+
+Figure 2: Illustration of faithfulness scoring metrics, comprehensiveness and sufﬁciency, on the Commonsense
+Explanations (CoS-E) dataset. For the former, erasing the tokens comprising the provided rationale (x˜i) ought to
+decrease model conﬁdence in the output ‘Forest’. For the latter, the model should be able to come to a similar
+disposition regarding ‘Forest’ using only the rationales ri.
+
+here means that the model became more conﬁdent                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           a prediction ﬂips (Serrano and Smith, 2019). How-
+in its prediction after the rationales were removed;                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     ever, the necessity of discretizing continuous scores
+this would seem counter-intuitive if the rationales                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      forces us to pick a particular threshold k.
+were indeed the reason for its prediction.
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            We can also consider the behavior of these mea-
+   Sufﬁciency. This captures the degree to which                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         sures as a function of k, inspired by the measure-
+the snippets within the extracted rationales are ade-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    ments proposed in Samek et al. (2016) in the con-
+quate for a model to make a prediction.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  text of evaluating saliency maps for image classi-
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         ﬁcation. They suggested ranking pixel regions by
+sufﬁciency = m(xi)j − m(ri)j                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    (2)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      importance and then measuring the change in out-
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         put as they are removed in rank order. Our datasets
+These metrics are illustrated in Figure 2.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               comprise documents and rationales with quite dif-
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         ferent lengths; to make this measure comparable
+   As deﬁned, the above measures have assumed                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            across datasets, we construct bins designating the
+discrete rationales ri. We would also like to eval-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      number of tokens to be deleted. Denoting the to-
+uate the faithfulness of continuous importance                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           kens up to and including bin k for instance i by rik,
+scores assigned to tokens by models. Here we                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             we deﬁne an aggregate comprehensiveness mea-
+adopt a simple approach for this. We convert soft                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        sure:
+scores over features si provided by a model into
+discrete rationales ri by taking the top−kd values,                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            1     B
+where kd is a threshold for dataset d. We set kd to                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            +
+the average rationale length provided by humans                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             B     1  (     m(xi)j                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      −  m(xi  rik)j )  (3)
+for dataset d (see Table 4). Intuitively, this says:
+How much does the model prediction change if we                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       k=0
+remove a number of tokens equal to what humans
+use (on average for this dataset) in order of the                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           This is deﬁned for sufﬁciency analogously. Here
+importance scores assigned to these by the model.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        we group tokens into k = 5 bins by grouping them
+Once we have discretized the soft scores into ra-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        into the top 1%, 5%, 10%, 20% and 50% of to-
+tionales in this way, we compute the faithfulness                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        kens, with respect to the corresponding importance
+scores as per Equations 1 and 2.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         score. We refer to these metrics as “Area Over the
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         Perturbation Curve” (AOPC).7
+   This approach is conceptually simple. It is also
+computationally cheap to evaluate, in contrast to                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           These AOPC sufﬁciency and comprehensiveness
+measures that require per-token measurements, e.g.,                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      measures score a particular token ordering under
+importance score correlations with ‘leave-one-out’                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       a model. As a point of reference, we also report
+scores (Jain and Wallace, 2019), or counting how                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         these when random scores are assigned to tokens.
+many ‘important’ tokens need to be erased before
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              7Our AOPC metrics are similar in concept to ROAR
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         (Hooker et al., 2019) except that we re-use an existing model
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         as opposed to retraining for each fraction.
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                4448
+5 Baseline Models                                       with bidirectional LSTMs (Hochreiter and Schmid-
+                                                        huber, 1997) on top to induce contextualized rep-
+Our focus in this work is primarily on the ERASER       resentations of tokens for the encoder and decoder,
+benchmark itself, rather than on any particular         respectively. The encoder generates a scalar (de-
+model(s). But to establish a starting point for future  noting the probability of selecting that token) for
+work, we evaluate several baseline models across        each LSTM hidden state using a feedfoward layer
+the corpora in ERASER.8 We broadly classify these       and sigmoid. In the variant using human rationales
+into models that assign ‘soft’ (continuous) scores      during training, we minimize cross entropy loss
+to tokens, and those that perform a ‘hard’ (discrete)   over rationale predictions. The ﬁnal loss is then
+selection over inputs. We additionally consider         a composite of classiﬁcation loss, regularizers on
+models speciﬁcally designed to select individual        rationales (Lei et al., 2016), and loss over rationale
+tokens (and very short sequences) as rationales, as     predictions, when available.
+compared to longer snippets. All of our implemen-
+tations are in PyTorch (Paszke et al., 2019) and are    Pipeline models. These are simple models in
+available in the ERASER repository.9                    which we ﬁrst train the encoder to extract ratio-
+                                                        nales, and then train the decoder to perform pre-
+   All datasets in ERASER comprise inputs, ratio-       diction using only rationales. No parameters are
+nales, and labels. But they differ considerably in      shared between the two models.
+document and rationale lengths (Table A). This mo-
+tivated use of different models for datasets, appro-       Here we ﬁrst consider a simple pipeline that ﬁrst
+priate to their sizes and rationale granularities. We   segments inputs into sentences. It passes these,
+hope that this benchmark motivates design of mod-       one at a time, through a Gated Recurrent Unit
+els that provide rationales that can ﬂexibly adapt to   (GRU) (Cho et al., 2014), to yield hidden represen-
+varying input lengths and expected rationale gran-      tations that we compose via an attentive decoding
+ularities. Indeed, only with such models can we         layer (Bahdanau et al., 2015). This aggregate rep-
+perform comparisons across all datasets.                resentation is then passed to a classiﬁcation module
+                                                        which predicts whether the corresponding sentence
+5.1 Hard selection                                      is a rationale (or not). A second model, using effec-
+                                                        tively the same architecture but parameterized inde-
+Models that perform hard selection may be viewed        pendently, consumes the outputs (rationales) from
+as comprising two independent modules: an en-           the ﬁrst to make predictions. This simple model is
+coder which is responsible for extracting snippets      described at length in prior work (Lehman et al.,
+of inputs, and a decoder that makes a prediction        2019). We further consider a ‘BERT-to-BERT’
+based only on the text provided by the encoder. We      pipeline, where we replace each stage with a BERT
+consider two variants of such models.                   module for prediction (Devlin et al., 2019).
+
+Lei et al. (2016). In this model, an encoder in-           In pipeline models, we train each stage indepen-
+duces a binary mask over inputs x, z. The decoder       dently. The rationale identiﬁcation stage is trained
+accepts the tokens in x unmasked by z to make a         using approximate sentence boundaries from our
+prediction yˆ. These modules are trained jointly via    source annotations, with randomly sampled neg-
+REINFORCE (Williams, 1992) style estimation,            ative examples at each epoch. The classiﬁcation
+minimizing the loss over expected binary vectors        stage uses the same positive rationales as the iden-
+z yielded from the encoder. One of the advantages       tiﬁcation stage, a type of teacher forcing (Williams
+of this approach is that it need not have access to     and Zipser, 1989) (details in Appendix C).
+marked rationales; it can learn to rationalize on the
+basis of instance labels alone. However, given that     5.2 Soft selection
+we do have rationales in the training data, we exper-
+iment with a variant in which we train the encoder      We consider a model that passes tokens through
+explicitly using rationale-level annotations.           BERT (Devlin et al., 2019) to induce contextual-
+                                                        ized representations that are then passed to a bi-
+   In our implementation of Lei et al. (2016), we       directional LSTM (Hochreiter and Schmidhuber,
+drop in two independent BERT (Devlin et al., 2019)      1997). The hidden representations from the LSTM
+or GloVe (Pennington et al., 2014) base modules         are collapsed into a single vector using additive
+                                                        attention (Bahdanau et al., 2015). The LSTM layer
+     8This is not intended to be comprehensive.         allows us to bypass the 512 word limit imposed by
+     9https://github.com/jayded/
+eraserbenchmark
+
+4449
+Evidence Inference     Perf.  IOU F1  Token F1              Evidence Inference         Perf.  AUPRC     Comp. ↑   Suff. ↓
+Lei et al. (2016)                                           GloVe + LSTM - Attention
+Lei et al. (2016) (u)  0.461   0.000    0.000               GloVe + LSTM - Gradient   0.429      0.506    -0.002  -0.023
+Lehman et al. (2019)   0.461   0.000    0.000               GloVe + LSTM - Lime       0.429      0.016     0.046  -0.138
+Bert-To-Bert           0.471   0.119    0.123               GloVe + LSTM - Random     0.429      0.014     0.006  -0.128
+                       0.708   0.455    0.468                                         0.429      0.014    -0.001  -0.026
+BoolQ                                                       BoolQ
+Lei et al. (2016)      0.381   0.000    0.000               GloVe + LSTM - Attention  0.471      0.525     0.010   0.022
+Lei et al. (2016) (u)  0.380   0.000    0.000               GloVe + LSTM - Gradient   0.471      0.072     0.024   0.031
+Lehman et al. (2019)   0.411   0.050    0.127               GloVe + LSTM - Lime       0.471      0.073     0.028  -0.154
+Bert-To-Bert           0.544   0.052    0.134               GloVe + LSTM - Random     0.471      0.074     0.000   0.005
+
+Movie Reviews          0.914   0.124    0.285               Movies                    0.970      0.417     0.129   0.097
+Lei et al. (2016)      0.920   0.012    0.322               BERT+LSTM - Attention     0.970      0.385     0.142   0.112
+Lei et al. (2016) (u)  0.750   0.063    0.139               BERT+LSTM - Gradient      0.970      0.280     0.187   0.093
+Lehman et al. (2019)   0.860   0.075    0.145               BERT+LSTM - Lime          0.970      0.259     0.058   0.330
+Bert-To-Bert                                                BERT+LSTM - Random
+                       0.719   0.218    0.234                                         0.870      0.235     0.037   0.122
+FEVER                  0.718   0.000    0.000               FEVER                     0.870      0.232     0.059   0.136
+Lei et al. (2016)      0.691   0.540    0.523               BERT+LSTM - Attention     0.870      0.291     0.212   0.014
+Lei et al. (2016) (u)  0.877   0.835    0.812               BERT+LSTM - Gradient      0.870      0.244     0.034   0.122
+Lehman et al. (2019)                                        BERT+LSTM - Lime
+Bert-To-Bert           0.655   0.271    0.456               BERT+LSTM - Random        0.655      0.244     0.036   0.052
+                       0.648  0.000†   0.000†                                         0.655      0.224     0.077   0.064
+MultiRC                0.614   0.136    0.140               MultiRC                   0.655      0.208     0.213  -0.079
+Lei et al. (2016)      0.633   0.416    0.412               BERT+LSTM - Attention     0.655      0.186     0.029   0.081
+Lei et al. (2016) (u)                                       BERT+LSTM - Gradient
+Lehman et al. (2019)   0.477   0.255    0.331               BERT+LSTM - Lime          0.487      0.606     0.080   0.217
+Bert-To-Bert           0.476  0.000†   0.000†               BERT+LSTM - Random        0.487      0.585     0.124   0.226
+                       0.344   0.389    0.519                                         0.487      0.544     0.223   0.143
+CoS-E                                                       CoS-E                     0.487      0.594     0.072   0.224
+Lei et al. (2016)      0.917   0.693    0.692               BERT+LSTM - Attention
+Lei et al. (2016) (u)  0.903   0.261    0.379               BERT+LSTM - Gradient      0.960      0.395     0.105   0.583
+Bert-To-Bert           0.733   0.704    0.701               BERT+LSTM - Lime          0.960      0.416     0.180   0.472
+                                                            BERT+LSTM - Random        0.960      0.513     0.437   0.389
+e-SNLI                                                                                0.960      0.357     0.081   0.487
+Lei et al. (2016)                                           e-SNLI
+Lei et al. (2016) (u)                                       BERT+LSTM - Attention
+Bert-To-Bert                                                BERT+LSTM - Gradient
+                                                            BERT+LSTM - Lime
+Table 3: Performance of models that perform hard ra-        BERT+LSTM - Random
+tionale selection. All models are supervised at the ratio-
+nale level except for those marked with (u), which learn    Table 4: Metrics for ‘soft’ scoring models. Perf. is ac-
+only from instance-level supervision; † denotes cases in    curacy (CoS-E) or F1 (others). Comprehensiveness and
+which rationale training degenerated due to the REIN-       sufﬁciency are in terms of AOPC (Eq. 3). ‘Random’
+FORCE style training. Perf. is accuracy (CoS-E) or          assigns random scores to tokens to induce orderings;
+macro-averaged F1 (others). Bert-To-Bert for CoS-E          these are averages over 10 runs.
+and e-SNLI uses a token classiﬁcation objective. Bert-
+To-Bert CoS-E uses the highest scoring answer.              6 Evaluation
+
+BERT; when we exceed this, we effectively start             Here we present initial results for the baseline mod-
+encoding a ‘new’ sequence (setting the positional           els discussed in Section 5, with respect to the met-
+index to 0) via BERT. The hope is that the LSTM             rics proposed in Section 4. We present results in
+learns to compensate for this. Evidence Inference           two parts, reﬂecting the two classes of rationales
+and BoolQ comprise very long (>1000 token) in-              discussed above: ‘Hard’ approaches that perform
+puts; we were unable to run BERT over these. We             discrete selection of snippets, and ‘soft’ methods
+instead resorted to swapping GloVe 300d embed-              that assign continuous importance scores to tokens.
+dings (Pennington et al., 2014) in place of BERT
+representations for tokens. spans.                             In Table 3 we evaluate models that perform dis-
+                                                            crete selection of rationales. We view these as in-
+   To soft score features we consider: Simple gra-          herently faithful, because by construction we know
+dients, attention induced over contextualized repre-        which snippets the decoder used to make a pre-
+sentations, and LIME (Ribeiro et al., 2016).                diction.10 Therefore, for these methods we report
+                                                            only metrics that measure agreement with human
+                                                            annotations.
+
+                                                                10This assumes independent encoders and decoders.
+
+                                                4450
+   Due to computational constraints, we were un-         fares better in terms of AUPRC — suggesting bet-
+able to run our BERT-based implementation of Lei         ter agreement with human rationales — which is
+et al. (2016) over larger corpora. Conversely, the       also in line with prior ﬁndings that it may provide
+simple pipeline of Lehman et al. (2019) assumes          plausible, but not faithful, explanation (Zhong et al.,
+a setting in which rationale are sentences, and so       2019). Interestingly, LIME does particularly well
+is not appropriate for datasets in which rationales      across these tasks in terms of faithfulness.
+tend to comprise only very short spans. Again, in
+our view this highlights the need for models that           From the ‘Random’ results that we conclude
+can rationalize at varying levels of granularity, de-    models with overall poor performance on their ﬁ-
+pending on what is appropriate.                          nal tasks tend to have an overall poor ordering, with
+                                                         marginal differences in comprehensiveness and suf-
+   We observe that for the “rationalizing” model         ﬁciency between them. For models that with high
+of Lei et al. (2016), exploiting rationale-level super-  sufﬁciency scores: Movies, FEVER, CoS-E, and e-
+vision often (though not always) improves agree-         SNLI, we ﬁnd that random removal is particularly
+ment with human-provided rationales, as in prior         damaging to performance, indicating poor absolute
+work (Zhang et al., 2016; Strout et al., 2019). In-      ranking; whereas those with high comprehensive-
+terestingly, this does not seem strongly correlated      ness are sensitive to rationale length.
+with predictive performance.
+                                                         7 Conclusions and Future Directions
+    Lei et al. (2016) outperforms the simple pipeline
+model when using a BERT encoder. Further, Lei            We have introduced a new publicly available re-
+et al. (2016) outperforms the ‘BERT-to-BERT’             source: the Evaluating Rationales And Simple En-
+pipeline on the comparable datasets for the ﬁnal         glish Reasoning (ERASER) benchmark. This com-
+prediction tasks. This may be an artifact of the         prises seven datasets, all of which include both
+amount of text each model can select: ‘BERT-to-          instance level labels and corresponding supporting
+BERT’ is limited to sentences, while Lei et al.          snippets (‘rationales’) marked by human annotators.
+(2016) can select any subset of the text. Designing      We have augmented many of these datasets with
+extraction models that learn to adaptively select        additional annotations, and converted them into a
+contiguous rationales of appropriate length for a        standard format comprising inputs, rationales, and
+given task seems a potentially promising direction.      outputs. ERASER is intended to facilitate progress
+                                                         on explainable models for NLP.
+   In Table 4 we report metrics for models that
+assign continuous importance scores to individ-             We proposed several metrics intended to mea-
+ual tokens. For these models we again measure            sure the quality of rationales extracted by models,
+downstream (task) performance (macro F1 or ac-           both in terms of agreement with human annota-
+curacy). Here the models are actually the same,          tions, and in terms of ‘faithfulness’. We believe
+and so downstream performance is equivalent. To          these metrics provide reasonable means of compar-
+assess the quality of token scores with respect to       ison of speciﬁc aspects of interpretability, but we
+human annotations, we report the Area Under the          view the problem of measuring faithfulness, in par-
+Precision Recall Curve (AUPRC).                          ticular, a topic ripe for additional research (which
+                                                         ERASER can facilitate).
+   These scoring functions assign only soft scores
+to inputs (and may still use all inputs to come to          Our hope is that ERASER enables future work
+a particular prediction), so we report the metrics       on designing more interpretable NLP models, and
+intended to measure faithfulness deﬁned above:           comparing their relative strengths across a vari-
+comprehensiveness and sufﬁciency, averaged over          ety of tasks, datasets, and desired criteria. It also
+‘bins’ of tokens ordered by importance scores. To        serves as an ideal starting point for several future
+provide a point of reference for these metrics —         directions such as better evaluation metrics for in-
+which depend on the underlying model — we re-            terpretability, causal analysis of NLP models and
+port results when rationales are randomly selected       datasets of rationales in other languages.
+(averaged over 10 runs).
+                                                         8 Acknowledgements
+   Both simple gradient and LIME-based scoring
+yield more comprehensive rationales than attention       We thank the anonymous ACL reviewers.
+weights, consistent with prior work (Jain and Wal-          This work was supported in part by the NSF (CA-
+lace, 2019; Serrano and Smith, 2019). Attention
+                                                         REER award 1750978), and by the Army Research
+                                                         Ofﬁce (W911NF1810328).
+
+4451
+References                                                 Kyunghyun Cho, Bart van Merrie¨nboer, Caglar Gul-
+                                                              cehre, Dzmitry Bahdanau, Fethi Bougares, Holger
+David Alvarez-Melis and Tommi Jaakkola. 2017. A               Schwenk, and Yoshua Bengio. 2014. Learning
+   causal framework for explaining the predictions of         phrase representations using RNN encoder–decoder
+   black-box sequence-to-sequence models. In Pro-             for statistical machine translation. In Proceedings of
+   ceedings of the 2017 Conference on Empirical Meth-         the 2014 Conference on Empirical Methods in Nat-
+   ods in Natural Language Processing, pages 412–             ural Language Processing (EMNLP), pages 1724–
+   421.                                                       1734, Doha, Qatar. Association for Computational
+                                                              Linguistics.
+Leila Arras, Franziska Horn, Gre´goire Montavon,
+   Klaus-Robert Mu¨ller, and Wojciech Samek. 2017.         Christopher Clark, Kenton Lee, Ming-Wei Chang,
+  ”what is relevant in a text document?”: An inter-           Tom Kwiatkowski, Michael Collins, and Kristina
+   pretable machine learning approach. In PloS one.           Toutanova. 2019. Boolq: Exploring the surprising
+                                                              difﬁculty of natural yes/no questions. In NAACL.
+Dzmitry Bahdanau, Kyunghyun Cho, and Yoshua Ben-
+   gio. 2015. Neural machine translation by jointly        Jacob Cohen. 1960. A coefﬁcient of agreement for
+   learning to align and translate. In 3rd Inter-             nominal scales. Educational and Psychological
+   national Conference on Learning Representations,           Measurement, 20(1):37–46.
+   ICLR 2015, San Diego, CA, USA, May 7-9, 2015,
+   Conference Track Proceedings.                           Jacob Devlin, Ming-Wei Chang, Kenton Lee, and
+                                                              Kristina Toutanova. 2019. BERT: Pre-training of
+Joost Bastings, Wilker Aziz, and Ivan Titov. 2019. In-        deep bidirectional transformers for language under-
+   terpretable neural predictions with differentiable bi-     standing. In Proceedings of the 2019 Conference
+   nary variables. In Proceedings of the 57th Annual          of the North American Chapter of the Association
+   Meeting of the Association for Computational Lin-          for Computational Linguistics: Human Language
+   guistics, pages 2963–2977, Florence, Italy. Associa-       Technologies, Volume 1 (Long and Short Papers),
+   tion for Computational Linguistics.                        pages 4171–4186, Minneapolis, Minnesota. Associ-
+                                                              ation for Computational Linguistics.
+Iz Beltagy, Kyle Lo, and Arman Cohan. 2019. Scib-
+   ert: Pretrained language model for scientiﬁc text. In   Yanzhuo Ding, Yang Liu, Huanbo Luan, and Maosong
+   EMNLP.                                                     Sun. 2017. Visualizing and understanding neural
+                                                              machine translation. In Proceedings of the 55th An-
+Samuel R. Bowman, Gabor Angeli, Christopher Potts,            nual Meeting of the Association for Computational
+   and Christopher D. Manning. 2015. A large anno-            Linguistics (Volume 1: Long Papers), Vancouver,
+   tated corpus for learning natural language inference.      Canada. Association for Computational Linguistics.
+   In Proceedings of the 2015 Conference on Empirical
+   Methods in Natural Language Processing (EMNLP).         Finale Doshi-Velez and Been Kim. 2017. Towards a
+   Association for Computational Linguistics.                 rigorous science of interpretable machine learning.
+                                                              arXiv preprint arXiv:1702.08608.
+Gino Brunner, Yang Liu, Damian Pascual, Oliver
+   Richter, Massimiliano Ciaramita, and Roger Watten-      Mark Everingham, Luc Van Gool, Christopher K. I.
+   hofer. 2020. On identiﬁability in transformers. In         Williams, John Winn, and Andrew Zisserman. 2010.
+   International Conference on Learning Representa-           The pascal visual object classes (voc) challenge. In-
+   tions.                                                     ternational Journal of Computer Vision, 88(2):303–
+                                                              338.
+Oana-Maria Camburu, Tim Rockta¨schel, Thomas
+   Lukasiewicz, and Phil Blunsom. 2018. e-snli: Nat-       Shi Feng, Eric Wallace, Alvin Grissom, Mohit Iyyer,
+   ural language inference with natural language expla-       Pedro Rodriguez, and Jordan L. Boyd-Graber. 2018.
+   nations. In Advances in Neural Information Process-        Pathologies of neural models make interpretation
+   ing Systems, pages 9539–9549.                              difﬁcult. In EMNLP.
+
+Shiyu Chang, Yang Zhang, Mo Yu, and Tommi                  Matt Gardner, Joel Grus, Mark Neumann, Oyvind
+   Jaakkola. 2019. A game theoretic approach to class-        Tafjord, Pradeep Dasigi, Nelson F. Liu, Matthew Pe-
+   wise selective rationalization. In Advances in Neu-        ters, Michael Schmitz, and Luke Zettlemoyer. 2018.
+   ral Information Processing Systems, pages 10055–           AllenNLP: A deep semantic natural language pro-
+   10065.                                                     cessing platform. In Proceedings of Workshop for
+                                                              NLP Open Source Software (NLP-OSS), pages 1–
+Sihao Chen, Daniel Khashabi, Wenpeng Yin, Chris               6, Melbourne, Australia. Association for Computa-
+   Callison-Burch, and Dan Roth. 2019. Seeing things          tional Linguistics.
+   from a different angle: Discovering diverse perspec-
+   tives about claims. In Proceedings of the Conference    Sepp Hochreiter and Ju¨rgen Schmidhuber. 1997.
+   of the North American Chapter of the Association           Long short-term memory. Neural computation,
+   for Computational Linguistics (NAACL), pages 542–          9(8):1735–1780.
+   557, Minneapolis, Minnesota.
+
+4452
+Sara Hooker, Dumitru Erhan, Pieter-Jan Kindermans,        Tyler McDonnell, Mucahid Kutlu, Tamer Elsayed, and
+   and Been Kim. 2019. A benchmark for interpretabil-        Matthew Lease. 2017. The many beneﬁts of anno-
+   ity methods in deep neural networks. In H. Wal-           tator rationales for relevance judgments. In IJCAI,
+   lach, H. Larochelle, A. Beygelzimer, F. d'Alche´-Buc,     pages 4909–4913.
+   E. Fox, and R. Garnett, editors, Advances in Neu-
+   ral Information Processing Systems 32, pages 9737–     Tyler McDonnell, Matthew Lease, Mucahid Kutlu, and
+   9748. Curran Associates, Inc.                             Tamer Elsayed. 2016. Why is that relevant? col-
+                                                             lecting annotator rationales for relevance judgments.
+Alon Jacovi and Yoav Goldberg. 2020. Towards faith-          In Fourth AAAI Conference on Human Computation
+   fully interpretable nlp systems: How should we            and Crowdsourcing.
+   deﬁne and evaluate faithfulness? arXiv preprint
+   arXiv:2004.03685.                                      Gre´goire Montavon, Sebastian Lapuschkin, Alexander
+                                                             Binder, Wojciech Samek, and Klaus-Robert Mu¨ller.
+Sarthak Jain and Byron C. Wallace. 2019. Attention is        2017. Explaining nonlinear classiﬁcation decisions
+   not Explanation. In Proceedings of the 2019 Con-          with deep taylor decomposition. Pattern Recogni-
+   ference of the North American Chapter of the Asso-        tion, 65:211–222.
+   ciation for Computational Linguistics: Human Lan-
+   guage Technologies, Volume 1 (Long and Short Pa-       Pooya Moradi, Nishant Kambhatla, and Anoop Sarkar.
+   pers), pages 3543–3556, Minneapolis, Minnesota.           2019. Interrogating the explanatory power of atten-
+   Association for Computational Linguistics.                tion in neural machine translation. In Proceedings of
+                                                             the 3rd Workshop on Neural Generation and Trans-
+Sarthak Jain, Sarah Wiegreffe, Yuval Pinter, and By-         lation, pages 221–230, Hong Kong. Association for
+   ron C. Wallace. 2020. Learning to Faithfully Ratio-       Computational Linguistics.
+   nalize by Construction. In Proceedings of the Con-
+   ference of the Association for Computational Lin-      Mark Neumann, Daniel King, Iz Beltagy, and Waleed
+   guistics (ACL).                                           Ammar. 2019. Scispacy: Fast and robust models
+                                                             for biomedical natural language processing. CoRR,
+Daniel Khashabi, Snigdha Chaturvedi, Michael Roth,           abs/1902.07669.
+   Shyam Upadhyay, and Dan Roth. 2018. Looking
+   Beyond the Surface: A Challenge Set for Reading        Dong Nguyen. 2018. Comparing automatic and human
+   Comprehension over Multiple Sentences. In Proc.           evaluation of local explanations for text classiﬁca-
+   of the Annual Conference of the North American            tion. In Proceedings of the 2018 Conference of the
+   Chapter of the Association for Computational Lin-         North American Chapter of the Association for Com-
+   guistics (NAACL).                                         putational Linguistics: Human Language Technolo-
+                                                             gies, Volume 1 (Long Papers), pages 1069–1078.
+Diederik Kingma and Jimmy Ba. 2014. Adam: A
+   method for stochastic optimization. International      Bo Pang and Lillian Lee. 2004. A sentimental edu-
+   Conference on Learning Representations.                   cation: Sentiment analysis using subjectivity sum-
+                                                             marization based on minimum cuts. In Proceed-
+Eric Lehman, Jay DeYoung, Regina Barzilay, and By-           ings of the 42nd Annual Meeting of the Association
+   ron C Wallace. 2019. Inferring which medical treat-       for Computational Linguistics (ACL-04), pages 271–
+   ments work from reports of clinical trials. In Pro-       278, Barcelona, Spain.
+   ceedings of the North American Chapter of the As-
+   sociation for Computational Linguistics (NAACL),       Adam Paszke, Sam Gross, Francisco Massa, Adam
+   pages 3705–3717.                                          Lerer, James Bradbury, Gregory Chanan, Trevor
+                                                             Killeen, Zeming Lin, Natalia Gimelshein, Luca
+Tao Lei, Regina Barzilay, and Tommi Jaakkola. 2016.          Antiga, et al. 2019. Pytorch: An imperative style,
+   Rationalizing neural predictions. In Proceedings of       high-performance deep learning library. In Ad-
+   the 2016 Conference on Empirical Methods in Natu-         vances in Neural Information Processing Systems,
+   ral Language Processing, pages 107–117.                   pages 8024–8035.
+
+Jiwei Li, Xinlei Chen, Eduard Hovy, and Dan Jurafsky.     David J Pearce. 2005. An improved algorithm for ﬁnd-
+   2016. Visualizing and understanding neural models         ing the strongly connected components of a directed
+   in NLP. In Proceedings of the 2016 Conference of          graph. Technical report, Victoria University, NZ.
+   the North American Chapter of the Association for
+   Computational Linguistics: Human Language Tech-        Jeffrey Pennington, Richard Socher, and Christopher
+   nologies, pages 681–691, San Diego, California. As-       Manning. 2014. Glove: Global vectors for word rep-
+   sociation for Computational Linguistics.                  resentation. In Proceedings of the 2014 Conference
+                                                             on Empirical Methods in Natural Language Process-
+Zachary C Lipton. 2016. The mythos of model inter-           ing (EMNLP), pages 1532–1543, Doha, Qatar. Asso-
+   pretability. arXiv preprint arXiv:1606.03490.             ciation for Computational Linguistics.
+
+Scott M Lundberg and Su-In Lee. 2017. A uniﬁed            Danish Pruthi, Mansi Gupta, Bhuwan Dhingra, Gra-
+   approach to interpreting model predictions. In Ad-        ham Neubig, and Zachary C. Lipton. 2020. Learn-
+   vances in Neural Information Processing Systems,          ing to deceive with attention-based explanations. In
+   pages 4765–4774.                                          Annual Conference of the Association for Computa-
+                                                             tional Linguistics (ACL).
+
+4453
+Sampo Pyysalo, F Ginter, Hans Moen, T Salakoski, and        Nitish Srivastava, Geoffrey Hinton, Alex Krizhevsky,
+   Sophia Ananiadou. 2013. Distributional semantics            Ilya Sutskever, and Ruslan Salakhutdinov. 2014.
+   resources for biomedical text processing. Proceed-          Dropout: A simple way to prevent neural networks
+   ings of Languages in Biology and Medicine.                  from overﬁtting. Journal of Machine Learning Re-
+                                                               search, 15:1929–1958.
+Alec Radford, Karthik Narasimhan, Tim Salimans, and
+   Ilya Sutskever. 2018. Improving language under-          Julia Strout, Ye Zhang, and Raymond Mooney. 2019.
+   standing by generative pre-training.                        Do human rationales improve machine explana-
+                                                               tions? In Proceedings of the 2019 ACL Workshop
+Nazneen Fatema Rajani, Bryan McCann, Caiming                   BlackboxNLP: Analyzing and Interpreting Neural
+   Xiong, and Richard Socher. 2019. Explain yourself!          Networks for NLP, pages 56–62, Florence, Italy. As-
+   leveraging language models for commonsense rea-             sociation for Computational Linguistics.
+   soning. Proceedings of the Association for Compu-
+   tational Linguistics (ACL).                              Mukund Sundararajan, Ankur Taly, and Qiqi Yan. 2017.
+                                                               Axiomatic attribution for deep networks. In Pro-
+Marco Ribeiro, Sameer Singh, and Carlos Guestrin.              ceedings of the 34th International Conference on
+   2016. why should i trust you?: Explaining the pre-          Machine Learning-Volume 70, pages 3319–3328.
+   dictions of any classiﬁer. In Proceedings of the 2016       JMLR. org.
+   Conference of the North American Chapter of the
+   Association for Computational Linguistics: Demon-        Alon Talmor, Jonathan Herzig, Nicholas Lourie, and
+   strations, pages 97–101.                                    Jonathan Berant. 2019. CommonsenseQA: A ques-
+                                                               tion answering challenge targeting commonsense
+Wojciech Samek, Alexander Binder, Gre´goire Mon-               knowledge. In Proceedings of the 2019 Conference
+   tavon, Sebastian Lapuschkin, and Klaus-Robert               of the North American Chapter of the Association
+   Mu¨ller. 2016. Evaluating the visualization of what         for Computational Linguistics: Human Language
+   a deep neural network has learned. IEEE trans-              Technologies, Volume 1 (Long and Short Papers),
+   actions on neural networks and learning systems,            pages 4149–4158, Minneapolis, Minnesota. Associ-
+   28(11):2660–2673.                                           ation for Computational Linguistics.
+
+Tal Schuster, Darsh J Shah, Yun Jie Serene Yeo, Daniel      James Thorne, Andreas Vlachos, Christos
+   Filizzola, Enrico Santus, and Regina Barzilay. 2019.        Christodoulopoulos, and Arpit Mittal. 2018.
+   Towards debiasing fact veriﬁcation models. In Pro-          FEVER: a Large-scale Dataset for Fact Extraction
+   ceedings of the 2019 Conference on Empirical Meth-          and VERiﬁcation. In Proceedings of the North
+   ods in Natural Language Processing (EMNLP). As-             American Chapter of the Association for Computa-
+   sociation for Computational Linguistics.                    tional Linguistics (NAACL), pages 809–819.
+
+Soﬁa Serrano and Noah A. Smith. 2019. Is attention          Shikhar Vashishth, Shyam Upadhyay, Gaurav Singh
+   interpretable? In Proceedings of the 57th Annual            Tomar, and Manaal Faruqui. 2019. Attention in-
+   Meeting of the Association for Computational Lin-           terpretability across nlp tasks. arXiv preprint
+   guistics, pages 2931–2951, Florence, Italy. Associa-        arXiv:1909.11218.
+   tion for Computational Linguistics.
+                                                            Byron C Wallace, Kevin Small, Carla E Brodley, and
+Burr Settles. 2012. Active learning. Synthesis Lec-            Thomas A Trikalinos. 2010. Active learning for
+   tures on Artiﬁcial Intelligence and Machine Learn-          biomedical citation screening. In Proceedings of
+   ing, 6(1):1–114.                                            the 16th ACM SIGKDD international conference on
+                                                               Knowledge discovery and data mining, pages 173–
+Manali Sharma, Di Zhuang, and Mustafa Bilgic. 2015.            182. ACM.
+   Active learning with rationales for text classiﬁcation.
+   In Proceedings of the 2015 Conference of the North       Alex Wang, Yada Pruksachatkun, Nikita Nangia,
+   American Chapter of the Association for Computa-            Amanpreet Singh, Julian Michael, Felix Hill, Omer
+   tional Linguistics: Human Language Technologies,            Levy, and Samuel Bowman. 2019a. Superglue: A
+   pages 441–451.                                              stickier benchmark for general-purpose language un-
+                                                               derstanding systems. In H. Wallach, H. Larochelle,
+Kevin Small, Byron C Wallace, Carla E Brodley, and             A. Beygelzimer, F. d'Alche´-Buc, E. Fox, and R. Gar-
+   Thomas A Trikalinos. 2011. The constrained weight           nett, editors, Advances in Neural Information Pro-
+   space svm: learning with ranked features. In Pro-           cessing Systems 32, pages 3266–3280. Curran Asso-
+   ceedings of the International Conference on Inter-          ciates, Inc.
+   national Conference on Machine Learning (ICML),
+   pages 865–872.                                           Alex Wang, Amanpreet Singh, Julian Michael, Felix
+                                                               Hill, Omer Levy, and Samuel R. Bowman. 2019b.
+D. Smilkov, N. Thorat, B. Kim, F. Vie´gas, and M. Wat-         GLUE: A multi-task benchmark and analysis plat-
+   tenberg. 2017. SmoothGrad: removing noise by                form for natural language understanding. In Inter-
+   adding noise. ICML workshop on visualization for            national Conference on Learning Representations.
+   deep learning.
+
+Robyn Speer. 2019. ftfy. Zenodo. Version 5.5.
+
+4454
+Sarah Wiegreffe and Yuval Pinter. 2019. Attention is      MultiRC (Khashabi et al., 2018) We perform min-
+   not not explanation. In Proceedings of the 2019 Con-   imal processing. We use the validation set as the
+   ference on Empirical Methods in Natural Language       testing set for public release.
+   Processing and the 9th International Joint Confer-
+   ence on Natural Language Processing (EMNLP-            Evidence Inference (Lehman et al., 2019) We per-
+   IJCNLP), pages 11–20, Hong Kong, China. Associ-        form minimal processing. As not all of the pro-
+   ation for Computational Linguistics.                   vided evidence spans come with offsets, we delete
+                                                          any prompts that had no grounded evidence spans.
+Ronald J Williams. 1992. Simple statistical gradient-
+   following algorithms for connectionist reinforce-      Movie reviews (Zaidan and Eisner, 2008) We per-
+   ment learning. Machine learning, 8(3-4):229–256.       form minimal processing. We use the ninth fold as
+                                                          the validation set, and collect annotations on the
+Ronald J Williams and David Zipser. 1989. A learn-        tenth fold for comprehensive evaluation.
+   ing algorithm for continually running fully recurrent
+   neural networks. Neural computation, 1(2):270–         FEVER (Thorne et al., 2018) We perform substan-
+   280.                                                   tial processing for FEVER - we delete the ”Not
+                                                          Enough Info” claim class, delete any claims with
+Thomas Wolf, Lysandre Debut, Victor Sanh, Julien          support in more than one document, and reparti-
+   Chaumond, Clement Delangue, Anthony Moi, Pier-         tion the validation set into a validation and a test
+   ric Cistac, Tim Rault, R’emi Louf, Morgan Funtow-      set for this benchmark (using the test set would
+   icz, and Jamie Brew. 2019. Huggingface’s trans-        compromise the information retrieval portion of
+   formers: State-of-the-art natural language process-    the original FEVER task). We ensure that there
+   ing. ArXiv, abs/1910.03771.                            is no document overlap between train, validation,
+                                                          and test sets (we use Pearce (2005) to ensure this,
+Mo Yu, Shiyu Chang, Yang Zhang, and Tommi                 as conceptually a claim may be supported by facts
+   Jaakkola. 2019. Rethinking cooperative rationaliza-    in more than one document). We ensure that the
+   tion: Introspective extraction and complement con-     validation set contains the documents used to cre-
+   trol. In Proceedings of the 2019 Conference on         ate the FEVER symmetric dataset (Schuster et al.,
+   Empirical Methods in Natural Language Processing       2019) (unfortunately, the documents used to create
+   and the 9th International Joint Conference on Natu-    the validation and test sets overlap so we cannot
+   ral Language Processing (EMNLP-IJCNLP), pages          provide this partitioning). Additionally, we clean
+   4094–4103, Hong Kong, China. Association for           up some encoding errors in the dataset via Speer
+   Computational Linguistics.                             (2019).
+
+Omar Zaidan, Jason Eisner, and Christine Piatko.          BoolQ (Clark et al., 2019) The BoolQ dataset re-
+   2007. Using annotator rationales to improve ma-        quired substantial processing. The original dataset
+   chine learning for text categorization. In Proceed-    did not retain source Wikipedia articles or col-
+   ings of the conference of the North American chap-     lection dates. In order to identify the source
+   ter of the Association for Computational Linguistics   paragraphs, we download the 12/20/18 Wikipedia
+   (NAACL), pages 260–267.                                archive, and use FuzzyWuzzy https://github.
+                                                          com/seatgeek/fuzzywuzzy to identify the source
+Omar F Zaidan and Jason Eisner. 2008. Modeling an-        paragraph span that best matches the original re-
+   notators: A generative approach to learning from an-   lease. If the Levenshtein distance ratio does not
+   notator rationales. In Proceedings of the Conference   reach a score of at least 90, the corresponding in-
+   on Empirical Methods in Natural Language Process-      stance is removed. For public release, we use the
+   ing (EMNLP), pages 31–40.                              ofﬁcial validation set for testing, and repartition
+                                                          train into a training and validation set.
+Ye Zhang, Iain Marshall, and Byron C Wallace. 2016.
+   Rationale-augmented convolutional neural networks      e-SNLI (Camburu et al., 2018) We perform mini-
+   for text classiﬁcation. In Proceedings of the Con-     mal processing. We separate the premise and hy-
+   ference on Empirical Methods in Natural Language       pothesis statements into separate documents.
+   Processing (EMNLP), volume 2016, page 795. NIH
+   Public Access.                                         Commonsense Explanations (CoS-E) (Rajani
+                                                          et al., 2019) We perform minimal processing, pri-
+Ruiqi Zhong, Steven Shao, and Kathleen McKeown.           marily deletion of any questions without a rationale
+   2019. Fine-grained sentiment analysis with faithful
+   attention. arXiv preprint arXiv:1908.06870.
+
+                     Appendix
+
+A Dataset Preprocessing
+
+We describe what, if any, additional processing we
+perform on a per-dataset basis. All datasets were
+converted to a uniﬁed format.
+
+4455
+Dataset                        Documents Instances Rationale % Evidence Statements Evidence Lengths
+
+MultiRC                        400 24029           17.4                      56298     21.5
+Train                                              18.5                       7498     22.8
+Val                            56      3214                                        -
+Test                                                   -                                   -
+Evidence Inference             83      4848                                  10371
+Train                                              1.34                       1294     39.3
+Val                            1924    7958        1.38                            -   40.3
+Test                            247     972
+Exhaustive Evidence Inference   240     959            -                      504.0        -
+Val                                                                                -
+Test                           81      101         4.47                                35.2
+Movie Reviews                                          -                     13878         -
+Train                          106     152                                  1143.0
+Val                                                9.35                                  7.7
+Test                           1599    1600        7.45                            -     6.6
+Exhaustive Movie Reviews        150     150
+Val                             200     200            -                      592.0        -
+FEVER
+Train                          50      50         19.10                    146856      12.8
+Val                                                                           8672
+Test                           2915    97957       20.0                            -   31.3
+BoolQ                           570     6122       21.6                                28.2
+Train                           614     6111                                6363.0
+Val                                                    -                    1491.0         -
+Test                           4518    6363
+e-SNLI                         1092    1491        6.64                            -  110.2
+Train                          2294    2817        7.13                               106.5
+Val                                                                     1199035.0
+Test                           911938  549309          -                   23639.0         -
+CoS-E                           16328     9823                                     -
+Train                           16299     9807     27.3                                  1.8
+Val                                                25.6                       8733       1.6
+Test                           8733    8733                                   1092
+                               1092    1092            -                                   -
+                               1092    1092                                        -
+                                                   26.6                                  7.4
+                                                   27.1                                  7.6
+
+                                                       -                                   -
+
+Table 5: Detailed breakdowns for each dataset - the number of documents, instances, evidence statements, and
+lengths. Additionally we include the percentage of each relevant document that is considered a rationale. For test
+sets, counts are for all instances including documents with non comprehensive rationales.
+
+         Dataset               Labels  Instances  Documents  Sentences  Tokens
+
+         Evidence Inference       3      9889        2411      156.0    4760.6
+         BoolQ                    2     10661        7026      175.3    3582.5
+         Movie Reviews            2      2000        1999       36.8    774.1
+         FEVER                    2     110190       4099       12.1    326.5
+         MultiRC                  2     32091         539       14.9    302.5
+         CoS-E                    5     10917        10917       1.0     27.6
+         e-SNLI                   3     568939      944565
+                                                                 1.7     16.0
+
+Table 6: General dataset statistics: number of labels, instances, unique documents, and average numbers of sen-
+tences and tokens in documents, across the publicly released train/validation/test splits in ERASER. For CoS-E
+and e-SNLI, the sentence counts are not meaningful as the partitioning of question/sentence/answer formatting is
+an arbitrary choice in this framework.
+
+                                       4456
+or questions with rationales that were not possi-            long (on average); the effective low pay rate
+ble to automatically map back to the underlying              was unintended.
+text. As recommended by the authors of Talmor
+et al. (2019) we repartition the train and validation  C Hyperparameter and training details
+sets into a train, validation, and test set for this
+benchmark. We encode the entire question and an-       C.1 (Lei et al., 2016) models
+swers as a prompt and convert the problem into a
+ﬁve-class prediction. We also convert the “Sanity”     For these models, we set the sparsity rate at 0.01
+datasets for user convenience.                         and we set the contiguity loss weight to 2 times
+                                                       sparsity rate (following the original paper). We
+   All datasets in ERASER were tokenized using         used bert-base-uncased (Wolf et al., 2019) as to-
+spaCy11 library (with SciSpacy (Neumann et al.,        ken embedder (for all datasets except BoolQ, Ev-
+2019) for Evidence Inference). In addition, we also    idence Inference and FEVER) and Bidirectional
+split all datasets except e-SNLI and CoS-E into        LSTM with 128 dimensional hidden state in each
+sentences using the same library.                      direction. A dropout (Srivastava et al., 2014) rate
+                                                       of 0.2 was used before feeding the hidden repre-
+B Annotation details                                   sentations to attention layer in decoder and linear
+                                                       layer in encoder. One layer MLP with 128 dimen-
+We collected comprehensive rationales for a subset     sional hidden state and ReLU activation was used
+of some test sets to accurately evaluate model recall  to compute the decoder output distribution.
+of rationales.
+                                                          For three datasets mentioned above, we use
+  1. Movies. We used the Upwork Platform12 to          GloVe embeddings (http://nlp.stanford.edu/
+      hire two ﬂuent english speakers to annotate      data/glove.840B.300d.zip).
+      each of the 200 documents in our test set.
+      Workers were paid at rate of USD 8.5 per hour       A learning rate of 2e-5 with Adam (Kingma and
+      and on average, it took them 5 min to anno-      Ba, 2014) optimizer was used for all models and we
+      tate a document. Each annotator was asked to     only ﬁne-tuned top two layers of BERT encoder.
+      annotate a set of 6 documents and compared       Th models were trained for 20 epochs and early
+      against in-house annotations (by authors).       stopping with patience of 5 epochs was used. The
+                                                       best model was selected on validation set using the
+  2. Evidence Inference. We again used Upwork          ﬁnal task performance metric.
+      to hire 4 medical professionals ﬂuent in en-
+      glish and having passed a pilot of 3 documents.     The input for the above model was encoded
+     125 documents were annotated (only once by        in form of [CLS] document [SEP] query
+      one of the annotators, which we felt was ap-     [SEP].
+      propriate given their high-level of expertise)
+      with an average cost of USD 13 per document.        This model was implemented using the
+      Average time spent of single document was        AllenNLP library (Gardner et al., 2018).
+      31 min.
+                                                       C.2 BERT-LSTM/GloVe-LSTM
+  3. BoolQ. We used Amazon Mechanical Turk
+      (MTurk) to collect reference comprehensive       This model is essentially the same as the decoder in
+      rationales from randomly selected 199 docu-      previous section. The BERT-LSTM uses the same
+      ments from our test set (ranging in 800 to 1500  hyperparameters, and GloVe-LSTM is trained with
+      tokens in length). Only workers from AU, NZ,     a learning rate of 1e-2.
+      CA, US, GB with more than 10K approved
+      HITs and an approval rate of greater than 98%    C.3 Lehman et al. (2019) models
+      were eligible. For every document, 3 annota-
+      tions were collected and workers were paid       With the exception of the Evidence Inference
+      USD 1.50 per HIT. The average work time          dataset, these models were trained using the GLoVe
+      (obtained through MTurk interface) was 21        (Pennington et al., 2014) 200 dimension word vec-
+      min. We did not anticipate the task taking so    tors, and Evidence Inference using the (Pyysalo
+                                                       et al., 2013) PubMed word vectors. We use Adam
+    11https://spacy.io/                                (Kingma and Ba, 2014) with a learning rate of
+    12http://www.upwork.com                            1e-3, Dropout (Srivastava et al., 2014) of 0.05 at
+                                                       each layer (embedding, GRU, attention layer) of
+                                                       the model, for 50 epochs with a patience of 10. We
+                                                       monitor validation loss, and keep the best model
+                                                       on the validation set.
+
+4457
+C.4 BERT-to-BERT model
+We primarily used the ‘bert-base-uncased‘ model
+for both components of the identiﬁcation and clas-
+siﬁcation pipeline, with the sole exception being
+Evidence Inference with SciBERT (Beltagy et al.,
+2019). We trained with the standard BERT parame-
+ters of a learning rate of 1e-5, Adam (Kingma and
+Ba, 2014), for 10 epochs. We monitor validation
+loss, and keep the best model on the validation set.
+
+                                                            4458
+

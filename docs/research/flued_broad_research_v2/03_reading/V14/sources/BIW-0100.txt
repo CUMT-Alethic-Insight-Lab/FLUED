@@ -1,0 +1,304 @@
+arXiv:2608.28151v1 [cs.CL] 28 Aug 2026  Nested Byte-Level Vocabularies Are Cheap to
+                                                              Deploy and
+
+                                        Expensive to Share: A Pre-Registered Negative
+                                                                 Result
+
+                                                                                            Christos Koutsiaris
+                                                                                           Cloud ERP – UX Foundation
+
+                                                                                                        SAP P&E
+                                                                                             christos.koutsiaris@sap.com
+
+                                           Abstract—A byte-level BPE tokenizer is an ordered list of             Byte-level BPE [1], [4] admits a structural shortcut. Because
+                                        merge rules, so applying only a prefix of them yields a coarser       the merge table is ordered, truncating it after Vc merges pro-
+                                        vocabulary whose token identifiers are exactly the first rows of      duces a valid tokenizer whose identifiers are precisely the first
+                                        the full one. This prefix-nesting property makes it possible to       Vc rows of the full vocabulary. Vocabularies at different sizes
+                                        train a single language model that operates at several vocabulary     are therefore prefix-nested: one embedding matrix contains
+                                        sizes, to condition it on which size is in use via a control          all of them. This suggests training a single model across
+                                        token, and to deploy it at any trained size by slicing rows from      several nested caps, telling it which cap each sequence uses,
+                                        the embedding and output head. We pre-registered five claims          and restricting its output distribution accordingly—so that one
+                                        about this construction—fixing margins, seeds, contrasts, and an      artifact serves every granularity and can be reduced to any of
+                                        engineering stop rule before spending compute—and trained 30          them by deleting rows.
+                                        models (3.1M and 10.6M parameter bodies, 200M tokens each)
+                                        to test them.                                                            Nesting is a familiar idea, applied here to an unfamiliar
+                                                                                                              axis. MatFormer nests feed-forward widths and Matryoshka
+                                           The construction works exactly and its central premise does        representation learning nests embedding dimensions, each
+                                        not. Slicing is numerically exact: a sliced model reproduces the      training a model so that a prefix of its hidden units stands
+                                        restricted full model’s logits bit-for-bit across 76 checks, and      alone [6], [7]. In both, the nesting must be optimised for: the
+                                        removes 66% of the deployed weights at unchanged latency. But         property does not exist until it is trained in. The vocabulary
+                                        a shared model trails a fixed-cap specialist by 3.64% bits-per-       is the case where it exists already, because the merge table
+                                        byte at 32k against a 1% margin, and by 2.96% at 8k against a         is ordered whether or not anyone exploits it—which is what
+                                        2% margin. A 2 × 2 ablation separating the control token from         makes it worth asking whether a model can be handed the
+                                        the output restriction finds the token worth +0.07% to +0.13%         property for free.
+                                        with all intervals crossing zero, while the output restriction costs
+                                        +0.47% to +1.19%; the two factors are substitutes rather than            The question is not feasibility, which is immediate, but cost.
+                                        complements.                                                          We pre-registered five claims, fixed the evaluation protocol
+                                                                                                              and margins before compute, and report what the experiment
+                                           Two positive results survive. Multi-cap training confers gen-      returned, including the outcomes that contradict the design’s
+                                        uine robustness to corrupted input: the same checkpoint degrades      motivating intuitions.
+                                        12.5–15.4 points less under typographical noise in its fine mode,
+                                        and outperforms each fixed-cap specialist at that specialist’s own       We work deliberately at 3.1M and 10.6M parameter bodies.
+                                        vocabulary size. The conditioning machinery earns no credit for       The design this question needs—30 models, paired seeds
+                                        this: a control trained across the same caps with no cap token        sharing initialisation and data order, a fully crossed 2 × 2,
+                                        and no output restriction is equally robust, so training at several   and a check of the deployment path exact to the last bit—is
+                                        granularities regularises against input noise on its own. And the     affordable at that size and is not affordable at the scales the
+                                        per-cap penalty tracks each cap’s share of training rows rather       construction would eventually serve, where the same compar-
+                                        than any property of the conditioning machinery, which yields a       isons would be run once and read through seed noise. The
+                                        falsifiable prediction for future work.                               trade is explicit: absolute performance for statistical resolution,
+                                                                                                              and a small-scale question decided rather than a large-scale
+                                           Index Terms—tokenization, byte-pair encoding, nested vocab-        one suggested. Section VI states what this therefore cannot
+                                        ularies, language models, pre-registration, negative results          establish.
+
+                                                                  I. INTRODUCTION
+
+                                           Subword vocabulary size is fixed at tokenizer construc-
+                                        tion and inherited by every model trained on it. A coarse
+                                        vocabulary yields short sequences and cheap inference but
+                                        obscures character-level structure; a fine vocabulary exposes
+                                        orthography at the cost of longer sequences. Systems that need
+                                        both typically train two models.
+                      one trained model          deployed at 2,048              experimental run. Embedding and output head are untied by
+                                                                                design: they are the two matrices a nested vocabulary slices,
+                         specials        select     eot, cap                    and tying them would confound input with output capacity.
+                      0 . . . 2047       rows    0 . . . 2047                   A sensitivity run confirms tying is better at every cap, so the
+                                                                                absolute figures below are about one percent pessimistic—the
+               2,048                                                            comparisons are not, both sides being untied (Section VI).
+                                                                                Every results row carries the git commit, configuration hash,
+        8,192                                                                   data hash, tokenizer hash, seed, and device that produced it.
+
+                      2048 . . . 8191            2050 × d embedding                A pre-registered engineering stop rule—both of the first
+                                                    2049 × d head               two shared-model seeds more than 3% behind the coarse
+                                                                                specialist—fired on the primary comparison and halted the
+32,768                                                                          larger tier, while the factorial corners continued at the smaller
+                                                                                tier so the negative result stayed interpretable.
+                      8192 . . . 32767
+                                                                                                             IV. RESULTS
+Fig. 1. Prefix nesting and slicing. Braces mark the three trained caps: each
+is a prefix of the next, so deploying at a smaller cap is row selection rather  A. Specialist equivalence (C1, C2)
+than retraining or approximation. Bands are not drawn to scale. Because the
+sliced model computes the same inner products over the same rows, its logits                                            TABLE I
+equal the restricted full model’s exactly—verified in Section IV-D.             EQUIVALENCE TESTS AGAINST FIXED-CAP SPECIALISTS, TIER S, PAIRED
+
+                             II. METHOD                                                                                              SEEDS
+
+A. Nested vocabularies                                                          Comparison                 Margin      Measured      Verdict
+                                                                                Shared vs. 32k specialist    1%                        fails
+   A single byte-level BPE tokenizer is trained to Vmax =                       Shared vs. 8k specialist     2%         +3.640%        fails
+32,768 merge ranks. Caps K = {2,048; 8,192; 32,768} are                                                            [+3.419, +3.861]
+obtained by truncation. Because rank order is preserved, a
+token identifier means the same thing at every cap that contains                                                        +2.958%
+it, so one embedding matrix contains every cap’s as a prefix                                                       [+2.846, +3.071]
+of its rows (Fig. 1).
+                                                                                   Both intervals lie wholly above their margins (Table I).
+B. Conditioning                                                                 The gap is roughly 180 times the seed-to-seed spread of the
+                                                                                specialist itself, so this is not a resolution limit. The same
+   Each training row draws a cap k ∼ p(k) = (0.2, 0.3, 0.5)                     comparison at a 4× smaller body gives +3.64%—the larger-
+over K with a recorded seed, carries a control token naming                     tier figure to three digits—so the penalty is stable across scale.
+k at position 0, and has its output distribution restricted to the
+k lexical rows plus an end-of-text row. Conditions differ only                  B. Explicit conditioning (C3)
+in whether the control token is informative and whether the
+restriction is applied, so a 2 × 2 design isolates each factor.                    Without the output restriction the control token does nothing
+Paired seeds share initialization and data order, and the mixed-                measurable: every interval crosses zero, and the point estimates
+cap conditions receive byte-identical rows differing only in the                carry the wrong sign for the claim (Table II). Two results
+prefix identifier.                                                              that the design required to be reported regardless of sign cut
+                                                                                against its motivating mechanism. First, output restriction
+C. Metric                                                                       costs rather than saves: masking the head to the vocabulary
+                                                                                currently in use raises BPB by 0.47% to 1.19%, every interval
+   The primary metric is bits per byte (BPB): total negative                    excluding zero, worst at the finest cap. Second, the token
+log-likelihood in bits over predicted targets, divided by the                   and the restriction are substitutes, not complements: the
+UTF-8 byte length of the decoded target text. Perplexity is                     interaction is negative at all three caps, so the token is worth
+never compared across tokenizers, as tokens per byte differ by                  more when the restriction is already present—it recovers part
+construction. Intervals are document-level block bootstraps.                    of what masking costs—where the design expected the two to
+                                                                                reinforce. The direction is consistent across caps; the interval
+                    III. EXPERIMENTAL SETUP                                     excludes zero at the coarsest cap only, so the sign is better
+                                                                                resolved than the magnitude.
+   Held-out sets were carved from FineWeb-Edu [5] before to-
+kenizer training and decontaminated: 6,473 training documents                      The four corners order as blind < token-only <
+sharing any 64-byte window with a held-out set were removed,                    restriction-only < both: the full treatment is 0.29% to 1.09%
+after which the overlap check reports zero shared windows at                    worse than telling the model nothing.
+stride 1. Models are decoder-only transformers at two tiers—
+XS, a 3.1M-parameter body, and S, a 10.6M-parameter body—                       C. Granularity dial (C4)
+each trained with AdamW, 300 warmup steps, cosine decay
+to 10% of peak, batch 32 × 1024 positions, and a 200M-                             The claim splits by evaluation (Table III). On robustness to
+token budget fixed from measured throughput before any                          typographical corruption it holds outright, and provides the
+                                                                                strongest positive result in this work: the same checkpoint
+                                                                              TABLE II
+THE 2 × 2 ABLATION, THREE PAIRED SEEDS, TIER XS. POSITIVE MEANS HIGHER BPB (WORSE). BRACKETS ARE DOCUMENT-LEVEL
+
+                                                                BLOCK-BOOTSTRAP INTERVALS.
+
+                     Contrast                          cap 2,048         cap 8,192                                    cap 32,768
+                     Token, no restriction
+                     Token, with restriction           +0.071%           +0.125%                                       +0.076%
+                     Restriction, no token        [−0.408, +0.431]  [−0.103, +0.258]                              [−0.047, +0.181]
+                     Interaction
+                     Total treatment                   −0.102%           −0.093%                                       −0.180%
+                                                  [−0.301, +0.061]  [−0.208, +0.010]                              [−0.367, −0.080]
+
+                                                       +1.192%           +0.608%                                       +0.472%
+                                                  [+1.080, +1.347]  [+0.476, +0.728]                              [+0.260, +0.703]
+
+                                                       −0.173%           −0.217%                                       −0.257%
+                                                  [−0.370, +0.107]  [−0.466, +0.023]                              [−0.462, −0.047]
+
+                                                       +1.090%           +0.516%                                       +0.292%
+                                                  [+0.849, +1.280]  [+0.413, +0.648]                              [+0.087, +0.609]
+
+                                   TABLE III                                                                8     cap 32,768            alt p(k)=0.33
+FINE MODE AGAINST COARSE MODE, AND AGAINST SPECIALISTS.                                                     7     cap 2,048
+
+                  POSITIVE FAVOURS THE FINE MODE.
+
+Comparison                          Orthographic     Typo           BPBopwennsalpteycivaslitsth (e c%)ap's  6     specialist  near-byte p(k)=0.4
+                                       accuracy   robustness
+Shared, fine vs. own 32k mode (XS)                                                                          5                                          p(k)=0.2
+Shared, fine vs. own 32k mode (S)       +0.021     +0.154
+Shared vs. 8k specialist                −0.004     +0.125                                                   4                 p(k)=0.5
+Shared vs. 32k specialist               −0.083     +0.042
+Blind control, fine vs. 32k (XS)        −0.113     +0.038                                                   3                           alt p(k)=0.34
+
+                                        −0.017     +0.161                                                   2
+
+                                                                                                            1
+
+degrades 12.5–15.4 points less in its fine mode, and—uniquely                                               0
+in these experiments—outperforms each specialist at that
+specialist’s own cap. On orthographic accuracy it fails: the                                                   1              0.5       0.33                                                 0.2
+dial is marginal at the smaller tier, absent at the larger, and                                                   share of training rows the cap received
+the shared model trails specialists by 8–11 accuracy points.
+                                                                    mTieixrtXurSe, taovkeerna-gmedatochveerd,thheelsde-eodust FitinsesWpeecbi-aElidsut .hSaese. ds present: {1, 2, 3}; each
+   The blind control settles attribution. A model trained across
+caps but given no control token and no restriction obtains the      Fig. 2. The per-cap penalty against how much data the cap received. Each
+same robustness (+0.161 against +0.154) and not the ortho-          filled point is a mixed-cap model charged against the fixed-cap specialist for
+graphic dial (−0.017 against +0.021). Robustness is therefore       its cap; the specialist gave that cap every row it had and is therefore the zero.
+a property of training across granularities, available without      Both caps are monotone in the share. The specialists at this tier were added
+any conditioning machinery; only the small orthographic effect      outside the pre-registration after the stop rule fired, and the alternative-p(k)
+is attributable to the control token and the restriction.           and near-byte mixtures are single-seed sensitivity runs. Cap 8,192 is absent
+                                                                    because its only specialist is at tier S, where the same comparison reads
+D. Deployment (C5)                                                  +2.96% at a share of 0.30.
+
+                                 TABLE IV                           selects rows and the restricted model computes the same inner
+DEPLOYMENT COST, TIER S, FIXED 10 KB BYTE STRING, IDLE              products over them.
+
+                                      ACCELERATOR                      Consequently slicing is a free memory saving: reducing the
+                                                                    artifact to cap 2,048 removes 66% of the weights at latency
+Configuration        Weights        Prefill  Tokens                 unchanged within measurement noise (Table IV). What costs
+                      (MB)           (ms)    per byte               is the granularity itself—running at cap 2,048 rather than
+Full model                                                          32,768 takes 34% longer for the same text because it requires
+Sliced to cap 8,192   71.58          24.7     0.2236                59% more tokens. The deployment trade is not shared-model-
+Sliced to cap 2,048   33.83          24.9     0.2560                versus-specialist but granularity-versus-throughput.
+                      24.39          33.1     0.3556
+
+   Slicing is numerically exact: across 76 checks spanning                                     V. DISCUSSION
+every run and cap, the sliced model’s logits equal the re-
+stricted full model’s with a worst-case absolute difference         A. The penalty is data dilution
+of 0.000e+00 against a pre-registered tolerance of 10−5.
+This is bit-identity rather than approximation, because slicing        Three observations converge. The per-cap deficit tracks each
+                                                                    cap’s share of training rows (Fig. 2): with shares 1.00, 0.50,
+                                                                    and 0.33 at cap 32,768, BPB is 1.3333, 1.3818, and 1.4228,
+a cost of 0.070 then 0.099 per natural-log unit of data—          makes it degrade less. The same checkpoint still pays 3.64%
+the same order and monotone. The relation survives a sign         BPB against a specialist on clean text and still trails specialists
+flip: the alternative mixture gives cap 32,768 fewer rows than    by 8–11 points on orthographic accuracy. What it buys is a
+the pre-registered one and is the worse model there (+6.72%       flatter response to corrupted input, and it buys that whether or
+against +3.64%), and gives cap 2,048 more rows than the pre-      not the model is told anything.
+registered one and is the better model there (+2.53% against
++4.89%). The ordering follows the share, not the condition.       D. Comparison with stochastic tokenization
+Neither the control token nor the output restriction adds data,
+and neither recovers the deficit. And the restriction, which         BPE-dropout [2] is the established method for making a
+removes gradient signal from excluded rows without supplying      model robust to segmentation, and belongs to the same family
+any elsewhere, actively costs.                                    as Kudo’s subword regularization [3]. At the native cap it
+                                                                  costs 1.40% against the specialist where multi-cap training
+   The prediction that follows is falsifiable and untested here:  costs 3.44%; asked to operate at cap 2,048, the plain specialist
+holding per-cap tokens fixed rather than total tokens should      scores 2.3748 BPB, the dropout model 1.9271, and the multi-
+shrink the gap toward zero at proportionally greater compute.     cap model 1.4609. The two techniques purchase different
+That, rather than further attempts to make the label matter, is   amounts of the same robustness at different prices, and which
+the experiment these results argue for.                           trade is preferable depends on how far from the native cap a
+                                                                  deployment must operate.
+B. Two results of independent interest
+                                                                     The rule that follows is a crossover rather than a winner.
+   Output restriction is not free. Masking a model’s output       Near the native cap BPE-dropout is the cheaper purchase,
+head to the vocabulary it is currently using is intuitively       1.40% against 3.44%; the ordering reverses as the deployment
+harmless—the excluded rows cannot be correct—and is mea-          moves away from it, and by cap 2,048 the multi-cap model
+surably harmful, by up to 1.19% BPB. Practitioners who            leads by 0.47 BPB. Choose BPE-dropout when robustness is
+restrict decoding to a sub-vocabulary during training should      wanted at one fixed granularity, and multi-cap training when
+expect to pay for it.                                             a single artifact must span granularities at inference time.
+
+   Labels a model can infer are worth nothing. Neither                                      VI. LIMITATIONS
+the vocabulary cap nor, in a second setting, whether an input
+was produced by BPE-dropout (−0.033%) changed loss mea-              The scale is the choice argued for in Section I, and it bounds
+surably. Two independent conditioning signals, both inferable     what can be claimed: nothing here establishes behaviour at
+from token statistics, both inert. A control token occupies a     larger scale, and the vocabulary is a far larger share of
+position and a vocabulary row; these results suggest that cost    parameters than it would be in any model anyone would
+is not repaid when the model can recover the same information     deploy. Roughly one epoch of the pool, so models are far
+from the input.                                                   from converged. English-centric data with small code and
+                                                                  non-English held-out sets. A context confound that the byte-
+C. Multi-granularity training as implicit regularisation          matched-context panel reduces asymmetrically rather than re-
+                                                                  moves: a fixed token window at a fine cap covers fewer bytes,
+   The robustness result and its control together describe an     and a 4,096-byte cap binds only above 4.0 bytes per token.
+effect the conditioning machinery earns no credit for. The        One tokenizer, one pretokenizer, one data mixture; tokenizer
+shared model degrades 12.5–15.4 points less than a specialist     variance is not estimated. Tying embedding and head, which
+under typographical noise and beats every specialist at that      Section III declines for the reason given there, is better at
+specialist’s own cap; the blind control—same caps, same           every cap with 42% fewer parameters, so the absolute figures
+data, no cap token, no output restriction—degrades 0.161          here are approximately one percent pessimistic—though the
+less against the shared model’s 0.154. Whatever produces the      comparisons are unaffected, both sides being untied.
+robustness is already present before any of the labelling is
+added.                                                               Measurement reproducibility differs by quantity: prefill la-
+                                                                  tency repeats to 0.2% and generated bytes per second to about
+   A hypothesis, formed after seeing these numbers and so         5%, while the head matmul timed alone does not repeat within
+not pre-registered: training across caps is segmentation-noise    tolerance and is reported flagged rather than quoted.
+augmentation. The same text arrives under several segmen-
+tations, so no single one can be relied on and the model                                   VII. CONCLUSION
+must keep representations that survive being resegmented. A
+typographical error is a resegmentation—the perturbation the         Nested byte-level vocabularies deliver on their engineering
+training distribution already contains. That is the mechanism     promise and not on their modelling promise. A single model
+BPE-dropout applies deliberately [2], [3], obtained here as a     can be sliced to any trained vocabulary size with bit-identical
+side effect of varying the cap, which is consistent with the      outputs and a 66% reduction in weights at no latency cost,
+two techniques buying the same robustness at different prices     which makes multi-granularity deployment practical. But shar-
+(Section V-D).                                                    ing capacity across caps costs 3.6% BPB against a specialist,
+                                                                  the visible cap label recovers none of it, and restricting the
+   The boundary matters as much as the effect. Multi-             output distribution to the active vocabulary makes matters
+granularity training does not make the shared model better; it
+worse. What multi-cap training does buy is robustness—the
+shared model beats every specialist under input corruption—
+and that benefit requires no conditioning machinery at all,
+arriving equally in a model told nothing.
+
+   All code, configurations, pre-registration, results tables,
+and per-run manifests are available at https://github.com/
+unseen1980/captok.
+
+                        ACKNOWLEDGMENT
+
+   The experimental campaign was executed autonomously
+under a pre-registration fixed before compute; every amend-
+ment carries a dated rationale and a changelog entry in the
+repository.
+
+                             REFERENCES
+
+ [1] R. Sennrich, B. Haddow, and A. Birch, “Neural machine translation of
+      rare words with subword units,” in Proc. 54th Annu. Meeting Assoc.
+      Comput. Linguistics, 2016, pp. 1715–1725.
+
+ [2] I. Provilkov, D. Emelianenko, and E. Voita, “BPE-dropout: Simple and
+      effective subword regularization,” in Proc. 58th Annu. Meeting Assoc.
+      Comput. Linguistics, 2020, pp. 1882–1892.
+
+ [3] T. Kudo, “Subword regularization: Improving neural network translation
+      models with multiple subword candidates,” in Proc. 56th Annu. Meeting
+      Assoc. Comput. Linguistics, 2018, pp. 66–75.
+
+ [4] A. Radford, J. Wu, R. Child, D. Luan, D. Amodei, and I. Sutskever,
+      “Language models are unsupervised multitask learners,” OpenAI Tech.
+      Rep., 2019.
+
+ [5] G. Penedo et al., “The FineWeb datasets: Decanting the web for the
+      finest text data at scale,” arXiv:2406.17557, 2024.
+
+ [6] A. Kudugunta et al., “MatFormer: Nested transformer for elastic infer-
+      ence,” arXiv:2310.07707, 2023.
+
+ [7] M. Kusupati et al., “Matryoshka representation learning,” in Adv. Neural
+      Inf. Process. Syst., 2022.
+

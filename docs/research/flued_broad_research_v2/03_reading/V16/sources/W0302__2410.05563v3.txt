@@ -1,0 +1,957 @@
+arXiv:2410.05563v3 [cs.CL] 23 Jun 2025  Preprint. Under review.
+
+                                        Rational Metareasoning for Large Language Models
+
+                                          Nicolo` De Sabbata1,2,∗ Theodore R. Sumers3, Badr AlKhamissi2
+                                         Antoine Bosselut2, Thomas L. Griffiths1
+                                         1Princeton University, 2EPFL, 3Anthropic
+
+                                                                                    Abstract
+
+                                                   Recent approaches for leveraging large language models (LLMs) for reason-
+                                                   ing often rely on additional inference-time computation to tackle complex
+                                                   tasks. However, as LLMs grow in size, the associated inference costs are
+                                                   becoming increasingly prohibitive. To address this, we introduce RaM
+                                                  (Rational Metareasoning): a cost-aware reasoning approach inspired by
+                                                   computational models of metareasoning in cognitive science. Our method
+                                                   trains LLMs to use intermediate reasoning steps selectively when they are
+                                                   likely to be beneficial. We first design a reward function that incorporates
+                                                   the Value of Computation by penalizing unnecessary reasoning, and then
+                                                   use it within an Expert Iteration framework to optimize the trade-off be-
+                                                   tween performance and efficiency. Compared to few-shot chain-of-thought
+                                                  prompting and STaR, our method significantly reduces inference costs (23-
+                                                   45% fewer tokens generated across three models) while maintaining or
+                                                   increasing task performance across diverse datasets.
+
+                                        1 Introduction
+
+                                        Large language models (LLMs) rely on substantial computational power to handle complex
+                                        problems (OpenAI et al., 2024; Chowdhery et al., 2022; de Vries, 2023). While initial studies
+                                        mostly focused on the cost of training (Verdecchia et al., 2023), widespread use of LLMs has
+                                        made inference-time costs an increasingly important factor. Moreover, there is a fundamental
+                                        tension between inference cost and task performance: although chain-of-thought prompting
+                                        (CoT; Wei et al., 2023; Kojima et al., 2023) and similar approaches improve task performance,
+                                        they also substantially increase inference costs (Snell et al., 2024).
+
+                                        This trend has recently spiked with the development of Large Reasoning Models (OpenAI,
+                                        2024; DeepSeek-AI et al., 2025), instruction-tuned LLMs which are typically post-trained
+                                        using reinforcement learning (RL) with outcome-based rewards to produce long chains
+                                        of thought before each response. It is also worth noting that these approaches are not
+                                        inherently adaptive: inference optimization (Wan et al., 2024) and existing CoT training
+                                        methods often tend to raise or lower the inference cost on all queries, regardless of task
+                                        complexity, or require the user to specify a budget up front (Anthropic et al., 2025).
+
+                                        In stark contrast to this static tradeoff, humans are able to adaptively allocate computational
+                                        resources based on task difficulty (Kahneman, 2014; Russell, 1997; Lieder & Griffiths, 2017).
+                                        In this work, we draw inspiration from rational metareasoning – literally, reasoning about
+                                        reasoning – a concept originally from the artificial intelligence literature (Russell & Wefald,
+                                        1991) that has been used to explain how humans adaptively manage computational resources
+                                        (Lieder & Griffiths, 2017; Lieder et al., 2018; Griffiths et al., 2019).
+
+                                        Building on this, we develop a novel reward function based on the Value of Computation
+                                        (VOC; Russell & Wefald, 1991), which formalizes the trade-off between inference cost
+                                        and task performance. We adopt an iterative reinforcement learning process inspired
+                                        by the Expert Iteration algorithm (Anthony et al., 2017). In each iteration, we generate
+                                        multiple reasoning chains for each question. These reasoning chains are ranked using the
+                                        reward function, and the dataset is filtered to retain only the best reasoning chain for each
+
+                                            ∗Now at Apple
+
+                                                                                                   1
+Preprint. Under review.
+
+question. The model is then fine-tuned using this filtered dataset. However, unlike previous
+applications of Expert Iteration to LLMs (Zelikman et al., 2022; Havrilla et al., 2024), which
+filter generated examples solely based on the correctness of the final answer, our method
+optimizes for both correctness and the cost of the reasoning process.
+
+We evaluated the effectiveness of our solution across a diverse set of tasks, from scientific
+knowledge (ARC; Clark et al., 2018) to commonsense reasoning (CommonsenseQA; Talmor
+et al., 2019), mathematical problem solving (GSM8K; Cobbe et al., 2021), and logical deduc-
+tive reasoning (ProofWriter; Tafjord et al., 2021). Additionally, we assess the out-of-domain
+generalization on MMLU (Hendrycks et al., 2021), a multitask benchmark. Our approach
+achieves a substantial reduction in generated tokens (35-42% compared to few-shot prompt-
+ing, and 23-32% compared to STaR) while matching or increasing performance. Thus, we
+make the following contributions:
+
+       1. We employ rational metareasoning to optimize the tradeoff between inference cost
+           and performance of LLMs on reasoning tasks.
+
+       2. We formalize a novel reward function inspired by the Value of Computation (VOC)
+           and integrate it into LLM training.
+
+       3. We empirically demonstrate that rational metareasoning improves task performance
+           at lower inference costs (23-42% fewer tokens on average) across various datasets
+           and reasoning tasks.
+
+2 Rational Metareasoning
+
+Humans have limited time and cognitive resources (Griffiths et al., 2019; Griffiths, 2020). We
+face diverse challenges requiring different approaches: avoiding a sudden obstacle when
+driving needs quick, intuitive thinking, whereas selecting a retirement investment strategy
+requires slow, deliberate reasoning (Kahneman, 2014). Rational metareasoning (Russell &
+Wefald, 1991) captures this by suggesting agents should adapt their reasoning based on the
+problem at hand.
+
+Intuitively, while reasoning solves a problem, metareasoning solves the problem of how
+to solve a problem: deciding which computations to perform while problem-solving. The
+essence of rational metareasoning is calculating the value of computation (VOC; Russell &
+Wefald, 1991) for each potential computation. The VOC balances the benefit of computation
+c (the expected increase in the agent’s utility) against its cost (usually time or energy).
+
+To formalize this, agents are assumed to have some internal belief state b ∈ B, which
+determines their expectation about the value of each action a ∈ A: E[U(a)|b]. A rational
+agent would simply choose the highest-value action: a∗ = argmaxa∈A[U(a)|b]. However,
+this picture becomes more complex if an agent can perform computation to change their
+belief state before choosing an action. Each computation c ∈ C updates the agent’s belief to
+b′ with probability P(b′|c), which in turn affects their beliefs about the value of actions, and
+incurs an associated cost (cost(c)). The VOC quantifies the value of performing computation
+c given a starting belief state b,
+
+VOC(c,  b)  =            EP(b′  |c)  [max   E[U(a′)|b′]  −  max   E[U(a)|b]]  −  cost(c).  (1)
+
+                                        a′                     a
+
+Thus, a meta-rational agent should pursue the computation c∗ with the highest VOC:
+c∗ = argmaxc∈C VOC(c, b). If no computation has positive VOC, the agent should stop
+thinking and act in the world. Rational metareasoning can explain how humans allocate
+cognitive resources in various tasks (Lieder & Griffiths, 2017; Lieder et al., 2018; Callaway
+et al., 2018; 2021; 2022; Russek et al., 2022).
+
+                                            2
+Preprint. Under review.
+
+Figure 1: RaM training. We iteratively generate reasoning chains using the current policy,
+score and filter them to approximate the optimal policy, and then finetune the base policy.
+
+3 Rational Metareasoning with Large Language Models
+
+To achieve an optimal balance between performance and efficiency, our approach introduces
+a new VOC-inspired reward function (Eq. 2) into Expert Iteration (Anthony et al., 2017;
+Zelikman et al., 2022), fine-tuning a LLM to produce reasoning chains adaptively.
+
+3.1 Reward modeling
+
+Chain-of-thought prompting encourages LLMs to generate an intermediate output – a
+
+“chain of thought” – prior to producing the answer to a question (Wei et al., 2023; Kojima
+
+et al., 2023). We define the reward of a chain of thought as the difference between its utility
+
+and its cost,
+
+                         Rπ(x, y, z) = Uπ(z|x, y) − C(z)             (2)
+
+where x denotes the input for the task, z represents the chain of thought, and y is the target
+
+solution. The utility of the chain of thought is represented by Uπ(z|x, y), and the cost of
+the intermediate computations is denoted by C(z). Equation 2 mirrors the VOC Equation
+
+1: here, individual reasoning tokens correspond to intermediate computations c, making
+
+the reasoning chain z a sequence of computations c, while the actions a ∈ A map to the
+
+potential outputs y ∈ Y of the language model. In the context of LLMs, utility quantifies
+
+the increase in the likelihood of generating the target sequence y when the chain of thought
+
+z is added to the input x, under the policy π:
+
+                         Uπ(z|x, y) = log πθ(y|z, x) − log πθ(y|x).  (3)
+
+Specifically, πθ(y|z, x) indicates the probability of generating the target sequence y given
+both the chain of thought z and the input x, while πθ(y|x) denotes the probability of
+generating y with only the input x. With respect to Equation 1, the language model’s initial
+
+belief about the value of actions or outputs is described by πθ(y | x) (from Equation 3),
+whereas its final belief after generating a sequence of computations or tokens (a chain of
+
+thought z) is described by πθ(y | z, x). The cost is directly proportional to the number of
+tokens in the chain of thought l(z):
+
+                         C(z) = γ · l(z).                            (4)
+
+The hyperparameter γ scales the cost and utility to the same magnitude. A key benefit of this
+
+reward function is that it is parameterized by the same weights θ as the generative policy
+
+πθ, eliminating the need for an external reward model. This allows for direct estimation of
+the utility of a reasoning chain using the policy itself.
+
+Finally, it’s worth noting that while standard reward models for RLHF bias the policy
+to produce longer reasoning chains (Singhal et al., 2024), thus necessitating appropriate
+corrections (Chen et al., 2024; Park et al., 2024) to correct for reward hacking, our reward
+model aims for and achieves the opposite effect.
+
+                         3
+Preprint. Under review.
+
+3.2 Metareasoning Training
+
+We demonstrate the effectiveness of our reward model using a variation of the Expert
+Iteration algorithm (EI, Anthony et al., 2017). EI is known for its sample efficiency and
+strong performance on reasoning tasks (Havrilla et al., 2024; Zelikman et al., 2022). As
+an example of an online reinforcement learning algorithm, EI involves both exploration
+and policy improvement phases, with the policy πθ being updated using data from the
+exploration phase (as can be seen in Algorithm 1 and Figure 3).
+
+Initially, in the exploration phase, we approximate the optimal policy πˆ ∗ (whose computa-
+tions maximize the VOC reward) by using rejection sampling on our student policy πθ. In
+particular, we begin with a pretrained language model πθ and an initial dataset of problems
+x along with their corresponding correct final answers y: D = {(xi, yi)}iD=1. Following
+prior work in online RL (Tang et al., 2024), we utilize the model itself to generate the rea-
+soning chains. Since we start with a pretrained model, we guide the model generation
+using few-shot prompting in the first iterations. Specifically, we concatenate a small set of
+examples, denoted as P, each containing intermediate reasoning chains z, to each example
+in D. During training and evaluation, we remove the few shot examples.
+
+For each task τi = (xi, yi) in the original dataset D, we generate K reasoning chains:
+τˆi = {(xi, zk,i, yi)}kK=1. Then, we evaluate them using our reward function Rπ (Section
+3.1), and compute the advantage of each chain by subtracting the average reward for that
+
+question:  ai,k  =  ri,k  −  1  ∑kK′ =1  ri,k′ .
+                             K
+
+Using these advantage scores, we perform rejection sampling (by discarding reasoning
+chains with negative advantage) to construct the dataset of optimal trajectories (D1∗). Finally,
+wcaendbisetiiltletrhaetisveelleyctreedpreoaltleoduttsoinrteofianepothliecypπol1icvyiaπsntaonndatrhdecdroastsa-seenttrDon∗p.y  loss. This process
+                                                                                                                              In closed-answer
+
+settings with verifiable answers, the reasoning chains that lead to incorrect answers can also
+
+be directly discarded, to produce a higher quality dataset.
+
+Algorithm 1 Rational Metareasoning Training
+
+    Input π: a pretrained LLM; dataset D = {(xi, yi)}iD=1
+
+1: π0 ← π                                                                   ▷ Copy the original model
+
+2: for n in 1...N do
+
+3: for k in 1...K do
+
+4:         (zi,k, yi,k) ← πn−1(xi) ∀i ∈ [1, D]                              ▷ Sample reasoning chains
+
+5: end for
+
+6: ri,k ← Rπn−1 (xi, yi, zi,k) ∀i, k(i ∈ [1, D], k ∈ [1, K])                ▷ Compute rewards
+
+7:  ai,k   ←     ri,k  −  1  ∑kK′ =1  ri,k′  ∀i, k(i ∈ [1, D], k ∈ [1, K])  ▷ Compute advantages
+                          K
+8: Zˆ i ← { zi,k | ai,k > 0 }
+                                                                            ▷ Select best reasoning chains
+
+9: Dn∗ ← { (xi, zˆi,k, yi) | zˆi,k ∈ Zˆ i, i ∈ [1, D] }                     ▷ Create the optimal dataset
+
+10: πn ← train(π, Dn∗)                            ▷ Finetune the original model on the optimal solutions
+
+11: end for
+
+4 Experiments
+
+4.1 Datasets
+
+To characterize the generality of our method, we applied it to a diverse range of datasets and
+reasoning tasks. We constructed our training set by combining the training sets from the
+following datasets into one dataset D and then evaluated the model on all corresponding
+public test sets T . To facilitate comparison with baselines that use the correctness of the
+answer as a reward, we limited the training to datasets with verifiable answers, although
+this is not strictly required by our method. We used four datasets:
+
+ARC (Clark et al., 2018). The AI2 Reasoning Challenge (ARC) dataset comprises grade-
+school science questions, designed to evaluate the capability to apply scientific knowledge.
+
+                                                  4
+Preprint. Under review.
+
+CommonsenseQA (Talmor et al., 2019). This dataset is centered on commonsense question
+answering. It leverages implicit human knowledge and testing everyday reasoning.
+
+GSM8K (Cobbe et al., 2021). This dataset includes a variety of linguistically diverse grade-
+school math word problems. It assesses proficiency in solving mathematical problems that
+require comprehension and application of arithmetic reasoning.
+
+ProofWriter (Tafjord et al., 2021). This dataset assesses logical deductive reasoning by asking
+the model to determine if a conclusion follows from premises presented in natural language.
+
+These datasets have very different train split sizes. To ensure fairness and balance between
+the datasets, and to manage computational costs, we composed our training mixture by
+sampling 1024 random samples from each of the training sets (for a total of 4096 samples).
+We then evaluated the model on the public test set of each dataset. To further assess the
+generalization of our approach, we conducted out-of-distribution testing on MMLU-CF
+(Zhao et al., 2024), a contamination free and more challenging variant of the original MMLU
+dataset (Hendrycks et al., 2021). This dataset consists of 10,000 multiple-choice questions
+from various branches of knowledge.
+
+4.2 Baselines
+
+We illustrate the advantages of our model by comparing its performance to two types
+of prompting strategies: Direct prompting, where the model is required to provide an
+immediate answer, and Chain of Thought prompting (CoT), where the model is encouraged
+to reason through the problem step-by-step before arriving at a solution. Since we are using
+pretrained models which are not specifically trained for instruction following, we provide
+five few-shot examples for each task from the unused portion of the training dataset. These
+are the same examples that are used to guide the model training during the first iteration. In
+addition to these prompting methods, we adopt as a finetuning baseline the most common
+reasoning bootstrapping method, STaR (Self-Taught Reasoner; Zelikman et al. 2022), which
+also uses a variation of Expert Iteration. In particular, this method was the first to adopt
+outcome-based rewards to enable models to self-improve: given a set of problems and
+solutions, it trains the model iteratively on reasoning chains that lead to the correct solution.
+
+As an upper bound, we also tested the instruction-tuned version of the models, which
+have been fine-tuned on a massive amount of annotated chain-of-thought data, followed by
+RLHF (Dubey et al., 2024). Finally, while CoT prompting may not yield optimal trajectories,
+more advanced methods (Yao et al., 2023a; Zheng et al., 2024; Madaan et al., 2023) often
+increase sequence lengths substantially, and are therefore less efficient. We focus on CoT
+for its simplicity – reducing reasoning tokens while gaining performance for CoT suggests
+similar gains for more complex approaches.
+
+4.3 Training Details
+
+For our experiments, we use Meta Llama-3.2-3B and Llama-3.1-8B (Dubey et al., 2024) as
+the pretrained base models. We have chosen γ = 0.1 to align the distributions of costs and
+rewards more closely, although we have found our method to be robust to small variations
+in the choice of this hyperparameter. We sample K = 4 reasoning chains for each question,
+using a temperature t of 0.5 and a topp value of 0.9. These parameters are chosen to balance
+exploration and exploitation, allowing us to generate diverse yet relevant reasoning chains.
+
+For greater efficiency during training, instead of using the entire dataset from the start,
+we begin by sampling a dataset Dn of size T = 1024 from the union of the four training
+datasets D described in 4.1. We then progressively increase the dataset size by T with each
+subsequent iteration (until it reaches the size of D) allowing the model to encounter new
+examples gradually. In the self-supervised fine-tuning step, we use a batch size of 16 and
+a learning rate of 1e-5. We execute five iterations of the training algorithm. We believe
+that further improvements are possible through a more comprehensive hyperparameter
+search; however, due to computational constraints, we leave this for future work. Finally,
+we evaluate all models using greedy decoding to ensure consistent and deterministic output
+
+                                                           5
+Preprint. Under review.
+
+Figure 2: Cost and performance. Accuracy is plotted against the output tokens. Our method,
+RaM, eliminates the need for few-shot prompting (reducing input tokens) and trains the
+model to use fewer reasoning tokens than STaR.
+
+Model                  Method           Accuracy (%) ↑ # Input Tokens ↓ # Output Tokens ↓
+
+     Llama-3.2-3B      Direct Few-Shot  33.5 (± 1.4)  291.7 (± 0.9)    0.0 (± 0.0)
+Llama-3.2-3B-Instruct
+                       CoT Few-Shot     34.8 (± 1.8)  1080.5 (± 0.9)  261.9 (± 4.8)
+     Llama-3.1-8B      STaR             47.4 (± 2.0)   73.2 (± 0.9)   222.7 (± 3.5)
+                       RaM              50.1 (± 1.8)   73.2 (± 0.8)   170.8 (± 2.9)
+
+                       CoT Prompting    53.2 (± 1.8)  157.2 (± 0.9)   259.1 (± 3.4)
+
+                       Direct Few-Shot  45.8 (± 1.5)  291.7 (± 0.9)    0.0 (± 0.0)
+
+                       CoT Few-Shot     56.4 (± 1.9)  1080.5 (± 0.9)  253.6 (± 4.2)
+                       STaR             61.9 (± 1.6)   73.2 (± 0.9)   215.1 (± 3.3)
+                       RaM              63.5 (± 1.7)   73.2 (± 0.9)   146.2 (± 3.3)
+
+Llama-3.1-8B-Instruct CoT Prompting 60.9 (± 1.7)      157.2 (± 0.9)   269.9 (± 3.8)
+
+Table 1: Comparison of different methods based on rescaled accuracy and length metrics,
+averaged across datasets (means with 95% confidence intervals; bold indicates best perform-
+ing approaches with overlapping 95% intervals). RaM achieves better performance while
+using significantly fewer input and output tokens compared to STaR or CoT Few-Shot.
+
+generation. We use pattern matching techniques to extract the answers; an exact match
+between the generated answer and the ground truth is considered correct.
+
+5 Results
+
+5.1 Performance vs Cost
+
+We first evaluate our approach against baselines (Sec. 4.2) across several datasets (Sec. 4.1).
+Our key criteria are performance (measured by rescaled accuracy) and cost (measured by the
+number of input and output tokens). Our experiments confirm that across all models and
+datasets, our training approach reduces cost while matching or improving performance
+(see Table 1 for results averaged across datasets; Tables 4 and 5 for per-dataset results; and
+Appendix C for example reasoning chains). Fig. 2 shows these results for all models.
+
+We first consider the performance of our baselines: CoT Few-Shot prompting uses a large
+number of input and output tokens, but yields reasonable performance. Direct Few-Shot
+prompting uses fewer input (and far fewer output) tokens, but yields poor performance
+
+                                        6
+Preprint. Under review.
+
+on reasoning-intensive datasets (GSM8K and Proofwriter, see Table 4). STaR improves on
+these approaches, using significantly fewer tokens while achieving comparable or superior
+performance.
+
+RaM further improves the cost-performance tradeoff by generating 23-32% fewer tokens on
+average compared to STaR, generally with higher accuracy. Interestingly, our findings align
+with the conclusions of a meta-analysis of over 100 papers (Sprague et al., 2024), in finding
+that explicit chains help mainly on maths or logic tasks and bring marginal gains elsewhere.
+
+Finally, it is worth noting that while the performance of the instruction-tuned model (CoT
+Instruct) is generally higher than that of the pretrained model, the length of the reasoning
+chains was generally much higher and not meaningfully adaptive to task complexity.
+
+5.2 Adaptive computation
+
+Section 5.1 demonstrates that our method reduces computational costs on average. But
+does it actually teach models to reason adaptively (by adjusting reasoning to match task
+complexity), or just to reason less? To address this question, we first divided our test set T
+based on whether or not reasoning was needed to solve the task. In particular, we split the
+data based on whether Direct Few-Shot obtained the correct answer (“easy split”) or not
+(“hard split”). Adaptive methods should use less computation to solve the easy problems.
+We can empirically compare the results across methods for these two data splits.
+
+As shown in Table 2, all models and methods are able to differentiate between hard and
+easy problems, generating fewer tokens on easier problems. The instruction-tuned model
+(CoT Instruct) did not effectively adapt response lengths to align with task complexity in
+our experiments. While STaR seems to improve this ratio, RaM increases the difference in
+reasoning between hard and easy problems, achieving a length reduction of up to 50.3%
+on Llama-3.2-3B. This indicates that RaM trains models to reason adaptively, helping them
+recognize when detailed reasoning is necessary and when a shorter response is sufficient.
+
+5.3 Generalization
+
+We assess the out-of-distribution generalization of the length reduction of RaM with respect
+to STaR using the public test set of the MMLU-CF benchmark (Hendrycks et al., 2021, see
+Section 4.1). As shown in Table 5.3, RaM achieves similar performance while generating
+28% to 36% fewer tokens than STaR.
+
+Looking at subdomains, Fig. 3 shows the ratio between the output length of RaM with
+respect to STaR. We can see that subjects that require multi-step reasoning (for example,
+physics or engineering) exhibit smaller reductions because they need detailed intermediate
+steps. In contrast, tasks focused primarily on recalling factual information tend to show a
+more pronounced length reduction.
+
+6 Related Work
+
+6.1 Reducing inference costs
+
+The rising cost of deploying large language models (LLMs) has driven efforts to reduce
+inference costs. Techniques such as Speculative Decoding (Leviathan et al., 2023) and
+Medusa (Cai et al., 2024) improve efficiency through parallelization, while Mixture of
+Experts (Jacobs et al., 1991; Zhou et al., 2022) activates only a subset of LLM parameters
+during decoding. Though effective, these methods require significant architectural changes
+and don’t adapt computation based on task difficulty. Other approaches have developed
+neural architectures that enable adaptive computation (Graves, 2017; Banino et al., 2021;
+Dehghani et al., 2019; Mohtashami et al., 2023; Schuster et al., 2022) but involve new
+architectures or training methods. In contrast, our approach uses existing architectures and
+pretrained models, modifying only the fine-tuning process. More similar to our approach,
+model routing (Ong et al., 2024; Jiang et al., 2024) optimizes resource utilization based on
+query complexity by routing easier queries to smaller models and harder queries to larger
+
+                                                           7
+Preprint. Under review.
+
+         Model         Method          Hard Split     Easy Split    Length Reduction (%) ↑
+     Llama-3.2-3B      CoT Few-Shot   210.0 (± 3.0)  170.0 (± 3.0)               19.0
+Llama-3.2-3B-Instruct  STaR           195.0 (± 5.0)  128.0 (± 1.0)               34.4
+     Llama-3.1-8B      RaM            145.0 (± 3.0)  72.0 (± 2.0)                50.3
+Llama-3.1-8B-Instruct
+                       CoT Prompting  222.0 (± 4.0)  221.0 (± 3.0)                0.5
+
+                       CoT Few-Shot   197.5 (± 3.5)  151.0 (± 1.0)               23.5
+                       STaR           202.0 (± 5.0)  129.5 (± 2.5)               35.9
+                       RaM            139.0 (± 3.0)  89.0 (± 1.0)                36.0
+
+                       CoT Prompting  228.0 (± 6.0)  226.0 (± 2.0)                0.9
+
+Table 2: Length of generated reasoning chains across models and methods (mean number of
+tokens with 95% confidence intervals). Adaptive methods should maximize the difference
+in length between the two distributions. RaM reduces the overall length and increases the
+difference in the length distribution between the Hard and Easy splits (Length Reduction),
+demonstrating an improvement in the ability to adapt reasoning length to task complexity.
+
+    Model              Method  Accuracy (%) ↑  # Input Tokens ↓     # Output Tokens ↓
+Llama-3.2-3B
+Llama-3.1-8B           STaR      27.0 (± 2.4)     75.1 (± 0.9)          150.6 (± 4.1)
+                       RaM       29.5 (± 2.5)     75.1 (± 0.9)          96.3 (± 3.7)
+
+                       STaR      40.2 (± 2.4)     75.1 (± 0.8)          153.6 (± 4.0)
+                       RaM       36.4 (± 2.4)     75.1 (± 0.9)          110.6 (± 3.8)
+
+Table 3: Comparison of STaR and RaM based on rescaled accuracy and length metrics in
+an out-of-distribution setting on the MMLU-CF benchmark. We report the mean with 95%
+confidence intervals. RaM has similar performance but generates fewer output tokens.
+
+ones. However, this necessitates multiple models and a router, while our approach trains a
+single model to adaptively adjust its own outputs to match task complexity.
+
+Finally, the concurrent “long-to-short” literature deliberately compresses reasoning paths
+while preserving accuracy. (Arora & Zanette, 2025) shows that adding a length penalty to
+verifiable rewards can shorten the reasoning length of Large Reasoning Models in mathe-
+matical settings. Here, we focus on bootstrapping the reasoning process, teaching pretrained
+language models to reason efficiently from scratch by developing a reward that is agnostic
+to the answer format. CoT-Valve (Ma et al., 2025) and Claude 3.7 (Anthropic, 2025) enable
+external control over the length of the reasoning chains (and therefore the computation
+budget), allowing a model to produce both long and short reasoning chains. Unlike these
+methods, our method enables the model to independently adapt the reasoning length ac-
+cording to the difficulty of the task. Concurrent work (Wu et al., 2025; Luo et al., 2025) also
+shows that reasoning length compression can also be achieved by merging LLMs and Large
+Reasoning Models. Similarly, Synergy-of-Thoughts (Shang et al., 2024) employed models of
+different sizes to adapt to the complexity of the task at hand. Our approach differs from
+all of the above on two fronts. First, it keeps a single set of parameters: there is no external
+controller, merged checkpoint, or auxiliary model. Second, adaptivity is learned through
+a principled Value-of-Computation reward, not by hard length constraints or heuristic
+escalation.
+
+6.2 Reasoning in LLMs
+
+Techniques such as Chain of Thought (CoT) and related methodologies (Wei et al., 2023;
+Yao et al., 2023a; Madaan et al., 2023; Zheng et al., 2024) have proven effective at enhancing
+LLM performance across a wide range of tasks. CoT boosts LLMs’ performance on complex
+reasoning by guiding them through a series of intermediate reasoning steps, increasing
+inference costs to improve task performance. This method can be implemented through
+in-context learning (Wei et al., 2023), prompting (Kojima et al., 2023), or training (Li et al.,
+2023). The benefits of CoT can be attributed to both a greater computation depth (Goyal et al.,
+
+                                                           8
+Preprint. Under review.
+
+Figure 3: Ratio of output length reduction. RaM ’s output length relative to STaR’s, for
+Llama-3.2-3B. Tasks requiring heavier reasoning tend to exhibit a lower length reduction ra-
+tio, whereas those relying more on knowledge display a more pronounced length reduction.
+
+2024; Pfau et al., 2024) and the semantic values of the thought tokens, which function as
+intermediate variables in the computation of the answer (Prystawski et al., 2023). However,
+recent studies have raised concerns regarding the meaningfulness of such reasoning chains
+in reaching the target solution, and whether models effectively utilize them to solve tasks
+(Turpin et al., 2023; Paul et al., 2024; Sprague et al., 2024). We further demonstrate that
+standard prompting and training methods fail to teach the model to use CoT purposefully,
+resulting in inefficient inference. Moreover, reasoning in situations where it is unnecessary
+may also harm model performance Liu et al. (2024).
+Reasoning can also be used to bootstrap language models. Self-improving techniques
+(Huang et al., 2022; Zelikman et al., 2022) consist of generating reasoning chain-augmented
+answers for unlabeled questions and fine-tuning the LLM using those self-generated solu-
+tions as target outputs. Similar techniques, such as ReST (Gulcehre et al., 2023), can also
+be used to better align LLMs with human preferences and needs. Our approach builds on
+these techniques to optimize the inference cost of reasoning in addition to task performance.
+Another related work, Quiet-STaR (Zelikman et al., 2024), has improved LLM reasoning
+performance by modifying pretraining to generate intermediate reasoning sequences be-
+tween tokens. While effective for downstream tasks, it increases computational costs by
+generating reasoning chains at every step, even when unnecessary. More recently, chat
+models that “think before answering” have been developed (OpenAI, 2024; Anthropic et al.,
+2025; DeepSeek-AI et al., 2025), using inference-time computation to enhance their outputs.
+Although these models outperform others, they expend more computational resources even
+when it may not be necessary. Our method could be incorporated into their training process
+to help the model determine when this additional computation is genuinely beneficial.
+
+7 Limitations and Future Work
+
+While our experiments show that rational metareasoning can successfully reduce inference
+costs in large language models, some limitations remain. First, our approach has only
+been tested on well-established datasets in science, commonsense reasoning, logic, and
+mathematics. Its effectiveness in other contexts has yet to be demonstrated. One particularly
+relevant example is the agentic setting, where LLMs act autonomously in complex digital
+environments (Yao et al., 2023b; Schick et al., 2023). Adapting our method to this context
+would require incorporating the cost of tool use (e.g., API calls) into the reward function to
+encourage the model to minimize unnecessary resource consumption. Second, while the
+VoC reward function is highly flexible and can be readily combined with various learning
+algorithms, our work focused on Expert Iteration (Havrilla et al., 2024) due to its sample
+efficiency for reasoning tasks. Extending the VoC reward framework to other training
+approaches like PPO or DPO remains an open research area. Evaluating whether VoC-based
+
+                                                           9
+Preprint. Under review.
+
+rewards maintain or even improve performance in these settings would further clarify the
+robustness and generalizability of our approach.
+
+8 Conclusion
+
+We introduced a cognitively inspired reward function grounded in rational metareasoning,
+aimed at optimizing LLM inference by balancing performance and computational cost.
+Empirically, we showed that this approach substantially reduces the number of generated
+tokens and input context length, while consistently improving task accuracy across a diverse
+range of benchmarks. Most excitingly, our work demonstrates how cognitively-inspired
+reward functions can endow LLMs with desirable inference-time properties, opening a
+broad avenue of future work. Given its flexibility, this method could be integrated into
+instruction tuning to potentially enhance performance, even in scenarios where verifying the
+correctness of answers is challenging. Since the utility measure within the reward function
+can be tailored to prioritize any desired, measurable property, this approach offers the
+potential to guide models toward achieving these enhanced qualities while still benefiting
+from the reduced computational costs.
+
+                                                          10
+Preprint. Under review.
+
+References
+
+Thomas Anthony, Zheng Tian, and David Barber. Thinking fast and slow with deep learning
+   and tree search, 2017. URL https://arxiv.org/abs/1705.08439.
+
+Anthropic. Claude 3.7 sonnet and claude code”, 2025. URL https://www.anthropic.com/
+   news/claude-3-7-sonnet.
+
+Anthropic et al. Claude 3.7 sonnet system card, 2025. URL https://assets.anthropic.com/
+   m/785e231869ea8b3b/original/claude-3-7-sonnet-system-card.pdf.
+
+Daman Arora and Andrea Zanette. Training language models to reason efficiently, 2025.
+   URL https://arxiv.org/abs/2502.04463.
+
+Andrea Banino, Jan Balaguer, and Charles Blundell. Pondernet: Learning to ponder, 2021.
+   URL https://arxiv.org/abs/2107.05407.
+
+Tianle Cai, Yuhong Li, Zhengyang Geng, Hongwu Peng, Jason D. Lee, Deming Chen, and
+  Tri Dao. Medusa: Simple llm inference acceleration framework with multiple decoding
+   heads, 2024. URL https://arxiv.org/abs/2401.10774.
+
+Frederick Callaway, Sayan Gul, Paul Krueger, Thomas L. Griffiths, and Falk Lieder. Learning
+   to select computations. In 34th Conference on Uncertainty in Artificial Intelligence (UAI 2018),
+  pp. 776–785. Curran Associates, Inc., 2018.
+
+Frederick Callaway, Antonio Rangel, and Thomas L Griffiths. Fixation patterns in simple
+   choice reflect optimal information sampling. PLoS computational biology, 17(3):e1008863,
+   2021.
+
+Frederick Callaway, Bas van Opheusden, Sayan Gul, Priyam Das, Paul M Krueger, Thomas L
+   Griffiths, and Falk Lieder. Rational use of cognitive resources in human planning. Nature
+  Human Behaviour, 6(8):1112–1125, 2022.
+
+Lichang Chen, Chen Zhu, Davit Soselia, Jiuhai Chen, Tianyi Zhou, Tom Goldstein, Heng
+   Huang, Mohammad Shoeybi, and Bryan Catanzaro. Odin: Disentangled reward mitigates
+   hacking in rlhf, 2024. URL https://arxiv.org/abs/2402.07319.
+
+Aakanksha Chowdhery, Sharan Narang, Jacob Devlin, Maarten Bosma, Gaurav Mishra,
+  Adam Roberts, Paul Barham, Hyung Won Chung, Charles Sutton, Sebastian Gehrmann,
+   et al. Palm: Scaling language modeling with pathways, 2022. URL https://arxiv.org/
+   abs/2204.02311.
+
+Peter Clark, Isaac Cowhey, Oren Etzioni, Tushar Khot, Ashish Sabharwal, Carissa Schoenick,
+   and Oyvind Tafjord. Think you have solved question answering? try arc, the ai2 reasoning
+   challenge, 2018. URL https://arxiv.org/abs/1803.05457.
+
+Karl Cobbe, Vineet Kosaraju, Mohammad Bavarian, Mark Chen, Heewoo Jun, Lukasz
+   Kaiser, Matthias Plappert, Jerry Tworek, Jacob Hilton, Reiichiro Nakano, Christopher
+   Hesse, and John Schulman. Training verifiers to solve math word problems, 2021. URL
+   https://arxiv.org/abs/2110.14168.
+
+Alex de Vries. The growing energy footprint of artificial intelligence. Joule, 7(10):2191–
+   2194, 2023. ISSN 2542-4351. doi: https://doi.org/10.1016/j.joule.2023.09.004. URL
+   https://www.sciencedirect.com/science/article/pii/S2542435123003653.
+
+DeepSeek-AI et al. Deepseek-r1: Incentivizing reasoning capability in llms via reinforcement
+   learning, 2025. URL https://arxiv.org/abs/2501.12948.
+
+Mostafa Dehghani, Stephan Gouws, Oriol Vinyals, Jakob Uszkoreit, and Łukasz Kaiser.
+   Universal transformers, 2019. URL https://arxiv.org/abs/1807.03819.
+
+Abhimanyu Dubey, Abhinav Jauhri, Abhinav Pandey, Abhishek Kadian, Ahmad Al-Dahle,
+  Aiesha Letman, Akhil Mathur, Alan Schelten, Amy Yang, Angela Fan, et al. The llama 3
+   herd of models, 2024. URL https://arxiv.org/abs/2407.21783.
+
+                                                          11
+Preprint. Under review.
+
+Sachin Goyal, Ziwei Ji, Ankit Singh Rawat, Aditya Krishna Menon, Sanjiv Kumar, and
+  Vaishnavh Nagarajan. Think before you speak: Training language models with pause
+   tokens, 2024. URL https://arxiv.org/abs/2310.02226.
+
+Alex Graves. Adaptive computation time for recurrent neural networks, 2017. URL https:
+  //arxiv.org/abs/1603.08983.
+
+Thomas L. Griffiths. Understanding human intelligence through human limitations. Trends
+   in Cognitive Sciences, 24(11):873–883, 2020. ISSN 1364-6613. doi: 10.1016/j.tics.2020.09.001.
+   URL http://dx.doi.org/10.1016/j.tics.2020.09.001.
+
+Thomas L Griffiths, Frederick Callaway, Michael B Chang, Erin Grant, Paul M Krueger, and
+   Falk Lieder. Doing more with less: meta-reasoning and meta-learning in humans and
+   machines. Current Opinion in Behavioral Sciences, 29:24–30, 2019. ISSN 2352-1546. doi:
+  10.1016/j.cobeha.2019.01.005. URL http://dx.doi.org/10.1016/j.cobeha.2019.01.005.
+
+Caglar Gulcehre, Tom Le Paine, Srivatsan Srinivasan, Ksenia Konyushkova, Lotte Weerts,
+  Abhishek Sharma, Aditya Siddhant, Alex Ahern, Miaosen Wang, Chenjie Gu, Wolfgang
+   Macherey, Arnaud Doucet, Orhan Firat, and Nando de Freitas. Reinforced self-training
+  (rest) for language modeling, 2023. URL https://arxiv.org/abs/2308.08998.
+
+Alex Havrilla, Yuqing Du, Sharath Chandra Raparthy, Christoforos Nalmpantis, Jane
+   Dwivedi-Yu, Maksym Zhuravinskyi, Eric Hambro, Sainbayar Sukhbaatar, and Roberta
+   Raileanu. Teaching large language models to reason with reinforcement learning, 2024.
+   URL https://arxiv.org/abs/2403.04642.
+
+Dan Hendrycks, Collin Burns, Steven Basart, Andy Zou, Mantas Mazeika, Dawn Song,
+   and Jacob Steinhardt. Measuring massive multitask language understanding, 2021. URL
+   https://arxiv.org/abs/2009.03300.
+
+Jiaxin Huang, Shixiang Shane Gu, Le Hou, Yuexin Wu, Xuezhi Wang, Hongkun Yu, and
+  Jiawei Han. Large language models can self-improve, 2022. URL https://arxiv.org/
+   abs/2210.11610.
+
+Robert A. Jacobs, Michael I. Jordan, Steven J. Nowlan, and Geoffrey E. Hinton. Adaptive
+   mixtures of local experts. Neural Computation, 3(1):79–87, 1991. doi: 10.1162/neco.1991.3.
+  1.79.
+
+Albert Q. Jiang, Alexandre Sablayrolles, Antoine Roux, Arthur Mensch, Blanche Savary,
+   Chris Bamford, Devendra Singh Chaplot, Diego de las Casas, Emma Bou Hanna, Florian
+   Bressand, Gianna Lengyel, Guillaume Bour, Guillaume Lample, Le´lio Renard Lavaud,
+   Lucile Saulnier, Marie-Anne Lachaux, Pierre Stock, Sandeep Subramanian, Sophia Yang,
+   Szymon Antoniak, Teven Le Scao, The´ophile Gervet, Thibaut Lavril, Thomas Wang,
+  Timothe´e Lacroix, and William El Sayed. Mixtral of experts, 2024. URL https://arxiv.
+   org/abs/2401.04088.
+
+Daniel Kahneman. Thinking, fast and slow. Stat. Pap. (Berl), 55(3):915–915, 2014.
+
+Takeshi Kojima, Shixiang Shane Gu, Machel Reid, Yutaka Matsuo, and Yusuke Iwasawa.
+   Large language models are zero-shot reasoners, 2023. URL https://arxiv.org/abs/2205.
+  11916.
+
+Yaniv Leviathan, Matan Kalman, and Yossi Matias. Fast inference from transformers via
+   speculative decoding, 2023. URL https://arxiv.org/abs/2211.17192.
+
+Liunian Harold Li, Jack Hessel, Youngjae Yu, Xiang Ren, Kai-Wei Chang, and Yejin Choi.
+   Symbolic chain-of-thought distillation: Small models can also “think” step-by-step. In
+  Anna Rogers, Jordan Boyd-Graber, and Naoaki Okazaki (eds.), Proceedings of the 61st
+  Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers),
+  pp. 2665–2679, Toronto, Canada, 2023. Association for Computational Linguistics. doi:
+  10.18653/v1/2023.acl-long.150. URL https://aclanthology.org/2023.acl-long.150.
+
+                                                          12
+Preprint. Under review.
+
+Falk Lieder and Thomas L. Griffiths. Strategy selection as rational metareasoning. Psy-
+   chological Review, 124(6):762–794, 2017. ISSN 0033-295X. doi: 10.1037/rev0000075. URL
+   http://dx.doi.org/10.1037/rev0000075.
+
+Falk Lieder, Amitai Shenhav, Sebastian Musslick, and Thomas L. Griffiths. Rational
+   metareasoning and the plasticity of cognitive control. PLOS Computational Biology, 14
+  (4):e1006043, 2018. ISSN 1553-7358. doi: 10.1371/journal.pcbi.1006043. URL http:
+  //dx.doi.org/10.1371/journal.pcbi.1006043.
+
+Ryan Liu, Jiayi Geng, Addison J. Wu, Ilia Sucholutsky, Tania Lombrozo, and Thomas L.
+   Griffiths. Mind your step (by step): Chain-of-thought can reduce performance on tasks
+  where thinking makes humans worse, 2024. URL https://arxiv.org/abs/2410.21333.
+
+Haotian Luo, Haiying He, Yibo Wang, Jinluan Yang, Rui Liu, Naiqiang Tan, Xiaochun
+   Cao, Dacheng Tao, and Li Shen. Ada-r1: Hybrid-cot via bi-level adaptive reasoning
+   optimization, 2025. URL https://arxiv.org/abs/2504.21659.
+
+Xinyin Ma, Guangnian Wan, Runpeng Yu, Gongfan Fang, and Xinchao Wang. Cot-valve:
+   Length-compressible chain-of-thought tuning, 2025. URL https://arxiv.org/abs/2502.
+   09601.
+
+Aman Madaan, Niket Tandon, Prakhar Gupta, Skyler Hallinan, Luyu Gao, Sarah Wiegr-
+   effe, Uri Alon, Nouha Dziri, Shrimai Prabhumoye, Yiming Yang, Shashank Gupta, Bod-
+   hisattwa Prasad Majumder, Katherine Hermann, Sean Welleck, Amir Yazdanbakhsh,
+   and Peter Clark. Self-refine: Iterative refinement with self-feedback, 2023. URL
+   https://arxiv.org/abs/2303.17651.
+
+Amirkeivan Mohtashami, Matteo Pagliardini, and Martin Jaggi. Cotformer: More tokens
+  with attention make up for less depth, 2023. URL https://arxiv.org/abs/2310.10845.
+
+Isaac Ong, Amjad Almahairi, Vincent Wu, Wei-Lin Chiang, Tianhao Wu, Joseph E. Gonzalez,
+   M Waleed Kadous, and Ion Stoica. Routellm: Learning to route llms with preference data,
+   2024. URL https://arxiv.org/abs/2406.18665.
+
+OpenAI. Openai o1 system card. preprint, 2024. URL https://openai.com/index/
+   openai-o1-system-card/.
+
+OpenAI, Josh Achiam, Steven Adler, Sandhini Agarwal, Lama Ahmad, Ilge Akkaya, Flo-
+   rencia Leoni Aleman, Diogo Almeida, Janko Altenschmidt, Sam Altman, et al. Gpt-4
+   technical report, 2024. URL https://arxiv.org/abs/2303.08774.
+
+Ryan Park, Rafael Rafailov, Stefano Ermon, and Chelsea Finn. Disentangling length from
+  quality in direct preference optimization, 2024. URL https://arxiv.org/abs/2403.19159.
+
+Debjit Paul, Robert West, Antoine Bosselut, and Boi Faltings. Making reasoning matter:
+   Measuring and improving faithfulness of chain-of-thought reasoning, 2024. URL https:
+  //arxiv.org/abs/2402.13950.
+
+Jacob Pfau, William Merrill, and Samuel R. Bowman. Let’s think dot by dot: Hidden
+   computation in transformer language models, 2024. URL https://arxiv.org/abs/2404.
+  15758.
+
+Ben Prystawski, Michael Y. Li, and Noah D. Goodman. Why think step by step? reasoning
+   emerges from the locality of experience, 2023. URL https://arxiv.org/abs/2304.03843.
+
+Evan Russek, Daniel Acosta-Kane, Bas van Opheusden, Marcelo G Mattar, and Tom Griffiths.
+  Time spent thinking in online chess reflects the value of computation. 2022.
+
+Stuart Russell and Eric Wefald. Principles of metareasoning. Artificial Intelligence, 49
+  (1–3):361–395, 1991. ISSN 0004-3702. doi: 10.1016/0004-3702(91)90015-c. URL http:
+  //dx.doi.org/10.1016/0004-3702(91)90015-C.
+
+                                                          13
+Preprint. Under review.
+
+Stuart J. Russell. Rationality and intelligence. Artificial Intelligence, 94(1–2):57–77, 1997.
+   ISSN 0004-3702. doi: 10.1016/s0004-3702(97)00026-x. URL http://dx.doi.org/10.1016/
+   S0004-3702(97)00026-X.
+
+Timo Schick, Jane Dwivedi-Yu, Roberto Dess`ı, Roberta Raileanu, Maria Lomeli, Luke
+   Zettlemoyer, Nicola Cancedda, and Thomas Scialom. Toolformer: Language models can
+   teach themselves to use tools, 2023. URL https://arxiv.org/abs/2302.04761.
+
+Tal Schuster, Adam Fisch, Jai Gupta, Mostafa Dehghani, Dara Bahri, Vinh Q. Tran, Yi Tay,
+   and Donald Metzler. Confident adaptive language modeling, 2022. URL https://arxiv.
+   org/abs/2207.07061.
+
+Yu Shang, Yu Li, Fengli Xu, and Yong Li. Synergy-of-thoughts: Eliciting efficient reasoning
+   in hybrid language models, 2024. URL https://arxiv.org/abs/2402.02563.
+
+Prasann Singhal, Tanya Goyal, Jiacheng Xu, and Greg Durrett. A long way to go: Investigat-
+   ing length correlations in rlhf, 2024. URL https://arxiv.org/abs/2310.03716.
+
+Charlie Snell, Jaehoon Lee, Kelvin Xu, and Aviral Kumar. Scaling llm test-time compute
+   optimally can be more effective than scaling model parameters, 2024. URL https://
+   arxiv.org/abs/2408.03314.
+
+Zayne Sprague, Fangcong Yin, Juan Diego Rodriguez, Dongwei Jiang, Manya Wadhwa,
+   Prasann Singhal, Xinyu Zhao, Xi Ye, Kyle Mahowald, and Greg Durrett. To cot or not
+   to cot? chain-of-thought helps mainly on math and symbolic reasoning, 2024. URL
+   https://arxiv.org/abs/2409.12183.
+
+Oyvind Tafjord, Bhavana Dalvi Mishra, and Peter Clark. Proofwriter: Generating im-
+  plications, proofs, and abductive statements over natural language, 2021. URL https:
+  //arxiv.org/abs/2012.13048.
+
+Alon Talmor, Jonathan Herzig, Nicholas Lourie, and Jonathan Berant. Commonsenseqa:
+  A question answering challenge targeting commonsense knowledge, 2019. URL https:
+  //arxiv.org/abs/1811.00937.
+
+Yunhao Tang, Daniel Zhaohan Guo, Zeyu Zheng, Daniele Calandriello, Yuan Cao, Eugene
+  Tarassov, Re´mi Munos, Bernardo A´ vila Pires, Michal Valko, Yong Cheng, and Will Dabney.
+   Understanding the performance gap between online and offline alignment algorithms,
+   2024. URL https://arxiv.org/abs/2405.08448.
+
+Miles Turpin, Julian Michael, Ethan Perez, and Samuel R. Bowman. Language models don’t
+   always say what they think: Unfaithful explanations in chain-of-thought prompting, 2023.
+   URL https://arxiv.org/abs/2305.04388.
+
+Roberto Verdecchia, June Sallou, and Lu´ıs Cruz. A systematic review of green ¡scp¿ai¡/scp¿.
+  WIREs Data Mining and Knowledge Discovery, 13(4), 2023. ISSN 1942-4795. doi: 10.1002/
+  widm.1507. URL http://dx.doi.org/10.1002/widm.1507.
+
+Zhongwei Wan, Xin Wang, Che Liu, Samiul Alam, Yu Zheng, Jiachen Liu, Zhongnan Qu,
+   Shen Yan, Yi Zhu, Quanlu Zhang, Mosharaf Chowdhury, and Mi Zhang. Efficient large
+   language models: A survey, 2024. URL https://arxiv.org/abs/2312.03863.
+
+Jason Wei, Xuezhi Wang, Dale Schuurmans, Maarten Bosma, Brian Ichter, Fei Xia, Ed Chi,
+   Quoc Le, and Denny Zhou. Chain-of-thought prompting elicits reasoning in large lan-
+   guage models, 2023. URL https://arxiv.org/abs/2201.11903.
+
+Han Wu, Yuxuan Yao, Shuqi Liu, Zehua Liu, Xiaojin Fu, Xiongwei Han, Xing Li, Hui-Ling
+   Zhen, Tao Zhong, and Mingxuan Yuan. Unlocking efficient long-to-short llm reasoning
+  with model merging, 2025. URL https://arxiv.org/abs/2503.20641.
+
+Shunyu Yao, Dian Yu, Jeffrey Zhao, Izhak Shafran, Thomas L. Griffiths, Yuan Cao, and
+   Karthik Narasimhan. Tree of thoughts: Deliberate problem solving with large language
+   models, 2023a. URL https://arxiv.org/abs/2305.10601.
+
+                                                          14
+Preprint. Under review.
+
+Shunyu Yao, Jeffrey Zhao, Dian Yu, Nan Du, Izhak Shafran, Karthik Narasimhan, and
+  Yuan Cao. React: Synergizing reasoning and acting in language models, 2023b. URL
+   https://arxiv.org/abs/2210.03629.
+
+Eric Zelikman, Yuhuai Wu, Jesse Mu, and Noah D. Goodman. Star: Bootstrapping reasoning
+  with reasoning, 2022. URL https://arxiv.org/abs/2203.14465.
+
+Eric Zelikman, Georges Harik, Yijia Shao, Varuna Jayasiri, Nick Haber, and Noah D. Good-
+   man. Quiet-star: Language models can teach themselves to think before speaking, 2024.
+   URL https://arxiv.org/abs/2403.09629.
+
+Qihao Zhao, Yangyu Huang, Tengchao Lv, Lei Cui, Qinzheng Sun, Shaoguang Mao, Xin
+   Zhang, Ying Xin, Qiufeng Yin, Scarlett Li, and Furu Wei. Mmlu-cf: A contamination-free
+   multi-task language understanding benchmark, 2024. URL https://arxiv.org/abs/2412.
+  15194.
+
+Huaixiu Steven Zheng, Swaroop Mishra, Xinyun Chen, Heng-Tze Cheng, Ed H. Chi, Quoc V
+   Le, and Denny Zhou. Take a step back: Evoking reasoning via abstraction in large
+   language models, 2024. URL https://arxiv.org/abs/2310.06117.
+
+Yanqi Zhou, Tao Lei, Hanxiao Liu, Nan Du, Yanping Huang, Vincent Zhao, Andrew Dai,
+   Zhifeng Chen, Quoc Le, and James Laudon. Mixture-of-experts with expert choice routing,
+   2022. URL https://arxiv.org/abs/2202.09368.
+
+A Complete Results Tables
+
+In this section, we present the comprehensive results tables.
+
+Model         Method      ARC Commonsenseqa GSM8K Proofwriter
+
+              Direct Few Shot 70.1 (± 1.8)  56.2 (± 3.2)       7.6 (± 1.6) 0.0 (± 1.3)
+                                            43.3 (± 3.3)       27.7 (± 2.4) 4.2 (± 4.5)
+              Cot Few Shot 63.8 (± 1.9)     66.0 (± 2.6)       41.2 (± 2.8) 36.3 (± 3.1)
+                                            52.5 (± 3.5)       26.8 (± 2.5) 43.6 (± 4.5)
+Llama-3.2-3B  Direct SFT  82.8 (± 1.2)      55.8 (± 3.3)       32.3 (± 2.5) 41.3 (± 4.4)
+
+              STaR        66.6 (± 1.9)
+
+              RaM         71.2 (± 1.7)
+
+Llama-3.2-3B-Instruct CoT Prompting 75.9 (± 1.7) 58.1 (± 3.2) 71.6 (± 2.2) 7.3 (± 4.4)
+
+              Direct Few Shot 82.6 (± 1.5)  66.4 (± 3.0)       14.9 (± 2.0) 19.4 (± 4.4)
+                                            60.4 (± 3.2)       52.8 (± 2.6) 32.9 (± 4.2)
+              Cot Few Shot 80.9 (± 1.5)     64.0 (± 3.0)       45.9 (± 2.8) 55.8 (± 4.1)
+                                            67.2 (± 3.1)       53.7 (± 2.5) 52.7 (± 4.0)
+Llama-3.1-8B  STaR        82.0 (± 1.6)
+
+              Metareasoning 80.3 (± 1.5)
+
+Llama-3.1-8B-Instruct CoT Prompting 85.4 (± 1.4) 66.6 (± 3.0) 80.5 (± 2.0) 11.2 (± 4.3)
+
+Table 4: Comparison of accuracy of different methods across datasets and models. We report
+the mean with 95% confidence scores.
+
+                          15
+Preprint. Under review.
+
+Model            Method  ARC Commonsenseqa GSM8K Proofwriter
+
+                 Direct Few Shot 0.0 (± 0.0)   0.0 (± 0.0)    0.0 (± 0.0) 0.0 (± 0.0)
+                                              182.0 (± 9.7)  236.9 (± 8.0) 459.2 (± 14.1)
+                 Cot Few Shot 169.6 (± 2.3)   130.0 (± 1.4)  259.7 (± 9.0) 380.0 (± 7.2)
+                                              91.3 (± 2.6)   184.1 (± 7.8) 330.4 (± 7.4)
+Llama-3.2-3B     STaR    121.0 (± 2.2)
+
+                 RaM     77.4 (± 1.5)
+
+Llama-3.2-3B-Instruct CoT Prompting 230.8 (± 2.2) 189.1 (± 3.7) 192.1 (± 4.6) 424.6 (± 11.0)
+
+                 Direct Few Shot 0.0 (± 0.0)   0.0 (± 0.0)    0.0 (± 0.0) 0.0 (± 0.0)
+                                              153.6 (± 6.8)  232.7 (± 8.6) 472.1 (± 16.8)
+Meta-Llama-3-8B  Cot Few Shot 147.9 (± 1.5)   143.6 (± 2.3)  256.9 (± 7.5) 340.4 (± 9.6)
+                                              93.1 (± 3.2)   171.4 (± 5.4) 228.7 (± 10.1)
+                 STaR    119.6 (± 2.0)
+
+                 Metareasoning 91.8 (± 1.4)
+
+Llama-3.1-8B-Instruct CoT Prompting 233.0 (± 2.2) 200.7 (± 4.3) 210.8 (± 5.0) 435.1 (± 11.7)
+
+Table 5: Comparison of mean output length of different methods across datasets and models.
+We report the mean with 95% confidence scores.
+
+B CoT Prompting
+
+For the “Instruct” versions of our models we use the following prompt:
+
+Answer the following question, thinking step by step to get to the answer. You can think
+however long you need, but answer as soon as you’re ready. Use the minimum number of steps
+to get to the answer. Once you’re finished thinking, you must end your response with ’The
+answer is [X]’, where [X] is the final answer to the question.
+
+C Qualitative examples
+
+Below we show one example of question, reasoning chain and answer per dataset, generated
+with each method: CoT Few Shots (blue), STaR (yellow) and RaM (green). The following
+examples were generated by Llama-3.2-3B (Dubey et al., 2024). The reasoning chains shown
+here serve as intermediate computations that guide the model to its final answers. While
+not intended as direct explanations, the examples remain interpretable and demonstrate the
+effectiveness of the respective methods.
+
+                         16
+Preprint. Under review.
+
+             Figure 4: Qualitative examples of reasoning processes for ARC dataset
+
+    Figure 5: Qualitative examples of reasoning processes for CommonsenseQA dataset
+                                                          17
+Preprint. Under review.
+
+           Figure 6: Qualitative examples of reasoning processes for GSM8k dataset
+                                                          18
+Preprint. Under review.
+
+        Figure 7: Qualitative examples of reasoning processes for Proofwriter dataset
+                                                          19
+

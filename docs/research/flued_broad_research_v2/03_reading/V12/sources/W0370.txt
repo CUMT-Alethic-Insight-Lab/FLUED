@@ -1,0 +1,920 @@
+Information-Theoretic Probing with Minimum Description Length
+
+Elena Voita1,2                                            Ivan Titov1,2
+
+                   1University of Edinburgh, Scotland
+                2University of Amsterdam, Netherlands
+
+lena-voita@hotmail.com ititov@inf.ed.ac.uk
+
+Abstract
+
+     To measure how well pretrained representa-           Figure 1: Illustration of the idea behind MDL probes.
+     tions encode some linguistic property, it is
+     common to use accuracy of a probe, i.e. a            work uses ‘probing tasks’ (aka ‘probes’ and ‘diag-
+     classiﬁer trained to predict the property from       nostic classiﬁers’); see Belinkov and Glass (2019)
+     the representations. Despite widespread adop-        for a comprehensive review. These classiﬁers are
+     tion of probes, differences in their accuracy        trained to predict a linguistic property from ‘frozen’
+     fail to adequately reﬂect differences in repre-      representations, and accuracy of the classiﬁer is
+     sentations. For example, they do not substan-        used to measure how well these representations
+     tially favour pretrained representations over        encode the property.
+     randomly initialized ones. Analogously, their
+     accuracy can be similar when probing for gen-           Despite widespread adoption of such probes,
+     uine linguistic labels and probing for random        they fail to adequately reﬂect differences in repre-
+     synthetic tasks. To see reasonable differences       sentations. This is clearly seen when using them to
+     in accuracy with respect to these random base-       compare pretrained representations with randomly
+     lines, previous work had to constrain either         initialized ones (Zhang and Bowman, 2018). Anal-
+     the amount of probe training data or its model       ogously, their accuracy can be similar when prob-
+     size. Instead, we propose an alternative to the      ing for genuine linguistic labels and probing for
+     standard probes, information-theoretic prob-         tags randomly associated to word types (‘control
+     ing with minimum description length (MDL).           tasks’, Hewitt and Liang (2019)). To see differ-
+     With MDL probing, training a probe to pre-           ences in the accuracy with respect to these random
+     dict labels is recast as teaching it to effectively  baselines, previous work had to reduce the amount
+     transmit the data. Therefore, the measure of         of a probe training data (Zhang and Bowman, 2018)
+     interest changes from probe accuracy to the de-      or use smaller models for probes (Hewitt and Liang,
+     scription length of labels given representations.    2019).
+     In addition to probe quality, the description
+     length evaluates ‘the amount of effort’ needed          As an alternative to the standard probing, we
+     to achieve the quality. This amount of effort        take an information-theoretic view at the task of
+     characterizes either (i) size of a probing model,    measuring relations between representations and la-
+     or (ii) the amount of data needed to achieve the     bels. Any regularity in representations with respect
+     high quality. We consider two methods for esti-      to labels can be exploited both to make predictions
+     mating MDL which can be easily implemented           and to compress these labels, i.e., reduce length of
+     on top of the standard probing pipelines: varia-     the code needed to transmit them. Formally, we
+     tional coding and online coding. We show that        recast learning a model of data (i.e., training a prob-
+     these methods agree in results and are more in-      ing classiﬁer) as training it to transmit the data (i.e.,
+     formative and stable than the standard probes.1      labels) in as few bits as possible. This naturally
+                                                          leads to a change of measure: instead of evaluating
+1 Introduction
+
+To estimate to what extent representations (e.g.,
+ELMo (Peters et al., 2018) or BERT (Devlin et al.,
+2019)) capture a linguistic property, most previous
+
+    1We release code at https://github.com/
+lena-voita/description-length-probing.
+
+                                                    183
+
+Proceedings of the 2020 Conference on Empirical Methods in Natural Language Processing, pages 183–196,
+                    November 16–20, 2020. c 2020 Association for Computational Linguistics
+probe accuracy, we evaluate minimum description          ences with random baselines, previous work manu-
+length (MDL) of labels given representations, i.e.       ally tuned (i) model size and/or (ii) the amount of
+the minimum number of bits needed to transmit the        data, we will see that these were indirect ways of
+labels knowing the representations. Note that since      accounting for the ‘amount of effort’ component
+labels are transmitted using a model, the model          of (i) variational and (ii) online codes, respectively.
+has to be transmitted as well (directly or indirectly).  Interestingly, since variational and online codes are
+Thus, the overall codelength is a combination of the     different methods to estimate the same quantity
+quality of ﬁt of the model (compressed data length)      (and, as we will show, they agree in the results), we
+with the cost of transmitting the model itself.          can conclude that the ability of a probe to achieve
+                                                         good quality using a small amount of data and its
+   Intuitively, codelength characterizes not only the    ability to achieve good quality using a small probe
+ﬁnal quality of a probe, but also the ‘amount of ef-     architecture reﬂect the same property: strength of
+fort’ needed achieve this quality (Figure 1). If rep-    the regularity in the data. In contrast to previous
+resentations have some clear structure with respect      work, MDL incorporates this naturally in a theo-
+to labels, the relation between the representations      retically justiﬁed way. Moreover, our experiments
+and the labels can be understood with less effort;       show that, differently from accuracy, conclusions
+for example, (i) the ‘rule’ predicting the label (i.e.,  made by MDL probes are not affected by an un-
+the probing model) can be simple, and/or (ii) the        derlying probe setting, thus no manual search for
+amount of data needed to reveal this structure can       settings is required.
+be small. This is exactly how our vague (so far)
+notion of ‘the amount of effort’ is translated into         We illustrate the effectiveness of MDL for dif-
+codelength. We explain this more formally when           ferent kinds of random baselines. For example,
+describing the two methods for evaluating MDL we         when considering control tasks (Hewitt and Liang,
+use: variational coding and online coding; they dif-     2019), while probes have similar accuracies, these
+fer in a way they incorporate model cost: directly       accuracies are achieved with a small probe model
+or indirectly.                                           for the linguistic task and a large model for the
+                                                         random baseline (control task); these architectures
+   Variational code explicitly incorporates cost of      are obtained as a byproduct of MDL optimization
+transmitting the model (probe weights) in addition       and not by manual search.
+to the cost of transmitting the labels; this joint cost
+is exactly the loss function of a variational learning      Our contributions are as follows:
+algorithm (Honkela and Valpola, 2004). As we will
+see in the experiments, close probe accuracies often        • we propose information-theoretic probing
+come at a very different model cost: the ‘rule’ (the           which measures MDL of labels given repre-
+probing model) explaining regularity in the data               sentations;
+can be either simple (i.e., easy to communicate) or
+complicated (i.e., hard to communicate) depending           • we show that MDL naturally characterizes not
+on the strength of this regularity.                            only probe quality, but also ‘the amount of
+                                                               effort’ needed to achieve it;
+   Online code provides a way to transmit data with-
+out directly transmitting the model. Intuitively, it        • we explain how to easily measure MDL on
+measures the ability to learn from different amounts           top of standard probe-training pipelines;
+of data. In this setting, the data is transmitted in a
+sequence of portions; at each step, the data trans-         • we show that, compared to standard probes,
+mitted so far is used to understand the regularity in          MDL results are more informative and stable.
+this data and compress the following portion. If the
+regularity in the data is strong, it can be revealed     2 Information-Theoretic Viewpoint
+using a small subset of the data, i.e., early in the
+transmission process, and can be exploited to efﬁ-       Let D = {(x1, y1), . . . , (xn, yn)} be a dataset,
+ciently transmit the rest of the dataset. The online     where x1:n = (x1, x2, . . . , xn) are representations
+code is related to the area under the learning curve,    from a model and y1:n = (y1, y2, . . . , yn) are
+which plots quality as a function of the number of       labels for some linguistic task (we assume that
+training examples.                                       yi ∈ {1, 2, . . . , K}, i.e. we consider classiﬁcation
+                                                         tasks). As in standard probing task, we want to
+   If we now recall that, to get reasonable differ-      measure to what extent x1:n encode y1:n. Differ-
+                                                         ently from standard probes, we propose to look at
+
+184
+this question from the information-theoretic per-                  Compression is usually compared against uni-
+spective and deﬁne the goal of a probe as learning
+to effectively transmit the data.                               form encoding which does not require any learning
+
+Setting. Following the standard information the-                from data. It assumes p(y|x) = punif (y|x) =
+ory notation, let us imagine that Alice has all
+(xi, yi) pairs in D, Bob has just the xi’s from D,              1  ,  and yields codelength Lunif (y1:n|x1:n)  =
+and that Alice wants to communicate the yi’s to                 K
+Bob. The task is to encode the labels y1:n knowing
+the inputs x1:n in an optimal way, i.e. with minimal            n log2 K bits. Another trivial encoding ignores
+codelength (in bits) needed to transmit y1:n.
+                                                                input x and relies on class priors p(y), resulting in
+Transmission: Data and Model. Alice can
+transmit the labels using some probabilistic model              codelength H(y) for a datapoint.
+of data p(y|x) (e.g., it can be a trained probing clas-
+siﬁer). Since Bob does not know the precise trained             Relation to Mutual Information. If the in-
+model that Alice is using, some explicit or implicit            puts and the outputs come from a true joint
+transmission of the model itself is also required.              distribution q(x, y), then, for any transmission
+In Section 2.1, we explain how to transmit data                 method with codelength L, it holds Eq[L(y|x)] ≥
+using a model p. In Section 2.2, we show direct                 H(y|x) (Grunwald, 2004). Therefore, the gain in
+and indirect ways of transmitting the model.                    codelength over the trivial codelength H(y) is
+                                                                H(y) − Eq[L(y|x)] ≤ H(y) − H(y|x) = I(y; x).
+Interpretation: quality and ‘amount of effort’.                 In other words, the compression is limited by the
+In Section 2.3, we show that total codelength char-             mutual information (MI) between inputs (i.e. pre-
+acterizes both probe quality and the ‘amount of                 trained representations) and outputs (i.e. labels).
+effort’ needed to achieve it. We draw connections
+between different interpretations of this ‘amount                  Note that total codelength includes model code-
+of effort’ part of the code and manual search for               length in addition to the data code. This means that
+probe settings done in previous work.2                          while high MI is necessary for effective compres-
+                                                                sion, a good representation is the one which also
+2.1 Transmission of Data Using a Model                          yields simple models predicting y from x, as we
+                                                                formalize in the next section.
+Suppose that Alice and Bob have agreed in advance
+on a model p, and both know the inputs x1:n. Then               2.2 Transmission of the Model (Explicit or
+there exists a code to transmit the labels y1:n loss-                 Implicit)
+lessly with codelength3
+                                                                We consider two compression methods that can be
+                                             n                  used with deep learning models (probing classi-
+                                                                ﬁers):
+        Lp(y1:n|x1:n) = − log2 p(yi|xi). (1)
+                                                                   • variational code – an instance of two-part
+                                           i=1                        codes, where a model is transmitted explicitly
+                                                                      and then used to encode the data;
+   This is the Shannon-Huffman code, which gives
+an optimal bound on the codelength if the data are                    • online code – a way to encode both model and
+independent and come from a conditional probabil-                       data without directly transmitting the model.
+ity distribution p(y|x).
+                                                                2.2.1 Variational Code
+Learning is compression. The bound (1) is ex-
+actly the categorical cross-entropy loss evaluated              We assume that Alice and Bob have agreed on a
+on the model p. This shows that the task of com-                model class H = {pθ|θ ∈ Θ}. With two-part
+pressing labels y1:n is equivalent to learning a                codes, for any model pθ∗, Alice ﬁrst transmits its
+model p(y|x): quality of a learned model p(y|x) is              parameters θ∗ and then encodes the data while re-
+the codelength needed to transmit the data.                     lying on the model. The description length decom-
+                                                                poses accordingly:
+    2Note that in this work, we do not consider practical im-
+plementations of transmission algorithms; everywhere in the              L2θ∗part(y1:n|x1:n) =
+text, ‘codelength’ refers to the theoretical codelength of the            = Lparam(θ∗) + Lpθ∗ (y1:n|x1:n)
+associated encodings.
+                                                                To compute the description length of the parameters
+    3Up to at most one bit on the whole sequence; for datasets  Lparam(θ∗), we can further assume that Alice and
+of reasonable size this can be ignored.                         Bob have agreed on a prior distribution over the
+                                                                parameters α(θ∗). Now, we can rewrite the total
+
+                                                                description length (using also eq. (1)) as
+
+185
+                                            n             the online setting, Alice and Bob agree on the form
+                                                          of the model pθ(y|x) with learnable parameters θ,
+      − log2(α(θ∗) m) − log2 pθ∗(yi|xi),                  its initial random seeds, and its learning algorithm.
+                                                          They also choose timesteps 1 = t0 < t1 < · · · <
+                                          i=1             tS = n and encode data by blocks.4 Alice starts
+                                                          by communicating y1:t1 with a uniform code, then
+where m is the number of parameters and is a              both Alice and Bob learn a model pθ1(y|x) that
+prearranged precision for each parameter. With            predicts y from x using data {(xi, yi)}ti=1 1, and Al-
+deep learning models, such straightforward codes          ice uses that model to communicate the next data
+for parameters are highly inefﬁcient. Instead, in the     block yt1+1:t2. Then both Alice and Bob learn a
+variational approach, weights are treated as random       model pθ2(y|x) from a larger block {(xi, yi)}it=2 1
+variables, and the description length is given by the     and use it to encode yt2+1:t3. This process contin-
+expectation                                               ues until the entire dataset has been transmitted.
+                                                          The resulting online codelength is
+Lvβar(y1:n|x1:n) =
+                                                                   Lonline(y1:n|x1:n) = t1 log2 K
+                                                       n
+                                                                         S−1
+= Eθ∼β log2α(θ) log2β(θ)+ log2 pθ(yi|xi)
+                                                                  − log2 pθi (yti+1:ti+1 |xti+1:ti+1 ). (3)
+                                                     i=1
+                                       n                                 i=1
+
+= KL(β α) Eθ∼β log2 pθ(yi|xi), (2)                           In this sequential evaluation, a model that per-
+                                                          forms well with a limited number of training ex-
+                                      i=1                 amples will be rewarded by having a shorter code-
+                                                          length (Alice will require fewer bits to transmit
+where β(θ) =  m    βi(θi)  is  a  distribution  encod-    the subsequent yti:ti+1 to Bob). The online code is
+              i=1                                         related to the area under the learning curve, which
+                                                          plots quality (in case of probes, accuracy) as a func-
+ing uncertainty about the parameter values. The           tion of the number of training examples. We will
+                                                          illustrate this in Section 3.2.
+distribution β(θ) is chosen by minimizing the code-
+                                                          2.3 Interpretations of Codelength
+length given in Expression (2). The formal jus-
+                                                          Connection to previous work. To get larger dif-
+tiﬁcation for the description length relies on the        ferences in scores compared to random baselines,
+                                                          previous work tried to (i) reduce size of a prob-
+bits-back argument (Hinton and von Cramp, 1993;           ing model and (ii) reduce the amount of a probe
+                                                          training data. Now we can see that these were in-
+Honkela and Valpola, 2004; MacKay, 2003). How-            direct ways to account for the ‘amount of effort’
+                                                          component of (i) variational and (ii) online codes,
+ever, the underlying intuition is straightforward:        respectively.
+
+parameters we are uncertain about can be transmit-        Online code and model size. While the online
+                                                          code does not incorporate model cost explicitly, we
+ted at a lower cost as the uncertainty can be used        can still evaluate model cost by interpreting the
+                                                          difference between the cross-entropy of the model
+to determine the required precision. The entropy          trained on all data and online codelength as the cost
+                                                          of the model. The former is codelength of the data
+term in Equation (2), H(β) = Eθ∼β log2 β(θ),              if one knows model parameters, the latter (online
+quantiﬁes this discount.                                  codelength) — if one does not know them. In
+                                                          Section 3.2 we will show that trends for model cost
+   The negated codelength −Lvβar(y1:n|x1:n) is            evaluated for the online code are similar to those
+known as the evidence-lower-bound (ELBO) and              for the variational code. It means that in terms of a
+
+used as the objective in variational inference. The           4In all experiments in this paper, the timesteps correspond
+                                                          to 0.1, 0.2, 0.4, 0.8, 1.6, 3.2, 6.25, 12.5, 25, 50, 100 percent of
+distribution β(θ) approximates the intractable pos-       the dataset.
+
+terior distribution p(θ|x1:n, y1:n). Consequently,
+any variational method can in principle be used to
+
+estimate the codelength.
+
+In our experiments, we use the network com-
+
+pression method of Louizos et al. (2017). Similarly
+
+to variational dropout (Molchanov et al., 2017),
+
+it uses sparsity-inducing priors on the parameters,
+
+pruning neurons from the probing classiﬁer as a
+
+byproduct of optimizing the ELBO. As a result we
+
+can assess the probe complexity both using its de-
+
+scription length KL(β α) and by inspecting the
+
+discovered architecture.
+
+2.2.2 Online (or Prequential) Code
+
+The online (or prequential) code (Rissanen, 1984)
+is a way to encode both the model and the labels
+without directly encoding the model weights. In
+
+                                                          186
+code, the ability of a probe to achieve good quality   focus only on the PoS tagging task, the task of as-
+using small amount of data or using a small probe      signing tags, such as noun, verb, and adjective, to
+architecture reﬂect the same property: the strength    individual word tokens. For the control task, for
+of the regularity in the data.                         each word type, a PoS tag is independently sam-
+                                                       pled from the empirical distribution of the tags in
+Which code to choose? In terms of implementa-          the linguistic data.
+tion, the online code uses a standard probe along
+with its training setting: it trains the probe on in-  Data. The pretrained model is the 5.5 billion-
+creasing subsets of the dataset. Using the varia-      word pre-trained ELMo (Peters et al., 2018).
+tional code requires changing (i) a probing model      The data comes from Penn Treebank (Marcus
+to a Bayesian model and (ii) the loss function to the  et al., 1993) with the traditional parsing train-
+corresponding variational loss (2) (i.e. adding the    ing/development/testing splits5 without extra pre-
+model KL term to the standard data cross-entropy).     processing. Table 7 shows dataset statistics.
+As we will show later, these methods agree in re-
+sults. Therefore, the choice of the method can be      Probes. The probe is MLP-2 of Hewitt and
+done depending on the preferences: the variational     Liang (2019) with the default hyperparame-
+code can be used to inspect the induced probe archi-   ters. Namely, it is a multi-layer perceptron
+tecture, but the online code is easier to implement.   with two hidden layers deﬁned as: yi ∼
+                                                       softmax(W3ReLU (W2ReLU (W1hi))); hidden
+3 Description Length and Control Tasks                 layer size h is 1000 and no dropout is used. Ad-
+                                                       ditionally, in the appendix, we provide results for
+Hewitt and Liang (2019) note that probe accuracy       both MLP-2 and MLP-1 for several h values: 1000,
+does not necessarily reveal if the representations     500, 250, 100, 50.
+encode the linguistic annotation or if the probe
+‘itself’ learned to predict this annotation. They in-     For the variational code, we replace dense layers
+troduce control tasks which associate word types       with the Bayesian compression layers from Louizos
+with random outputs, and each word token is as-        et al. (2017); the loss function changes to Eq. (2).
+signed its type’s output, regardless of context. By
+construction, such tasks can only be learned by        Optimizer. All of our probing models are trained
+the probe itself. The authors argue that selectivity,  with Adam (Kingma and Ba, 2015) with learning
+i.e. difference between linguistic task accuracy and   rate 0.001. With standard probes, we follow the
+control task accuracy, reveals how much the lin-       original paper (Hewitt and Liang, 2019) and anneal
+guistic probe relies on the regularities encoded in    the learning rate by a factor of 0.5 once the epoch
+the representations. They propose to tune probe hy-    does not lead to a new minimum loss on the devel-
+perparameters to maximize selectivity. In contrast,    opment set; we stop training when 4 such epochs
+we will show that MDL probes do not require such       occur in a row. With variational probes, we do
+tuning.                                                not anneal learning rate and train probes for 200
+                                                       epochs; long training is recommended to enable
+3.1 Experimental Setting                               pruning (Louizos et al., 2017).
+
+In all experiments, we use the data and follow the     3.2 Experimental Results
+setting of Hewitt and Liang (2019); we build on
+top of their code and release our extended version     Results are shown in Table 1.6
+to reproduce the experiments.
+                                                       Different compression methods, similar results.
+   In the main text, we use a probe with default       First, we see that both compression methods show
+hyperparameters which was a starting point in He-      similar trends in codelength. For the linguistic task,
+witt and Liang (2019) and was shown to have low        the best layer is the ﬁrst one. For the control task,
+selectivity. In the appendix, we provide results for   codes become larger as we move up from the em-
+10 different settings and show that, in contrast to    bedding layer; this is expected since the control
+accuracy, codelength is stable across settings.
+                                                           5As given by the code of Qi and Manning (2017) at
+Task: part of speech. Control tasks were de-           https://github.com/qipeng/arc-swift.
+signed for two tasks: part-of-speech (PoS) tagging
+and dependency edge prediction. In this work, we           6Accuracies can differ from the ones reported in Hewitt
+                                                       and Liang (2019): we report accuracy on the test set, while
+                                                       they – on the development set. Since the development set is
+                                                       used for stopping criteria, we believe that test scores are more
+                                                       reliable.
+
+187
+     Accuracy             Variational code                             Online code
+
+                     codelength compression codelength compression
+
+LAYER 0 93.7 / 96.3  163 / 267                          31.32 / 19.09  173 / 302  29.5 / 16.87
+LAYER 1 97.5 / 91.9  85 / 470                           59.76 / 10.85  96 / 515   53.06 / 9.89
+LAYER 2 97.3 / 89.4  103 / 612                          49.67 / 8.33   115 / 717  44.3 / 7.11
+
+Table 1: Experimental results (MLP-2, h = 1000); shown in pairs: linguistic task / control task. Codelength is
+measured in kbits (variational codelength is given in equation (2), online – in equation (3)). Accuracy is shown for
+the standard probe as in Hewitt and Liang (2019); for the variational probe, scores are similar (see Table 2).
+
+(a)                  (b)                                (c)                       (d) random seeds
+
+Figure 2: (a), (b): codelength split into data and model codes; (c): learning curves corresponding to online code
+(solid lines for linguistic task, dashed – for control); (d): results for 5 random seeds, linguistic task (for control
+task, see appendix).
+
+task measures the ability to memorize word type.        This is something that probe accuracy alone is not
+Note that codelengths for control tasks are substan-    able to reﬂect: representations have structure with
+tially larger than for the linguistic task (at least    respect to the linguistic labels and this structure
+twice larger). This again illustrates that description  can be ‘explained’ with a small model. The same
+length is preferable to probe accuracy: in contrast     representations do not have structure with respect
+to accuracy, codelength is able to distinguish these    to random labels, therefore these labels can be pre-
+tasks without any search for settings.                  dicted only using a larger model.
+
+LAYER 0: MDL is correct, accuracy is not.                  Using interpretation from Section 2.3 to split
+What is even more surprising, codelength identiﬁes      the online code into data and model codelength,
+the control task even when accuracy indicates the       we get Figure 2(b). The trends are similar to the
+opposite: for LAYER 0, accuracy for the control         ones with the variational code; but with the online
+task is higher, but the code is twice longer than for   code, the model component shows how easy it is
+the linguistic task. This is because codelength char-   to learn from small amount of data: if the represen-
+acterizes how hard it is to achieve this accuracy: for  tations have structure with respect to some labels,
+the control task, accuracy is higher, but the cost of   this structure can be revealed with a few training ex-
+achieving this score is very big. We will illustrate    amples. Figure 2(c) shows learning curves showing
+this later in this section.                             the difference between behavior of the linguistic
+                                                        and control tasks. In addition to probe accuracy,
+Embedding vs contextual: drastic difference.            such learning curves have also been used by Yo-
+For the linguistic task, note that codelength for       gatama et al. (2019) and Talmor et al. (2019).
+the embedding layer is approximately twice larger
+than that for the ﬁrst layer. Later in Section 4 we     Architecture: sparse for linguistic, dense for
+will see the same trends for several other tasks, and   control. The method for the variational code we
+will show that even contextualized representations      use, Bayesian compression of Louizos et al. (2017),
+obtained with a randomly initialized model are a        lets us assess the induced probe complexity not
+lot better than with the embedding layer alone.         only by using its description length (as we did
+                                                        above), but also by looking at the induced architec-
+Model: small for linguistic, large for control.         ture (Table 2). Probes learned for linguistic tasks
+Figure 2(a) shows data and model components of          are much smaller than those for control tasks, with
+the variational code. For control tasks, model size     only 33-75 neurons at the second and third layers.
+is several times larger than for the linguistic task.   This relates to the work by Hewitt and Liang (2019).
+
+                                188
+Layer Task Accuracy Final probe
+
+0  base  93.5  406-33-49
+
+   control 96.3 427-214-137
+
+1  base  97.7  664-55-35
+
+   control 92.2 824-272-260                              Figure 3: Results for 10 probe settings: accuracy is
+                                                         wrong for 8 out of 10 settings, MDL is always correct
+2  base  97.3  750-75-41                                 (for accuracy higher is better, for codelength – lower).
+
+   control 88.7 815-308-481                              in Figure 2(d). We see that using accuracy can lead
+                                                         to different rankings of layers depending on a ran-
+Table 2: Pruned architecture of a trained variational    dom seed, making it hard to draw conclusions about
+probe (starting probe: 1024-1000-1000).                  their relative qualities. For example, accuracy for
+                                                         LAYER 1 and LAYER 2 are 97.48 and 97.31 for seed
+The authors considered several predeﬁned probe           1, but 97.38 and 97.48 for seed 0. On the contrary,
+architectures and picked one of them based on a          the MDL results are stable and the scores given to
+manually deﬁned criterion. In contrast, the varia-       different layers are well separated.
+tional code gives probe architecture as a byproduct
+of training and does not need human guidance.               Note that for this ‘real’ task, where the true rank-
+                                                         ing of layers 1 and 2 is not known in advance, tun-
+3.3 Stability and Reliability of MDL Probes              ing a probe setting by maximizing difference with
+                                                         the synthetic control task (as done by Hewitt and
+Here we discuss stability of MDL results across          Liang (2019)) does not help: in the tuned setting,
+compression methods, underlying probing classi-          scores for these layers remain very close (e.g., 97.3
+ﬁer setting and random seeds.                            and 97.0 (Hewitt and Liang, 2019)).
+
+The two compression methods agree in results.            4 MDL and Random Models
+Note that the observed agreement in codelengths
+from different methods (Table 1) is rather surpris-      Now, from random labels for word types, we come
+ing: this contrasts to Blier and Ollivier (2018), who    to another type of random baselines: randomly
+experimented with images (MNIST, CIFAR-10)               initialized models. Probes using these represen-
+and argued that the variational code yields very         tations show surprisingly strong performance for
+poor compression bounds compared to online code.         both token (Zhang and Bowman, 2018) and sen-
+We can speculate that their results may be due to        tence (Wieting and Kiela, 2019) representations.
+the particular variational approach they use. The        This again conﬁrms that accuracy alone does not
+agreement between different codes is desirable and       reﬂect what a representation encodes. With MDL
+suggests sensibility and reliability of the results.     probes, we will see that codelength shows large dif-
+                                                         ference between trained and randomly initialized
+Hyperparameters: change results for accuracy,            representations.
+do not for MDL. While here we will discuss
+in detail results for the default settings, in the ap-      In this part, we also experiment with ELMo and
+pendix we provide results for 10 different settings;     compare it with a version of the ELMo model in
+for LAYER 0, results are given in Figure 3. We see       which all weights above the lexical layer (LAYER
+that accuracy can change greatly with the settings.      0) are replaced with random orthonormal matrices
+For example, difference in accuracy for linguistic       (but LAYER 0, is retained from trained ELMo). We
+and control tasks varies a lot; for LAYER 0 there        conduct a line of experiments using a suite of edge
+are settings with contradictory results: accuracy        probing tasks (Tenney et al., 2019). In these tasks, a
+can be higher either for the linguistic or for the       probe can access only representations within given
+control task depending on the settings (Figure 3).       spans, such as a predicate-argument pair, and must
+In striking contrast to accuracy, MDL results are        predict properties, such as semantic roles.
+stable across settings, thus MDL does not require
+search for probe settings.                                  We build our experiments on top of the original
+                                                         code by Tenney et al. (2019) and release our ex-
+Random seed: affects accuracy but not MDL.               tended version. Examples for each task are shown
+We evaluated results from Table 1 for random seeds       in Table 3; more details on dataset statistics, probe
+from 0 to 4; for the linguistic task, results are shown  architecture and optimization are in the appendix.
+
+                                                       189
+Part-of-speech        I want to ﬁnd more , [something] bigger or deeper . −→ NN (Noun)
+Constituents          I want to ﬁnd more , [something bigger or deeper] . −→ NP (Noun Phrase)
+Dependencies          [I]1 am not [sure]2 how reliable that is , though . −→ nsubj (nominal subject)
+Entities              The most fascinating is the maze known as [Wind Cave] . −→ LOC
+SRL                   I want to [ﬁnd]1 [more , something bigger or deeper]2 . −→ Agr1 (Agent)
+Coreference           So [the followers]1 waited to say anything about what [they]2 saw . −→ True
+Rel. (SemEval)        The [shaman]1 cured him with [herbs]2 . −→ Instrument-Agency(e2, e1)
+
+                Table 3: Examples of sentences, spans, and target labels for each task.
+
+                Accuracy   Variational code              Online code
+
+                           codelength compression codelength compression
+
+Part-of-speech
+
+LAYER 0         91.3          483     23.4            462          24.5
+                           209 / 273                            58.8 / 38.5
+LAYER 1 97.8 / 95.7        252 / 273  54.0 / 41.4 192 / 294     52.3 / 38.5
+
+LAYER 2 97.5 / 95.7                   44.7 / 41.4 216 / 294
+
+Constituents
+
+LAYER 0         75.9         1181     7.5             1149         7.7
+                           603 / 877                            15.6 / 8.2
+LAYER 1 86.4 / 77.6        719 / 875  14.7 / 10.1 570 / 1081    13.1 / 8.3
+
+LAYER 2 85.1 / 77.6                   12.3 / 10.1 680 / 1074
+
+Dependencies
+
+LAYER 0         80.9         158          7.1           175        6.4
+                           80 / 103   14.0 / 10.8     74 / 106  15.1 / 10.5
+LAYER 1 94.0 / 90.3        94 / 103   11.9 / 10.8     82 / 106  13.7 / 10.6
+
+LAYER 2 92.8 / 90.4
+
+Entities         92.3        40          13.2           40         13.1
+  LAYER 0     95.0 / 93.5  27 / 34    19.3 / 15.4     27 / 35   19.8 / 15.1
+  LAYER 1     95.3 / 93.6  30 / 34    17.7 / 15.2     26 / 35   19.9 / 15.1
+  LAYER 2
+
+SRL              81.1         411     8.6             381          9.3
+  LAYER 0     91.9 / 84.4  228 / 306                            16.7 / 9.7
+  LAYER 1     90.2 / 84.5  272 / 306  15.5 / 11.5 212 / 365     14.4 / 9.7
+  LAYER 2
+                                      13.0 / 11.6 245 / 363
+
+Coreference      89.9      57.4       3.54              60         3.4
+  LAYER 0     92.9 / 90.7                             51 / 65   4.0 / 3.1
+  LAYER 1     92.2 / 90.4  50.3 / 54.5 4.04 / 3.72    55 / 65   3.7 / 3.1
+  LAYER 2
+                           56.8 / 54.3 3.57 / 3.74
+
+Rel. (SemEval)
+
+LAYER 0         55.8         11.5     2.48            15.9        1.79
+                           8.0 / 9.7                            3.2 / 2.4
+LAYER 1 75.2 / 69.1        8.4 / 9.7  3.56 / 2.94 8.8 / 11.8    3.3 / 2.4
+
+LAYER 2 77.0 / 68.9                   3.40 / 2.92 8.6 / 11.7
+
+Table 4: Results are shown in pairs: trained / randomly initialized model. Code- Table 5: Data and model
+length is measured in kbits (variational codelength is given in equation (2), on- code components for the
+line – in (3)), compression – with respect to the corresponding uniform code. tasks from Table 4.
+
+4.1 Experimental Results                                 enough information about the task, i.e., MI be-
+                                                         tween labels and context-agnostic representations
+Results are shown in Table 4.                            is smaller than between labels and contextualized
+                                                         representations. Since compression of the labels
+LAYER 0 vs contextual. As we have already                given model (i.e., data component of the code) is
+seen in the previous section, codelength shows dras-     limited by the MI between the representations and
+tic difference between the embedding layer (LAYER        the labels (Section 2.1), the data component of the
+0) and contextualized representations: codelengths       codelength is much bigger for the embedding layer
+differ about twice for most of the tasks. Both com-      than for contextualized representations.
+pression methods show that even for the randomly
+initialized model, contextualized representations        Trained vs random. As expected, codelengths
+are better than lexical representations. This is be-     for the randomly initialized model are larger than
+cause context-agnostic embeddings do not contain
+
+                                                    190
+for the trained one. This is more prominent when       or in QA settings (Radford et al., 2019; Petroni
+not just looking at the bare scores, but compar-       et al., 2019; Poerner et al., 2019; Jiang et al., 2019).
+ing compression against context-agnostic repre-        An information-theoretic view on analysis of NLP
+sentations. For all tasks, compression bounds for      models has been previously attempted in Voita et al.
+the randomly initialized model are closer to those     (2019a) when explaining how representations in the
+of context-agnostic LAYER 0 than representations       Transformer evolve between layers under different
+from the trained model. This shows that gain from      training objectives.
+using context for the randomly initialized model is
+at least twice smaller than for the trained model.        In context of probing, Pimentel et al. (2020) at-
+                                                       tempted to formalize probing for linguistic struc-
+   Note also that randomly initialized layers do not   ture from the information-theoretic perspective.
+evolve: for all tasks, MDL for layers of the ran-      The authors measure mutual information between
+domly initialized model is the same. Moreover,         representations and labels, and argue the impor-
+Table 5 shows that not only total codelength but       tance of deﬁning and taking into account “ease of
+data and model components of the code for random       extraction”, though they do not formalize this no-
+model layers are also identical. For the trained       tion. That work can serve as an additional motiva-
+model, this is not the case: LAYER 2 is worse than     tion for using MDL. Namely, minimum description
+LAYER 1 for all tasks. This is one more illustra-      length is the sum of (i) the data codelength, which
+tion of the general process explained in Voita et al.  is related to mutual information, and (ii) the model
+(2019a): the way representations evolve between        codelength, which measures “the amount of effort”
+layers is deﬁned by the training objective. For the    needed to extract labels from representations; in
+randomly initialized model, since no training ob-      Pimentel et al. (2020), this is referred to as “ease
+jective has been optimized, no evolution happens.      of extraction”.
+
+5 Related work                                         6 Conclusions
+
+Probing classiﬁers are the most common approach        We propose information-theoretic probing which
+for associating representations with linguistic prop-  measures minimum description length (MDL) of
+erties (see Belinkov and Glass (2019) for a survey).   labels given representations. We show that MDL
+Among the works highlighting limitations of stan-      naturally characterizes not only probe quality, but
+dard probes (not mentioned above) is the work by       also ‘the amount of effort’ needed to achieve it (or,
+Saphra and Lopez (2019), who show that probes          intuitively, strength of the regularity in representa-
+are not suitable for analyzing learning dynamics.      tions with respect to the labels); this is done in a
+                                                       theoretically justiﬁed way without manual search
+   In addition to task performance, learning curves    for settings. We explain how to easily measure
+have also been used before by Yogatama et al.          MDL on top of standard probe-training pipelines.
+(2019) to evaluate how quickly a model learns a        We show that results of MDL probing are more
+new task, and by Talmor et al. (2019) to understand    sensible compared to standard probes.
+whether the performance of a LM on a task should
+be attributed to the pre-trained representations or    Acknowledgments
+to the process of ﬁne-tuning on the task data.
+                                                       The work is partially supported by the European
+   Other methods for analyzing NLP models in-          Research Council (ERC StG BroadSem 678254)
+clude (i) inspecting the mechanisms a model uses       and the Dutch National Science Foundation (NWO
+to encode information, e.g. attention weights (Voita   VIDI 639.022.518).
+et al., 2018; Raganato and Tiedemann, 2018; Voita
+et al., 2019b; Clark et al., 2019; Kovaleva et al.,    References
+2019) or individual neurons (Karpathy et al., 2015;
+Pham et al., 2016; Bau et al., 2019), (ii) look-       Anthony Bau, Yonatan Belinkov, Hassan Sajjad, Nadir
+ing at model predictions using manually deﬁned            Durrani, Fahim Dalvi, and James Glass. 2019. Iden-
+templates, either evaluating sensitivity to speciﬁc       tifying and controlling important neurons in neural
+grammatical errors (Linzen et al., 2016; Gulordava        machine translation. In International Conference on
+et al., 2018; Tran et al., 2018; Marvin and Linzen,       Learning Representations, New Orleans.
+2018) or understanding what language models
+know when applying them as knowledge bases             Yonatan Belinkov and James Glass. 2019. Analysis
+                                                          methods in neural language processing: A survey.
+
+191
+   Transactions of the Association for Computational     Zhengbao Jiang, Frank F Xu, Jun Araki, and Graham
+   Linguistics, 7:49–72.                                    Neubig. 2019. How can we know what language
+                                                            models know? arXiv preprint arXiv:1911.12543.
+Léonard Blier and Yann Ollivier. 2018. The descrip-
+   tion length of deep learning models. In Advances      Andrej Karpathy, Justin Johnson, and Li Fei-Fei. 2015.
+   in Neural Information Processing Systems, pages          Visualizing and understanding recurrent networks.
+   2216–2226.                                               arXiv preprint arXiv:1506.02078.
+
+Ciprian Chelba, Tomas Mikolov, Mike Schuster, Qi Ge,     Diederik Kingma and Jimmy Ba. 2015. Adam: A
+   Thorsten Brants, Phillipp Koehn, and Tony Robin-         method for stochastic optimization. In Proceedings
+   son. 2014. One billion word benchmark for mea-           of the International Conference on Learning Repre-
+   suring progress in statistical language modeling. In     sentation (ICLR 2015).
+   Fifteenth Annual Conference of the International
+   Speech Communication Association.                     Olga Kovaleva, Alexey Romanov, Anna Rogers, and
+                                                            Anna Rumshisky. 2019. Revealing the dark secrets
+Kevin Clark, Urvashi Khandelwal, Omer Levy, and             of BERT. In Proceedings of the 2019 Conference on
+   Christopher D. Manning. 2019. What does BERT             Empirical Methods in Natural Language Processing
+   look at? an analysis of BERT’s attention. In Pro-        and the 9th International Joint Conference on Natu-
+   ceedings of the 2019 ACL Workshop BlackboxNLP:           ral Language Processing (EMNLP-IJCNLP), pages
+   Analyzing and Interpreting Neural Networks for           4365–4374, Hong Kong, China. Association for
+   NLP, pages 276–286, Florence, Italy. Association         Computational Linguistics.
+   for Computational Linguistics.
+                                                         Kenton Lee, Luheng He, Mike Lewis, and Luke Zettle-
+Jacob Devlin, Ming-Wei Chang, Kenton Lee, and               moyer. 2017. End-to-end neural coreference reso-
+   Kristina Toutanova. 2019. BERT: Pre-training of          lution. In Proceedings of the 2017 Conference on
+   deep bidirectional transformers for language under-      Empirical Methods in Natural Language Processing,
+   standing. In Proceedings of the 2019 Conference          pages 188–197, Copenhagen, Denmark. Association
+   of the North American Chapter of the Association         for Computational Linguistics.
+   for Computational Linguistics: Human Language
+   Technologies, Volume 1 (Long and Short Papers),       Tal Linzen, Emmanuel Dupoux, and Yoav Goldberg.
+   pages 4171–4186, Minneapolis, Minnesota. Associ-         2016. Assessing the ability of lstms to learn syntax-
+   ation for Computational Linguistics.                     sensitive dependencies. Transactions of the Associa-
+                                                            tion for Computational Linguistics, 4:521–535.
+Peter Grunwald. 2004. A tutorial introduction to
+   the minimum description length principle. arXiv       Christos Louizos, Karen Ullrich, and Max Welling.
+   preprint math/0406077.                                   2017. Bayesian compression for deep learning. In
+                                                            Advances in Neural Information Processing Systems,
+Kristina Gulordava, Piotr Bojanowski, Edouard Grave,        pages 3288–3298.
+   Tal Linzen, and Marco Baroni. 2018. Colorless
+   green recurrent networks dream hierarchically. In     David JC MacKay. 2003. Information theory, infer-
+   Proceedings of the 2018 Conference of the North          ence and learning algorithms. Cambridge university
+   American Chapter of the Association for Computa-         press.
+   tional Linguistics: Human Language Technologies,
+   Volume 1 (Long Papers), pages 1195–1205. Associ-      Mitchell P. Marcus, Beatrice Santorini, and Mary Ann
+   ation for Computational Linguistics.                     Marcinkiewicz. 1993. Building a large annotated
+                                                            corpus of English: The Penn Treebank. Computa-
+John Hewitt and Percy Liang. 2019. Designing and            tional Linguistics, 19(2):313–330.
+   interpreting probes with control tasks. In Proceed-
+   ings of the 2019 Conference on Empirical Methods      Rebecca Marvin and Tal Linzen. 2018. Targeted syn-
+   in Natural Language Processing and the 9th Inter-        tactic evaluation of language models. In Proceed-
+   national Joint Conference on Natural Language Pro-       ings of the 2018 Conference on Empirical Methods
+   cessing (EMNLP-IJCNLP), pages 2733–2743, Hong            in Natural Language Processing, pages 1192–1202,
+   Kong, China. Association for Computational Lin-          Brussels, Belgium. Association for Computational
+   guistics.                                                Linguistics.
+
+GE Hinton and D von Cramp. 1993. Keeping neu-            Dmitry Molchanov, Arsenii Ashukha, and Dmitry
+   ral networks simple by minimising the description        Vetrov. 2017. Variational dropout sparsiﬁes deep
+   length of weights. In Proceedings of COLT-93,            neural networks. In Proceedings of the 34th Inter-
+   pages 5–13.                                              national Conference on Machine Learning.
+
+Antti Honkela and Harri Valpola. 2004. Variational       Matthew Peters, Mark Neumann, Mohit Iyyer, Matt
+   learning and bits-back coding: an information-           Gardner, Christopher Clark, Kenton Lee, and Luke
+   theoretic view to bayesian learning. In IEEE Trans-      Zettlemoyer. 2018. Deep contextualized word rep-
+   actions on Neural Networks, volume 15, pages 800–        resentations. In Proceedings of the 2018 Confer-
+   810.                                                     ence of the North American Chapter of the Associ-
+                                                            ation for Computational Linguistics: Human Lan-
+                                                            guage Technologies, Volume 1 (Long Papers), pages
+
+192
+   2227–2237, New Orleans, Louisiana. Association         Alon Talmor, Yanai Elazar, Yoav Goldberg, and
+   for Computational Linguistics.                            Jonathan Berant. 2019. olmpics – on what lan-
+                                                             guage model pre-training captures. arXiv preprint
+Fabio Petroni, Tim Rocktäschel, Sebastian Riedel,            arXiv:1912.13283.
+   Patrick Lewis, Anton Bakhtin, Yuxiang Wu, and
+   Alexander Miller. 2019. Language models as knowl-      Ian Tenney, Patrick Xia, Berlin Chen, Alex Wang,
+   edge bases? In Proceedings of the 2019 Confer-            Adam Poliak, R Thomas McCoy, Najoung Kim,
+   ence on Empirical Methods in Natural Language             Benjamin Van Durme, Samuel R Bowman, Dipan-
+   Processing and the 9th International Joint Confer-        jan Das, et al. 2019. What do you learn from con-
+   ence on Natural Language Processing (EMNLP-               text? probing for sentence structure in contextual-
+   IJCNLP), pages 2463–2473, Hong Kong, China. As-           ized word representations. In International Confer-
+   sociation for Computational Linguistics.                  ence on Learning Representations.
+
+Ngoc-Quan Pham, German Kruszewski, and Gemma              Ke Tran, Arianna Bisazza, and Christof Monz. 2018.
+   Boleda. 2016. Convolutional neural network lan-           The importance of being recurrent for modeling hi-
+   guage models. In Proceedings of the 2016 Con-             erarchical structure. In Proceedings of the 2018
+   ference on Empirical Methods in Natural Language          Conference on Empirical Methods in Natural Lan-
+   Processing, pages 1153–1162, Austin, Texas. Asso-         guage Processing, pages 4731–4736, Brussels, Bel-
+   ciation for Computational Linguistics.                    gium. Association for Computational Linguistics.
+
+Tiago Pimentel, Josef Valvoda, Rowan Hall Maudslay,       Elena Voita, Rico Sennrich, and Ivan Titov. 2019a. The
+   Ran Zmigrod, Adina Williams, and Ryan Cotterell.          bottom-up evolution of representations in the trans-
+   2020. Information-theoretic probing for linguistic        former: A study with machine translation and lan-
+   structure. In Proceedings of the 58th Annual Meet-        guage modeling objectives. In Proceedings of the
+   ing of the Association for Computational Linguistics,     2019 Conference on Empirical Methods in Natu-
+   pages 4609–4622, Online. Association for Computa-         ral Language Processing and the 9th International
+   tional Linguistics.                                       Joint Conference on Natural Language Processing
+                                                             (EMNLP-IJCNLP), pages 4396–4406, Hong Kong,
+Nina Poerner, Ulli Waltinger, and Hinrich Schütze.           China. Association for Computational Linguistics.
+   2019. Bert is not a knowledge base (yet): Fac-
+   tual knowledge vs. name-based reasoning in unsu-       Elena Voita, Pavel Serdyukov, Rico Sennrich, and Ivan
+   pervised qa. arXiv preprint arXiv:1911.03681.             Titov. 2018. Context-aware neural machine trans-
+                                                             lation learns anaphora resolution. In Proceedings
+Peng Qi and Christopher D. Manning. 2017. Arc-swift:         of the 56th Annual Meeting of the Association for
+   A novel transition system for dependency parsing.         Computational Linguistics (Volume 1: Long Papers),
+   In Proceedings of the 55th Annual Meeting of the As-      pages 1264–1274, Melbourne, Australia. Associa-
+   sociation for Computational Linguistics (Volume 2:        tion for Computational Linguistics.
+   Short Papers), pages 110–117, Vancouver, Canada.
+   Association for Computational Linguistics.             Elena Voita, David Talbot, Fedor Moiseev, Rico Sen-
+                                                             nrich, and Ivan Titov. 2019b. Analyzing multi-head
+Alec Radford, Jeffrey Wu, Rewon Child, David Luan,           self-attention: Specialized heads do the heavy lift-
+   Dario Amodei, and Ilya Sutskever. 2019. Language          ing, the rest can be pruned. In Proceedings of the
+   models are unsupervised multitask learners. OpenAI        57th Annual Meeting of the Association for Com-
+   Blog, 1(8):9.                                             putational Linguistics, pages 5797–5808, Florence,
+                                                             Italy. Association for Computational Linguistics.
+Alessandro Raganato and Jörg Tiedemann. 2018. An
+   analysis of encoder representations in transformer-    John Wieting and Douwe Kiela. 2019. No train-
+   based machine translation. In Proceedings of the          ing required: Exploring random encoders for sen-
+   2018 EMNLP Workshop BlackboxNLP: Analyzing                tence classiﬁcation. In International Conference on
+   and Interpreting Neural Networks for NLP, pages           Learning Representations.
+   287–297, Brussels, Belgium. Association for Com-
+   putational Linguistics.                                Dani Yogatama, Cyprien de Masson d’Autume, Jerome
+                                                             Connor, Tomas Kocisky, Mike Chrzanowski, Ling-
+Jorma Rissanen. 1984. Universal coding, information,         peng Kong, Angeliki Lazaridou, Wang Ling, Lei
+   prediction, and estimation. IEEE Transactions on          Yu, Chris Dyer, and Phil Blunsom. 2019. Learning
+   Information theory, 30(4):629–636.                        and evaluating general linguistic intelligence. arXiv
+                                                             preprint arXiv:1901.11373.
+Naomi Saphra and Adam Lopez. 2019. Understand-
+   ing learning dynamics of language models with          Kelly Zhang and Samuel Bowman. 2018. Language
+   SVCCA. In Proceedings of the 2019 Conference              modeling teaches you more than translation does:
+   of the North American Chapter of the Association          Lessons learned through auxiliary syntactic task
+   for Computational Linguistics: Human Language             analysis. In Proceedings of the 2018 EMNLP Work-
+   Technologies, Volume 1 (Long and Short Papers),           shop BlackboxNLP: Analyzing and Interpreting Neu-
+   pages 3257–3267, Minneapolis, Minnesota. Associ-          ral Networks for NLP, pages 359–361, Brussels, Bel-
+   ation for Computational Linguistics.                      gium. Association for Computational Linguistics.
+
+193
+A Description Length and Control Tasks
+
+Accuracy  Description Length
+
+          variational code online code
+
+          codelength compr. codelength compr.
+
+MLP-2, h=1000                                30 / 17      Figure 4: Results for 5 random seeds, control task (de-
+L 0 93.7 / 96.3 163 / 267 32 / 19 173 / 302  53 / 10      fault setting: MLP-2, h = 1000).
+L 1 97.5 / 91.9 85 / 470 60 / 11 96 / 515    44 / 7
+L 2 97.3 / 89.4 103 / 612 50 / 8 115 / 717                B MDL and Random Models
+
+MLP-2, h=500                                              B.1 Experimental Setting
+L 0 93.5 / 96.2 161 / 268 32 / 19 170 / 313 30 / 16
+L 1 97.8 / 92.1 84 / 470 61 / 11 93 / 547 55 / 9          Tasks and datasets. We focus on several core
+L 2 97.1 / 86.5 102 / 611 50 / 8 112 / 755 46 / 7         NLP tasks: PoS tagging, syntactic constituent and
+                                                          dependency labeling, named entity recognition, se-
+MLP-2, h=250                                              mantic role labeling, coreference resolution, and
+L 0 93.6 / 96.1 161 / 274 32 / 19 169 / 328 30 / 16       relation classiﬁcation. Examples for each task are
+L 1 97.7 / 90.3 84 / 470 61 / 11 91 / 582 56 / 9          shown in Table 3, dataset statistics are in Table 8.
+L 2 97.1 / 85.2 101 / 611 50 / 8 112 / 799 46 / 6         See extra details in Tenney et al. (2019).
+
+MLP-2, h=100                                                 We follow Tenney et al. (2019) and use
+L 0 93.7 / 95.5 161 / 261 32 / 20 167 / 367 31 / 14       ELMo (Peters et al., 2018) trained on the Billion
+L 1 97.6 / 86.9 84 / 492 61 / 10 91 / 678 56 / 8          Word Benchmark dataset (Chelba et al., 2014).
+L 2 97.2 / 80.9 102 / 679 50 / 8 112 / 901 46 / 6
+                                                          Probes and optimization. Probing architecture
+MLP-2, h=50                                               is illustrated in Figure 5. It takes a list of con-
+L 0 93.7 / 93.1 161 / 314 32 / 16 166 / 416 31 / 12       textual vectors [e0, e1, . . . , en] and integer spans
+L 1 97.6 / 82.7 84 / 605 61 / 8 93 / 781 55 / 7           s1 = [i1, j1) and (optionally) s2 = [i2, j2) as in-
+L 2 97.0 / 76.2 102 / 833 50 / 6 116 / 1007 44 / 5        puts, and uses a projection layer followed by the
+                                                          self-attention pooling operator of Lee et al. (2017)
+MLP-1, h=1000                                             to compute ﬁxed-length span representations. The
+L 0 93.7 / 96.8 160 / 254 32 / 20 166 / 275 31 / 19       span representations are concatenated and fed into
+L 1 97.7 / 92.7 82 / 468 62 / 11 88 / 477 58 / 11         a two-layer MLP followed by a softmax output
+L 2 97.0 / 86.7 100 / 618 51 / 8 107 / 696 48 / 7         layer. As in the original paper, we use the standard
+                                                          cross-entropy loss, hidden layer size of 256 and
+MLP-1, h=500                                              dropout of 0.3. For further details on training, we
+L 0 93.6 / 97.2 159 / 257 32 / 20 164 / 295 31 / 17       refer the reader to the original paper by Tenney
+L 1 97.5 / 91.6 82 / 468 62 / 11 88 / 516 58 / 10         et al. (2019).7
+L 2 97.0 / 86.3 100 / 619 51 / 8 107 / 736 48 / 7
+                                                             For the variational code, the layers are replaced
+MLP-1, h=250                                              with that of Bayesian compression by Louizos et al.
+L 0 93.6 / 96.6 159 / 257 32 / 20 164 / 316 31 / 16       (2017); loss function changes to (2) and no dropout
+L 1 97.5 / 89.9 82 / 473 62 / 11 87 / 574 58 / 9          is used. Similar to the experiments in the previous
+L 2 97.1 / 84.2 99 / 632 51 / 8 109 / 795 47 / 6          section, we do not anneal learning rate and train at
+                                                          least 200 validations to enable pruning.
+MLP-1, h=100
+L 0 93.7 / 95.3 159 / 269 32 / 19 163 / 374 31 / 14          We build our experiments on top of the origi-
+L 1 97.6 / 86.4 82 / 525 62 / 10 87 / 683 58 / 8          nal code by Tenney et al. (2019) and release our
+L 2 97.1 / 80.0 100 / 731 51 / 7 109 / 905 47 / 6         extended version.
+
+MLP-1, h=50                                                   7The differences with the original implementation by Ten-
+L 0 93.7 / 92.7 159 / 336 32 / 15 164 / 438 31 / 11       ney et al. (2019) are: softmax with the cross-entropy loss
+L 1 97.6 / 82.0 82 / 648 62 / 8 90 / 790 56 / 7           instead of sigmoid with binary cross-entropy, using the loss
+L 2 97.2 / 75.0 100 / 875 51 / 6 114 / 1016 45 / 5        instead of F1 in the early stopping criterion.
+
+Table 6: Experimental results; shown in pairs: linguis-
+tic task / control task. Codelength is measured in kbits
+(variational codelength is given in equation (2), online
+– in equation (3)). h is the probe hidden layer size.
+
+A.1 Results for Different Settings
+Results are given in Table 6.
+
+A.2 Results for Random Seeds: Control Task
+Results are shown in Figure 4.
+
+                                                      194
+                            Labels Number of sentences Number of targets
+       Part-of-speech 45 39832 / 1700 / 2416 950028 / 40117 / 56684
+Table 7: Dataset statistics. Numbers of sentences and targets are given for train / dev / test sets.
+
+                 Labels Number of sentences                          Number of targets
+
+Part-of-speech 48 115812 / 15680 / 12217 2070382 / 290013 / 212121
+
+Constituents     30 115812 / 15680 / 12217 1851590 / 255133 / 190535
+
+Dependencies     49  12522 / 2000 / 2075                             203919 / 25110 / 25049
+
+Entities         18 115812 / 15680 / 12217 128738 / 20354 / 12586
+
+SRL              66 253070 / 35297 / 26715 598983 / 83362 / 61716
+
+Coreference      2 115812 / 15680 / 12217 207830 / 26333 / 27800
+
+Rel. (SemEval) 19    6851 / 1149 / 2717                              6851 / 1149 / 2717
+
+Table 8: Dataset statistics. Numbers of sentences and targets are given for train / dev / test sets.
+
+                                                                     Accuracy Final probe
+
+                                                            layer 0  75.61 976-47-242
+                                                               base
+
+                                                            layer 1  86.01  1011-53-227
+                                                               base  81.35  1001-57-235
+
+                                                             random
+
+Figure 5: Probing model architecture for an edge prob-      layer 2  84.36  985-61-238
+ing task. The example is for semantic role labeling; for       base  81.42  971-57-234
+PoS, NER and constituents, only a single span is used.
+                                                             random
+
+B.2 Pruned Probe Architectures                              Table 10: Pruned architecture of a trained variational
+                                                            probe, constituent labeling (starting probe: 1024-256-
+For each task, we provide pruned architecture of            256).
+trained variational probes in Tables 9-15.
+
+         Accuracy Final probe
+
+layer 0   91.31 728-31-154                                           Accuracy Final probe
+   base
+
+layer 1   97.7   878-42-172                                 layer 0  80.11 (423+356)-36-119
+   base   96.76  876-50-228                                    base
+
+ random                                                     layer 1
+                                                               base
+layer 2   97.32  872-50-211                                          92.3   (682+565)-38-85
+   base   96.76  929-47-229                                  random  89.86  (635+548)-40-98
+
+ random                                                     layer 2
+                                                               base
+Table 9: Pruned architecture of a trained variational                90.6   (581+422)-42-104
+probe, Part of Speech (starting probe: 1024-256-256).        random  89.96  (646+538)-38-94
+
+                                                          Table 11: Pruned architecture of a trained vari-
+                                                          ational probe, dependency labeling (starting probe:
+                                                          (1024+1024)-512-256).
+
+                                                       195
+         Accuracy Final probe
+
+layer 0
+
+base     91.7   450-16-36
+
+layer 1  94.95  509-16-35
+   base  93.36  551-18-36
+
+ random
+
+layer 2  94.93  527-17-41
+   base  93.57  536-18-34
+
+ random
+
+Table 12: Pruned architecture of a trained variational
+probe, named entity recognition (starting probe: 1024-
+256-256).
+
+         Accuracy Final probe                                    Accuracy Final probe
+
+layer 0  79.1 (567+754)-46-158                          layer 0  48.77 (138+137)-10-14
+   base                                                    base
+
+layer 1  90.25  (709+937)-48-140                        layer 1  71.07  (116+178)-16-17
+   base  86.59  (678+857)-55-148                           base  60.73  (168+135)-15-15
+
+ random                                                  random
+
+layer 2  88.5   (601+863)-52-142                        layer 2  71.59  (123+164)-14-18
+   base  86.34  (744+889)-53-151                           base  60.69  (167+125)-13-15
+
+ random                                                  random
+
+Table 13: Pruned architecture of a trained varia-       Table 15: Pruned architecture of a trained varia-
+tional probe, semantic role labeling (starting probe:   tional probe, relation classiﬁcation (starting probe:
+(1024+1024)-512-256).                                   (1024+1024)-512-256).
+
+         Accuracy Final probe
+
+layer 0  88.87 (358+352)-16-20
+   base
+
+layer 1  91.6   (497+492)-20-22
+   base  90.35  (363+357)-23-21
+
+ random
+
+layer 2  90.29  (519+505)-18-19
+   base  90.45  (375+377)-21-21
+
+ random
+
+Table 14: Pruned architecture of a trained varia-
+tional probe, coreference resolution (starting probe:
+(1024+1024)-512-256).
+
+                                  196
+

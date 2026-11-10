@@ -1,0 +1,366 @@
+GQA: Training Generalized Multi-Query Transformer Models from
+                            Multi-Head Checkpoints
+
+                   Joshua Ainslie,∗ James Lee-Thorp,∗ Michiel de Jong∗ †
+                  Yury Zemlyanskiy, Federico Lebrón, Sumit Sanghai
+
+                                 Google Research
+
+                      Abstract                                show that language model checkpoints with multi-
+                                                              head attention (MHA) can be uptrained (Komat-
+     Multi-query attention (MQA), which only                  suzaki et al., 2022) to use MQA with a small frac-
+     uses a single key-value head, drastically                tion of original training compute. This presents a
+     speeds up decoder inference. However, MQA                cost-effective method to obtain fast multi-query as
+     can lead to quality degradation, and moreover            well as high-quality MHA checkpoints.
+     it may not be desirable to train a separate
+     model just for faster inference. We (1) propose             Second, we propose grouped-query attention
+     a recipe for uptraining existing multi-head lan-         (GQA), an interpolation between multi-head and
+     guage model checkpoints into models with                 multi-query attention with single key and value
+     MQA using 5% of original pre-training com-               heads per subgroup of query heads. We show that
+     pute, and (2) introduce grouped-query atten-             uptrained GQA achieves quality close to multi-
+     tion (GQA), a generalization of multi-query at-          head attention while being almost as fast as multi-
+     tention which uses an intermediate (more than            query attention.
+     one, less than number of query heads) number
+     of key-value heads. We show that uptrained               2 Method
+     GQA achieves quality close to multi-head at-
+     tention with comparable speed to MQA.                    2.1 Uptraining
+                                                              Generating a multi-query model from a multi-head
+1 Introduction                                                model takes place in two steps: ﬁrst, converting the
+                                                              checkpoint, and second, additional pre-training to
+Autoregressive decoder inference is a severe bottle-          allow the model to adapt to its new structure. Fig-
+neck for Transformer models due to the memory                 ure 1 shows the process for converting a multi-head
+bandwidth overhead from loading decoder weights               checkpoint into a multi-query checkpoint. The pro-
+and all attention keys and values at every decod-             jection matrices for key and value heads are mean
+ing step (Shazeer, 2019; Pope et al., 2022; de Jong           pooled into single projection matrices, which we
+et al., 2022). The memory bandwidth from loading              ﬁnd works better than selecting a single key and
+keys and values can be sharply reduced through                value head or randomly initializing new key and
+multi-query attention (Shazeer, 2019), which uses             value heads from scratch.
+multiple query heads but single key and value
+heads.                                                        Figure 1: Overview of conversion from multi-head to
+                                                              multi-query attention. Key and value projection matri-
+   However, multi-query attention (MQA) can lead              ces from all heads are mean pooled into a single head.
+to quality degradation and training instability, and
+it may not be feasible to train separate models                  The converted checkpoint is then pre-trained for
+optimized for quality and inference. Moreover,
+while some language models already use multi-
+query attention, such as PaLM (Chowdhery et al.,
+2022), many do not, including publicly available
+language models such as T5 (Raffel et al., 2020)
+and LLaMA (Touvron et al., 2023).
+
+   This work contains two contributions for faster
+inference with large language models. First, we
+
+     ∗Equal contribution.
+     †University of Southern California. Work done at Google
+Research.
+
+                                                    4895
+
+Proceedings of the 2023 Conference on Empirical Methods in Natural Language Processing, pages 4895–4901
+                       December 6-10, 2023 ©2023 Association for Computational Linguistics
+Figure 2: Overview of grouped-query method. Multi-head attention has H query, key, and value heads. Multi-query
+attention shares single key and value heads across all query heads. Grouped-query attention instead shares single
+key and value heads for each group of query heads, interpolating between multi-head and multi-query attention.
+
+a small proportion α of its original training steps    et al., 2022); GQA removes the waste from such
+on the same pre-training recipe.                       partitioning. Therefore, we expect GQA to present
+                                                       a particularly good trade-off for larger models.
+2.2 Grouped-query attention
+                                                          We note that GQA is not applied to the encoder
+Grouped-query attention divides query heads into       self-attention layers; encoder representations are
+G groups, each of which shares a single key head       computed in parallel, and memory bandwidth is
+and value head. GQA-G refers to grouped-query          therefore generally not the primary bottleneck.
+with G groups. GQA-1, with a single group and
+therefore single key and value head, is equivalent to  3 Experiments
+MQA, while GQA-H, with groups equal to number
+of heads, is equivalent to MHA. Figure 2 shows a       3.1 Experimental setup
+comparison of grouped-query attention and multi-
+head/multi-query attention. When converting a          Conﬁgurations All models are based on the
+multi-head checkpoint to a GQA checkpoint, we          T5.1.1 architecture (Raffel et al., 2020), im-
+construct each group key and value head by mean-       plemented with JAX (Bradbury et al., 2018),
+pooling all the original heads within that group.      Flax (Heek et al., 2020), and Flaxformer1. For
+                                                       our main experiments we consider T5 Large and
+   An intermediate number of groups leads to an        XXL with multi-head attention, as well as up-
+interpolated model that is higher quality than MQA     trained versions of T5 XXL with multi-query and
+but faster than MHA, and, as we will show, rep-        grouped-query attention. We use the Adafactor op-
+resents a favorable trade-off. Going from MHA          timizer with the same hyperparameters and learn-
+to MQA reduces H key and value heads to a sin-         ing rate schedule as T5 (Raffel et al., 2020). We
+gle key and value head, reducing the size of the       apply MQA and GQA to decoder self-attention
+key-value cache and therefore amount of data that      and cross-attention, but not encoder self-attention.
+needs to be loaded by a factor of H. However,
+larger models generally scale the number of heads,     Uptraining Uptrained models are initialized
+such that multi-query attention represents a more      from public T5.1.1 checkpoints. The key and value
+aggressive cut in both memory bandwidth and ca-        heads are mean-pooled to the appropriate MQA or
+pacity. GQA lets us keep the same proportional         GQA structure, and then pre-trained for a further
+decrease in bandwidth and capacity as model size       α proportion of original pre-training steps with the
+increases.                                             original pre-training setup and dataset from (Raffel
+                                                       et al., 2020). For α = 0.05, training took approxi-
+   Moreover, larger models suffer relatively less      mately 600 TPUv3 chip-days.
+from memory bandwidth overhead from attention,
+as the KV-cache scales with model dimension            Data We evaluate on summarization datasets
+while model FLOPs and parameters scale with the        CNN/Daily Mail (Nallapati et al., 2016), arXiv
+square of model dimension. Finally, standard shard-    and PubMed (Cohan et al., 2018), MediaSum (Zhu
+ing for large models replicates the single key and     et al., 2021), and Multi-News (Fabbri et al., 2019);
+value head by the number of model partitions (Pope
+                                                           1https://github.com/google/flaxformer
+
+4896
+Model      Tinfer  Average  CNN   arXiv  PubMed                    MediaSum  MultiNews            WMT    TriviaQA
+MHA-Large    s       46.0    R1     R1      R1                          R1        R1              BLEU       F1
+MHA-XXL              47.2   42.9   44.6    46.2                        35.5      46.6              27.7     78.2
+MQA-XXL    0.37      46.6   43.8   45.6    47.5                        36.4      46.9              28.4     81.9
+GQA-8-XXL  1.51      47.1   43.0   45.0    46.9                        36.1      46.5              28.5     81.3
+           0.24             43.5   45.4    47.7                        36.3      47.2              28.4     81.6
+           0.28
+
+Table 1: Inference time and average dev set performance comparison of T5 Large and XXL models with multi-
+head attention, and 5% uptrained T5-XXL models with multi-query and grouped-query attention on summarization
+datasets CNN/Daily Mail, arXiv, PubMed, MediaSum, and MultiNews, translation dataset WMT, and question-
+answering dataset TriviaQA.
+
+translation dataset WMT 2014 English-to-German;                    47        GQA-XXL MHA-XXL
+and question answering dataset TriviaQA (Joshi
+et al., 2017). We do not evaluate on popular clas-    Performance  46.5     MQA-XXL
+siﬁcation benchmarks such as GLUE (Wang et al.,
+2019) as autoregressive inference is less applicable
+for those tasks.
+
+Fine-tuning For ﬁne-tuning, we use a constant                      46
+learning rate of 0.001, batch size 128, and dropout
+rate 0.1 for all tasks. CNN/Daily Mail and WMT                                      MHA-Large
+use input length of 512 and output length 256.
+Other summarization datasets use input length                            0   0.5               1         1.5
+2048 and output length 512. Finally, TriviaQA
+uses input length 2048 and output length 32. We                              Time per sample (ms)
+train until convergence and select the checkpoint
+with the highest dev performance. We use greedy       Figure 3: Uptrained MQA yields a favorable trade-
+decoding for inference.                               off compared to MHA with higher quality and
+                                                      faster speed than MHA-Large, and GQA achieves
+Timing We report time per sample per TPUv4            even better performance with similar speed gains
+chip, as measured by xprof (Google, 2020). For        and comparable quality to MHA-XXL. Average per-
+timing experiments we use 8 TPUs with the largest     formance on all tasks as a function of average inference
+batch size that ﬁts up to 32 per TPU, and paral-      time per sample for T5-Large and T5-XXL with multi-
+lelization optimized separately for each model.       head attention, and 5% uptrained T5-XXL with MQA
+                                                      and GQA-8 attention.
+
+3.2 Main results                                      uate performance on a representive subsample of
+                                                      tasks: CNN/Daily Mail, (short-form summariza-
+Figure 3 shows average performance over all           tion), MultiNews (long-form summarization), and
+datasets as a function of average inference time      TriviaQA (question-answering).
+for MHA T5-Large and T5-XXL, and uptrained
+MQA and GQA-8 XXL models with uptraining              Checkpoint conversion Figure 4 compares the
+proportion α = 0.05. We see that a larger up-         performance of different methods for checkpoint
+trained MQA model provides a favorable trade-         conversion. Mean pooling appears to work best,
+off relative to MHA models, with higher quality       followed by selecting a single head and then ran-
+and faster inference than MHA-Large. Moreover,        dom initialization. Intuitively, results are ordered
+GQA achieves signiﬁcant additional quality gains,     by the degree to which information is preserved
+achieving performance close to MHA-XXL with           from the pre-trained model.
+speed close to MQA. Table 1 contains full results
+for all datasets.                                     Uptraining steps Figure 5 shows how perfor-
+                                                      mance varies with uptraining proportion for T5
+3.3 Ablations                                         XXL with MQA and GQA. First, we note that
+                                                      GQA already achieves reasonable performance af-
+This section presents experiments to investigate      ter conversion while MQA requires uptraining to
+the effect of different modeling choices. We eval-
+
+                                         4897
+   Mean  Performance                                                                           2     MHA
+    First                                                                 Time per sample (s)
+Random                                                                                               GQA
+                                                                                                     MQA
+                                                                                               1
+
+             54.4 54.6 54.8 55 55.2 55.4 55.6                                                     1       4 8 16 32 64
+Figure 4: Performance comparison of different check-
+point conversion methods for T5-Large uptrained to                                                        GQA groups
+MQA with proportion α = 0.05. ‘Mean’ mean-pools
+key and value heads, ‘First’ selects the ﬁrst head and                                       Figure 6: Time per sample for GQA-XXL as a func-
+‘Random’ initializes heads from scratch.                                                     tion of the number of GQA groups with input length
+                                                                                             2048 and output length 512. Going from 1 (MQA) to
+be useful. Both MQA and GQA gain from 5%                                                     8 groups adds modest inference overhead, with increas-
+uptraining with diminishing returns from 10%.                                                ing cost to adding more groups.
+
+         57                                                                                  cially helpful for long inputs (Pope et al., 2022;
+                                                                                             de Jong et al., 2022). Rabe (2023) independently
+         56                                      MHA                                         developed GQA with public implementation.
+         55                                      GQA
+         54                                      MQA                                            A number of other methods have been proposed
+                                                                                             to reduce memory bandwidth overhead from keys
+                0  0.02 0.04 0.06 0.08 0.1                                                   and values, as well as parameters. Flash atten-
+                   Uptraining proportion α                                                   tion (Dao et al., 2022) structures the attention com-
+                                                                                             putation to avoid materializing the quadratic at-
+Figure 5: Performance as a function of uptraining pro-                                       tention scores, reducing memory and speeding up
+portion for T5 XXL models with MQA and GQA-8.                                                training. Quantization (Dettmers et al., 2022; Fran-
+                                                                                             tar et al., 2022) reduces the size of weights and
+Number of groups Figure 6 demonstrates the                                                   activations, including keys and values, by lowering
+effect of the number of GQA groups on infer-                                                 precision. Model distillation (Hinton et al., 2015;
+ence speed. For larger models the memory band-                                               Gou et al., 2021) instead reduces model size at
+width overhead from the KV cache is less con-                                                a given precision, using data generated from the
+straining (Shazeer, 2019), while the reduction in                                            larger model to ﬁnetune the smaller model. Layer-
+key-value size is sharper due to the increased num-                                          sparse cross-attention (de Jong et al., 2022) elim-
+ber of heads. As a result, increasing the number                                             inates most cross-attention layers which make up
+of groups from MQA only results in modest slow-                                              the primary expense for longer inputs. Speculative
+downs initially, with increasing cost as we move                                             sampling (Chen et al., 2023; Leviathan et al., 2022)
+closer to MHA. We selected 8 groups as a favor-                                              ameliorates the memory bandwidth bottleneck by
+able middle ground.                                                                          proposing multiple tokens with a smaller model
+                                                                                             which are then scored in parallel by a larger model.
+4 Related Work
+                                                                                                Finally, the uptraining procedure we propose
+This work is focused on achieving a better trade-                                            is inspired by Komatsuzaki et al. (2022), which
+off between decoder quality and inference time                                               uptrains standard T5 checkpoints into sparsely acti-
+through reducing the memory bandwidth over-                                                  vated Mixture-of-Experts models.
+head (Williams et al., 2009) from loading keys and
+values. Shazeer (2019) ﬁrst proposed reducing this                                           5 Conclusion
+overhead through multi-query attention. Follow-up
+work showed that multi-query attention is espe-                                              Language models are expensive for inference pri-
+                                                                                             marily due to the memory bandwidth overhead
+                                                                                             from loading keys and values. Multi-query atten-
+                                                                                             tion reduces this overhead at the cost of decreased
+                                                                                             model capacity and quality. We propose to convert
+                                                                                             multi-head attention models to multi-query models
+
+                                                      4898
+with a small fraction of original pre-training com-      Yin, Toju Duke, Anselm Levskaya, Sanjay Ghe-
+pute. Moreover, we introduce grouped-query atten-        mawat, Sunipa Dev, Henryk Michalewski, Xavier
+tion, an interpolation of multi-query and multi-head     Garcia, Vedant Misra, Kevin Robinson, Liam Fe-
+attention that achieves quality close to multi-head      dus, Denny Zhou, Daphne Ippolito, David Luan,
+at comparable speed to multi-query attention.            Hyeontaek Lim, Barret Zoph, Alexander Spiridonov,
+                                                         Ryan Sepassi, David Dohan, Shivani Agrawal, Mark
+Limitations                                              Omernick, Andrew M. Dai, Thanumalayan Sankara-
+                                                         narayana Pillai, Marie Pellat, Aitor Lewkowycz,
+This paper focuses on ameliorating the memory            Erica Moreira, Rewon Child, Oleksandr Polozov,
+bandwidth overhead from loading keys and values.         Katherine Lee, Zongwei Zhou, Xuezhi Wang, Bren-
+This overhead is most important when generating          nan Saeta, Mark Diaz, Orhan Firat, Michele Catasta,
+longer sequences, for which quality is inherently        Jason Wei, Kathy Meier-Hellstern, Douglas Eck,
+difﬁcult to evaluate. For summarization we employ        Jeff Dean, Slav Petrov, and Noah Fiedel. 2022.
+Rouge score, which we know is a ﬂawed evaluation         Palm: Scaling language modeling with pathways.
+that does not tell the whole story; for that reason,  Arman Cohan, Franck Dernoncourt, Doo Soon Kim,
+it is difﬁcult to be certain our trade-offs are cor-     Trung Bui, Seokhwan Kim, Walter Chang, and Na-
+rect. Due to limited computation, we also do not         zli Goharian. 2018. A discourse-aware attention
+compare our XXL GQA model to a comparitive               model for abstractive summarization of long docu-
+model trained from scratch, so we do not know the        ments. In Proceedings of the 2018 Conference of
+relative performance of uptraining vs training from      the North American Chapter of the Association for
+scratch. Finally, we evaluate the impact of uptrain-     Computational Linguistics: Human Language Tech-
+ing and GQA only on encoder-decoder models.              nologies, Volume 2 (Short Papers), pages 615–621,
+Recently, decoder-only models are extremely pop-         New Orleans, Louisiana. Association for Computa-
+ular, and since these models do not have separate        tional Linguistics.
+self-attention and cross-attention, we expect GQA     Tri Dao, Daniel Y. Fu, Stefano Ermon, Atri Rudra,
+to have a stronger advantage over MQA.                   and Christopher Ré. 2022. Flashattention: Fast and
+                                                         memory-efﬁcient exact attention with io-awareness.
+Acknowlegements                                          CoRR, abs/2205.14135.
+                                                      Michiel de Jong, Yury Zemlyanskiy, Joshua Ainslie,
+We thank Santiago Ontañón, Afroz Mohiuddin,              Nicholas FitzGerald, Sumit Sanghai, Fei Sha, and
+William Cohen and others at Google Research for          William Cohen. 2022. FiDO: Fusion-in-decoder op-
+insightful advice and discussion.                        timized for stronger performance and faster infer-
+                                                         ence. arXiv preprint arXiv:2212.08153.
+References                                            Tim Dettmers, Mike Lewis, Younes Belkada, and
+                                                         Luke Zettlemoyer. 2022. Llm.int8(): 8-bit ma-
+James Bradbury, Roy Frostig, Peter Hawkins,              trix multiplication for transformers at scale. CoRR,
+   Matthew James Johnson, Chris Leary, Dougal            abs/2208.07339.
+   Maclaurin, George Necula, Adam Paszke, Jake        Alexander R. Fabbri, Irene Li, Tianwei She, Suyi Li,
+   VanderPlas, Skye Wanderman-Milne, and Qiao            and Dragomir R. Radev. 2019. Multi-news: A large-
+   Zhang. 2018. JAX: composable transformations of       scale multi-document summarization dataset and ab-
+   Python+NumPy programs.                                stractive hierarchical model. In Proceedings of the
+                                                         57th Conference of the Association for Computa-
+Charlie Chen, Sebastian Borgeaud, Geoffrey Irv-          tional Linguistics, ACL 2019, Florence, Italy, July
+   ing, Jean-Baptiste Lespiau, Laurent Sifre, and        28- August 2, 2019, Volume 1: Long Papers, pages
+   John Jumper. 2023. Accelerating large language        1074–1084. Association for Computational Linguis-
+   model decoding with speculative sampling. CoRR,       tics.
+   abs/2302.01318.                                    Elias Frantar, Saleh Ashkboos, Torsten Hoeﬂer, and
+                                                         Dan Alistarh. 2022. GPTQ: accurate post-training
+Aakanksha Chowdhery, Sharan Narang, Jacob Devlin,        quantization for generative pre-trained transformers.
+   Maarten Bosma, Gaurav Mishra, Adam Roberts,           CoRR, abs/2210.17323.
+   Paul Barham, Hyung Won Chung, Charles Sutton,      Google. 2020. Proﬁle your model with cloud tpu
+   Sebastian Gehrmann, Parker Schuh, Kensen Shi,         tools. https://cloud.google.com/tpu/docs/
+   Sasha Tsvyashchenko, Joshua Maynez, Abhishek          cloud-tpu-tools. Accessed: 2022-11-11.
+   Rao, Parker Barnes, Yi Tay, Noam Shazeer, Vin-     Jianping Gou, Baosheng Yu, Stephen J. Maybank, and
+   odkumar Prabhakaran, Emily Reif, Nan Du, Ben          Dacheng Tao. 2021. Knowledge distillation: A sur-
+   Hutchinson, Reiner Pope, James Bradbury, Jacob        vey. Int. J. Comput. Vis., 129(6):1789–1819.
+   Austin, Michael Isard, Guy Gur-Ari, Pengcheng
+
+4899
+Jonathan Heek, Anselm Levskaya, Avital Oliver, Mar-        Alex Wang, Amanpreet Singh, Julian Michael, Felix
+   vin Ritter, Bertrand Rondepierre, Andreas Steiner,         Hill, Omer Levy, and Samuel R. Bowman. 2019.
+   and Marc van Zee. 2020. Flax: A neural network             GLUE: A multi-task benchmark and analysis plat-
+   library and ecosystem for JAX.                             form for natural language understanding. In 7th
+                                                              International Conference on Learning Representa-
+Geoffrey E. Hinton, Oriol Vinyals, and Jeffrey Dean.          tions, ICLR 2019, New Orleans, LA, USA, May 6-9,
+   2015. Distilling the knowledge in a neural network.        2019. OpenReview.net.
+   CoRR, abs/1503.02531.
+                                                           Samuel Williams, Andrew Waterman, and David A.
+Mandar Joshi, Eunsol Choi, Daniel S. Weld, and Luke           Patterson. 2009. Rooﬂine: an insightful visual per-
+   Zettlemoyer. 2017. Triviaqa: A large scale distantly       formance model for multicore architectures. Com-
+   supervised challenge dataset for reading comprehen-        mun. ACM, 52(4):65–76.
+   sion. In Proceedings of the 55th Annual Meeting of
+   the Association for Computational Linguistics, Van-     Chenguang Zhu, Yang Liu, Jie Mei, and Michael Zeng.
+   couver, Canada. Association for Computational Lin-         2021. Mediasum: A large-scale media interview
+   guistics.                                                  dataset for dialogue summarization. In Proceedings
+                                                              of the 2021 Conference of the North American Chap-
+Aran Komatsuzaki, Joan Puigcerver, James Lee-Thorp,           ter of the Association for Computational Linguistics:
+   Carlos Riquelme Ruiz, Basil Mustafa, Joshua                Human Language Technologies, NAACL-HLT 2021,
+   Ainslie, Yi Tay, Mostafa Dehghani, and Neil                Online, June 6-11, 2021, pages 5927–5934. Associ-
+   Houlsby. 2022. Sparse upcycling: Training mixture-         ation for Computational Linguistics.
+   of-experts from dense checkpoints.
+
+Yaniv Leviathan, Matan Kalman, and Yossi Matias.
+   2022. Fast inference from transformers via specu-
+   lative decoding. CoRR, abs/2211.17192.
+
+Ramesh Nallapati, Bowen Zhou, Cícero Nogueira dos
+   Santos, Çaglar Gülçehre, and Bing Xiang. 2016.
+   Abstractive text summarization using sequence-to-
+   sequence rnns and beyond. In Proceedings of the
+   20th SIGNLL Conference on Computational Natural
+   Language Learning, CoNLL 2016, Berlin, Germany,
+   August 11-12, 2016, pages 280–290. ACL.
+
+Reiner Pope, Sholto Douglas, Aakanksha Chowdhery,
+   Jacob Devlin, James Bradbury, Anselm Levskaya,
+   Jonathan Heek, Kefan Xiao, Shivani Agrawal, and
+   Jeff Dean. 2022. Efﬁciently scaling transformer in-
+   ference. arXiv preprint arXiv:2211.05102.
+
+Markus Rabe. 2023. Memory-efﬁcient attention.
+   https://github.com/google/flaxformer/
+   blob/main/flaxformer/components/
+   attention/memory_efficient_attention.py.
+   Accessed: 2023-05-23.
+
+Colin Raffel, Noam Shazeer, Adam Roberts, Katherine
+   Lee, Sharan Narang, Michael Matena, Yanqi Zhou,
+   Wei Li, and Peter J. Liu. 2020. Exploring the limits
+   of transfer learning with a uniﬁed text-to-text trans-
+   former. J. Mach. Learn. Res., 21:140:1–140:67.
+
+Noam Shazeer. 2019. Fast transformer decoding:
+   One write-head is all you need. arXiv preprint
+   arXiv:1911.02150.
+
+Hugo Touvron, Thibaut Lavril, Gautier Izacard, Xavier
+   Martinet, Marie-Anne Lachaux, Timothée Lacroix,
+   Baptiste Rozière, Naman Goyal, Eric Hambro,
+   Faisal Azhar, Aurelien Rodriguez, Armand Joulin,
+   Edouard Grave, and Guillaume Lample. 2023.
+   Llama: Open and efﬁcient foundation language mod-
+   els.
+                                                            4900
+A Training Stability
+
+We ﬁnd that multi-query attention can lead to train-
+ing instability during ﬁne-tuning, in particular com-
+bined with long input tasks. We trained multiple
+T5-Large models with multi-query attention from
+scratch. In each case, pre-training suffered from
+frequent loss spikes and the ﬁnal models diverged
+immediately when ﬁne-tuning on long-input tasks.
+Uptrained multi-query attention models are more
+stable but still display high variance, so for multi-
+query models on unstable tasks we report average
+performance over three ﬁne-tuning runs. Uptrained
+grouped-query attention models, however, appear
+to be stable, so we did not investigate futher on the
+root causes of multi-query instability.
+
+                                                            4901
+

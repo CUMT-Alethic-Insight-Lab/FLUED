@@ -1,0 +1,640 @@
+                                        Counterfactual Risk Minimization: Learning from Logged Bandit Feedback
+
+                                        Adith Swaminathan                                              ADITH@CS.CORNELL.EDU
+                                        Cornell University, Ithaca, NY 14853 USA                            TJ@CS.CORNELL.EDU
+
+arXiv:1502.02362v2 [cs.LG] 20 May 2015  Thorsten Joachims
+                                        Cornell University, Ithaca, NY 14853 USA
+
+                                                                Abstract                               number of ranked articles the user read) (Li et al., 2010).
+                                                                                                       The feedback, however, provides only partial information
+                                              We develop a learning principle and an efﬁcient          – “bandit feedback”– limited to the particular prediction
+                                              algorithm for batch learning from logged bandit          shown by the system. The feedback for all the other predic-
+                                              feedback. This learning setting is ubiquitous in         tions the system could have made is typically not known.
+                                              online systems (e.g., ad placement, web search,          This makes learning from log data fundamentally different
+                                              recommendation), where an algorithm makes a              from supervised learning, where “correct” predictions (e.g.,
+                                              prediction (e.g., ad ranking) for a given input          the best ranking of news articles for that user) together with
+                                              (e.g., query) and observes bandit feedback (e.g.,        a loss function provide full-information feedback.
+                                              user clicks on presented ads). We ﬁrst address
+                                              the counterfactual nature of the learning problem        We study the problem of batch learning from logged ban-
+                                              through propensity scoring. Next, we prove gen-          dit feedback. Unlike online learning with bandit feedback,
+                                              eralization error bounds that account for the vari-      batch learning does not require interactive experimental
+                                              ance of the propensity-weighted empirical risk           control over the system. Furthermore, it enables the reuse
+                                              estimator. These constructive bounds give rise           of existing data and ofﬂine cross-validation techniques for
+                                              to the Counterfactual Risk Minimization (CRM)            model selection (e.g., “should we perform feature selec-
+                                              principle. We show how CRM can be used                   tion?”, “which learning algorithm to use?”, etc.).
+                                              to derive a new learning method – called Pol-
+                                              icy Optimizer for Exponential Models (POEM)              To solve this batch-learning problem, we ﬁrst need a coun-
+                                              – for learning stochastic linear rules for struc-        terfactual estimator (Bottou et al., 2013) of a system’s per-
+                                              tured output prediction. We present a decomposi-         formance, so that we can estimate how other systems would
+                                              tion of the POEM objective that enables efﬁcient         have performed if they had been in control of choosing pre-
+                                              stochastic gradient optimization. POEM is eval-          dictions. Such estimators have been developed recently for
+                                              uated on several multi-label classiﬁcation prob-         the off-policy evaluation problem (Langford et al., 2011),
+                                              lems showing substantially improved robustness           (Li et al., 2011), (Li et al., 2014), where data collected
+                                              and generalization performance compared to the           from the interaction logs of one bandit algorithm is used
+                                              state-of-the-art.                                        to evaluate another system.
+
+                                        1. Introduction                                                Our approach to counterfactual learning centers around the
+                                                                                                       insight that, to perform robust learning, it is not sufﬁcient
+                                        Log data is one of the most ubiquitous forms of data avail-    to have just an unbiased estimator of the off-policy sys-
+                                        able, as it can be recorded from a variety of systems (e.g.,   tem’s performance. We must also reason about how the
+                                        search engines, recommender systems, ad placement) at lit-     variances of these estimators differ across the hypothesis
+                                        tle cost. The interaction logs of such systems typically con-  space, and pick the hypothesis that has the best possi-
+                                        tain a record of the input to the system (e.g., features de-   ble guarantee (tightest conservative bound) for its perfor-
+                                        scribing the user), the prediction made by the system (e.g.,   mance. We ﬁrst prove generalization error bounds analo-
+                                        a recommended list of news articles) and the feedback (e.g.,   gous to structural risk minimization (Vapnik, 1998) for a
+                                                                                                       stochastic hypothesis family using an empirical Bernstein
+                                        Proceedings of the 32 nd International Conference on Machine   argument (Maurer & Pontil, 2009). The constructive na-
+                                        Learning, Lille, France, 2015. JMLR: W&CP volume 37. Copy-     ture of these bounds suggests a general principle – Counter-
+                                        right 2015 by the author(s).                                   factual Risk Minimization (CRM) – for designing methods
+                                                                                                       for batch learning from bandit feedback.
+Counterfactual risk minimization
+
+Using the CRM principle, we derive a new learning algo-         estimators are even more efﬁcient when we additionally
+rithm – Policy Optimizer for Exponential Models (POEM)          have a good model of the feedback (Langford et al., 2011).
+– for structured output prediction. The training objective      In our work, we focus on the inverse propensity scoring es-
+is decomposed using repeated variance linearization, and        timator, but the results we derive hold equally for the dou-
+optimizing it using AdaGrad (Duchi et al., 2011) yields a       bly robust estimators. Recent work (Thomas et al., 2015)
+fast and effective algorithm. We evaluate POEM on several       has additionally developed tighter conﬁdence bounds for
+multi-label classiﬁcation problems, verify that its empirical   counterfactual estimators, which can be directly co-opted
+performance supports the theory, and demonstrate substan-       in our approach to counterfactual learning.
+tial improvement in generalization performance over the
+state-of-the-art.                                               In the current work, we concentrate on the case where
+                                                                the historical algorithm was a stationary, stochastic policy.
+We review existing approaches in Section 2. The learning        Techniques like exploration scavenging (Langford et al.,
+setting is detailed in Section 3, and contrasted with super-    2008) and bootstrapping (Mary et al., 2014) allow us to
+vised learning. In Section 4, we derive the Counterfactual      perform counterfactual evaluation even when the historical
+Risk Minimization learning principle and provide a rule of      algorithm was deterministic or adaptive.
+thumb for setting hyper-parameters. In Section 5, we in-
+stantiate the CRM principle for structured output prediction    Our strategy of picking the hypothesis with the tight-
+using exponential models and construct an efﬁcient decom-       est conservative bound on performance mimics similar
+position of the objective for stochastic optimization. Em-      successful approaches in other problems like supervised
+pirical evaluations are reported in Section 6 and we con-       learning (Vapnik, 1998), risk averse multi-armed bandits
+clude with future directions and discussion in Section 7.       (Galichet et al., 2013), regret minimizing contextual ban-
+                                                                dits (Langford & Zhang, 2008) and reinforcement learning
+2. Related Work                                                 (Garcia & Fernandez, 2012).
+
+Existing approaches for batch learning from logged ban-         Beyond the problem of batch learning from bandit
+dit feedback fall into two categories. The ﬁrst approach        feedback, our approach can have implications for sev-
+is to reduce the problem to supervised learning. In princi-     eral applications that require learning from logged ban-
+ple, since the logs give us an incomplete view of the feed-     dit feedback data: warm-starting multi-armed bandits
+back for different predictions, one could ﬁrst use regression   (Shivaswamy & Joachims, 2012) and contextual bandits
+to estimate a feedback oracle for unseen predictions, and       (Strehl et al., 2010), pre-selecting retrieval functions for
+then use any supervised learning algorithm using this feed-     search engines (Hofmann et al., 2013), and policy evalua-
+back oracle. Such a two-stage approach is known to not          tion for contextual bandits (Li et al., 2011), to name a few.
+generalize well (Beygelzimer & Langford, 2009). More
+sophisticated techniques using a cost weighted classiﬁca-       3. Learning Setting: Batch Learning with
+tion (Zadrozny et al., 2003) or the Offset Tree algorithm          Logged Bandit Feedback
+(Beygelzimer & Langford, 2009) allow us to perform batch
+learning when the space of possible predictions is small. In    Consider a structured output prediction problem that takes
+contrast, our approach generalizes structured output predic-    as input x ∈ X and outputs a prediction y ∈ Y. For ex-
+tion, with exponential-sized prediction spaces.                 ample, in multi-label document classiﬁcation, x could be a
+                                                                news article and y a bitvector indicating the labels assigned
+The second approach to batch learning from bandit feed-         to this article. The inputs are assumed drawn from a ﬁxed
+back uses propensity scoring (Rosenbaum & Rubin, 1983)          but unknown distribution Pr(X ), x i.∼i.d. Pr(X ). Consider
+to derive unbiased estimators from the interaction logs         a hypothesis space H of stochastic policies. A hypothesis
+(Bottou et al., 2013). These estimators are used for a small    h(Y | x) ∈ H deﬁnes a probability distribution over the
+set of candidate policies, and the best estimated candidate is  output space Y, and the hypothesis makes predictions by
+picked via exhaustive search. In contrast, our approach can     sampling, y ∼ h(Y | x). Note that this deﬁnition also in-
+be optimized via gradient descent, over hypothesis families     cludes deterministic hypotheses, where the distributions as-
+(of inﬁnite size) that are equally as expressive as those used  sign probability 1 to a single y. For notational convenience,
+in supervised learning.                                         denote h(Y | x) by h(x), and the probability assigned by
+                                                                h(x) to y as h(y | x).
+Our approach builds on counterfactual estimators that have
+been developed for off-policy evaluation. The inverse           In interactive learning systems, we only observe feedback
+propensity scoring estimator can be optimal when we have        δ(x, y) for the y sampled from h(x). In this work, feedback
+a good model of the historical algorithm (Strehl et al.,        δ : X ×Y → R is a cardinal loss that is only observed at the
+2010), (Li et al., 2014), (Li et al., 2015), and doubly robust  sampled data points. Small values for δ(x, y) indicate user
+                               Counterfactual risk minimization
+
+Table 1. Comparison of assumptions, hypotheses and learning principles for supervised learning and batch learning with bandit feedback.
+
+Setting     Distribution       Data, D Hypothesis, h                        Loss            Learning principle
+
+Supervised  (x,y∗) ∼ Pr(X ×Y)  {xi,yi∗}              y = h(x)     ∆(y∗, ·) known            argminh Rˆ(h) + C · Reg(H)
+                                                    y ∼ h(Y | x)  δ(x, ·) unknown
+Batch w/bandit x ∼ Pr(X ), y ∼ h0(x) {xi,yi,δi,pi}                                          argminh RˆM (h) + λ ·      V ar(h)
+                                                                                                                            n
+
+satisfaction with y for x, while large values indicate dissat-  of the logging policy, we keep track of the propensity,
+isfaction. The expected loss – called risk – of a hypothesis    h0(y | x) of the historical system to generate y for x. From
+R(h) is deﬁned as,                                              these propensity-augmented logs
+
+             R(h) = Ex∼Pr(X )Ey∼h(x) [δ(x, y)] .                  D = {(x1,y1,δ1,p1), . . . , (xn,yn,δn,pn)},
+
+The goal of the system is to minimize risk, or equivalently,    where pi ≡ h0(yi | xi), we can derive an unbiased estimate
+maximize expected user satisfaction. The aim of learning        of R(h) via Monte Carlo approximation,
+is to ﬁnd a hypothesis h ∈ H that has minimum risk.
+                                                                               Rˆ(h)  =  1   n   δi  h(yi |  xi) .             (1)
+We wish to re-use the interaction logs of these systems for                              n  i=1          pi
+batch learning. Assume that its historical algorithm acted
+according to a stationary policy h0(x) (also called logging     At ﬁrst thought, one may think that directly estimating
+policy). The data collected from this system is                 Rˆ(h) over h ∈ H and picking the empirical minimizer is
+                                                                a valid learning strategy. Unfortunately, there are several
+            D = {(x1, y1, δ1), . . . , (xn, yn, δn)},           potential pitfalls.
+
+where yi ∼ h0(xi) and δi ≡ δ(xi, yi).                           First, this strategy is not invariant to additive transforma-
+                                                                tions of the loss and will give degenerate results if the loss
+Sampling bias. D cannot be used to estimate R(h) for a          is not appropriately scaled. In Section 4.1, we develop in-
+new hypothesis h using the estimator typically used in su-      tuition for why this is so, and derive the optimal scaling of
+pervised learning. We ideally need either full information      δ. For now, assume that ∀x, ∀y, δ(x, y) ∈ [−1, 0].
+about δ(xi, ·) or need samples y ∼ h(xi) to directly esti-
+mate R(h). This explains why, in practice, model selection      Second, this estimator has unbounded variance, since pi ≃
+over a small set of candidate systems is typically done via     0 in D can cause Rˆ(h) to be arbitrarily far away from the
+A/B tests, where the candidates are deployed to collect new     true risk R(h). This problem can be ﬁxed by “clipping” the
+data sampled according to y ∼ h(x) for each hypothesis          importance sampling weights (Ionides, 2008)
+h. A relative comparison of the assumptions, hypotheses,
+and principles used in supervised learning vs. our learn-       RM (h) = ExEy∼h0(x)         δ(x, y) min      M,     h(y | x)   ,
+ing setting is outlined in Table 1. Fundamentally, batch                                                            h0(y | x)
+learning with bandit feedback is hard because D is both bi-
+ased (predictions favored by the historical algorithm will                  1  n                     h(yi |  xi)
+be over-represented) and incomplete (feedback for other                     n                            pi
+predictions will not be available) for learning.                RˆM (h)  =          δi min  M,                      .
+
+4. Learning Principle: Counterfactual Risk                                     i=1
+   Minimization
+                                                                M > 0 is a hyper-parameter chosen to trade-off bias and
+The distribution mismatch between h0 and any hypothesis         variance in the estimate, where smaller values of M induce
+h ∈ H can be addressed using importance sampling, which         larger bias in the estimate. Optimizing RˆM (h) through ex-
+corrects the sampling bias as:                                  haustive enumeration over H yields the Inverse Propensity
+                                                                Scoring (IPS) training objective (Bottou et al., 2013)
+     R(h) = Ex∼Pr(X )Ey∼h(x) [δ(x, y)]
+                                                   h(y | x)                 hˆIP S = argmin RˆM (h) .                          (2)
+
+             = Ex∼Pr(X )Ey∼h0(x) δ(x, y) h0(y | x) .                                     h∈H
+
+This motivates the propensity scoring approach                  Third, importance sampling typically estimates RˆM (h) of
+(Rosenbaum & Rubin, 1983). During the operation                 different hypotheses h ∈ H with vastly different variances.
+
+                                                                Consider two hypotheses h1 and h2, where h1 is similar to
+                                                                h0, but where h2 samples predictions that were not well ex-
+                                                                plored by h0. Importance sampling gives us low-variance
+                                                                estimates for RˆM (h1), but highly variable estimates for
+                                                           Counterfactual risk minimization
+
+RˆM (h2). Intuitively, if we can develop variance-sensitive                        and observed losses δ1, . . . , δn, for n ≥ 16 and a stochas-
+conﬁdence bounds over the hypothesis space, optimizing a
+conservative conﬁdence bound should ﬁnd a h whose R(h)                             tic  hypothesis  space  H     with  capacity  N∞(  1  ,  FH,  2n),
+will not be much worse, with high probability.                                                                                        n
+
+                                                                                   ∀h ∈ H : R(h) ≤ RˆM (h) + 18V arh(u)QH(n, γ)/n
+                                                                                                      + M · 15Q(n, γ)/(n − 1).
+
+Generalization error bound. A standard analysis would                              Proof. Follow the proof of Theorem 6 of (Maurer & Pontil,
+give a bound that is agnostic to variance introduced by im-
+portance sampling. Following our intuition above, we de-                           2009) with the function class as FH. Use Equations (3), (4)
+rive a higher order bound that includes the variance term                          to translate from fh(x, y) to RM (h). RˆM (h) = M ·fˆh − 1,
+using empirical Bernstein bounds (Maurer & Pontil, 2009).                          RM (h) = M · fh − 1, and M 2V arh(u) = V arfh(u).
+To develop such a generalization error bound, we ﬁrst need                         Finally, since δ(·,·) ≤ 0, hence R(h) ≤ RM (h).
+a concept of capacity for stochastic hypothesis classes. For
+any stochastic class H, deﬁne an auxiliary function class                          CRM Principle. This generalization error bound is con-
+FH = {fh : X ×Y → [0, 1]}. Each h ∈ H corresponds to a                             structive, and it motivates a general principle for designing
+function fh ∈ FH,                                                                  machine learning methods for batch learning from bandit
+                                                                                   feedback. In particular, a learning algorithm following this
+      fh(x,  y)  =    1  +     δ(x, y)  min     M,    h(y | x)   .            (3)  principle should jointly optimize the estimate RˆM (h) as
+                                 M                    h0(y | x)                    well as its empirical standard deviation, where the latter
+                                                                                   serves as a data-dependent regularizer.
+fh is a deterministic, bounded function, and satisﬁes
+
+         ExEy∼h0(x) [fh(x, y)] = 1 + RM (h)/M.                                (4)       hˆCRM = argmin           RˆM (h) + λ     V arh(u)        .     (5)
+                                                                                                                                      n
+                                                                                                            h∈H
+
+Hence, we can use classic notions of capacity for FH to                            M > 0 and λ ≥ 0 are regularization hyper-parameters.
+reason about the convergence of RˆM (h) → RM (h).                                  When λ = 0, we recover the Inverse Propensity Scoring
+                                                                                   objective of Equation (2). In analogy to Structural Risk
+Recall the covering number N∞(ǫ, F , n) for a func-                                Minimization (Vapnik, 1998), we call this principle Coun-
+tion class F (refer (Anthony & Bartlett, 2009),                                    terfactual Risk Minimization, since both pick the hypothe-
+                                                                                   sis with the tightest upper bound on the true risk R(h).
+(Maurer & Pontil, 2009) and the references therein).
+Deﬁne an ǫ−cover N (ǫ, A, · ∞) for a set A ⊆ Rn                                    4.1. Optimal Loss Scaling
+to be the size of the smallest cardinality subset A0 ⊆ A
+such that A is contained in the union of balls of radius ǫ                         When performing supervised learning with true labels y∗
+centered at points in A0, in the metric induced by · ∞.                            and a loss function ∆(y∗, ·), empirical risk minimization
+
+The covering number is,                                                            using the standard estimator is invariant to additive trans-
+                                                                                   lation and multiplicative scaling of ∆. The risk estimators
+N∞(ǫ, F , n) = sup N (ǫ, F ({(xi, yi)}), · ∞),                                     Rˆ(h) and RˆM (h) in bandit learning, however, crucially re-
+                                                                                   quire δ(·, ·) ∈ [−1, 0].
+                          (xi,yi)∈(X ×Y)n
+
+where F ({(xi, yi)}) is the function class conditioned on
+sample {(xi, yi)},
+
+F ({(xi, yi)}) = {(f (x1, y1), . . . , f (xn, yn)) : f ∈ F }.                      Consider, for example, the case of δ(·, ·) ≥ 0. The training
+                                                                                   objectives in Equation (2) (IPS) and Equation (5) (CRM)
+Our measure for the capacity of our stochastic class H to                          become degenerate! A hypothesis h ∈ H that completely
+                                                                                   avoids the sample D (i.e. ∀i = 1, . . . , n, h(yi | xi) = 0)
+“ﬁt”  a  sample  of  size   n  shall  be   N∞(  1  ,  FH,  2n).                    trivially achieves the best possible RˆM (h) (= 0) with 0
+                                                n                                  empirical variance. This degeneracy arises because when
+                                                                                   δ(·, ·) ≥ 0, the optimization objectives are a lower bound
+Theorem 1. For a compact notation, deﬁne                                           on R(h), whereas what we need is an upper bound.
+
+                                                                           n
+
+uhi ≡ δi min{M, h(yi | xi)/pi}, uh ≡ uhi/n,
+
+                                                      i=1                          For any bounded loss δ(·, ·) ∈ [▽, △], we have, ∀x
+
+                        n                                                          Ey∼h(x)[δ(x, y)] ≤ △+ Ey∼h0(x)      (δ(x,     y)  −  △)  h(y   | x)  .
+                                                                                                                                            h0(y  | x)
+V arh(u) ≡ (uhi − uh)2/(n − 1),
+
+                 i=1
+
+QH(n,    γ)  ≡   log(10     ·  N∞(  1   ,  FH,  2n)/γ),    0 < γ < 1.              We assert that this is the tightest possible upper bound pos-
+                                    n                                              sible without additional assumptions. Since the optimiza-
+                                                                                   tion objectives in Equations (2),(5) are unaffected by a con-
+With probability at least 1 − γ in the random vector                               stant scale factor (e.g., △−▽), we should transform δ → δ′
+(x1, y1) · · · (xn, yn), with xi i.∼i.d. Pr(X ) and yi ∼ h0(xi),
+                                 Counterfactual risk minimization
+
+to derive a conservative training objective w.r.t. δ′,          parametrized by w. A hypothesis hw(x) ∈ Hlin
+                   δ′ ≡ {δ − △}/{△ − ▽}.                        samples y from the distribution
+
+4.2. Selecting hyper-parameters                                              hw(y | x) = exp(w · φ(x, y))/Z(x).
+
+We propose selecting the hyper-parameters M > 0 and             Z(x) = y′∈Y exp(w · φ(x, y′)) is the partition function.
+λ ≥ 0 via validation. However, we must be care-                 This can be thought of as the “soft-max” variant of the
+ful not to set M too small or λ too big. The esti-              “hard-max” rules from Equation (6). Additionally, for a
+mated risk RˆM (h) ∈ [−M, 0], while the variance penalty        temperature multiplier α > 1, w → αw induces a more
+                                                                “peaked” distribution hαw that preserves the modes of hw,
+V arh(u)  ∈   0,   M √  .  If M  is too small, all hypothe-     and intuitively is a “more deterministic” variant of hw.
+     n            2n
+                                                                hw lies in the exponential family of distributions, and has a
+ses will have the same biased estimate of risk M RˆM (h0),      simple gradient,
+
+since all the importance sampling weights will be clipped.          ∇hw(y | x) = hw(y | x) φ(x,y)−Ey′∼hw(x)[φ(x,y′)] .
+
+Similarly, if λ ≫ 0, a hypothesis h ∈ H that completely         Consider a bandit-feedback structured-output dataset D =
+                                                                {(x1, y1, δ1, p1), . . . , (xn, yn, δn, pn)}. In multi-label doc-
+avoids D achieves the best possible training objective of       ument classiﬁcation, this data could be collected from an
+                                                                interactive labeling system, where each y indicates the la-
+0. As a rule of thumb, we can calibrate M and λ so that         bels predicted by the system for a document x. The feed-
+                                                                back δ(x, y) is how many labels (but not which ones) were
+the estimator is unbiased and objective is negative for some    correct. To perform learning, ﬁrst we scale the losses as
+h ∈ H. When h0 ∈ H, M ≃ max{pi}/ min{pi} and                    outlined in Section 4.1. Next, instantiating the CRM prin-
+                                                                ciple (Equation (5)) for Hlin, (using notation analogous to
+RˆM (h0) + λ  V arh0 (u)        < 0 are natural choices.        that in Theorem 1, adapted for Hlin), yields the POEM
+                    n                                           training objective.
+
+4.3. When is counterfactual learning possible?                  POEM Training Objective:
+
+The bounds in Theorem 1 are with respect to the random-                     w∗ = argmin uw + λ        V     arw(u)     ,  (7)
+ness in h0. Known impossibility results for counterfactual                                                    n
+evaluation using h0 (Langford et al., 2008) also apply to                                w∈Rd
+counterfactual learning. In particular, if h0 was determinis-
+tic, or even stochastic but without full support over Y, it is  uwi  ≡  δi  min{M,  exp(w    · φ(xi,  yi))  },  uw  ≡      n
+easy to engineer examples involving the unexplored y ∈ Y                                 pi  · Z(xi)
+that guarantee sub-optimal learning even as |D| → ∞.                                                                          uwi/n,
+Also, a stochastic h0 with heavier tails need not always al-
+low more effective learning. From importance sampling                                                                     i=1
+theory (Owen, 2013), what really matters is how well h0
+explores the regions of Y with favorable losses.
+
+                                                                            n
+
+5. Learning Algorithm: POEM                                     V arw(u) ≡ (uwi − uw)2/(n − 1).
+
+We now use the CRM principle to derive an efﬁcient al-                      i=1
+gorithm for structured output prediction using linear rules.
+Classic models in supervised learning (e.g., structured sup-    While the objective in Equation (7) is not convex in w (even
+port vector machines (Tsochantaridis et al., 2004) and con-     for λ = 0), prior work (Yu et al., 2010), (Lewis & Overton,
+ditional random ﬁelds (Lafferty et al., 2001)) predict using
+                                                                2013) has established theoretically sound modiﬁcations to
+
+                                                                L-BFGS for non-zmooth non-convex optimization. We
+
+                                                                ﬁnd that batch gradient descent (e.g., L-BFGS out of the
+
+          hswup(x) = argmax {w · φ(x, y)} ,               (6)   box) and the stochastic gradient approach introduced be-
+
+                           y∈Y                                  low ﬁnd local optima that have good generalization error.
+
+where w is a d−dimensional weight vector, and φ(x, y) is        Software implementing POEM is available at
+a d−dimensional joint feature map. For example, in multi-       http://www.cs.cornell.edu/∼adith/poem/ for down-
+label document classiﬁcation, for a news article x and a        load, as is all the code and data needed to run each of the
+possible assignment of labels y represented as a bitvec-        experiments reported in Section 6.
+tor, φ(x, y) could simply be a concatenation of the bag-of-
+words features of the document (x), one copy for each of        5.1. Iterated Variance Majorization
+the assigned labels in y, x ⊗ y. Several efﬁcient inference
+                                                                The POEM training objective in Equation (7), speciﬁcally
+algorithms have been developed to solve Equation (6).           the variance term V arw(u), resists stochastic gradi-
+                                                                ent optimization in the presented form. To remove this
+Consider the following stochastic family Hlin,
+                                              Counterfactual risk minimization
+
+obstacle, we now develop a Majorization-Minimization            Table 2. Corpus statistics for different multi-label datasets from
+                                                                the LibSVM repository. LYRL was post-processed so that only
+scheme, similar in spirit to recent approaches to multi-        top level categories were treated as labels.
+
+class SVMs (van den Burg & Groenen, 2014) that can be           Name   p(# features)   q(# labels)  ntrain   ntest
+                                                                Scene       294             6        1211    1196
+shown to converge to a local optimum of the POEM train-         Yeast       103            14        1500     917
+                                                                TMC       30438            22       21519    7077
+ing objective. In particular, we will show how to decom-        LYRL      47236             4       23149   781265
+pose V arw(u) as a sum of differentiable functions (e.g.,
+
+   i uwi or i{uwi}2) so that we can optimize the overall
+training objective at scale using stochastic gradient descent.
+
+Proposition 1. For any w0,                                      and simulate a bandit feedback dataset from a logging pol-
+
+                       n                n                       icy h0 by sampling yi ∼ h0(xi) and collecting feedback
+                                                                ∆(yi∗, yi). In principle, we could use any arbitrary stochas-
+   V arw(u) ≤ Aw0 uwi + Bw0 {uwi}2 + Cw0                        tic policy as h0. We choose a CRF trained on 5% of D∗
+                                                                as h0 using default hyper-parameters, since they provide
+                       i=1           i=1
+                                                                probability distributions amenable to sampling. In all the
+              = Q(w; w0).
+
+         Aw0 ≡ −uw0 /{(n − 1) V arw0 (u)},                      multi-label experiments, ∆(y∗, y) is the Hamming loss be-
+
+         Bw0 ≡ 1/{2(n − 1) V arw0 (u)},                         tween the supervised label y∗ vs. the sampled label y for
+
+                          n{uw0 }2            V arw0 (u) .      input x. Hamming loss is just the number of incorrectly as-
+                          1) V arw0 (u)           2
+         Cw0  ≡                            +                    signed labels (both false positives and false negatives). To
+
+                 2(n   −                                        create bandit feedback D = {(xi, yi, δi ≡ ∆(yi∗, yi), pi ≡
+                                                                h0(yi | xi))}, we take four passes through D∗ and sample
+Proof. Consider a ﬁrst √order Taylor approximation of
+   V arw(u) around w0, · is concave. Again Taylor ap-           labels from h0. Note that each supervised label is worth
+                                                                ≃ |Y| = 2q bandit feedback labels. We can explore dif-
+proximate −{uw}2, noting that −{·}2 is concave.
+                                                                ferent learning strategies (e.g., IPS, CRM, etc.) on D and
+
+                                                                obtain learnt weight vectors wips, wcrm, etc. On the su-
+
+Iteratively minimizing wt+1 = argminw Q(w; wt) ensures          pervised test set, we then report the expected loss per in-
+that the sequence of iterates w1, . . . , wt+1 are successive
+                                                                stance R(w)  =     1   i Ey∼hw(xi)∆(yi∗, y) and compare
+                                                                                ntest
+
+minimizers of V arw(u). Hence, during an epoch t,               the generalization performance of these learning strategies.
+POEM proceeds by sampling uniformly i ∼ D, comput-
+
+ing uwi, ∇uwi and, for learning rate η, updating                Baselines and learning methods. The expected Ham-
+                                                                ming loss of h0 is the baseline to beat. Lower loss is
+w  ←  w  −  η{∇uwi  +   √       ∇uw  i  +  2Bwt uwi∇uwi)}.      better. The na¨ıve, variance-agnostic approach to counter-
+                       λ n(Awt                                  factual learning (Bottou et al., 2013) can be generalized to
+                                                                handle parametric multilabel classiﬁcation (Equation (7)
+After each epoch, wt+1 ← w, and iterated minimization           with λ = 0). We optimize it either using L-BFGS (IPS(B))
+proceeds until convergence.                                     or stochastic optimization (IPS(S)). POEM(S) uses our
+                                                                Iterative-Majorization approach to variance regularization
+6. Experiments                                                  as outlined in Section 5.1, while POEM(B) is a L-BFGS
+                                                                variant. Finally, we report results from a supervised CRF
+We now empirically evaluate the prediction performance          as a skyline, despite its unfair advantage of having access
+and computational efﬁciency of POEM. Consider multi-            to the full-information examples.
+label classiﬁcation with input x ∈ Rp and prediction y ∈
+{0, 1}q. Popular supervised algorithms that solve this prob-    We keep aside 25% of D as a validation set – we use the
+lem include Structured SVMs (Tsochantaridis et al., 2004)       unbiased counterfactual estimator from Equation (1) for se-
+and Conditional Random Fields (Lafferty et al., 2001). In       lecting hyper-parameters. λ = cλ∗, where λ∗ is the cali-
+the simplest case, CRF essentially performs logistic re-        bration factor from Section 4.2 and c ∈ 10−6, . . . , 1 in
+gression for each of the q labels independently. As out-        multiples of 10. The clipping constant M is similarly set
+lined in Section 5, we use a joint feature map: φ(x, y) =       to the ratio of the 90%ile to the 10%ile propensity score
+x ⊗ y. We conducted experiments on different multi-label        observed in the training set of D. For all methods, when
+datasets collected from the LibSVM repository, with dif-        optimizing any objective over w, we always begin the opti-
+ferent ranges for p (features), q (labels) and n (samples)      mization from w = 0 (⇒ hw = uniform(Y)). We use
+represented as summarized in Table 2.                           mini-batch AdaGrad (Duchi et al., 2011) with batch size
+                                                                = 100 to adapt our learning rates for the stochastic ap-
+Experiment methodology. We employ the Supervised                proaches and use progressive validation (Blum et al., 1999)
+→ Bandit conversion (Agarwal et al., 2014) method. Here,        and gradient norms to detect convergence. Finally, the en-
+we take a supervised dataset D∗ = {(x1, y1∗) . . . (xn, yn∗ )}
+                                           Counterfactual risk minimization
+
+tire experiment set-up is run 10 times (i.e. h0 trained on            6.3. Can MAP predictions derived from stochastic
+randomly chosen 5% subsets, D re-created, and test set per-                policies perform well?
+formance of different approaches collected) and we report
+                                                                      For the policies learnt by POEM as shown in Table 3, Ta-
+the averaged test set expected error across runs.                     ble 5 reports the averaged performance of the deterministic
+                                                                      predictor derived from them. For a learnt weight vector w,
+6.1. Does variance regularization improve                             this simply amounts to applying Equation (6). In practice,
+     generalization?                                                  this method of generating predictions can be substantially
+                                                                      faster than sampling since computing the argmax does not
+Results are reported in Table 3. We statistically test the per-       require computation of the partition function Z(x) which
+formance of POEM against IPS (batch variants are paired               can be expensive in structured output prediction. From Ta-
+together, and the stochastic variants are paired together)            ble 5, we see that the loss of the deterministic predictor is
+using a one-tailed paired difference t-test at signiﬁcance            typically not far from the loss of the stochastic policy, but
+level of 0.05 across 10 runs of the experiment, and ﬁnd               often slightly better.
+POEM to be signiﬁcantly better than IPS on each dataset
+and each optimization variant. Furthermore, on all datasets           Table 5. Mean Hamming loss of MAP predictions from the poli-
+POEM learns a hypothesis that substantially improves over             cies in Table 3. POEMmap is not signiﬁcantly worse than POEM
+the performance of h0. This suggests that the CRM princi-             (one-sided paired difference t-test, signiﬁcance level 0.05).
+ple is practically useful for designing learning algorithms,
+and that the variance regularizer is indeed beneﬁcial.                      POEM(S )     Scene Yeast TMC LYRL
+                                                                            POEM(S )map  1.143 4.517 2.522 0.996
+Table 3. Test set Hamming loss for different approaches to multi-                        1.143 4.065 2.299 0.880
+label classiﬁcation on different datasets, averaged over 10 runs.
+POEM is signiﬁcantly better than IPS on each dataset and each         6.4. How does generalization improve with size of D?
+optimization variant (one-tailed paired difference t-test at signiﬁ-
+cance level of 0.05).
+
+h0        Scene  Yeast  TMC                LYRL                             4
+IPS(B)    1.543  5.547  3.445              1.463
+POEM(B)   1.193  4.635  2.808              0.921                      R(w)  3.5          h0
+IPS(S )   1.168  4.480  2.197              0.918
+POEM(S )  1.519  4.614  3.023              1.118                                         CRF
+          1.143  4.517  2.522              0.996
+CRF       0.659  2.822  1.189              0.222                                           POEM(S)
+                                                                            3
+
+6.2. How computationally efﬁcient is POEM?                                       20 21 22 23 24 25 26 27 28
+                                                                                                      ReplayCount
+Table 4 shows the time taken (in CPU seconds) to run each
+method on each dataset, averaged over different validation            Figure 1. Generalization performance of POEM(S) as a function
+runs when performing hyper-parameter grid search. Some                of n on the Yeast dataset. Even with ReplayCount = 28,
+of the timing results are skewed by outliers, e.g., when un-          POEM(S) is learning from much less information than the CRF
+der very weak regularization, CRFs tend to take a lot longer          (each supervised label conveys 214 bandit label feedbacks).
+to converge. In aggregate, it is clear that the stochastic vari-
+ants are able to recover good parameter settings in a frac-           As we collect more data under h0, our generalization error
+tion of the time of batch L-BFGS optimization, and this is            bound indicates that prediction performance should even-
+even more pronounced when the number of labels grows                  tually approach that of the optimal hypothesis in the hy-
+(the run-time is dominated by computation of Z(xi)).                  pothesis space. We can simulate n → ∞ by replaying the
+                                                                      training data multiple times, collecting samples y ∼ h0(x).
+Table 4. Average time in seconds for each validation run for dif-     In the limit, we would observe every possible y in the ban-
+ferent approaches to multi-label classiﬁcation. CRF is the scikit-    dit feedback dataset, since h0(x) has non-zero probability
+learn implementation (Pedregosa et al., 2011). On all datasets,       of exploring each prediction y. However, the learning rate
+stochastic approaches are substantially faster than batch gradients.  may be slow, since the exponential model family has very
+                                                                      thin tails, and hence may not be an ideal logging distri-
+IPS(B)    Scene  Yeast  TMC                LYRL                       bution to learn from. Holding all other details of the ex-
+IPS(S )   2.58   47.61  136.34             21.01                      periment setup ﬁxed, we vary the number of times we re-
+POEM(B)   1.65   2.86   49.12              13.66                      played the training set (ReplayCount) to collect samples
+POEM(S )  75.20  94.16  949.95             561.12                     from h0, and report the performance of POEM(S) on the
+          4.71   5.02   276.13             120.09
+CRF       4.86   3.28   99.18              62.93
+                     Counterfactual risk minimization
+
+Yeast dataset in Figure 1.                                            recovers h0 map, suggesting that the CRM principle in-
+                                                                      deed achieves robust learning.
+6.5. How does quality of h0 affect learning?
+                                                                                  1.6                 h0
+In this experiment, we change the fraction of the training
+set f · ntrain that was used to train the logging policy; as f                                        POEM(S)
+is increased, the quality of h0 improves. Intuitively, there’s
+a trade-off: better h0 probably samples correct predictions                       1.4                 h0 map
+more often and so produces a higher quality D to learn
+from, but it should also be harder to beat h0. We vary f
+R(w)                                                                              1.2
+                                                                            R(w)
+                                                                                  1
+
+6                        h0                                                       2−1 20  21  22  23  24       25
+                     POEM(S)
+                                                                                              α
+
+5                                                                     Figure 3. Performance of POEM(S) on the LYRL dataset as h0
+                                                                      becomes more deterministic. For α ≥ 25, h0 ≡ h0 map (within
+4                                                                     machine precision).
+
+   0.2  0.4     0.6  0.8      1                                       We observe the same trends (Figures 1, 2 and 3) across
+                                                                      all datasets and optimization variants. They also remain
+             f                                                        unchanged when we include l2−regularization (analogous
+                                                                      to supervised CRFs to capture the capacity of Hlin).
+Figure 2. Performance of POEM(S) on the Yeast dataset as h0 is
+improved. The fraction f of the supervised training set used to       7. Conclusion
+train h0 is varied to control h0’s quality. h0 performance does not
+reach CRF when f = 1 because we do not tune hyper-parameters,         Counterfactual risk minimization serves as a robust prin-
+and we report its expected loss, not the loss of its MAP prediction.  ciple to design algorithms that can learn from a batch of
+                                                                      bandit feedback interactions. The key insight for CRM is
+from 1% to 100% while keeping all other conditions iden-              to expand the classical notion of a hypothesis class to in-
+tical to the original experiment setup in Figure 2, and ﬁnd           clude stochastic policies, reason about variance in the risk
+that POEM(S) is able to consistently ﬁnd a hypothesis at              estimator, and derive a generalization error bound over this
+least as good as h0. Moreover, even D collected from a                hypothesis space. The practical take-away is a simple, data-
+poor quality h0 (0.5 ≤ f ≤ 0.2) allows POEM(S) to effec-              dependent regularizer that guarantees robust learning. Fol-
+tively learn an improved policy.                                      lowing the CRM principle, we developed POEM for struc-
+                                                                      tured output prediction. POEM can optimize over rich pol-
+6.6. How does stochasticity of h0 affect learning?                    icy families (exponential models corresponding to linear
+                                                                      rules in supervised learning), and deal with massive output
+Finally, the theory suggests that counterfactual learning is          spaces as efﬁciently as classical supervised methods.
+only possible when h0 is sufﬁciently stochastic (the gen-
+eralization bounds hold with high probability in the sam-             The CRM principle more generally applies to supervised
+ples drawn from h0). Does CRM degrade gracefully when                 learning with non-differentiable losses, since the objective
+this assumption is violated? We test this by introducing              does not require the gradient of the loss function. We also
+the temperature multiplier w → αw, α > 0 (as discussed                foresee extensions of this work that relax some of the as-
+in Section 5) into the logging policy. For h0 = hw0 , we              sumptions, e.g., to handle noisy δ(·, ·), and ordinal or co-
+scale w0 → αw0, to derive a “more deterministic” vari-                active feedback, or adaptive h0 etc.
+ant of h0, and generate D ∼ hαw0 . We report the perfor-
+mance of POEM(S) on the LYRL dataset in Figure 3 as                   Acknowledgement
+we change α ∈ [0.5, . . . , 32], compared against h0, and the
+deterministic predictor – h0 map – derived from h0. So                This research was funded in part through NSF Awards IIS-
+long as there is some minimum amount of stochasticity in              1247637 and IIS-1217686, the JTCII Cornell-Technion Re-
+h0, POEM(S) is still able to ﬁnd a w that improves upon               search Fund, and a gift from Bloomberg. We thank Chen-
+h0 and h0 map. The margin of improvement is typically                 hao Tan, Karthik Raman and Vikram Rao for proofreading
+greater when h0 is more stochastic. Even when h0 is too               our manuscript, and the anonymous reviewers of ICML for
+deterministic (α ≥ 24), performance of POEM(S) simply                 their constructive feedback.
+Counterfactual risk minimization
+
+References                                                    Langford, John and Zhang, Tong. The epoch-greedy al-
+                                                                 gorithm for multi-armed bandits with side information.
+Agarwal, Alekh, Hsu, Daniel, Kale, Satyen, Langford,             In Proceedings of the 21st Annual Conference on Neural
+   John, Li, Lihong, and Schapire, Robert. Taming the            Information Processing Systems, pp. 817–824, 2008.
+   monster: A fast and simple algorithm for contextual ban-
+   dits. In Proceedings of the 31st International Conference  Langford, John, Strehl, Alexander, and Wortman, Jennifer.
+   on Machine Learning, pp. 1638–1646, 2014.                     Exploration scavenging. In Proceedings of the 25th In-
+                                                                 ternational Conference on Machine Learning, pp. 528–
+Anthony, Martin and Bartlett, Peter L. Neural Network            535, 2008.
+   Learning: Theoretical Foundations. Cambridge Univer-
+   sity Press, New York, NY, USA, 2009.                       Langford, John, Li, Lihong, and Dud´ık, Miroslav. Doubly
+                                                                 robust policy evaluation and learning. In Proceedings of
+Beygelzimer, Alina and Langford, John. The offset tree for       the 28th International Conference on Machine Learning,
+   learning with partial labels. In Proceedings of the 15th      pp. 1097–1104, 2011.
+   ACM SIGKDD International Conference on Knowledge
+   Discovery and Data Mining, pp. 129–138, 2009.              Lewis, Adrian S. and Overton, Michael L. Nonsmooth opti-
+                                                                 mization via quasi-newton methods. Mathematical Pro-
+Blum, Avrim, Kalai, Adam, and Langford, John. Beating            gramming, 141(1-2):135–163, 2013.
+   the hold-out: Bounds for k-fold and progressive cross-
+   validation. In Proceedings of the Twelfth Annual Confer-   Li, Lihong, Chu, Wei, Langford, John, and Schapire,
+   ence on Computational Learning Theory, pp. 203–208,           Robert E. A contextual-bandit approach to personalized
+   1999.                                                         news article recommendation. In Proceedings of the 19th
+                                                                 International Conference on World Wide Web, pp. 661–
+Bottou, Le´on, Peters, Jonas, Candela, Joaquin Q., Charles,      670, 2010.
+   Denis X., Chickering, Max, Portugaly, Elon, Ray, Di-
+   pankar, Simard, Patrice Y., and Snelson, Ed. Counter-      Li, Lihong, Chu, Wei, Langford, John, and Wang, Xuanhui.
+   factual reasoning and learning systems: the example of        Unbiased ofﬂine evaluation of contextual-bandit-based
+   computational advertising. Journal of Machine Learning        news article recommendation algorithms. In Proceed-
+   Research, 14(1):3207–3260, 2013.                              ings of the 4th ACM International Conference on Web
+                                                                 Search and Data Mining, pp. 297–306, 2011.
+Duchi, John, Hazan, Elad, and Singer, Yoram. Adaptive
+   subgradient methods for online learning and stochastic     Li, Lihong, Chen, Shunbao, Kleban, Jim, and Gupta,
+   optimization. Journal of Machine Learning Research,           Ankur. Counterfactual estimation and optimization of
+   12:2121–2159, 2011.                                           click metrics for search engines. CoRR, abs/1403.1891,
+                                                                 2014.
+Galichet, Nicolas, Sebag, Miche`le, and Teytaud, Olivier.
+   Exploration vs exploitation vs safety: Risk-aware multi-   Li, Lihong, Munos, Remi, and Szepesvari, Csaba. Toward
+   armed bandits. In Asian Conference on Machine Learn-          minimax off-policy value estimation. In Proceedings of
+   ing, pp. 245–260, 2013.                                       the 18th International Conference on Artiﬁcial Intelli-
+                                                                 gence and Statistics (AISTATS), 2015.
+Garcia, J. and Fernandez, F. Safe exploration of state and
+   action spaces in reinforcement learning. Journal of Arti-  Mary, Je´re´mie, Preux, Philippe, and Nicol, Olivier. Im-
+   ﬁcial Intelligence Research, 45:515–564, 2012.                proving ofﬂine evaluation of contextual bandit algo-
+                                                                 rithms via bootstrapping techniques. In Proceedings of
+Hofmann, Katja, Schuth, Anne, Whiteson, Shimon, and              the 31st International Conference on Machine Learning,
+   de Rijke, Maarten. Reusing historical interaction data        pp. 172–180, 2014.
+   for faster online learning to rank for IR. In Sixth ACM
+   International Conference on Web Search and Data Min-       Maurer, Andreas and Pontil, Massimiliano. Empirical
+   ing, pp. 183–192, 2013.                                       bernstein bounds and sample-variance penalization. In
+                                                                 Proceedings of the 22nd Conference on Learning The-
+Ionides, Edward L. Truncated importance sampling. Jour-          ory, 2009.
+   nal of Computational and Graphical Statistics, 17(2):
+   295–311, 2008.                                             Owen, Art B. Monte Carlo theory, methods and examples.
+                                                                 2013.
+Lafferty, John D., McCallum, Andrew, and Pereira, Fer-
+   nando C. N. Conditional random ﬁelds: Probabilis-          Pedregosa, F., Varoquaux, G., Gramfort, A., Michel, V.,
+   tic models for segmenting and labeling sequence data.         Thirion, B., Grisel, O., Blondel, M., Prettenhofer, P.,
+   In Proceedings of the 18th International Conference on
+   Machine Learning, pp. 282–289, 2001.
+                                                            Counterfactual risk minimization
+
+   Weiss, R., Dubourg, V., Vanderplas, J., Passos, A., Cour-
+   napeau, D., Brucher, M., Perrot, M., and Duchesnay, E.
+   Scikit-learn: Machine learning in Python. Journal of
+   Machine Learning Research, 12:2825–2830, 2011.
+
+Rosenbaum, Paul R. and Rubin, Donald B. The central
+   role of the propensity score in observational studies for
+   causal effects. Biometrika, 70(1):41–55, 1983.
+
+Shivaswamy, Pannagadatta K. and Joachims, Thorsten.
+   Multi-armed bandit problems with history. In Proceed-
+   ings of the 15th International Conference on Artiﬁcial
+   Intelligence and Statistics, pp. 1046–1054, 2012.
+
+Strehl, Alexander L., Langford, John, Li, Lihong, and
+   Kakade, Sham. Learning from logged implicit explo-
+   ration data. In Proceedings of the 24th Annual Con-
+   ference on Neural Information Processing Systems, pp.
+   2217–2225, 2010.
+
+Thomas, Philip S., Theocharous, Georgios, and
+   Ghavamzadeh, Mohammad. High-conﬁdence off-
+   policy evaluation. In Proceedings of the 29th AAAI
+   Conference on Artiﬁcial Intelligence, pp. 3000–3006,
+   2015.
+
+Tsochantaridis, Ioannis, Hofmann, Thomas, Joachims,
+   Thorsten, and Altun, Yasemin. Support vector machine
+   learning for interdependent and structured output spaces.
+   In Proceedings of the 21st International Conference on
+   Machine Learning, pp. 104–, 2004.
+
+van den Burg, G.J.J. and Groenen, P.J.F. GenSVM: A Gen-
+   eralized Multiclass Support Vector Machine. Techni-
+   cal Report EI 2014-33, Erasmus University Rotterdam,
+   Erasmus School of Economics (ESE), Econometric In-
+   stitute, 2014.
+
+Vapnik, V. Statistical Learning Theory. Wiley, Chichester,
+   GB, 1998.
+
+Yu, Jin, Vishwanathan, S. V. N., Gu¨nter, Simon, and
+   Schraudolph, Nicol N. A quasi-Newton approach to non-
+   smooth convex optimization problems in machine learn-
+   ing. Journal of Machine Learning Research, 11:1145–
+   1200, 2010.
+
+Zadrozny, Bianca, Langford, John, and Abe, Naoki. Cost-
+   sensitive learning by cost-proportionate example weight-
+   ing. In Proceedings of the Third IEEE International
+   Conference on Data Mining, pp. 435–, 2003.
+

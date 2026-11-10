@@ -1,0 +1,1017 @@
+                                       Stateful Large Language Model Serving with Pensieve
+
+                                          Lingfan Yu            Jinkun Lin                                             Jinyang Li
+
+                                       New York University  New York University                                    New York University
+
+                                       lingfan.yu@nyu.edu   jinkun.lin@nyu.edu                                     jinyang@cs.nyu.edu
+
+arXiv:2312.05516v3 [cs.LG] 7 Oct 2024  Abstract                                                                    require very expensive computation due to two factors. One,
+                                                                                                                   LLMs have huge parameter sizes (10s or 100s of billions)
+                                       Large Language Models (LLMs) are wildly popular today                       and have a trend of growing even larger. Two, LLMs need
+                                       and it is important to serve them efficiently. Existing LLM                 to support a large context size (2K to 32K tokens) to be
+                                       serving systems are stateless across requests. Consequently,                useful. There has been much related work to improve the
+                                       when LLMs are used in the common setting of multi-turn                      performance of LLM inference/serving from various angles,
+                                       conversations, a growing log of the conversation history                    including better batching [52], operation fusion [10], better
+                                       must be processed alongside any request by the serving                      GPU memory utilization [27], faster output generation [6,
+                                       system at each turn, resulting in repeated processing.                      28], low rank adaptation [21] and quantization [12] (see §7).
+                                                                                                                   In contrast to these works, in this paper, we take a step
+                                          In this paper, we design 𝑃𝑒𝑛𝑠𝑖𝑒𝑣𝑒, a system optimized for        back and examine inefficiencies that arise in the setting of
+                                       multi-turn conversation LLM serving. 𝑃𝑒𝑛𝑠𝑖𝑒𝑣𝑒 maintains             a specific but very popular LLM use case today, aka as a
+                                       the conversation state across requests by caching previously                multi-turn conversational chatbot.
+                                       processed history to avoid duplicate processing. 𝑃𝑒𝑛𝑠𝑖𝑒𝑣𝑒’s
+                                       multi-tier caching strategy can utilize both GPU and CPU                       In the conversational setup, the user and the chatbot are
+                                       memory to efficiently store and retrieve cached data. 𝑃𝑒𝑛𝑠𝑖𝑒𝑣𝑒      engaged in a dialogue that may last many rounds. In order
+                                       also generalizes the recent PagedAttention kernel to support                for the chatbot not to “lose memory” of what has been said
+                                       attention between multiple input tokens with a GPU cache                    so far when responding, the cumulative history of the dia-
+                                       spread over non-contiguous memory. Our evaluation shows                     logue must be part of the context for LLM’s autoregressive
+                                       that 𝑃𝑒𝑛𝑠𝑖𝑒𝑣𝑒 can achieve 1.14-3.0× the throughput of vLLM          generation. As existing LLM serving systems are stateless
+                                       and TensorRT-LLM and significantly reduce latency.                          across requests, one must prepend a growing log of conversa-
+                                                                                                                   tion history alongside each new request as the input prompt
+                                       CCS Concepts: • Software and its engineering → Virtual                      to be processed from scratch. This causes much duplicate
+                                       memory; • Computer systems organization → Data flow                         processing for multi-turn conversations.
+                                       architectures.
+                                                                                                                      How to avoid duplicate processing of the chat history? To
+                                       Keywords: LLM Serving, Multi-turn Conversations, Cache                      do so, the serving system can save any previously processed
+                                                                                                                   context data in the form of token embeddings. When new
+                                       ACM Reference Format:                                                       requests from the same conversation arrive, the saved con-
+                                       Lingfan Yu, Jinkun Lin, and Jinyang Li. 2025. Stateful Large Lan-           text data can be re-used and subsequently augmented. This
+                                       guage Model Serving with Pensieve. In Twentieth European Con-               can be done with best effort. Essentially, the serving system
+                                       ference on Computer Systems (EuroSys ’25), March 30–April 3, 2025,          is allowed to keep some cached state containing previously
+                                       Rotterdam, Netherlands. ACM, New York, NY, USA, 15 pages. https:            processed context across requests. Doing so enables the serv-
+                                       //doi.org/10.1145/3689031.3696086                                           ing system to exploit the opportunity that when users are
+                                                                                                                   actively chatting with an AI chatbot, follow-up requests usu-
+                                       1 Introduction                                                              ally arrive within a reasonably short time period to leverage
+                                                                                                                   the cached state.
+                                       The world has recently witnessed the fast expansion of Large
+                                       Language Models (LLMs). The most popular use of LLM is                         Caching state across requests is straightforward at the
+                                       for chatbots, with applications like ChatGPT demonstrating                  high level, but several challenges remain to make it really
+                                       an astounding capability of following instructions and inter-               work. First, where to save the data? Keeping it in the GPU
+                                       acting with humans as a virtual assistant. Other LLM-backed                 is the fastest, but is very constrained by the relatively small
+                                       applications include writing code, responding to emails, do-                GPU memory size. Putting it on disk would incur much
+                                       ing literature reviews, etc. As LLM continues its explosive                 longer load latency, hurting the user experience. A two-tier
+                                       growth, it is imperative to develop fast and efficient LLM                  caching solution spanning both GPU and CPU memory is
+                                       serving systems.                                                            promising, but care must be taken to cope with each tier’s
+                                                                                                                   capacity limit and to swap in/out saved context data from/to
+                                          An LLM is an autoregressive DNN model based on the                       the GPU without damaging performance. Second, how to
+                                       Transformer [48] architecture. The model iteratively predicts               reuse saved context data efficiently when processing a new
+                                       the next output token based on the current context which                    request? Furthermore, some parts of the saved context can
+                                       includes the sequence of input prompt tokens followed by
+                                       output tokens generated in the previous iterations. LLMs
+
+                                       ∗An earlier draft of this work was published on arXiv [53] on Dec 9, 2023.
+EuroSys ’25, March 30–April 3, 2025, Rotterdam, Netherlands            Lingfan Yu, Jinkun Lin, and Jinyang Li
+
+be dropped due to the cache limit. How to handle partially       2.1 LLM and the Attention Mechanism
+saved context by recomputing what has been dropped?
+                                                                 Popular large language models, e.g. GPT-3 [5], OPT [55],
+   In this paper, we design a stateful LLM serving system,       Llama [46, 47], are all based on the Transformer architec-
+called Pensieve, to address the aforementioned challenges.       ture [48]. A model consists of many transformer layers, each
+Pensieve saves a conversation’s processed context in a two-      of which is composed of an attention module, seen as the
+tier GPU-CPU cache. It evicts cached data to the next tier       dashed box Figure 1, and a 2-layer feed-forward network.
+(or discards it), preferring conversations that have been inac-  The model takes as input a sequence of token IDs represent-
+tive for longer and/or those that are cheaper to recompute.      ing the natural language sentence and feeds them through
+The eviction is done at the granularity of a chunk of tokens     an embedding layer to obtain a continuous representation
+instead of the whole conversation. Therefore, a conversa-        (aka embedding) for each token before feeding them through
+tion’s saved context might span both tiers of the cache and      transformer layers. For simplicity, we refer to token embed-
+may be partially dropped. Pensieve uses ahead-of-time swap-      dings as “tokens”, and refer to token IDs as “raw tokens”.
+ping and pipelined transfer to overlap computation with the      LLM is autoregressive in the sense that it iteratively predicts
+data movement between cache tiers. Dropped contexts are          the next output token based on the current context which
+handled via recomputation. Evicting and restoring cause a        includes the input prompt tokens followed by output tokens
+conversation’s cached context to occupy non-contiguous           generated in the previous iterations.
+GPU memory. We develop a new GPU kernel to compute
+attention [48] between multiple input tokens and cached con-        The success of the Transformer originates from the capa-
+text residing in non-contiguous memory, which is lacking         bility of its attention module. For each layer, the attention
+in existing LLM serving systems. Our kernel is a generalized     module first performs QKV projection, aka linear transfor-
+version of the PagedAttention kernel in vLLM [27].               mations on its input token embedding (𝑋 ), to produce three
+                                                                 new embeddings Query (𝑄), Key (𝐾), and Value (𝑉 ):
+   We have built Pensieve and compared its performance
+against vLLM [27] and TensorRT-LLM [36], two state-of-the-       𝑄 = 𝑋𝑊𝑞𝑢𝑒𝑟 𝑦
+art serving systems that do not cache state across requests.
+Experiments show that Pensieve achieves serving through-         𝐾 = 𝑋𝑊𝑘𝑒𝑦                              (1)
+put that is 1.14-1.70× of vLLM and TensorRT-LLM for small
+single-GPU models (OPT-13B, Llama 2-13B) and 1.64-3.0× for       𝑉 = 𝑋𝑊𝑣𝑎𝑙𝑢𝑒
+large four-GPU models (OPT-66B, Llama 2-70B). At moderate
+serving load, Pensieve also significantly reduces latency.       where 𝑊𝑞𝑢𝑒𝑟 𝑦, 𝑊𝑘𝑒𝑦 and 𝑊𝑣𝑎𝑙𝑢𝑒 are trainable weights. We
+                                                                 refer to the 𝐾 and 𝑉 embeddings as KV-tokens. The mod-
+   In summary, this paper makes the following contributions:     ule then computes all-to-all attention scores using the dot
+                                                                 product between each pair of tokens’ query and key:
+    • We identify a major inefficiency of existing LLM serv-
+       ing systems when used for multi-turn conversations:       𝐴 =  𝑄𝐾𝑇                                 (2)
+       a conversation’s history context is recomputed with
+       each successive new request in the same conversation.           𝑠𝑐𝑎𝑙𝑒
+
+    • We develop Pensieve, a stateful LLM serving system         where scale is a normalization factor. This attention score
+       that saves the conversation context in a multi-tier GPU-
+       CPU cache and reuses it across requests to minimize       is then normalized using softmax and used for weighted
+       redundant computation. Our system design can ef-
+       ficiently move data between cache tiers and handle        aggregation of the token embeddings in 𝑉 :
+       partially dropped context via recomputation.
+                                                                 𝑂 = 𝑠𝑜 𝑓 𝑡𝑚𝑎𝑥 (𝐴)𝑉                 (3)
+    • We build a new attention GPU kernel to compute at-
+       tention between a new request’s multiple input tokens     The above equations show the process of so-called single-
+       and the saved context scattered in non-contiguous         head attention. In practice, multi-head attention is used,
+       GPU memory. Existing kernels either require contigu-      where 𝑄, 𝐾, 𝑉 produced by Equation (1) are divided into
+       ous GPU context cache or are restricted to a single       groups, called attention heads. Each attention head indepen-
+       input token.                                              dently performs attention as Equation (2) and (3).
+
+    • We evaluate Pensieve using real-world conversation         2.2 How LLM is Served
+       datasets to demonstrate its effectiveness compared to
+       the state-of-the-art stateless serving system.               The prefill vs. generation phase. To perform inference
+                                                                 using an LLM, one needs to keep a KV cache in GPU to avoid
+2 Background                                                     recomputation during the autoregressive output generation.
+                                                                 Figure 1 shows the typical LLM inference process adopted by
+This section provides a brief background on LLMs and how         systems like FasterTransformer [35], ORCA [52], vLLM [27].
+existing systems serve them.                                     It is divided into two phases: 1) In the prefill phase, all input
+                                                                 prompt tokens are processed together to generate 𝐾 and 𝑉
+                                                                 (aka KV-tokens) for each layer, and the KV cache is initialized
+                                                                 with the resulting KV-tokens. The embedding of the last
+                                                                 token from the last layer is used to generate the first output
+Stateful Large Language Model Serving with Pensieve                               EuroSys ’25, March 30–April 3, 2025, Rotterdam, Netherlands
+
+Prefill Phase                                                              Generation Phase
+
+        is                                                      great                        <EOS>
+
+2-layer FFN           ×𝑁                            2-layer FFN           ×𝑁               2-layer FFN            ×𝑁
+
+Attention Out Linear                                 Attention Out Linear                    Attention Out Linear
+
+Multi-head Attention                                 Multi-head Attention                    Multi-head Attention
+
+Attention  Query      Key                            Attention      Query   Key              Attention  Query       Key
+ Module               Value                           Module               Value              Module                Value
+
+QKV Linear                   KV Cache                QKV Linear                   KV Cache   QKV Linear                    KV Cache
+
+I think this                                                    is                                      great
+
+                             Figure 1. How inference is done for Transformer-based LLMs
+
+token; 2) The generation (also referred to as decoding) phase                            A multi-turn conversation           Input tokens to LLM
+works iteratively over many steps. In each step, the token                 Request 1 User: Hello!                     Hello!
+generated by the last generation step is processed as a single             Response 1 LLM: Hi!                        Hello! Hi! What’s the weather?
+new input token. Each layer computes the 𝑄,𝐾,𝑉 embedding
+vector for the new token, updates the KV cache, and performs               Request 2 User: What’s the weather?      Conversation history New request
+attention using the new token’s 𝑄 embedding with all KV-                  Response 2 LLM: It’s sunny.
+tokens in the KV cache.
+                                                                           Figure 2. Existing serving systems process a cumulative history
+   Iteration-level batching. For LLMs that have variable-                  repeatedly with each request in a multi-turn conversation.
+sized input and output, the granularity of batching has a huge
+impact on system throughput and serving latency. If schedul-               3 Motivation and Challenges
+ing is performed at the request granularity, executing a batch
+of requests with different input prompt lengths requires                   3.1 Motivation
+padding tensors to the maximum length and waiting for
+the request with the longest output to finish. Iteration-level             Existing techniques for serving LLMs mostly focus on im-
+batching strategy, originally proposed by BatchMaker [17]                  proving the inference time or memory efficiency of a single
+for non-transformer-based sequence-to-sequence models,                     request. We take a step back and examine inefficiencies that
+performs batching at token granularity. ORCA [52] extends                  arise in a very popular LLM use case today, aka as a multi-
+this approach to support the LLM workload: whenever a                      turn conversational chatbot.
+request finishes an iterative generation step, the scheduler
+checks whether it has reached the end of a sequence and                       In a multi-turn conversation, the user engages in multiple
+can leave the batch, making room for a request to start its                rounds of conversations with the chatbot so the underlying
+generation phase immediately.                                              LLM needs to be aware of the conversation history to gen-
+                                                                           erate an appropriate response. This is done by prepending
+   Memory management. For each request, the model per-                     the cumulative conversation history as raw text to each new
+forms iterative generation until either the special end-of-                request, due to the stateless nature of existing serving sys-
+sentence token (EOS) is emitted or the preconfigured maxi-                 tems, as shown in Figure 2. As the interaction between the
+mum decoding length is reached. Systems like FasterTrans-                  user and chatbot continues, the conversation history grows,
+former [35] and ORCA [52] reserve slots in KV cache for                    making the cost of the prefill phase overshadow that of the it-
+each request based on the maximum decoding size. A more                    erative generation phase. Unfortunately, much of the history
+recent system, vLLM [27], can dynamically grow the allo-                   processing is redundant.
+cated cache slots for each request and allow these slots to
+reside in non-contiguous GPU memory. vLLM develops Page-                      Figure 3 demonstrates the heavy cost of the prompt initia-
+dAttention GPU kernel to handle the generation phase with                  tion phase under an artificial workload where each request
+non-contiguous KV cache. Existing serving systems are state-               has 200 new prompt tokens and has varying conversation
+less across requests. In other words, they de-allocate all the             history sizes. As shown in the figure, the cost of recomputing
+cache slots used by a request as soon as it finishes.                      the conversation history (solid blue line) causes the cost of
+                                                                           the prefill phase to soon outgrow the generation phase.
+
+                                                                              The goal of this project is to minimize redundant com-
+                                                                           putation of the conversation history. This can be done by
+                                                                           caching any previously processed embeddings at the serving
+                                                                           system and re-using them across requests from the same
+EuroSys ’25, March 30–April 3, 2025, Rotterdam, Netherlands                                                                                                                                               Lingfan Yu, Jinkun Lin, and Jinyang Li
+
+25                                                                                                                                                                       1.6
+
+Execution Time (s)Prefill                                                                                                                                                1.4  Non-attention
+
+                                                                                                                                              Normalized execution time20GenerationAttention
+
+                                                                                                                                                                         1.2
+
+15                                                                                                                                                                       1.0
+
+                                                                                                                                                                         0.8
+
+10                                                                                                                                                                       0.6
+
+5                                                                                                                                                                        0.4
+
+                                                                                                                                                                         0.2
+
+00  1024        2048            3072                         4096                                                                                                        0.0  256  512       1024         2048          4096  8192 16384
+
+                History Length                                                                                                                                                                            Context size
+
+Figure 3. Execution time for a batch of 32 requests performing     Figure 4. Execution time of attention operation for a chunk of 32
+prompt (32 tokens) prefill and generations for 200 steps.          tokens with different context sizes. Results are normalized by the
+                                                                   execution time of non-attention operations in a transformer layer.
+
+conversation. More concretely, one can save the KV-tokens          Recompute                                                                                                           Load into GPU        Reuse                    Compute
+in the KV cache belonging to a previous request and only             Dropped                                                                                                            Available in CPU  Still in GPU            Never Processed
+process the new user prompts of the next follow-up request                                                                                                                         Past KV-tokens                             New Request Prompt
+while re-using history embeddings saved in the KV cache.
+                                                                   Figure 5. Layout of a typical request’s KV-token context. The
+3.2 Challenges                                                     shaded areas, which occur at both ends of the context, mark those
+                                                                   tokens that must be processed by the prefill phase.
+   Limited GPU memory for caching. LLM has very large
+model parameters, resulting in large KV-tokens. For example,       for all other non-attention operators). As can be seen in Fig-
+a 13 billion parameter GPT-3 model has 40 layers and a hid-        ure 4, the cost of attention grows linearly with context size.
+den size of 5120. Assuming the use of 16-bit half-precision        Thus, when deciding which tokens to discard to reclaim CPU
+numbers, storing each KV-token takes 2 * 40 (layer) * 5120         memory, it is more preferable to drop the leading tokens of
+(units/layer) * 2 (bytes/unit) = 0.78MB memory space. Given        a conversation history.
+the limited GPU memory capacity, depending on the history
+lengths, only a few dozen or hundreds of conversation histo-          Dropping KV-tokens from the leading end of a conversa-
+ries can be kept in the GPU. Therefore, we must extend our         tion brings additional complexities. Figure 5 illustrates the
+cache space to use the more abundant CPU memory.                   layout of a typical request from a continuing conversation
+                                                                   in its prefill phase. The request’s context can be viewed as
+   Token-level cache management and recovery. When                 composed of four segments: 1) the first and earliest segment
+using a multi-tier GPU-CPU cache, the serving system needs         corresponds to tokens that have been dropped from the CPU
+to swap cached history from GPU to CPU and vice versa.             cache and must be recomputed. 2) the second segment cor-
+Swapping at the coarse granularity of an entire conversation       responds to tokens that reside in the CPU cache and will be
+history is sub-optimal; not only does it utilize the cache space   fetched into the GPU. 3) the third segment contains tokens
+inefficiently but also it incurs large swapping latency. Thus,     residing in the GPU cache. 4) the fourth and latest segment
+we decide to swap at the granularity of individual tokens.         contains the raw tokens corresponding to this request’s new
+Specifically, in order to make room for the processing of          prompt. As we can see, both the first and fourth segment
+new requests, the serving system chooses certain cached            requires computation. However, such separation of compu-
+KV-tokens to swap from GPU to CPU. Later, it also needs to         tation at both ends of the context breaks the assumption of
+restore the swapped out KV-tokens from CPU to GPU.                 all existing attention kernels that the input tokens belong in
+                                                                   a consecutive context region in the prefill phase.
+   When the system is under CPU memory pressure, some
+cached KV-tokens need to be dropped and re-computed later             Handling non-contiguous KV cache. Existing systems
+when needed. We note that, although each token occupies            [27, 52] batch requests separately for the prefill and genera-
+the same amount of memory space, the recomputation cost            tion phase so that they can use existing high-performance
+of each token is different due to the nature of causal attention   attention kernels [10, 39] for the prefill phase. Unfortunately,
+computation. Specifically, tokens appearing later in the con-      we cannot simply adopt such a design in our setting. This
+text sequence require more computation than earlier ones           is because existing attention kernels for prefill assume a KV
+because tokens “attend to” all preceding but not succeeding        cache with contiguous memory. However, in order to support
+tokens. Figure 4 shows the execution time of the attention         the swapping of KV-tokens between GPU and CPU, it is more
+operator for 32 tokens with a prompt context of varying            efficient to allow KV-tokens to reside in non-contiguous GPU
+sizes; the execution time shown has been normalized against        memory regions. Although vLLM [27] has developed the
+the rest of inference time (aka the sum of execution times
+Stateful Large Language Model Serving with Pensieve                             EuroSys ’25, March 30–April 3, 2025, Rotterdam, Netherlands
+
+                                                      KV Cache in GPU
+
+                                             0 What   is         the   capital                             Conversation
+                                                                                                               history
+                                             1 end    ?          It    climate
+                                                                       saving                 Scheduler
+                                             2 me     about      the
+                                                                          It
+Request 0 It                                 3 When   does daylight      Tell
+Request 1 Tell me about the climate there .
+                                             4  of    Australia  ?              User request
+                                     Query                                       Response
+                                             5  is    Canberra   .                             Iteration-level           Batch Info Cache
+                                                                                              Request Batcher                              Manager
+                                             6
+                                                                                                                                   Cache Plan
+                                             7 there  .
+
+Figure 6. Multi-token attention with non-contiguous KV cache.                                 Worker Batch Output
+The batch contains two requests, whose tokens (Query represen-
+tations) are shown on the left. The right side shows the requests’                            GPU executor  KV cache     Recover
+context (KV-tokens) which reside in non-contiguous GPU memory                                      Model                                 CPU
+(chunk 3, 1 for request 0 and chunk 0, 4, 5, 2, 7 for request 1).
+                                                                                                                         Backup KV cache
+
+PagedAttention kernel to handle non-contiguous KV cache,                        Figure 7. System architecture of Pensieve
+it is designed to be solely used in the generation phase, be-
+cause it limits each request in the batch to have exactly one                   GPU kernels to process a batch of requests. 2) it performs
+input token. As each request has more than one token in                         the actual data movements between the GPU and CPU KV
+the prefill phase, one cannot simply use PagedAttention for                     cache based on the batch’s cache plan as determined by the
+prefill. A naive hack is to process the new prompt one token                    scheduler.
+at a time, in the same manner as iterative generation, so that
+the PagedAttention kernel can be applied. But this method                       4.2 A unified batch scheduler
+gives up the parallelization opportunity brought by the extra
+query token dimension in the prefill phase. Thus, to achieve                    Pensieve performs fine-grained iteration-level batching [17,
+efficient GPU computation, we must address the challenge of                     27, 52]. However, our batching strategy differs from exist-
+supporting non-contiguous KV cache during prefill. Doing so                     ing LLM serving systems. While ORCA only batches non-
+also brings extra benefit: as both the prefill phase and gener-                 attention operations and handles attention operations indi-
+ation phase can compute using the same non-contiguous KV                        vidually for each request [52], Pensieve and vLLM [27] batch
+cache, we can handle requests in different phases together in                   requests for both non-attention and attention operations.
+the same batch. Figure 6 illustrates the desired Multi-token                    However, unlike vLLM which only forms a batch among
+attention kernel for computing attention for a batch of two                     requests in the same phase and thus processes each of the
+requests, one in its generation phase, the other in its prefill                 two types of batches in separate kernel invocation, Pensieve
+phase, over non-contiguous KV cache.                                            handles both the prefill phase and generation phase in a
+                                                                                unified way. In other words, the Pensieve scheduler forms
+4 System Design                                                                 a batch of requests regardless of which phase they are in.
+                                                                                In the same batch, some could be in their generation phase
+At a high level, we aim to save a conversation’s KV-tokens                      while others are in their prefill phase. Such unified batching
+across multiple turns in a multi-tier GPU-CPU cache. To                         is made possible by Pensieve’s multi-token attention kernel
+realize the potential performance benefits, we need to make                     design (§4.4.1).
+cache swapping and dropped token recomputation efficient,
+by developing techniques to address the challenges in §3.                          Pensieve’s iteration-level scheduler is “clocked” for action
+                                                                                by the completion of a generation step. In particular, after
+4.1 System Overview                                                             each iteration of token generation, the worker returns any
+                                                                                finished request that has either emitted the end-of-sentence
+Figure 7 shows the system architecture. Pensieve consists                       token or reached maximum decoding length. The scheduler
+of a single scheduler and multiple workers, each of which                       finds the next request in its wait queue to join the batch, if
+manages one GPU. The scheduler has two jobs: 1) it is re-                       there is room (i.e. the total number of tokens in the batch is
+sponsible for batching requests for execution, and 2) it en-                    fewer than some pre-configured threshold). We use the sim-
+sures that requests in the batch have sufficient GPU memory                     ple first-come-first-serve scheduling policy when choosing
+for execution. For 1), the scheduler performs fine-grained                      which new requests to join the batch.
+iteration-level batching [17, 27, 52] so that a new request
+can join the batch with existing requests while the latter is                      For unified batch formation, the scheduler concatenates
+in the process of performing autoregressive generation. For                     the tokens to be processed from all requests. For each new
+2), the scheduler manages the allocation of slots in the KV                     request joining the batch, its tokens include those corre-
+cache and determines when to swap between the GPU and                           sponding to the request’s new user prompt. For each existing
+CPU KV cache. Each worker also has two jobs: 1) it invokes                      request in the batch, its token includes the one generated by
+EuroSys ’25, March 30–April 3, 2025, Rotterdam, Netherlands                                                                 Lingfan Yu, Jinkun Lin, and Jinyang Li
+
+the last generation step. By combining the prefill phase to-                    the ascending order of their retention values so that chunks
+gether with the generation phase, we avoid running separate                     with lower recomputation cost and/or those belonging to
+small kernels and can thus improve GPU utilization.                             conversations with longer inactive periods are preferentially
+                                                                                evicted.
+4.3 KV cache management
+                                                                                   Estimating the recomputation cost. In order to calcu-
+Traditionally, the KV cache in GPU only serves as a computa-                    late the retention value of a chunk, we need to estimate
+tion workspace. In Pensieve, the GPU KV cache also serves as                    its recomputation cost. In particular, we view the cost to
+storage space to cache the KV-tokens of recently completed                      recompute the embedding of a chunk as the sum of recom-
+requests of active conversations. Pensieve adopts a two-tier                    puting the LLM model’s attention operation and the rest of
+hierarchical caching strategy and uses the much larger CPU                      the non-attention operation: 𝐶𝑜𝑠𝑡 (𝑠, 𝑙) = 𝐶𝑜𝑠𝑡𝑎𝑡𝑡𝑒𝑛𝑡𝑖𝑜𝑛 (𝑠, 𝑙) +
+memory as the second-tier cache space. The scheduler deter-                     𝐶𝑜𝑠𝑡𝑜𝑡ℎ𝑒𝑟 (𝑠), where 𝑠 is the chunk size and 𝑙 is the size of the
+mines the caching plan and instructs the worker to perform                      context to which the chunk “attends” for the attention opera-
+the actual data movements between GPU and CPU.                                  tion. The cost of non-attention computation cost (𝐶𝑜𝑠𝑡𝑜𝑡ℎ𝑒𝑟 (𝑠))
+                                                                                consists of linear layers, layer normalization, non-linear
+   The scheduler tracks the amount of free GPU KV cache                         activation, etc., and therefore is independent of the con-
+slots left. Before handing off a batch of requests to the worker,               text size. On the contrary, attention requires accessing and
+the scheduler tries to ensure that any new request’s past KV-                   performing computation with all 𝑙 context tokens. Since
+tokens will reside in the GPU and there is sufficient GPU                       the eviction decisions are made for fixed-size chunks of
+memory for the execution. Specifically, if a request in the                     32 tokens, we can simplify the cost function to become
+batch has any KV-tokens that have been swapped out to                           𝐶𝑜𝑠𝑡 (𝑙 ) = 𝐶𝑜𝑠𝑡𝑎𝑡𝑡𝑒𝑛𝑡𝑖𝑜𝑛 (𝑙 ) + 𝑐 where 𝐶𝑜𝑠𝑡𝑎𝑡𝑡𝑒𝑛𝑡𝑖𝑜𝑛 (𝑙 ) is the
+the CPU memory or dropped, the scheduler determines how                         cost of performing attention operation for a chunk of 32
+many additional GPU KV cache slots are needed to swap in                        tokens with context length 𝑙, and 𝑐 is a constant capturing
+or re-calculate those absent KV-tokens. If there is sufficient                  the cost of non-attention computation. We perform offline
+space, the scheduler instructs the worker to perform the                        profiling to estimate 𝑐 as well as 𝐶𝑜𝑠𝑡𝑎𝑡𝑡𝑒𝑛𝑡𝑖𝑜𝑛 (𝑙) with vary-
+necessary allocation and to start swapping those KV-tokens                      ing context sizes. Since it’s not feasible to profile all possible
+from the CPU as part of the batch’s cache plan.                                 context sizes, we profile context sizes that are powers of 2
+                                                                                and use the measured values to interpolate the cost for other
+4.3.1 Eviction Policy. Pensieve performs fine-grained                           context sizes.
+token-level cache eviction and dropping. We design the evic-
+tion policy to express two kinds of preferences: 1) it prefer-                  4.3.2 Ahead-of-the-time swapping. Since Pensieve tries
+entially evicts from older conversations, aka those that have                   to preserve KV-tokens in the GPU for reuse by a later request
+been inactive for a longer period of time. This is based on the                 in the same conversation, the scheduler does not immediately
+same LRU assumption that the least recently active conversa-                    release a request’s GPU cache slots as soon as it finishes,
+tion will not see activity for a longer time. 2) it preferentially              unlike existing systems [27]. Instead of waiting until the GPU
+evicts tokens from the leading end of a conversation’s his-                     cache has run out, the scheduler asks the worker to copy
+tory context. This is based on the observation, previously                      (aka swap out) selected KV-tokens to the CPU if less than a
+shown in Figure 4, that leading tokens of a conversation are                    threshold (e.g. 25%) of the GPU cache slots are available. The
+cheaper to recompute than trailing ones. Below, we describe                     corresponding GPU memory is reclaimed in a lazy manner
+how our policy evicts according to these preferences.                           and is not immediately released until the scheduler later
+                                                                                decides to allocate the same slots to another conversation.
+   Eviction granularity. In order to reduce the overhead
+caused by frequent eviction decision-making and moving                             When the CPU cache runs out of space, the same eviction
+small amounts of memory over the PCIe bus, we group KV-                         policy (§4.3.1) is used to decide which KV-tokens to drop.
+tokens into chunks and make eviction decisions at the gran-                     Performing ahead-of-the-time swapping allows the sched-
+ularity of chunks. The chunk size is configurable. In our                       uler to overlap cache eviction with GPU computation, thus
+experiments, we find that setting the chunk size to 32 tokens                   fully hiding the latency of swapping.
+works well.
+                                                                                4.3.3 Pipelined KV cache recovery. The scheduler does
+   The retention value of a chunk. In order to combine                          not wait for a request’s KV-tokens to be fully swapped in
+both the LRU preference and the evicting from the front                         from the CPU before handing it off to the worker for execu-
+preference, we calculate a score for each chunk to capture its                  tion. Rather, we follow the pipelined approach [4] to overlap
+retention value. Specifically, the retention value of a chunk                   computation with data transfer. Specifically, we exploit the
+is 𝑉 = 𝐶𝑜𝑠𝑡 (𝑠,𝑙 ) , where 𝐶𝑜𝑠𝑡 (𝑠, 𝑙) represents the cost of re-  fact that an LLM model has many layers and each layer’s KV-
+                                                                                token is only used in this layer’s self-attention calculation.
+                  𝑇                                                            Instead of waiting for all layers to finish data transfer before
+
+computing a chunk of size 𝑠 with a context of size 𝑙, and
+the denominator 𝑇 is the amount of time since the conver-
+sation was last active. Pensieve evicts chunks according to
+Stateful Large Language Model Serving with Pensieve                             EuroSys ’25, March 30–April 3, 2025, Rotterdam, Netherlands
+
+starting the execution, we initiate the transfer layer by layer  swap-out), we try to avoid it by conservatively reserving 10%
+and start model computation at the same time. The worker         of GPU cache slots for the execution of existing requests that
+uses GPU events to preserve data dependency: it only starts      are in the generation phase. In other words, the scheduler
+a layer’s self-attention kernel once that layer’s KV-tokens      stops adding new requests into the running batch unless
+have been fully copied to the GPU. Pipelining transfer with      there are more than 10% free GPU cache slots.
+computation allows us to hide the swap-in latency.
+                                                                 4.4 Multi-token attention for non-contiguous cache
+4.3.4 Handling dropped tokens. If a request has some
+of its KV-tokens dropped due to CPU memory pressure, we          How to combine existing KV-tokens in the GPU cache with
+resort to recomputation to handle such dropped tokens. Fig-      those just swapped in from the CPU? The most naive solu-
+ure 5 shows the whereabouts of a typical new request’s KV-       tion is to allocate a contiguous memory region in the GPU
+tokens. As we always evict cached tokens from the leading        to hold them both. However, doing so would incur expen-
+end of a conversation, the GPU cache generally holds the         sive memory copying, since KV-tokens are large. A more
+request’s latest tokens and the CPU cache holds the middle,      promising solution is to allocate separate space only for those
+while the earlier ones may have been dropped.                    swapped-in KV-tokens and to design an attention kernel im-
+                                                                 plementation that can handle non-contiguous memory in its
+   The scheduler swaps in those tokens cached in the CPU.        KV cache.
+For dropped tokens, the scheduler will fetch their correspond-
+ing raw text tokens from the conversation history saved in a        vLLM’s PagedAttention kernel can handle non-contiguous
+persistent store (Figure 7). These retrieved raw tokens will     KV cache in the generation phase [27]. However, for the
+be merged into (i.e. prepended to) the new request’s prompt      prefill phase, it still uses existing kernels which require all
+and become part of the batch’s input tokens, as shown in Fig-    KV-tokens to reside in contiguous memory. We cannot use
+ure 8 (step a). In the prefill phase, the embedding of dropped   PagedAttention because it assumes each request in a batch
+tokens and new prompt tokens are concatenated together           has exactly one input token, which is the case for generation
+as they are processed by successive model layers. At each        but not prefill. Thus, we refer to PagedAttention as a single-
+Transformer layer, the Query, Key, and Value tensors are         token attention kernel because it computes the attention
+computed (step b). Key and Value are stored in KV cache,         scores between a single input token’s query representation
+and Pensieve maintains the KV locations for the entire con-      (Q) and the KV cache. We need to build a multi-token at-
+versation context including previously cached tokens (step       tention kernel that supports performing attention between
+c), which can then be used to perform attention.                 the query representations (Q) of multiple input tokens per
+                                                                 request and the KV cache over non-contiguous memory.
+   However, as discussed in §3.2, the challenge that comes
+with dropping leading tokens is that tokens in query ten-           Our new kernel is similar to that of vLLM to the extent
+sor correspond to two disconnected ranges in the context,        that both kernels need to support loading KV cache from
+while all existing attention kernels assume that the Query       non-contiguous GPU global memory into on-chip shared
+tensor region is consecutive. To address this, we treat these    memory. Their main difference is illustrated in Figure 9. As
+two ranges as two sub-requests that happen to share por-         vLLM’s kernel performs attention between a request’s sin-
+tions of the underlying context. Each row in Figure 8 (step      gle input token and the existing KV-tokens, its underlying
+d) represents the Query tensor and its corresponding KV          computation can be described as two matrix-vector multi-
+context locations of each sub-request of the original request.   plication operations1, as shown in Figure 9. In contrast, our
+As our multi-token attention GPU kernel design (§4.4) can        kernel handles multiple input tokens for each request, com-
+support Query tensors of variable lengths for different re-      puting attention scores between all pairs of input tokens and
+quests in the batch and also accept non-contiguous KV-token      the conversation’s existing KV-tokens. Therefore, its under-
+locations, Pensieve only needs to update auxiliary data struc-   lying computation can be described as two matrix-matrix
+tures and no memory copy is incurred when processing the         multiplication operations, and the batched version of our
+sub-requests.                                                    kernel performs batched matrix-matrix multiplications. Like
+                                                                 vLLM, we fuse the two multiplication operations according
+4.3.5 Suspending requests during generation. Despite             to [10]. Because of the additional dimension in the Q tensor,
+ahead-of-time eviction, the scheduler might still encounter      our kernel has more parallelization and tiling opportunities
+scenarios when the generation phase runs out of GPU cache        on the GPU. However, care must be taken to handle the new
+since a request’s decoding length is not known a priori. In      challenge that Q is a ragged-sized tensor as different requests
+this situation, the scheduler suspends some requests’ execu-     in the batch have different numbers of input tokens.
+tion by taking them out of the current batch, swaps out their
+corresponding KV-tokens to the CPU, and puts them back              When multiple input tokens of a request are handled to-
+in the waiting queue. It chooses which request to suspend        gether in a kernel, we need to apply causal masking so that
+according to the descending order of their arrival time. As
+suspension causes increased latency (due to waiting for the      1The batched version of PagedAttention performs batched matrix-vector
+                                                                 multiplications.
+EuroSys ’25, March 30–April 3, 2025, Rotterdam, Netherlands                                                                                                    Lingfan Yu, Jinkun Lin, and Jinyang Li
+
+                        a) Input of a layer                                                                                                Dropped New Prompt
+
+                        b) QKV projection                                                                                    Query                 Key                Value
+                                                                                                                      Dropped New Prompt   Dropped New Prompt  Dropped New Prompt
+
+                             Store KV into cache &                                                                           Query                     Tokens in KV Cache
+                             swap in evicted KV tokens                                                                Dropped New Prompt
+                        c)                                                                                                                 Dropped             Cached Tokens  New Prompt
+
+                                                                                                                      Query Non-contiguous KV Indices  Tokens in KV Cache
+
+                        d)   Do attention as            Dropped                                                                            Dropped             Cached Tokens  New Prompt
+                             two sub-requests           New Prompt
+
+Figure 8. How Pensieve handles dropped tokens. (a) concatenate tokens of the dropped context and new prompt as the input. (b) Calculate
+projections 𝑄, 𝐾, 𝑉 (c) Update KV cache using newly calculated 𝐾, 𝑉 ; swap in KV-tokens previously evicted to the CPU. (d) Do attention for
+a batch of two sub-requests: one for the dropped context to attend to itself, and the other for the new prompt to attend to the entire context.
+
+Single-Token Attention:                                                                                                                    4.4.1 Unifying the prefill and generation phase. As
+                                                                                                                                           discussed in §4.2, in Pensieve’s batch formation, new requests
+                                                                                                                   d                       in their prefill phase can be grouped with existing requests
+                                                                                                                                           in their generation phase. This is enabled by our multi-token
+   d                            =              ×                                                                                        d  attention kernel because single-token attention performed
+                                                                                                                                           in the generation phase can be treated as a special case of
+1      ×                     d                                                                                        =1                   multi-token attention with query size equal to 1.
+
+   𝑄                              Attention                                                                                            d     More concretely, Pensieve’s scheduler concatenates the
+                                                                                                                                           input tokens to be processed from all requests, regardless
+                                   Score                                                                              =                    of whether they correspond to prompts of new requests or
+                                                                                                                                           the last step’s output token from existing requests. Some
+                        𝐾!                             𝑉                                                                                 auxiliary data structure is maintained to keep track of each
+                                                                                                                                           request’s corresponding region. During execution by the
+Multi-Token Attention:                                                                                                                     worker, these batched input tokens are fed through linear
+                                                                                                                                           layers to generate each token’s QKV representations. Newly
+                                                        d                                                                                  generated KV-tokens are stored in the allocated slots in the
+                                                                                                                                           GPU’s KV cache. Then the worker applies our multi-token
+   d                                                                                                                                       attention kernel to produce the output tokens for all requests.
+
+             ×               d  =              ×                                                                                           4.4.2 Multi-GPU support. For large LLM models that do
+                                                                                                                                           not fit into a single GPU, we adopted Tensor Parallelization,
+   𝑄                              Attention                                                                                               as implemented in Megatron-LM [45], to partition large mod-
+                                     Score                                                                                                 els across multiple GPUs. The KV cache in Pensieve is also
+                                                                                                                                           partitioned accordingly. Each model partition is managed by
+                        𝐾!                             𝑉                                                                                 a worker process which has its own GPU and CPU cache
+                                                                                                                                           partition to store the attention state partition assigned to
+Figure 9. Single-token attention vs multi-token attention, softmax                                                                         this worker. Since the model partitioning occurs along the
+and rescaling omitted. 𝑑 is the dimension of the embedding vector.                                                                        feature dimension of KV cache, it does not affect the eviction
+The red shaded area in the multi-token attention score represents                                                                          policy that decides which token to migrate or drop. There-
+causal masking. 𝐾 and 𝑉 are logically contiguous, but physically                                                                         fore, each worker follows the same migration plan to swap
+placed at random locations when paged memory management is                                                                                 attention states between GPU and CPU memory.
+used.
+                                                                                                                                           5 Implementation
+an earlier input token does not “attend” to later tokens. This
+requires setting a corresponding upper triangular part of the                                                                              We have implemented our prototype serving system Pen-
+attention score matrix to 0, as shown by the red shaded area                                                                               sieve with ∼7K lines of C++/CUDA code. Pensieve manages
+in Figure 9. Causal masking is not needed for the single-token                                                                             KV cache and auxiliary data structure needed by multi-token
+attention kernel since it only processes one input token. We                                                                               attention on the GPU, but relies on PyTorch (v2.0.0, CUDA
+fuse the causal masking operation inside the multi-token                                                                                   11.8) C++ front-end APIs to execute GPU operators in Large
+attention kernel to avoid materializing the intermediate at-
+tention score matrix [10].
+
+   Matrix-matrix multiplication kernels are much more com-
+plex than those for matrix-vector multiplication because they
+typically use sophisticated algorithms to extract additional
+data reuse opportunities with GPU’s on-chip shared memory
+and to leverage GPU’s tensor core primitives. Therefore, in-
+stead of trying to extend vLLM’s PagedAttention kernel for
+multi-token attention, we base our implementation on an ex-
+isting multi-token attention kernel from PyTorch and extend
+it to handle non-contiguous KV cache. Our kernel uses the
+high-performance thread-block level matrix-matrix multipli-
+cation provided by NVIDIA Cutlass template library [33].
+Stateful Large Language Model Serving with Pensieve                     EuroSys ’25, March 30–April 3, 2025, Rotterdam, Netherlands
+
+Model OPT-13B OPT-66B Llama 2-13B Llama 2-70B                                                       ShareGPT     UltraChat
+                                                                                                        48,159    1,468,352
+# layer  40    64    40                              80                        # conversations             5.56
+                                                                               Mean # of turns            37.77         3.86
+# hidden 5120  9216  5120                            8192               Mean request input length       204.58        51.78
+                                                                        Mean request output length                   257.81
+# head   40    72    40                              64
+
+# KV head 40   72    10∗                             8
+
+Head size 128  128   128                             128
+
+# GPU    1     4     1                               4                  Table 2. Dataset statistics
+
+Table 1. Hyper-paramaters for OPT and Llama 2 models.
+
+Language Models. Based on PyTorch’s fused memory effi-                     We evaluate two different sizes for each model: a small
+cient attention, we develop our own fused multi-token atten-            one on a single GPU, and a large one partitioned onto 4 GPUs
+tion kernel using NVIDIA Cutlass library to support perform-            using Tensor Parallelization as done in Megatron-LM (§4.4.2).
+ing attention with KV-tokens that reside in non-contiguous              Detailed model hyper-parameters can be found in Table 1.
+memory.                                                                 By default, Llama 2 only uses GQA for models with over 70
+                                                                        billion parameters. To demonstrate Pensieve’s effectiveness
+   Optimization: Prioritize data retrieval over eviction.               when used with GQA, we changed the number of KV heads
+Although PCIe allows full-duplex bidirectional data transfer,           of Llama 2-13B from 40 to 10. In all experiments, the 16-bit
+in practice, we found that when CPU-to-GPU data transfer                half-precision float format is used for both model parameters
+is done concurrently with GPU-to-CPU data transfer, there               and intermediate hidden representations.
+is a significant throughput drop (18-20%) in both directions.
+Similar issues have been reported2. Since Pensieve performs                Dataset. We evaluate Pensieve on two multi-turn conver-
+KV-token swap-out ahead of time, there is no urgency to fin-            sation datasets: ShareGPT and UltraChat. ShareGPT [42] is
+ish the transfer right away. To prevent eviction from slowing           a real-world dataset containing user-shared ChatGPT con-
+down the swapping in of past KV-token, we set up a wait-                versations. UltraChat [14] is a recent large-scale synthetic
+ing mechanism. In particular, if a worker has any ongoing               dataset for multi-turn dialogue: it uses separate LLMs to
+swap-in task, it waits to perform GPU-to-CPU copy until the             simulate the interaction between a user and the chatbot as-
+swap-in task is done. Although this conservative approach               sistant. Table 2 shows the statistics of both datasets. In our
+does not fully utilize the duplex PCIe bandwidth, we find               experiments, we limited the maximum context size to 16384
+that this optimization performs well and we never run into              tokens and dropped 0.57% of the conversations in ShareGPT
+the situation that the GPU-to-CPU copying can’t catch up.               dataset that exceed this limit.
+
+6 Evaluation                                                               Workload. Since the datasets do not provide timestamps
+                                                                        for each user request, we simulate a request’s arrival time by
+6.1 Experimental Setup                                                  sampling from a Poisson distribution under different request
+                                                                        rates. We maintain the causal dependency for requests be-
+   System Environment. We evaluate Pensieve on Azure                    longing to the same conversation: a new user prompt is only
+NC A100 v4 series, which are equipped with up to 4 A100-                sent to the system after the response to the conversation’s
+80GB GPUs, a 24-core AMD EPYC 7003 processor and 220                    previous request has been received. Additionally, we also
+GB CPU memory per GPU. For each system evaluated, we                    simulate user think time, aka the time taken for users to
+configure it to allocate 40 GB memory on each GPU for KV                generate the next conversation turn, by sampling from an
+cache for a fair comparison.                                            exponential distribution with varying mean.
+
+   Models. We use two open-source models: OPT [55] and                     Baselines. We evaluate Pensieve against two state-of-
+Llama 2 [47]. OPT has an almost identical model architecture            the-art serving systems: vLLM [27] (v0.2.0) and TensorRT-
+to GPT-3 [5] while Llama 2 is a more recent model that em-              LLM [36] (v0.12.0). Both of them use a stateless serving API.
+ploys more advanced model features like rotary embedding,               For each request, the new user prompt is appended to the
+RMS Layernorm [54], SiLU, etc. Notably, Llama 2 follows                 history and then processed as an input request. vLLM uses
+the trend of adopting Grouped-Query Attention (GQA) [2]                 PyTorch as its execution backend. By contrast, TensorRT-
+which divides query heads into groups so that only one KV               LLM compiles and optimizes the model using graph rewrit-
+head is used within each group. GQA significantly reduces               ing optimizations such as operator fusion, and executes the
+the memory consumption of KV-tokens, allowing Pensieve                  optimized model using the TensorRT Runtime. Since vLLM
+to store more past KV-tokens.                                           is an execution engine without a serving loop that drives the
+                                                                        engine to process incoming requests, we implement such a
+2https://forums.developer.nvidia.com/t/data-transfers-are-slower-when-  driver that adds newly arrived requests into vLLM job queue
+overlapped-than-when-running-sequentially/187542                        and invokes the engine execution until all requests are fully
+                                                                        processed.
+EuroSys ’25, March 30–April 3, 2025, Rotterdam, Netherlands                                                                           Lingfan Yu, Jinkun Lin, and Jinyang Li
+
+Normalized Latency (s/token)  0.3                                           Normalized Latency (s/token)  0.3
+
+                                    vLLM                                                                        vLLM
+
+                                    TensorRT-LLM                                                                TensorRT-LLM
+
+                              0.2   Pensieve (GPU cache)                                                  0.2   Pensieve (GPU cache)
+                                    Pensieve (all)                                                              Pensieve (all)
+
+                              0.1                                                                         0.1
+
+                              0.00        1               2           3  4                                0.00  2             4       6           8  10
+
+                              0.3                 Throughput (req/s)                                                          Throughput (req/s)
+                              0.2
+                              0.1         (a) OPT-13B, ShareGPT                                                       (b) Llama 2-13B, ShareGPT
+
+Normalized Latency (s/token)                                                Normalized Latency (s/token)  0.3
+
+                                    vLLM                                                                        vLLM
+                                    TensorRT-LLM
+                                    Pensieve (GPU cache)                                                        TensorRT-LLM
+                                    Pensieve (all)
+                                                                                                          0.2   Pensieve (GPU cache)
+                                                                                                                Pensieve (all)
+
+                                                                                                          0.1
+
+                              0.00        1               2           3  4                                0.00  2             4       6           8  10
+
+                                                  Throughput (req/s)                                                          Throughput (req/s)
+
+                                          (c) OPT-13B, UltraChat                                                      (d) Llama 2-13B, UltraChat
+
+                                                             Figure 10. LLM serving performance on 1 GPU.
+
+   We also experiment with a variant of Pensieve called Pen-                more conversation turns (Table 2), which makes saving past
+sieve (GPU cache) that simply drops evicted tokens from                     KV-tokens more beneficial.
+the GPU instead of swapping them out to the CPU. This
+variant is used to examine the effectiveness of CPU caching                    In Figure 10, TensorRT-LLM outperforms vLLM consis-
+in Pensieve.                                                                tently. It even outperforms Pensieve (GPU cache) in Fig-
+                                                                            ure 10(a) and (c). This is because both Pensieve and vLLM
+   Performance Metric. Pensieve is designed to optimize                     use PyTorch API to execute the model while TensorRT-LLM
+both peak throughput and latency of serving LLM in conver-                  performs optimizations like graph rewriting and operator
+sational scenarios. Following prior work [27, 52], we measure               fusion during an offline compiling stage, and then executes
+the achieved serving throughput and 90-percentile normal-                   the optimized model using the TensorRT Runtime. However,
+ized latency, which is calculated as the end-to-end request                 by avoiding recomputing past KV-tokens for continuing con-
+serving latency divided by the number of output tokens.                     versations, Pensieve achieves significant throughput gain
+                                                                            over TensorRT-LLM.
+6.2 End-to-End Serving Performance
+                                                                               Pensieve’s performance gain is more significant for Llama
+Figure 10 shows the normalized latency vs throughput for                    2-13B than for OPT-13B because our version of Llama 2-
+OPT-13B and Llama 2-13B served with a single A100-80GB                      13B uses Grouped-Query Attention with group size 4 (i.e.
+GPU. The normalized latency is calculated as the mean of                    every four query heads share a single key-value head). Con-
+each request’s end-to-end latency divided by its output length,             sequently, the amount of memory required to store past
+as done in [27, 52]. On the ShareGPT dataset shown in Fig-                  KV-tokens is reduced by 4×, thus allowing Pensieve to store
+ure 10(a) and (b), Pensieve’s throughput is 1.36× of vLLM and               more past KV-tokens and better avoid recomputation.
+1.14× of TensorRT-LLM for serving OPT-13B at 120 ms per to-
+ken latency, and 1.70× of vLLM and 1.58× of TensorRT-LLM                       When Pensieve is used without CPU cache, i.e. Pensieve
+for serving Llama 2-13B at 180 ms per token latency. On the                 (GPU cache), it may still reduces latency because baseline
+UltraChat dataset shown in Figure 10(c) and (d), Pensieve’s                 systems always recompute past KV-tokens for requests from
+throughput is 1.17× and 1.14× of vLLM and TensorRT-LLM                      a returning conversation, and thus, the number of tokens
+respectively for serving OPT-13B at 120 ms per token latency,               processed in the prefill phase is on average larger. But un-
+1.58× and 1.47× for serving Llama 2-13B at 100 ms per token                 der relatively higher request rates, GPU cache is quickly
+latency. Pensieve has more throughput gains on ShareGPT                     exhausted, and Pensieve (GPU cache) also resorts to recom-
+than UltraChat because the real world dataset ShareGPT has                  puting past KV-tokens from scratch.
+Stateful Large Language Model Serving with Pensieve                                                     EuroSys ’25, March 30–April 3, 2025, Rotterdam, Netherlands
+
+Normalized Latency (s/token)  0.5
+
+                                    vLLM
+
+                              0.4   TensorRT-LLM
+
+                                    Pensieve (GPU cache)
+
+                              0.3   Pensieve (all)                            Execution Time (ms)  4.0  Ideal
+
+                              0.2                                                                  3.5  CopyOut + Attention
+
+                                                                                                   3.0  Multi-round PagedAttention
+
+                              0.1                                                                  2.5  Pensieve kernel
+
+                              0.00                                                                 2.0
+
+                                          1               2             3  4                       1.5
+
+                                                    Throughput (req/s)                             1.0
+
+                                                    (a) OPT-66B                                    0.5
+
+Normalized Latency (s/token)  0.5                                                                  0.0  256    512           1024      2048
+
+                                    vLLM                                                                     Number of Past KV-tokens
+
+                              0.4   TensorRT-LLM
+
+                                    Pensieve (GPU cache)
+
+                              0.3   Pensieve (all)
+
+                              0.2                                             Figure 12. Execution time of Pensieve’s multi-token attention
+                                                                              kernel over non-contiguous context memory with different context
+                              0.1                                             sizes. Measured with batch size 32 and query size 8.
+
+                              0.00        2               4             6  8
+
+                                                    Throughput (req/s)
+
+                                             (b) Llama 2-70B                  of 8 query tokens and different numbers of past KV-tokens
+                                                                              stored in non-contiguous GPU memory. As described in
+Figure 11. LLM serving performance on 4 GPUs for ShareGPT.                    §3.1, existing attention kernels are not directly applicable.
+                                                                              We compare against two straw-man implementations: (1)
+6.3 Multi-GPU Serving Performance                                             “CopyOut+Attention” allocates additional contiguous GPU
+                                                                              memory to copy past KV-tokens into and then invokes an
+Figure 11 shows the performance of Pensieve for larger mod-                   existing fused attention kernel (orange bar), and 2) “Multi-
+els, OPT-66B and Llama 2-70B, when run on four GPUs us-                       round PagedAttention” invokes multiple rounds of vLLM’s
+ing the ShareGPT dataset. Larger models amplify Pensieve’s                    single-query PagedAttention to process one token from the
+advantage over the baselines because the amount of com-                       prompt at a time (green bar). We also show the performance
+putation grows faster than the memory usage of KV-tokens.                     of the ideal situation which assumes that past KV-tokens
+For example, from OPT-13B to OPT-66B, the model param-                        are stored in contiguous memory space (blue bar). Figure 12
+eter size and computation amount increase by more than                        shows that both straw-man solutions add significant over-
+5×, while the KV cache size (# layer × # hidden × 2) only                     head compared to the ideal performance. Copying to contigu-
+increases by 2.88× (Table 1). Since the number of GPUs and                    ous memory incurs cost proportional to the number of past
+CPU memory are usually scaled linearly with the model size,                   KV-tokens. Applying multiple rounds of PagedAttention,
+Pensieve can store more past KV-tokens in its KV cache.                       on the other hand, gives up parallelization opportunities
+                                                                              on prompt tokens, resulting in execution time linear to the
+   Pensieve achieves 2.04× the throughput of vLLM and                         number of tokens in the prompt. Pensieve’s kernel matches
+1.64× of TensorRT-LLM for serving OPT-66B at 200 ms per                       the ideal baseline. In fact, it has slightly better performance
+token latency, and 3.0× of vLLM and 2.47× of TensorRT-LLM                     because we offload auxiliary data computing (like calculating
+for serving Llama 2-70B at 400 ms per token latency. The im-                  the cumulative sum for the sequence length of a batch) to
+provement is more significant on Llama 2-70B because it uses                  the CPU. Since each transformer layer in the model shares
+Grouped-Query Attention with group size 8, which reduces                      the same caching plan, these auxiliary data can be reused by
+the memory requirement for past KV-tokens by 8×. This                         all layers.
+much-reduced memory consumption in KV-tokens also sig-
+nificantly benefits the throughput of Pensieve (GPU cache),                   6.5 Effect of Unified Scheduling
+as shown in Figure 11(b).
+                                                                              We evaluate whether using a unified scheduler for both pre-
+6.4 Performance of Multi-token attention Kernel                               fill and generation phases is beneficial for performance. Fig-
+                                                                              ure 13 shows the performance of Pensieve with and without
+Figure 12 shows the performance of Pensieve’s multi-token                     unified scheduling for Llama 2-13B on the ShareGPT dataset.
+attention kernel compared to alternative implementations.                     Compared to processing prefill and generation phases sep-
+In this microbenchmark, we measure the latency of the atten-                  arately, unifying them into a single execution step avoids
+tion operator for a batch of 32 requests each with a prompt
+EuroSys ’25, March 30–April 3, 2025, Rotterdam, Netherlands                                                                                                     Lingfan Yu, Jinkun Lin, and Jinyang Li
+
+        0.3Normalized Latency (s/token)                                                      Normalized Latency (s/token)  0.3
+                          Pensieve (separate)
+                          Pensieve (unified)                                                                                     vLLM (600s)
+
+        0.2                                                                                                                      Pensieve (30s)
+
+        0.1                                                                                                                0.2   Pensieve (60s)
+                                                                                                                                 Pensieve (120s)
+
+                                                                                                                                 Pensieve (300s)
+
+                                                                                                                                            Pensieve (600s)
+                                                                                                                           0.1
+
+                              0.00  2                          4     6                8  10                                0.00  2                           4  6    8  10
+
+                                                               Throughput (req/s)                                                                Throughput (req/s)
+
+Figure 13. Performance of serving Llama 2-13B with and without                               Figure 15. Performance of serving Llama 2-13B with different
+unified scheduling on ShareGPT dataset.                                                      average user reaction time on ShareGPT dataset.
+
+Normalized Latency (s/token)  0.3                                                            throughput compared to vLLM, although the performance
+                                               Pensieve (LRU)                                gap becomes smaller than that for smaller think times.
+                                               Pensieve
+                                                                                             7 Related Works
+                              0.2
+                                                                                                LLM inference and serving systems. Many systems have
+                              0.1                                                            been recently developed to serve language models with bet-
+                                                                                             ter performance including vLLM [27], ORCA [52], TensorRT-
+                              0.00     1                          2                3     4   LLM [36], FasterTransformer [35], LightSeq [49], DeepSpeed
+                                                                                             [3] and [38]. These systems investigate different performance
+                                                               Throughput (req/s)            improvement opportunities than Pensieve. The wide range
+                                                                                             of proposed techniques include incremental decoding [35],
+Figure 14. Performance of serving OPT-13B with different evic-                               iteration-level batching [17, 52], supporting paged KV cache
+tion policies on ShareGPT dataset.                                                           over non-contiguous GPU memory [27, 36], finding an ef-
+                                                                                             ficient multi-device partitioning plan [38], better load bal-
+having to execute the prefill phase with a small number of re-                               ancing between prefill and generation to reduce pipeline
+quests. As a result, Pensieve with unified scheduling achieves                               parallelism bubbles [1, 20], kernel fusion [10, 11, 39], specu-
+better throughput and latency.                                                               lative decoding [6, 28], and quantization [13, 18, 31, 51].
+
+6.6 Effect of the Eviction Policy                                                               ServerlessLLM [15] proposes techniques to do fast model
+                                                                                             loading and live migration in order to serve requests in a
+We compare Pensieve’s caching policy against the classic                                     serverless setup. DistServe [57] advocates performing the
+LRU policy. We use OPT-13B as the workload for this evalua-                                  prefill and generation phase of the same request on separate
+tion. Figure 14 shows that both policies exhibit similar perfor-                             GPUs to better satisfy SLA. By contrast, Pensieve performs
+mance until the workload approaches 3 requests per second,                                   unified batching of both phases because we aim to optimize
+beyond which Pensieve’s eviction policy outperforms LRU.                                     throughput instead of latency SLA.
+After analyzing the execution traces, we find that both poli-
+cies have less than 80% cache hit rate, however, Pensieve’s                                     Systems that cache LLM attention states. Several sys-
+policy has up to 4.4 percentage points higher CPU cache hit                                  tems (Table 3), developed concurrently with Pensieve, also
+rate than LRU. On average, Pensieve’s policy reduces the                                     cache attention states in LLM serving to reduce computation.
+number of recomputed KV-tokens by up to 14.6%.
+                                                                                                PromptCache [19], SGLang [56], RAGCache [25] and Cache-
+6.7 Impact of User Think Time                                                                dAttention [16] all cache attention states of shared text
+                                                                                             segments across different requests. Among these systems,
+Our experiments so far use the average user think time of 60                                 CachedAttention targets multi-turn conversations, RAG-
+seconds. Figure 15 evaluates the impact of different average                                 Cache targets retrieval-augmented generation (RAG) while
+user think times on the performance of Pensieve using Llama                                  others aim to be general. PromptCache requires users to
+2-13B. Additionally, we also show vLLM with 600-second                                       define a schema a priori to explicitly specify any reuse op-
+think time as a comparison point. As seen in Figure 15, the                                  portunities. This requirement is too restrictive since static
+throughput of Pensieve decreases as the average user think                                   schemas cannot specify those dynamic prefixes to be cached
+time increases, causing past KV-tokens to drop from the                                      in multi-turn conversations. SGLang and RAGCache employ
+cache at a higher rate. Even as user think time increases                                    a tree-based cache in order to enable prefix sharing across dif-
+to 600 seconds, Pensieve still achieves better latency and                                   ferent users or different RAG document prefixes. By contrast,
+Stateful Large Language Model Serving with Pensieve                                      EuroSys ’25, March 30–April 3, 2025, Rotterdam, Netherlands
+
+                              PromptCache [19] SGLang [56] CachedAttention [16] RAGCache [25] CacheGen [29]     Pensieve
+                                                                                                                   No
+Cache shared across users     Yes                    Yes                     No          Yes         Yes
+                                                                                                              CPU & GPU
+Cache storage                 CPU                    GPU                     CPU & Disk  CPU & GPU   Network     tokens
+                                                                                                                 leading
+Eviction granularity          N/A                    requests entire conversation history documents  N/A
+
+Eviction location preference  N/A                    trailing                N/A         trailing    N/A
+
+                      Table 3. Comparison of Pensieve with other caching systems for LLM attention states.
+
+Pensieve and CachedAttention are designed specifically for                   meet the accuracy and latency requirements of a given user
+multi-turn conversation scenarios where different users are                  task. For example, INFaaS [41] and Tabi [50] serve requests
+unlikely to share conversational content3. In this setting,                  with a small model and only re-route to a larger model when
+there is no need for the extra complexity of a tree-based                    the output confidence score is low.
+cache structure. Instead, Pensieve and CachedAttention both
+focus on managing a dynamic cache for ongoing conserva-                         Techniques addressing the GPU memory limit. These
+tion histories which grow in size over time.                                 include GPU-CPU swapping, recomputation, and unified
+                                                                             memory. Most of the systems described below are not specif-
+   As Table 3 shows, the important difference between Pen-                   ically targeted for LLM serving.
+sieve and others (SGLang [56], RAGCache [25] and Cache-
+dAttention [16]) lies in Pensieve’s eviction strategy which                     GPU-CPU Swapping: SwapAdvisor [22] swaps weight and
+evicts at the finer-granularity of groups of tokens at the lead-             activation tensors for DNN training. It uses the dataflow
+ing end to reduce the cost of recomputation. By contrast,                    graph to determine an optimal plan that involves operator
+CachedAttention evicts at the granularity of an entire con-                  execution order, memory allocation, and swapping. Zero-
+versation and does not recompute truncated conversation                      Offload [40] offloads optimizer state and gradients to the
+context, while SGLang and RAGCache evict at the granu-                       CPU during LLM training with a single GPU. DeepSpeed-
+larity of a tree node containing an entire user request or                   ZeroInference [3] and FlexGen [44] use offloading to serve
+document. SGLang and RAGCache also preferentially evict                      LLM with a weak GPU. DeepSpeed-ZeroInference offloads
+from the bottom of the tree (aka the trailing end of a prefix)               entire model weights to CPU or NVMe memory. FlexGen
+as opposed to the leading end as done in Pensieve. Pensieve’s                offloads currently unused model weights, activation, or KV
+eviction strategy introduces challenges in supporting compu-                 cache to CPU memory or disk. As a result of frequent data
+tation in non-sequential regions of request context (Figure 5),              movement and high disk latency, these two systems require
+which is addressed in Pensieve’s multi-token attention kernel                a large batch size to hide the offloading latency. Therefore,
+(§4.3.4).                                                                    they mainly target latency-insensitive applications. Neither
+                                                                             system persists the KV cache across requests.
+   Another recent system, CacheGen [29], addresses the prob-
+lem of reducing the context-loading delay for long contexts                     Recomputation: For DNN training, recomputing activation
+stored in remote network storage. CacheGen proposes an                       on the backward pass [7] is a popular technique used to
+adaptive compression scheme to accelerate the transfer of                    reduce memory footprint. The decision for which tensors
+the KV cache over a bandwidth-limited and bursty network.                    to compute is done at the granularity of layers [7], a group
+As Pensieve only keeps the KV cache in local GPU and CPU                     of operators within a layer (aka modules) [26], or individual
+memory, CacheGen’s techniques are orthogonal to those of                     operators [23]. Unlike these works, Pensieve’s fine-grained
+Pensieve. For conversational chatbots, Pensieve using local                  recomputation is done at the token(chunk)-level, to exploit
+cache can already bring significant performance gains.                       the insight that earlier tokens in a sequence incur less re-
+                                                                             computation cost due to the causal nature of attention.
+   Non-LLM specific DNN serving systems. Systems like
+TensorFlow Serving [37], Clipper [9], NVIDIA Triton In-                         Unified Memory and Direct Host Access: Swapping between
+ference Server [34], Nexus [43], and InferLine [8] serve as                  CPU and GPU memory can also be achieved transparently
+scheduling components of a general-purpose DNN serv-                         through Unified Memory [32], which automatically triggers
+ing system. They are mostly model-agnostic and execution                     memory page migration between CPU and GPU using a page
+backend-agnostic and apply general system techniques like                    fault mechanism. The Direct Host Access feature allows a
+batching, caching, and software pipelining to serve DNN                      GPU kernel to directly read from CPU memory, thereby
+models. Some are also in charge of properly provisioning                     allowing a subset of the threads to execute as soon as their
+compute resources to improve overall cluster efficiency. A                   data is ready without waiting for the entire transfer to finish.
+few existing works target model-less serving and provide                     It has been used to enable better overlap of data transfer
+inference as a service: they automatically select models to                  and kernel computation when swapping in a model from
+                                                                             CPU [30] or accessing large graph neural network features
+3If the chatbot uses a common system prompt across users, it can be handled  on the CPU [24]. For our implementation of Pensieve, we
+by explicitly designating the system prompt state as reusable.               choose not to use Unified Memory nor Direct Host Access
+                                                                             because these mechanisms trigger memory transfer only
+EuroSys ’25, March 30–April 3, 2025, Rotterdam, Netherlands                                                                Lingfan Yu, Jinkun Lin, and Jinyang Li
+
+when the data is accessed by a GPU kernel and we want to                              Large Language Model Decoding with Speculative Sampling. In
+manage data movement explicitly to prefetch the KV cache.                             arXiv:2302.01318.
+Furthermore, for Direct Host Access, since the copied data is                    [7] Tianqi Chen, Bing Xu, Chiyuan Zhang, and Carlos Guestrin. 2016.
+not explicitly stored in GPU memory, it has to be loaded from                         Training deep nets with sublinear memory cost. arXiv preprint
+the CPU again if it is repeatedly used. In our workload, the                          arXiv:1604.06174 (2016).
+context cache is not only used to prefill the prompt tokens                      [8] Daniel Crankshaw, Gur-Eyal Sela, Xiangxi Mo, Corey Zumar, Ion
+but also in every generation step, which makes Direct Host                            Stoica, Joseph Gonzalez, and Alexey Tumanov. 2020. InferLine: latency-
+Access significantly less efficient.                                                  aware provisioning and scaling for prediction serving pipelines. In
+                                                                                      Proceedings of the 11th ACM Symposium on Cloud Computing. 477–491.
+8 Conclusion                                                                     [9] Daniel Crankshaw, Xin Wang, Guilio Zhou, Michael J Franklin,
+                                                                                      Joseph E Gonzalez, and Ion Stoica. 2017. Clipper: A Low-Latency
+When serving Large Language Models for multi-turn conver-                             online prediction serving system. In 14th USENIX Symposium on Net-
+sations, a major inefficiency is due to the recomputation of a                        worked Systems Design and Implementation (NSDI 17). 613–627.
+conversation’s cumulative history context. We develop Pen-                      [10] Tri Dao, Daniel Y. Fu, Stefano Ermon, Atri Rudra, and Christopher Ré.
+sieve, a stateful LLM serving system that preserves history                           2022. FlashAttention: Fast and Memory-Efficient Exact Attention with
+embeddings in a multi-tier GPU-CPU cache. It uses a new                               IO-Awareness. In Advances in Neural Information Processing Systems.
+GPU attention kernel to perform attention between requests’                     [11] Tri Dao, Daniel Haziza, Francisco Massa, and Grigory Sizov. 2023.
+new multi-token input and their saved context stored in                               Flash-Decoding for long-context inference. https://pytorch.org/blog/
+non-contiguous GPU memory. Experiments show that Pen-                                 flash-decoding/.
+sieve achieves 1.14-1.70× the throughput of baseline systems                    [12] Tim Dettmers, Artidoro Pagnoni, Ari Holtzman, and Luke Zettlemoyer.
+for small models (OPT-13B, Llama 2-13B) and 1.64-3.0× for                             2023. Qlora: Efficient finetuning of quantized llms. arXiv preprint
+larger models (OPT-66B, Llama 2-70B).                                                 arXiv:2305.14314 (2023).
+                                                                                [13] Tim Dettmers and Luke Zettlemoyer. 2023. The case for 4-bit precision:
+Acknowledgments                                                                       k-bit inference scaling laws. In International Conference on Machine
+                                                                                      Learning. PMLR, 7750–7774.
+We would like to thank our shepherd Yizhou Shan and the                         [14] Ning Ding, Yulin Chen, Bokai Xu, Yujia Qin, Zhi Zheng, Shengding Hu,
+anonymous EuroSys reviewers for their constructive feed-                              Zhiyuan Liu, Maosong Sun, and Bowen Zhou. 2023. Enhancing Chat
+back. This project is partially supported by the National                             Language Models by Scaling High-quality Instructional Conversations.
+Science Foundation under Grant No. 2220407 and through                                arXiv preprint arXiv:2305.14233 (2023).
+the NYU IT High Performance Computing resources, ser-                           [15] Yao Fu, Leyang Xue, Yeqi Huang, Andrei Octavian Brabete, Dmitrii
+vices, and staff expertise. Lingfan Yu is supported by an AMD                         Ustiugov, Yuvraj Patel, and Luo Mai. 2024. ServerlessLLM: Locality
+research award.                                                                       Enhanced Serverless Inference for Large Language Models. In OSDI.
+                                                                                [16] Bin Gao, Zhuomin He, Puru Sharma, Qingxuan Kang, Djordje Jevdjic,
+References                                                                            Junbo Deng, Xingkun Yang, Zhou Yu, and Pengfei Zuo. 2024. Cost-
+                                                                                      Efficient Large Language Model Serving for Multi-turn Conversations
+ [1] Amey Agrawal, Ashish Panwar, Jayashree Mohan, Nipun Kwatra, Bhar-                with CachedAttention. In 2024 USENIX Annual Technical Conference
+      gav S Gulavani, and Ramachandran Ramjee. 2023. Sarathi: Efficient               (USENIX ATC 24). 111–126.
+      llm inference by piggybacking decodes with chunked prefills. arXiv        [17] Pin Gao, Lingfan Yu, Yongwei Wu, and Jinyang Li. 2018. Low latency
+      preprint arXiv:2308.16369 (2023).                                               rnn inference with cellular batching. In Proceedings of the Thirteenth
+                                                                                      EuroSys Conference. 1–15.
+ [2] Joshua Ainslie, James Lee-Thorp, Michiel de Jong, Yury Zemlyanskiy,        [18] Amir Gholami, Sehoon Kim, Zhen Dong, Zhewei Yao, Michael W
+      Federico Lebrón, and Sumit Sanghai. 2023. Gqa: Training generalized             Mahoney, and Kurt Keutzer. 2022. A survey of quantization methods
+      multi-query transformer models from multi-head checkpoints. arXiv               for efficient neural network inference. In Low-Power Computer Vision.
+      preprint arXiv:2305.13245 (2023).                                               Chapman and Hall/CRC, 291–326.
+                                                                                [19] In Gim, Guojun Chen, Seung-seob Lee, Nikhil Sarda, Anurag Khandel-
+ [3] Reza Yazdani Aminabadi, Samyam Rajbhandari, Ammar Ahmad Awan,                    wal, and Lin Zhong. 2024. Prompt cache: Modular attention reuse for
+      Cheng Li, Du Li, Elton Zheng, Olatunji Ruwase, Shaden Smith, Minjia             low-latency inference. Proceedings of Machine Learning and Systems 6
+      Zhang, Jeff Rasley, et al. 2022. DeepSpeed-inference: enabling efficient        (2024), 325–338.
+      inference of transformer models at unprecedented scale. In SC22: In-      [20] Connor Holmes, Masahiro Tanaka, Michael Wyatt, Ammar Ahmad
+      ternational Conference for High Performance Computing, Networking,              Awan, Jeff Rasley, Samyam Rajbhandari, Reza Yazdani Aminabadi,
+      Storage and Analysis. IEEE, 1–15.                                               Heyang Qin, Arash Bakhtiari, Lev Kurilenko, et al. 2024. DeepSpeed-
+                                                                                      FastGen: High-throughput Text Generation for LLMs via MII and
+ [4] Zhihao Bai, Zhen Zhang, Yibo Zhu, and Xin Jin. 2020. PipeSwitch: Fast            DeepSpeed-Inference. arXiv preprint arXiv:2401.08671 (2024).
+      pipelined context switching for deep learning applications. In 14th       [21] Edward J. Hu, Yelong Shen, Phillip Wallis, Zeyuan Allen-Zhu, Yuanzhi
+      USENIX Symposium on Operating Systems Design and Implementation                 Li, Shean Wang, and Weizhu Chen. 2021. LoRA: Low-Rank Adaptation
+      (OSDI 20). 499–514.                                                             of Large Language Models. (2021). arXiv:2106.09685 https://arxiv.org/
+                                                                                      abs/2106.09685
+ [5] Tom Brown, Benjamin Mann, Nick Ryder, Melanie Subbiah, Jared D             [22] Chien-Chin Huang, Gu Jin, and Jinyang Li. 2020. SwapAdvisor: Push-
+      Kaplan, Prafulla Dhariwal, Arvind Neelakantan, Pranav Shyam, Girish             ing deep learning beyond the gpu memory limit via smart swapping.
+      Sastry, Amanda Askell, et al. 2020. Language models are few-shot                In Proceedings of the Twenty-Fifth International Conference on Archi-
+      learners. Advances in neural information processing systems 33 (2020),          tectural Support for Programming Languages and Operating Systems.
+      1877–1901.                                                                      1341–1355.
+
+ [6] Charlie Chen, Sebastian Borgeaud, Geoffrey Irving, Jean-Baptiste
+      Lespiau, Laurent Sifre, and John Jumper. 2023. Accelerating
+Stateful Large Language Model Serving with Pensieve                                           EuroSys ’25, March 30–April 3, 2025, Rotterdam, Netherlands
+
+[23] Paras Jain, Ajay Jain, Aniruddha Nrusimha, Amir Gholami, Pieter           [43] Haichen Shen, Lequn Chen, Yuchen Jin, Liangyu Zhao, Bingyu Kong,
+      Abbeel, Joseph Gonzalez, Kurt Keutzer, and Ion Stoica. 2020. Check-            Matthai Philipose, Arvind Krishnamurthy, and Ravi Sundaram. 2019.
+      mate: Breaking the memory wall with optimal tensor rematerialization.          Nexus: A GPU cluster engine for accelerating DNN-based video anal-
+      Proceedings of Machine Learning and Systems 2 (2020), 497–511.                 ysis. In Proceedings of the 27th ACM Symposium on Operating Systems
+                                                                                     Principles. 322–337.
+[24] Jinwoo Jeong, Seungsu Baek, and Jeongseob Ahn. 2023. Fast and
+      Efficient Model Serving Using Multi-GPUs with Direct-Host-Access.        [44] Ying Sheng, Lianmin Zheng, Binhang Yuan, Zhuohan Li, Max Ryabinin,
+      In Proceedings of the Eighteenth European Conference on Computer               Daniel Y Fu, Zhiqiang Xie, Beidi Chen, Clark Barrett, Joseph E Gonza-
+      Systems. 249–265.                                                              lez, et al. 2023. High-throughput generative inference of large language
+                                                                                     models with a single gpu. arXiv preprint arXiv:2303.06865 (2023).
+[25] Chao Jin, Zili Zhang, Xuanlin Jiang, Fangyue Liu, Xin Liu, Xuanzhe
+      Liu, and Xin Jin. 2024. RAGCache: Efficient Knowledge Caching for        [45] Mohammad Shoeybi, Mostofa Patwary, Raul Puri, Patrick LeGresley,
+      Retrieval-Augmented Generation. In arXiv:2404.12457.                           Jared Casper, and Bryan Catanzaro. 2019. Megatron-lm: Training multi-
+                                                                                     billion parameter language models using model parallelism. arXiv
+[26] Vijay Anand Korthikanti, Jared Casper, Sangkug Lym, Lawrence                    preprint arXiv:1909.08053 (2019).
+      McAfee, Michael Andersch, Mohammad Shoeybi, and Bryan Catan-
+      zaro. 2023. Reducing activation recomputation in large transformer       [46] Hugo Touvron, Thibaut Lavril, Gautier Izacard, Xavier Martinet, Marie-
+      models. Proceedings of Machine Learning and Systems 5 (2023).                  Anne Lachaux, Timothée Lacroix, Baptiste Rozière, Naman Goyal, Eric
+                                                                                     Hambro, Faisal Azhar, et al. 2023. Llama: Open and efficient foundation
+[27] Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lianmin                     language models. arXiv preprint arXiv:2302.13971 (2023).
+      Zheng, Cody Hao Yu, Joseph E. Gonzalez, Hao Zhang, and Ion Sto-
+      ica. 2023. Efficient Memory Management for Large Language Model          [47] Hugo Touvron, Louis Martin, Kevin Stone, Peter Albert, Amjad Alma-
+      Serving with PagedAttention. In Proceedings of the ACM SIGOPS 29th             hairi, Yasmine Babaei, Nikolay Bashlykov, Soumya Batra, Prajjwal
+      Symposium on Operating Systems Principles.                                     Bhargava, Shruti Bhosale, et al. 2023. Llama 2: Open foundation and
+                                                                                     fine-tuned chat models. arXiv preprint arXiv:2307.09288 (2023).
+[28] Yaniv Leviathan, Matan Kalman, and Yossi Matias. 2023. Fast inference
+      from transformers via speculative decoding. In ICML.                     [48] Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion
+                                                                                     Jones, Aidan N Gomez, Łukasz Kaiser, and Illia Polosukhin. 2017. At-
+[29] Yuhan Liu, Hanchen Li, Yihua Cheng, Siddhant Ray, Yuyang Huang,                 tention is all you need. Advances in neural information processing
+      Qizheng Zhang, Kuntai Du, Jiayi Yao, Shan Lu, Ganesh Anantha-                  systems 30 (2017).
+      narayanan, et al. 2024. CacheGen: KV Cache Compression and Stream-
+      ing for Fast Large Language Model Serving. In Proceedings of the ACM     [49] Xiaohui Wang, Ying Xiong, Yang Wei, Mingxuan Wang, and Lei Li.
+      SIGCOMM 2024 Conference. 38–56.                                                2021. LightSeq: A High Performance Inference Library for Trans-
+                                                                                     formers. In Proceedings of the 2021 Conference of the North American
+[30] Seung Won Min, Kun Wu, Sitao Huang, Mert Hidayetoğlu, Jinjun                    Chapter of the Association for Computational Linguistics: Human Lan-
+      Xiong, Eiman Ebrahimi, Deming Chen, and Wen-mei Hwu. 2021. Large               guage Technologies: Industry Papers (NAACL-HLT). Association for
+      graph convolutional network training with gpu-oriented data commu-             Computational Linguistics, 113–120.
+      nication architecture. arXiv preprint arXiv:2103.03330 (2021).
+                                                                               [50] Yiding Wang, Kai Chen, Haisheng Tan, and Kun Guo. 2023. Tabi: An
+[31] Markus Nagel, Marios Fournarakis, Rana Ali Amjad, Yelysei Bon-                  Efficient Multi-Level Inference System for Large Language Models.
+      darenko, Mart Van Baalen, and Tijmen Blankevoort. 2021. A white                In Proceedings of the Eighteenth European Conference on Computer
+      paper on neural network quantization. arXiv preprint arXiv:2106.08295          Systems. 233–248.
+      (2021).
+                                                                               [51] Guangxuan Xiao, Ji Lin, Mickael Seznec, Hao Wu, Julien Demouth, and
+[32] NVIDIA. 2017. CUDA Unified Memory. https://developer.nvidia.com/                Song Han. 2023. SmoothQuant: Accurate and Efficient Post-Training
+      blog/unified-memory-cuda-beginners/.                                           Quantization for Large Language Models. International Conference on
+                                                                                     Machine Learning (ICML) (2023).
+[33] NVIDIA. 2017. CUTLASS. https://github.com/NVIDIA/cutlass.
+[34] NVIDIA. 2018. Triton Inference Server. https://docs.nvidia.com/           [52] Gyeong-In Yu, Joo Seong Jeong, Geon-Woo Kim, Soojeong Kim, and
+                                                                                     Byung-Gon Chun. 2022. Orca: A distributed serving system for
+      deeplearning/triton-inference-server/user-guide/docs/index.html.               Transformer-Based generative models. In 16th USENIX Symposium on
+[35] NVIDIA. 2021. FasterTransformer. https://github.com/NVIDIA/                     Operating Systems Design and Implementation (OSDI 22). 521–538.
+
+      FasterTransformer.                                                       [53] Lingfan Yu and Jinyang Li. 2023. Stateful Large Language Model
+[36] NVIDIA. 2023. TensorRT-LLM. https://github.com/NVIDIA/TensorRT-                 Serving with Pensieve. In arXiv preprint 2312.05516.
+
+      LLM.                                                                     [54] Biao Zhang and Rico Sennrich. 2019. Root mean square layer nor-
+[37] Christopher Olston, Noah Fiedel, Kiril Gorovoy, Jeremiah Harmsen, Li            malization. Advances in Neural Information Processing Systems 32
+                                                                                     (2019).
+      Lao, Fangwei Li, Vinu Rajashekhar, Sukriti Ramesh, and Jordan Soyke.
+      2017. Tensorflow-serving: Flexible, high-performance ml serving.         [55] Susan Zhang, Stephen Roller, Naman Goyal, Mikel Artetxe, Moya Chen,
+      arXiv preprint arXiv:1712.06139 (2017).                                        Shuohui Chen, Christopher Dewan, Mona Diab, Xian Li, Xi Victoria
+[38] Reiner Pope, Sholto Douglas, Aakanksha Chowdhery, Jacob Devlin,                 Lin, et al. 2022. Opt: Open pre-trained transformer language models.
+      James Bradbury, Jonathan Heek, Kefan Xiao, Shivani Agrawal, and                arXiv preprint arXiv:2205.01068 (2022).
+      Jeff Dean. 2023. Efficiently scaling transformer inference. Proceedings
+      of Machine Learning and Systems 5 (2023).                                [56] Lianmin Zheng, Liangsheng Yin, Zhiqiang Xie, Chuyue Sun, Jeff
+[39] Markus N Rabe and Charles Staats. 2021. Self-attention Does Not Need            Huang, Cody Hao Yu, Shiyi Cao, Christos Kozyrakis, Ion Stoica,
+      𝑂 (𝑛2 ) Memory. arXiv preprint arXiv:2112.05682 (2021).                      Joseph E Gonzalez, et al. 2023. SGLang: Efficient Execution of Struc-
+[40] Jie Ren, Samyam Rajbhandari, Reza Yazdani Aminabadi, Olatunji                   tured Language Model Programs.
+      Ruwase, Shuangyan Yang, Minjia Zhang, Dong Li, and Yuxiong He.
+      2021. ZeRO-Offload: Democratizing Billion-Scale model training. In       [57] Yinmin Zhong, Shengyu Liu, Junda Chen, Jianbo Hu, Yibo Zhu, Xu-
+      2021 USENIX Annual Technical Conference (USENIX ATC 21). 551–564.              anzhe Liu, Xin Jin, and Hao Zhang. 2024. DistServe: Disaggregating
+[41] Francisco Romero, Qian Li, Neeraja J Yadwadkar, and Christos                    Prefill and Decoding for Goodput-optimized Large Language Model
+      Kozyrakis. 2021. INFaaS: Automated model-less inference serving.               Serving. In OSDI.
+      In 2021 USENIX Annual Technical Conference (USENIX ATC 21). 397–
+      411.
+[42] ShareGPT. 2023. https://sharegpt.com/.
+

@@ -1,0 +1,1334 @@
+                                             Continuous First, Discrete Later:
+                                        VQ-VAEs Without Dimensional Collapse
+
+                                         Xinyu Zhao∗                              Nikita Karagodin∗
+                                             MIT                                           MIT
+
+                                        lxz@mit.edu                               nikitus@mit.edu
+
+arXiv:2605.06870v3 [cs.LG] 27 Sep 2026        Hamed Hassani         Sinan Hersek  Paul Pu Liang  Yury Polyanskiy
+                                        University of Pennsylvania      Google          MIT             MIT
+
+                                                                                    Abstract
+
+                                                   While many approaches to improve VQ-VAE performance focus on codebook
+                                                   size and utilization, the effect of dimensional collapse, where trained VQ-VAE
+                                                   representations live in an extremely low-dimensional subspace (1 − 2% of full
+                                                   rank), remains unaddressed. We show theoretically and empirically that dimension
+                                                   collapse causes a hard loss lower bound that various codebook improvement tech-
+                                                   niques fail to surpass. Our analytic framework extends the sequential learning effect
+                                                   of Saxe et al. [2014] by introducing ideas from rate-distortion theory and explains
+                                                   how the latent collapse is caused by the VQ suppressing lower-variance directions.
+                                                   Our theory justifies a simple solution: a “warm-up phase” that trains the model as
+                                                   an (unquantized) autoencoder before introducing VQ. On both synthetic experi-
+                                                   ments and large-scale image (VQGAN) and audio (WavTokenizer) VQ-VAEs, we
+                                                   show that AE Warm-Up successfully restores representation dimension, leading
+                                                   to lower reconstruction and perceptual loss at the same training budget. Across
+                                                   codebook sizes K ∈ {210, 214, 216}, AE warm-up raises VQGAN codebook effec-
+                                                   tive dimension from 3–5 to 17–19 and reduces rFID by 17–35%; on WavTokenizer
+                                                   at K ∈ {213, 214}, it raises codebook dimension from 4 to 17–19 and improves
+                                                   PESQ by 11–14%. We empirically characterize how warm-up duration governs
+                                                   the achievable final loss. In agreement with experiment, our theoretical analysis
+                                                   predicts downstream performance as a function of warm-up length, enabling an
+                                                   adaptive criterion for switching from AE Warm-up to VQ-VAE training. 2
+
+                                        1 Introduction
+
+                                        Vector-quantized variational autoencoders (VQ-VAEs) are the backbone of modern discrete tokeniza-
+                                        tion for audio and image representation learning and generative models [van den Oord et al., 2017,
+                                        Razavi et al., 2019, Esser et al., 2021, Zeghidour et al., 2021, Ji et al., 2025]. Scaling the codebook is
+                                        the standard lever for improving VQ-VAE reconstruction, and a sustained line of work has improved
+                                        codebook utilization through techniques such as EMA updates, dead-code respawn, and codebook
+                                        reparameterization [Lancucki et al., 2020, Zheng and Vedaldi, 2023, Zhu et al., 2024, 2025]. It is thus
+                                        quite surprising that large-scale VQ-VAEs use only a small fraction of allocated latent dimensions:
+                                        we find that WavTokenizer on LibriTTS, with a 512-dimensional pre-quantization latent, uses only 4
+                                        effective dimensions at codebook size K = 212 despite 100% codebook utilization, or as Zhang et al.
+                                        [2025] shows, VQGAN on ImageNet collapses to 2–5 effective dimensions across codebook sizes
+                                        from K = 210 to K = 214. This dimensional collapse creates an irreducible loss floor that does not
+                                        improve with codebook scaling. The bottleneck is not the codebook size, but the effective dimension
+                                        of the latent subspace.
+
+                                           ∗Equal contribution.
+                                            2Code for our experiments can be found at https://github.com/xyz-zy/vqvae_latent_span_collapse.
+
+                                        Preprint.
+Figure 1: Dimensional collapse in VQ-VAEs and the warm-up fix. During plain autoencoder
+training (gray), the latent effective dimension deff grows as directions of data variance (“modes")
+are learned sequentially. Turning on the quantizer too early collapses deff; reconstruction loss hits
+a floor that is independent of codebook size |C| (blue). Training the encoder–decoder as a plain
+autoencoder before introducing the quantizer (AE Warm-up) allows the encoder to learn lower-
+variance directions, preserving higher deff after introducing VQ and restoring the expected scaling
+of reconstruction quality with |C| (yellow-red). We give an information-theoretic account of this
+mechanism (Section 3) and validate it in both image (VQGAN trained on ImageNet, Section 4.1) and
+audio (WavTokenizer trained on LibriTTS, Section 4.2) VQ-VAEs.
+
+To theoretically analyze the mechanism behind collapse, we build on the seminal work of Saxe et al.
+[2014], Refinetti and Goldt [2022], which demonstrated how plain autoencoders learn the principal
+modes of their data sequentially, in decreasing order of variance. Unfortunately, extending their idea
+to VQ-VAE is difficult, since it requires analyzing coupled dynamics of the K codebook vectors
+and encoder-decoder matrices, complicated by the non-differentiable nearest-neighbor quantizer.
+Our contribution is the introduction of a tractable model, RD-AE flow, which replaces VQ with a
+stochastic noising operation, chosen to minimize mean-squared error subject to mutual information
+upper bound of log2 K. We show that under the optimal coupling, latent directions corresponding
+to low-variance modes may fall below a so-called water level and stop evolving due to interaction
+between the commitment loss term and the STE, see Fig. 2, thereby collapsing the latent dimension.
+
+This model shows that the cause of dimensional collapse is the timing of quantization: latent directions
+that were not yet properly learned when the quantizer turns on are deactivated by the rate constraint
+and never recover. Our proposed fix trains the encoder and decoder as a plain autoencoder until
+enough directions are represented by the encoder before introducing VQ; we call this AE warm-up.
+Our theory predicts dependence of the latent effective dimension on the length of the warm-up, and is
+corroborated by experiments on VQGAN, see Figure 5. AE Warm-up raises the VQGAN codebook
+dimension from 5 to 18 at K = 214 and the WavTokenizer codebook dimension from 4 to 21 at
+K = 216, breaking the loss floor that cold-start training hits regardless of codebook size and restoring
+expected scaling with K. Increasing warm-up steps up to the predicted stopping point both increases
+final codebook dimension and reduces final loss, with gains scaling with target codebook size.
+
+Contributions.
+
+• (practice) We demonstrate dimensionality collapse in popular VQ-VAEs for audio and image
+  tokenization (WavTokenizer, VQGAN) and show that the resulting performance degradation cannot
+  be fixed by increasing codebook size K (“loss floor”).
+
+• (practice) We propose a simple fix, AE Warm-up, in which the bottleneck between encoder and
+  decoder remains unquantized during the initial training phase.
+
+• (theory) We introduce RD-AE, a toy model for studying VQ-VAE training dynamics that extends
+  the well-known sequential learning analysis of Saxe et al. [2014] to the VQ-VAE setting.
+
+• (theory+practice) We derive a tight bound on the latent dimensionality and reconstruction loss as a
+  function of warm-up duration. This allows us to adaptively detect the optimal warm-up duration.
+
+• (practice) Our approach improves VQGAN (ImageNet-1K) and WavTokenizer (LibriTTS), where
+  AE Warm-up raises codebook effective dimension by 4-5× and restores loss scaling with K.
+
+Prior work. The warm-up approach has been previously proposed in various ways, although without
+similar justification or connection to latent dimension. Lancucki et al. [2020] delay quantization as
+a stability measure within their codebook-utilization method, Zhao et al. [2024] report empirical
+
+                                                           2
+Figure 2: Sequential learning in AE and VQ-VAE. A 2-layer linear AE learns latent modes
+sequentially Saxe et al. [2014] (left). In VQ-VAEs, however, quantizing the bottleneck freezes
+lower modes (those under the water level D∗), thus severely constraining effective dimension (right).
+See Section 3 for details.
+
+gains from AE pretraining followed by VQ fine-tuning, Wang et al. [2025] take this to its limit by
+applying post-hoc quantization to a frozen pretrained continuous VAE without any VQ training,
+and (concurrently with this work) Zhao et al. [2026] propose the warm-up under the name deferred
+quantization, though not connecting it to the latent dimension collapse.
+
+2 Background
+
+Autoencoders and vector quantization. An autoencoder pairs an encoder fθ : X → Rk with a
+decoder gϕ : Rk → X and minimizes the reconstruction loss ∥x − gϕ(fθ(x))∥2. A vector-quantized
+
+autoencoder [van den Oord et al., 2017] inserts a discretization step between the two: a finite codebook
+C = {c1, . . . , cK } ⊂ Rk and a nearest-neighbor quantizer Q(z) = arg minc∈C ∥z − c∥. The encoder
+produces a continuous pre-quantization latent z = fθ(x); the quantizer replaces it with the nearest
+codeword zq = Q(z); the decoder reconstructs xˆ = gϕ(zq). Training minimizes
+
+L(ϕ, θ) = Lrec + Lcom = E[∥x − xˆ∥2 + β ∥z − sg(zq)∥2],                        (1)
+
+where β is the commitment weight and sg is the stop-gradient and expectation is over the batch
+
+(practice) or population (theory). The encoder receives its gradient through the straight-through
+
+estimator [van den Oord et al., 2017], ∂zq/∂z := I. Codebook entries are typically updated by
+exponential moving averages of assigned latents.
+
+Evaluation metrics. VQ-VAEs are evaluated on reconstruction quality and on the health of the
+learned codebook. Reconstruction is measured directly via pixel- or sample-level losses (L1, L2,
+mel-spectrogram), and perceptually via task-specific metrics — LPIPS [Zhang et al., 2018] and
+rFID for images, PESQ [Rix et al., 2001] and STOI [Taal et al., 2010] for audio. Modern VQ-VAEs
+additionally include an adversarial discriminator loss [Esser et al., 2021, Ji et al., 2025]. On the
+codebook side, utilization measures how many allocated codewords are actually in use.
+
+Even at full utilization, standard VQ-VAE representations live in a low-dimensional subspace (typi-
+cally 4–10 dimensions), as measured by deff , the number of principal components needed to explain
+99% of the pre-quantization latent variance:
+
+                    deff = min m : i≤m λi i λi ≥ 0.99 ,                        (2)
+
+with {λi} as the PCA eigenvalues of z in decreasing order. The same definition applies to the
+codebook entries themselves; we report both deff (z) and deff (C) in Section 4.
+
+Autoencoder gradient flow. Saxe et al. [2014] analyzed the gradient flow of the plain-AE objective
+
+LAE(W1, W2) = E∥x − W2W1x∥2 for the two-layer linear network Xˆ = W2W1X. On the diagonal
+manifold W1 = diag(uj), W2 = diag(vj), the loss decouples as LAE(u, v) = j σj2(1 − ujvj)2,
+and the flow acts independently on each mode:
+
+              u˙ j  =  2σj2  vj  (1  −  uj vj ),    v˙j = 2σj2 uj (1 − ujvj).  (3)
+                                               √
+With balanced initialization uj(0) = vj(0) = s at small scale s ∈ (0, 1), the activation for each
+
+mode rj(t) := uj(t)vj(t) has the closed form
+
+                             rj(t) =    1     +  1−s  e−4σj2 t  −1             (4)
+                                                   s
+                                                                   ,
+
+                                                 3
+                      STE backward: ∂zq/∂z := I
+
+x  W1x     z          Q(z) = arg minI(Q(z),z)≤R E∥Q(z) − z∥2     zq  W2zq  xˆ
+
+Figure 3: The linear RD-AE. The linear encoder W1 maps data to the pre-quantization latent z; the
+(potentially stochastic) quantizer Q assigns z to code zq; the linear decoder W2 reconstructs xˆ. The
+backward pass through the quantizer uses the straight-through estimator.
+
+so modes activate sequentially in decreasing order of variance (Figure 2, left). Consequently deff
+dips as top modes saturate first, then recovers as the rest catch up (Figure 4, black) — a pattern also
+visible in large-scale VQGAN and WavTokenizer AEs trained with Adam (Figure 5 and Figure 7).
+
+3 Theoretical model of collapse
+
+We propose to model VQ-VAE training dynamics by replacing the nearest-neighbor quantizer with
+the rate-distortion-optimal continuous channel at rate R = log2 K, resulting in a model that we call
+RD-AE. This relaxation makes the joint dynamics of the encoder, decoder, and channel analytically
+tractable. We study the framework in the classical linear-Gaussian setting where AE training dynamics
+admit closed-form analysis [Saxe et al., 2014]. Despite the simplifications, the resulting toy model
+exhibits dimensional collapse (Figure 4). Rigorous analysis predicts that the collapse results from the
+interplay of two mechanisms: sequential learning in autoencoders [Saxe et al., 2014, Refinetti and
+Goldt, 2022] and a fundamental property of MSE-trained vector-quantizers to collapse low-variance
+dimensions (which we model here information-theoretically via rate-distortion bottleneck).
+
+This section is organized as follows. RD-AE is introduced in Section 3.1, which also simulates the
+dense case of the model. The dense case is still difficult to analyze, and thus in Section 3.2 we further
+simplify it to the case of diagonal covariance matrices and weight initialization, and present the
+collapse mechanism in detail. Section 3.3 explains how to predict effective dimension of the resulting
+VQ-VAE from the state of the AE Warm-up checkpoint used. Subsequent Section 4 validates that the
+behavior of non-linear VQ-VAEs trained on real data is in qualitative agreement with the behavior of
+our toy model.
+
+3.1 Setup
+
+Architecture. The data is x ∼ N (0, Σ) on Rd with Σ = diag(σ12, . . . , σd2) and σ12 ≥ · · · ≥ σd2 > 0.
+A linear encoder W1 ∈ Rd×d produces the pre-quantization latent z = W1x; a (potentially stochastic)
+quantizer Q produces zq := Q(z); a linear decoder W2 ∈ Rd×d returns xˆ = W2zq (Figure 3).
+Training objective is the standard VQ-VAE loss (1).
+
+The learning dynamics follow standard VQ-VAE conventions: the encoder reconstruction “gradient”
+uses the straight-through estimator ∂zq/∂z := I, and the commitment term treats zq as constant via
+stop-gradient. As a result, the update equations for W1 and W2 are not the gradient of (1).
+
+Information-theoretic relaxation. Analyzing VQ’s effect on the training dynamics requires jointly
+tracking K high-dimensional codewords alongside the encoder and decoder. The codebook also
+breaks the diagonal structure exploited by Saxe et al. [2014], preventing a per-mode decomposition.
+Our key insight is that we can replace the dynamically evolving VQ with its information-theoretic
+optimal counterpart. Specifically, we assume that the map z → zq at every instant of training is the
+one that minimizes MSE subject to the information bottleneck constraint:
+
+              min     E[∥z − zq∥2] : I(z; zq) ≤ log2 K  ≜ D(R),            (5)
+
+              Pzq |z
+
+where we denote the minimum MSE as the optimal rate-R distortion in latent space, D(R). This can
+be understood as relaxing the hard constraint |suppzq| ≤ K to a softer mutual information constraint.
+Although we optimistically assume that quantizer is trained fast enough to remain optimal for the
+evolving statistics of z, RD-AE nevertheless exhibits dimensional collapse. Due to the Gaussianity of
+z, the solution of (5) is given by a classical waterfilling formula [Polyanskiy and Wu, 2025, Ex. I.9]
+and conveniently diagonalizes when the initialization and Σ does. Thus we obtain a similarly simple
+and insightful dynamics as in Saxe et al. [2014] except now including the VQ part.
+
+                                 4
+Figure 4: Plain AE vs. RD-AE flow. d = 64, Σ = diag(j−1), β = 1. W1, W2 are d × d matrices
+with i.i.d. entries (Wi)jk ∼ N (0, s2/(4d)), s = 0.01, evolved under the RD-AE flow (6)–(7). Each
+curve is the median over 128 seeds; cross-seed variance is below 10−3. (Left) Effective dimension
+
+deff . Plain AE (black) dips and recovers; RD-AE (colored by rate R) dips and plateaus. (Right)
+Reconstruction loss. Dashed lines are Shannon floors D(R), achieved by optimal enc-dec pair.
+
+RD-AE flow (dense case). Training is governed by the system of ODEs on W1, W2 (derived in
+Section A.1):
+
+W˙ 1 = −2 W2⊤W2 M W1 − W2⊤ Σ − 2β W1 − M W1 Σ,                                    (6)
+
+W˙ 2 = 2ΣW1⊤M − 2W2 U diag(cjλj)U ⊤ ,                                             (7)
+
+where M is a covariance of the noise in the z → zq channel, and cj and λj are the spectra of M and
+Cov(z), respectively (see Section A.1). Importantly, when K → ∞ the channel matrix M → I, and
+the commitment term vanishes. In this limit the RD-AE flow (6)–(7) reduces to the gradient flow of
+the AE objective in Section 2, though the K required for this to happen is impractically large.
+
+Numerical simulation (dense case). Before deriving the dynamics formally, we preview the
+qualitative behavior. Figure 4 simulates the RD-AE flow with d = 64, σj2 = j−1, β = 1, with
+i.i.d. Gaussian initialization, compared with the plain-AE limit. The plain AE drives Lrec → 0
+while deff dips and recovers. The RD-AE, by contrast, exhibits dimensional collapse at every rate
+R ∈ {10, 14, 18} bits, to deff = 3, 4, 5 respectively, mirroring the behavior we see in practice. The
+reconstruction loss plateaus strictly above the Shannon distortion floor D(R). This gap is the cost of
+
+dimensionality collapse.
+
+3.2 Analysis of the RD-AE dynamics in the diagonal case
+
+To get more insight into the dynamics, we restrict attention to diagonal W1, W2:
+
+W1(t) =: diag(uj(t)), W2(t) =: diag(vj(t)), Σ =: diag(λj) .
+
+It is clear that in this case equations (6)-(7) decouple and diagonality at initialization is preserved
+throughout training. Next, we derive equations for uj, vj and characterize the dimensional collapse
+mechanism via: (1) a per-mode flow that reduces to a Saxe et al. [2014] logistic with a channel-
+dependent timescale, (2) a dynamical water level whose rise pushes active modes below threshold and
+freezes them, and (3) a closed-form expression for the resulting loss plateau. The restriction to the
+diagonal case is only done for analytic convenience; this simplification still expresses all the major
+phenomena in the dense dynamics of W1, W2 (cf. (6)-(7)) that is simulated Figure 2 and Figure 4.
+
+The rate-distortion channel. Since W1 is diagonal, zj = ujxj has independent coordinates
+zj ∼ N (0, λj) with λj = u2j σj2. The rate-R channel Pzq|z minimizing E∥z − zq∥2 under the
+information constraint factorizes across coordinates [Polyanskiy and Wu, 2025, Sec. 20.4, Ch. 26]
+and is given by reverse water-filling: a unique water level D⋆ = D⋆(λ1, . . . , λd; R), representing the
+
+variance threshold below which modes are dropped from the channel, solves
+
+j                  1  log2+(λj /D⋆)  =  R,                                        (8)
+                   2
+
+and the channel acts coordinatewise as zq,j | zj ∼ N (cjzj, τj2) with per-mode distortion Dj, channel
+gain cj, and noise variance τj2 given by
+
+Dj = min(λj, D⋆),     cj = 1 − Dj/λj,                    τj2 = cj D⋆.             (9)
+
+                      5
+Coordinates with λj ≤ D⋆ satisfy cj = τj2 = 0 and are passed through as zero; we call these inactive
+and the rest active, and write the active set A(t) = {j : λj(t) > D⋆(t)} with k(t) = |A(t)|. The
+channel decomposes as zj = zq,j + nj jointly, with nj ∼ N (0, Dj) independent of zq,j, so that the
+total latent distortion E∥z − zq∥2 = j Dj equals D(R) from (5).
+
+Diagonal RD-AE flow. Differentiating the full training objective (1) requires care. We begin
+with the reconstruction loss Lrec = E∥x − W2zq∥2, which decomposes per mode using the joint
+decomposition z = zq + n, coupled across modes through D⋆:
+
+                                              d
+
+                      Lrec(u, v) =               σj2(1 − cj uj vj )2 + vj2τj2 ,                 (10)
+
+                                    j=1
+
+Under these conditions, the decoder gradient is directly computed from (10). For the encoder,
+we apply the chain rule with the STE and SG conventions (∂zq/∂z =: I and ∂ sg(x)/∂x := 0)
+per-sample and take expectation. We get (full derivation in Section A.2):
+
+        ∂Lrec      =  −2cj uj σj2(1 − uj vj ),         ∂Lrec        =  −2σj2vj (1 − cj uj vj )  (11)
+         ∂vj                                            ∂uj
+                                                              STE
+
+The encoder commitment gradient gives ∂Lcom/∂uj = 2Dj/uj. Assembling, we get the diagonal
+RD-AE flow
+
+        u˙ j       =  2σj2vj (1 − cj uj vj )  −  2βDj ,       v˙j = 2σj2cj uj (1 − uj vj ).     (12)
+                                                   uj
+
+We note that due to the straight-through estimator, the flow (12) is not a gradient flow, since the
+symmetry condition ∂u˙ j/∂vj = ∂v˙j/∂uj fails whenever cj ≠ 1.
+
+Mode    dynamics   √at balanced  initialization. We specialize      to β   =  1 and balanced  initialization
+uj (0)  = vj(0) =    s. Balance  is preserved throughout training:  for j  ∈  A, Dj = D⋆ =    λj(1−cj) =
+
+uj2σj2(1 − cj), and at uj = vj =: aj, we have u˙ j − v˙j = 0.
+
+Hence uj(t) = vj(t) for all t where mode j is active. Then, rj := ujvj = u2j obeys
+
+        r˙j = 4σj2 cj(t) rj(1 − rj) for j ∈ A, r˙j = 0 for j ∈/ A,                              (13)
+
+derived in Appendix A.4. This is structurally similar to logistic (4) with cj(t) acting as a time-
+dependent scale factor: at cj(t) ≡ 1 (the K → ∞ limit), (13) reduces to (3). For j ∈/ A, cj = 0
+and Dj = λj give u˙ j = v˙j = 0 on the balanced manifold. The choice β = 1 preserves the
+encoder-decoder balance, and our experiments support the resulting predictions at β values used in
+
+practice.
+
+Collapse mechanism. Implicit differentiation of (8) yields the water level dynamics:
+
+                                    D˙ ⋆         =  2 u˙ i ,                                    (14)
+                                    D⋆              k i∈A ui
+
+derived in Appendix A.3. As active modes grow, D⋆ rises through (14), and modes whose λj
+falls below the water line drop out of A and freeze permanently. The active set is therefore non-
+
+increasing, unlike in the plain AE, where every mode eventually activates. This is the dimensional
+collapse phenomenon: weak modes that have not yet activated when D⋆ overtakes them will remain
+
+unrepresented in the latent space forever.
+
+Loss plateau. At convergence, with k∞ = |A∞| active modes surviving, the reconstruction loss is
+
+                                 Lr∞ec = k∞D∞ ⋆ +               σj2,                            (15)
+
+                                                         j∈/A∞
+
+where the rate budget R is spent only on A∞, leaving frozen modes unrepresented (paying their full
+variance σj2). The plateau therefore exceeds the Shannon optimum D(R) whenever A∞ is a strict
+subset of the optimal active set (Figure 4).
+
+Special case of β = 0. Removing the commitment term by setting β = 0 leads to very different
+dynamics: (12) gives u˙ j = 2σj2vj > 0 on inactive modes, so RD-AE always eventually recovers
+
+                                                    6
+Figure 5: VQGAN on ImageNet-1K, |C| = 214. Codebook deff (left) and validation reconstruction
+loss (center) during training for AE warm-up durations Twu ∈ {0, 1k, . . . , 30k}; longer warm-up
+raises codebook dimension and lowers the loss floor, with returns diminishing past Twu ≈ 10k. Right:
+reverse water-filling on the AE checkpoint’s PCA spectrum at rate R = 14 is an empirical upper
+bound on the final trained codebook deff.
+
+from dimensional collapse at β = 0. This does not, however, justify dropping the commitment loss
+in practice: in VQGAN, we find that β = 0 allows dimension recovery when trained with dead code
+reset, but achieves worse final loss (Appendix C.2). We hypothesize that this discrepancy can be
+attributed to the finite codebook adaptation speed (causing staleness between codewords and statistics
+of z).
+
+3.3 Effect of AE Warm-up
+
+Section 3.2 showed that dimensional collapse happens because the rate constraint imposes a rising
+water level that freezes modes falling below it. A natural fix is AE Warm-up: delay quantization until
+enough modes have activated. This runs the plain-AE flow (3) from balanced diagonal initialization
+W1(0) = W2(0) = εI for warm-up duration Twu, then switch to the RD-AE flow (12) with rate R
+and β = 1. The following theorem bounds how many modes survive the switch as a function of Twu.
+
+Theorem 1. Let x ∼ N (0, Σ) with Σ = diag(σ12, . . . , σd2) and σ12 > · · · > σd2 > 0. Let gj(T ) =
+      e 1−ε2 −4σj2T  −1 denote the activation of mode j at time T in plain-AE training (4). Define
+1  +
+        ε2
+
+                                                             m−1  log σi2 gi(Twu)
+
+      mwu(Twu, R)    :=   max  m ∈ {1, . . . , d}  :  R>  1            2 σm 2 gm(Twu)  .   (16)
+                                                          2
+
+                                                             i=1
+
+After switching to RD-AE flow at Twu, at most mwu modes remain active at convergence, and
+
+                                                                  m       1/m
+
+      Lr∞ec ≥ mwu δmwu (R) +          σj2,         δm(R) :=          σi2       2−2R/m.     (17)
+
+                               j>mwu                         i=1
+
+Proof sketch. At the switch time, λj(Twu) = gj(Twu)σj2, and the condition in (16) is the water-
+filling requirement for the top mwu modes to lie above D⋆(Twu). Modes inactive at Twu stay at
+rj = gj(Twu), contributing variance σj2 to the reconstruction loss. The bound on Lr∞ec follows from
+optimal water-filling of rate R over the top mwu modes; full proof in Appendix A.6.
+
+Empirical validation of the warm-up theory. Although Theorem 1 is stated for the diagonal
+RD-AE model (where it is nearly tight; see Appendix A.6.1), its core construction transfers directly
+to non-linear VQ-VAEs. Indeed, one can snapshot a state of AE during the warm-up stage, compute
+PCA of the covariance matrix of the latents, evaluate water-filling rate allocation, and compute the
+number of surviving dimensions. The resulting number turns out to give a rather accurate upper
+bound on the final latent dimension of the trained VQ-VAE if the warm-up is switched off at the time
+of the snapshot (see Figure 5 (right) and Appendix C). This allows us to make on-the-fly automatic
+decision about when to switch from the AE (warm-up) phase and start training the actual VQ-VAE.
+
+                                      7
+Table 1: VQGAN on ImageNet-100 (20k) warm-up ablation. L1, LPIPS, and rFID: lower is better.
+D: codebook deff (higher is better). Bold indicates the best value within each codebook size. Vanilla
+VQGAN uses uniform codebook init and no respawn; VQGAN w/ Respawn adds k-means init and
+respawn; Twu = {1k, . . . , 40k} additionally pre-trains the encoder–decoder as a plain autoencoder for
+the indicated number of steps before introducing the codebook. All runs share the same 100k-step
+
+budget, so warm-up trades VQ steps for AE steps.
+
+           |C| = 210     |C| = 214  |C| = 216
+
+Variant    Util% D↑ L1↓ LPIPS↓ rFID↓ Util% D↑ L1↓ LPIPS↓ rFID↓ Util% D↑ L1↓ LPIPS↓ rFID↓
+
+Vanilla VQGAN 82.7 2 0.153 0.405 87.8 8.0 2 0.153 0.408 81.0 2.2 2 0.153 0.406 83.6
+
+w/ Respawn 100.0 3 0.148 0.389 74.2 99.9 3 0.140 0.372 69.7 47.0 5 0.140 0.363 67.9
+
+Twu = 1k   100.0 5 0.142 0.355 69.1 100.0 4 0.134 0.338 61.9 98.4 5 0.128 0.313 52.6
+
+Twu = 5k   100.0 7 0.141 0.343 61.7 100.0 7 0.129 0.308 51.4 98.5 7 0.124 0.294 47.4
+
+Twu = 10k  100.0 7 0.141 0.339 63.4 99.9 10 0.128 0.302 52.0 98.0 12 0.124 0.284 47.8
+
+Twu = 15k  100.0 10 0.142 0.337 67.0 99.9 12 0.129 0.299 51.4 97.7 13 0.124 0.282 47.3
+
+Twu = 20k  100.0 11 0.142 0.334 60.9 99.8 13 0.129 0.297 52.6 97.6 14 0.125 0.281 47.4
+
+Twu = 30k  100.0 14 0.142 0.332 61.8 99.8 15 0.130 0.295 49.8 97.2 16 0.126 0.279 46.7
+
+Twu = 40k  100.0 19 0.143 0.334 61.3 99.8 17 0.131 0.294 50.6 97.0 18 0.126 0.279 43.9
+
+4 Escaping Dimensional Collapse with Autoencoder Warm-up
+
+Section 3 argues that VQ-VAE reconstruction is bottlenecked by the latent effective dimension, not
+the codebook size: modes inactive when the quantizer turns on are frozen by the rate constraint and
+never recover. The suggested fix, AE Warm-up, trains the encoder–decoder as a plain autoencoder
+for Twu steps so that lower-variance directions activate, and then introduces VQ. A single warm-up
+checkpoint can be reused across codebook sizes, amortizing its cost over a sweep.
+
+Choosing Twu. The theory tells us that reverse water-filling at rate R = log2 K on the PCA
+spectrum of the encoder’s latents upper-bounds the codebook deff that the downstream VQ-VAE will
+achieve (Figure 5, right). In practice, Twu should be chosen by monitoring deff during AE training and
+stopping once it plateaus — further AE training does not lift additional modes above the water level
+at the target rate. This happens within 20k-40k steps in our ImageNet experiments, and while gains
+from the additional dimension may plateau earlier than this point based on the dataset, this approach
+ensures that dimension is not a constraining factor.
+
+Empirical validation. We test the prediction at scale on both image and audio modalities, training
+VQGAN on ImageNet (Section 4.1) and WavTokenizer on LibriTTS (Section 4.2). Each setting
+addresses three questions: (Q1) does cold-start VQ training collapse the latent to a low-dimensional
+subspace in large-scale architectures; (Q2) does the resulting loss floor persist as K grows; and (Q3)
+does AE warm-up recover latent dimensionality and restore the expected scaling of reconstruction
+quality with K.
+
+4.1 VQGAN on ImageNet
+
+Setup. We evaluate AE Warm-up by training the f16 VQGAN architecture on ImageNet in two
+complementary setups. First, we use 20k images from ImageNet-100 to perform controlled ablations
+over both codebook size and warm-up duration, allowing us to test whether dimensional collapse
+prevents VQGAN from benefiting from larger codebooks and whether AE Warm-up restores this
+scaling. We then train on the full ImageNet-1K dataset for 500k steps (adversarial loss enabled at
+step 250k) at K = 214 to test whether the warm-up effect persists at substantially larger scale.
+
+In both settings, we compare: Vanilla VQGAN (random codebook init); VQGAN w/ Respawn,
+the standard modern VQ-VAE training method with k-means init, EMA codebook usage (de-
+cay 0.99), and dead-code respawn at usage threshold 0.01 [Takida et al., 2022, Mentzer et al.,
+2024, Dhariwal et al., 2020]; and AE Warm-up, which trains as a plain autoencoder for Twu ∈
+{1k, 5k, 10k, 15k, 20k, 30k, 40k} steps before resuming the Respawn protocol. Full training and
+evaluation details can be found in Section B.1.
+
+Key findings. Table 1 shows the final metrics. Without warm-up, neither Vanilla VQGAN nor
+the Respawn-only baseline improves substantially as K grows. AE Warm-up restores scaling with
+codebook size and improves all metrics over both baselines: 8.1–18.6% over Vanilla VQGAN and
+
+                      8
+Table 2: WavTokenizer audio reconstruction performance on LibriTTS test-clean/test-other.
+Each row pair compares cold-start WavTokenizer training against AE Warm-up at the same codebook
+size. Bold indicates the winner within each codebook size; underline indicates the overall best.
+Without warm-up, codebook utilization collapses as K grows and codebook effective dimension is
+pinned at 4. AE Warm-up maintains near-full utilization at every K and raises codebook effective
+dimension to 11–21, and causes D (codebook deff), Mel, PESQ, and STOI to improve monotonically
+with K. Cold-start at K = 216 is omitted given the severity of collapse at K = 214.
+
+Method  |C| Util↑ D ↑ Mel↓ UTMOS↑ PESQ↑ STOI↑ V/UV F1↑
+
+WavTokenizer 4096 100.0% 4 0.480/0.548 4.051/3.563 2.336/2.054 0.912/0.878 0.940/0.916
+AE Warm-up 4096 100.0% 11 0.469/0.526 3.980/3.484 2.275/2.032 0.907/0.873 0.931/0.905
+
+WavTokenizer 8192 16.9% 4 0.510/0.584 4.009/3.547 2.179/1.937 0.902/0.867 0.934/0.908
+AE Warm-up 8192 100.0% 17 0.448/0.504 3.991/3.480 2.425/2.147 0.915/0.882 0.933/0.907
+
+WavTokenizer 16384 8.4% 4 0.497/0.566 4.007/3.539 2.209/1.977 0.904/0.870 0.936/0.912
+AE Warm-up 16384 100.0% 19 0.432/0.486 4.041/3.536 2.514/2.229 0.920/0.889 0.942/0.917
+
+AE Warm-up 65536 99.7% 21 0.428/0.480 4.050/3.521 2.626/2.328 0.925/0.895 0.940/0.915
+
+5.3–11.0% over Respawn on L1, 18.0–31.4% and 14.5–23.1% on LPIPS, and 30.6–47.5% and
+17.9–35.4% on rFID. Returns plateau beyond Twu = 20k.
+
+Vanilla VQGAN does not benefit from a larger codebook. The three vanilla rows sit at the
+same L1 loss (0.153) and the same codebook dimension (deff = 2) despite K growing by 64×, with
+utilization collapsing from 82.7% at K = 210 to 2.2% at K = 216.
+
+Respawn partially rescues the loss floor but cannot recover dead modes. VQGAN w/ Respawn
+improves on Vanilla at every K but falls short of AE warm-up in all cases. Its codebook dimension
+reaches only 3 at K ∈ {210, 214} and 5 at K = 216 — far below warm-up values — consistent with
+respawn redistributing dead codes within the active subspace rather than reviving collapsed modes.
+
+Warm-up lowers the loss floor. Increasing Twu from 1k to 40k steps monotonically raises codebook
+effective dimension (from 4–5 to 17–19) and improves LPIPS (from 0.31–0.36 to 0.28–0.33), with
+noisier but consistent gains on rFID. As predicted by Theorem 1, each additional warm-up step allows
+more modes to be represented by the encoder before the quantizer is introduced.
+
+AE Warm-up benefits scale to training on ImageNet-1K with adversarial losses. Figure 5 and
+Table 3 show the results for K = 214 across several warm-up durations. Cold-start VQGAN, even
+with respawn, exhibits dimensional collapse, with deff = 4, 5. AE Warm-up progressively raises
+the final codebook dimension, reaching deff = 18 at Twu = 30k; reverse water-filling on the AE
+checkpoint upper bounds the achievable codebook dimension. The best warm-up duration based
+on validation loss is Twu = 10k, and the best rFID (5.35) is achieved by Twu = 20k, and further
+increasing warm-up and dimension plateaus past this point.
+
+4.2 WavTokenizer on LibriTTS
+
+Setup. To validate our theory in the audio domain and on a larger-scale setting, we train WavTok-
+enizer [Ji et al., 2025] on LibriTTS [Zen et al., 2019] with full reconstruction and adversarial losses.
+We use four codebook sizes (K ∈ {4096, 8192, 16384, 65536}) and a fixed training budget of 100
+epochs in two regimes: (i) cold-start WavTokenizer training (the baseline) and (ii) AE Warm-up for
+43 epochs before initializing the codebook with k-means and training as a VQ-VAE with dead code
+respawn. All other hyperparameters match the original WavTokenizer; details are in Section B.2.
+
+Key findings. Table 2 confirms the same pattern as VQGAN. Cold-start training pins codebook
+deff at 4 regardless of K—fewer than 1% of the 512 available directions—and utilization collapses
+from 100% at K=212 to 8.4% at K=214. Performance does not merely plateau but degrades with
+K: test-clean PESQ drops from 2.34 at K=212 to 2.18 at K=213. The exception is K=212, where
+a 4-dimensional latent already tiles the codebook and warm-up’s extra dimensions (deff=11) are
+surplus capacity—consistent with the theory.
+
+                                                           9
+AE Warm-up restores monotone scaling: codebook deff rises from 11 to 21 as K grows from 212 to
+216, all at near-full utilization. The reconstruction metrics also improve: Mel loss drops from 0.469
+to 0.428 on test-clean, and PESQ improves from 2.275 to 2.626. We did not attempt cold-start at
+K=216 given the severity of collapse already at K=214.
+
+5 Discussion and Limitations
+
+The bottleneck in VQ-VAE training is the span of the latent subspace the encoder delivers to the
+quantizer, not the number of codes. AE warm-up addresses this directly, and because it acts before
+quantization begins, it is agnostic to the downstream quantizer: residual VQ [Zeghidour et al., 2021,
+Kumar et al., 2023, Zhang et al., 2024, Défossez et al., 2024], product quantization [Zhang et al.,
+2025], and structural reparameterizations such as SimVQ [Zhu et al., 2025] are all compatible. Indeed,
+the mode-suppression mechanism operates within each residual stage or product factor, so these
+methods stand to benefit from warm-up as well.
+
+Scope and future work. Our theory assumes linear encoders and decoders with independent
+Gaussian inputs — enough to expose the mechanism, but restrictive. Extending to nonlinear encoders
+and predicting the loss floor quantitatively in realistic models are natural next steps. The method also
+raises practical questions: how far can codebook size be pushed once warm-up is in place, and which
+existing codebook-geometry techniques continue to work in the higher-deff regime warm-up unlocks?
+
+References
+
+Alexandre Défossez, Laurent Mazaré, Manu Orsini, Amélie Royer, Patrick Pérez, Hervé Jégou,
+   Edouard Grave, and Neil Zeghidour. Moshi: a speech-text foundation model for real-time dia-
+   logue. ArXiv, abs/2410.00037, 2024. URL https://api.semanticscholar.org/CorpusID:
+   273022979.
+
+Prafulla Dhariwal, Heewoo Jun, Christine Payne, Jong Wook Kim, Alec Radford, and Ilya Sutskever.
+   Jukebox: A generative model for music. ArXiv, abs/2005.00341, 2020. URL https://api.
+   semanticscholar.org/CorpusID:218470180.
+
+Patrick Esser, Robin Rombach, and Bjorn Ommer. Taming transformers for high-resolution im-
+   age synthesis. In Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern
+   Recognition (CVPR), pages 12873–12883, June 2021.
+
+Shengpeng Ji, Ziyue Jiang, Wen Wang, Yifu Chen, Minghui Fang, Jialong Zuo, Qian Yang, Xize
+   Cheng, Zehan Wang, Ruiqi Li, Ziang Zhang, Xiaoda Yang, Rongjie Huang, Yidi Jiang, Qian Chen,
+   Siqi Zheng, and Zhou Zhao. Wavtokenizer: an efficient acoustic discrete codec tokenizer for audio
+   language modeling. In The Thirteenth International Conference on Learning Representations,
+   2025. URL https://openreview.net/forum?id=yBlVlS2Fd9.
+
+Rithesh Kumar, Prem Seetharaman, Alejandro Luebs, Ishaan Kumar, and Kundan Kumar. High-
+   fidelity audio compression with improved rvqgan. In A. Oh, T. Naumann, A. Glober-
+   son, K. Saenko, M. Hardt, and S. Levine, editors, Advances in Neural Information Pro-
+   cessing Systems, volume 36, pages 27980–27993. Curran Associates, Inc., 2023. doi:
+  10.52202/075280-1214. URL https://proceedings.neurips.cc/paper_files/paper/
+   2023/file/58d0e78cf042af5876e12661087bea12-Paper-Conference.pdf.
+
+Adrian Lancucki, Jan Chorowski, Guillaume Sanchez, Ricard Marxer, Nanxin Chen, Hans J. G. A.
+   Dolfing, Sameer Khurana, Tanel Alumäe, and Antoine Laurent. Robust training of vector quantized
+   bottleneck models. 2020 International Joint Conference on Neural Networks (IJCNN), pages 1–7,
+   2020. URL https://api.semanticscholar.org/CorpusID:218673823.
+
+Fabian Mentzer, David Minnen, Eirikur Agustsson, and Michael Tschannen. Finite scalar quanti-
+   zation: Vq-vae made simple. In B. Kim, Y. Yue, S. Chaudhuri, K. Fragkiadaki, M. Khan, and
+  Y. Sun, editors, International Conference on Learning Representations, volume 2024, pages
+   51772–51783, 2024. URL https://proceedings.iclr.cc/paper_files/paper/2024/
+   file/e2dd53601de57c773343a7cdf09fae1c-Paper-Conference.pdf.
+
+                                                          10
+Max Morrison, Rithesh Kumar, Kundan Kumar, Prem Seetharaman, Aaron Courville, and Yoshua
+   Bengio. Chunked autoregressive GAN for conditional waveform synthesis. In International
+  Conference on Learning Representations, 2022. URL https://openreview.net/forum?id=
+  v3aeIsY_vVX.
+
+Yury Polyanskiy and Yihong Wu. Information Theory: From Coding to Learning. Cambridge
+   University Press, 2025.
+
+Ali Razavi, Aaron van den Oord, and Oriol Vinyals. Generating diverse high-fidelity images
+  with vq-vae-2. In H. Wallach, H. Larochelle, A. Beygelzimer, F. d'Alché-Buc, E. Fox, and
+   R. Garnett, editors, Advances in Neural Information Processing Systems, volume 32. Curran As-
+   sociates, Inc., 2019. URL https://proceedings.neurips.cc/paper_files/paper/2019/
+   file/5f8e2fa1718d1bbcadf1cd9c7a54fb8c-Paper.pdf.
+
+Maria Refinetti and Sebastian Goldt. The dynamics of representation learning in shallow, non-linear
+   autoencoders. In Kamalika Chaudhuri, Stefanie Jegelka, Le Song, Csaba Szepesvari, Gang Niu,
+   and Sivan Sabato, editors, Proceedings of the 39th International Conference on Machine Learning,
+  volume 162 of Proceedings of Machine Learning Research, pages 18499–18519. PMLR, 17–23
+  Jul 2022. URL https://proceedings.mlr.press/v162/refinetti22a.html.
+
+A.W. Rix, J.G. Beerends, M.P. Hollier, and A.P. Hekstra. Perceptual evaluation of speech quality
+  (pesq)-a new method for speech quality assessment of telephone networks and codecs. In 2001
+  IEEE International Conference on Acoustics, Speech, and Signal Processing. Proceedings (Cat.
+  No.01CH37221), volume 2, pages 749–752 vol.2, 2001. doi: 10.1109/ICASSP.2001.941023.
+
+Takaaki Saeki, Detai Xin, Wataru Nakata, Tomoki Koriyama, Shinnosuke Takamichi, and Hiroshi
+   Saruwatari. UTMOS: UTokyo-SaruLab system for VoiceMOS challenge 2022. pages 4521–4525,
+   09 2022. doi: 10.21437/Interspeech.2022-439.
+
+Andrew M. Saxe, James L. McClelland, and Surya Ganguli. Exact solutions to the nonlinear dynamics
+   of learning in deep linear neural networks, 2014. URL https://arxiv.org/abs/1312.6120.
+
+Cees H. Taal, Richard C. Hendriks, Richard Heusdens, and Jesper Jensen. A short-time objective
+   intelligibility measure for time-frequency weighted noisy speech. In 2010 IEEE International
+  Conference on Acoustics, Speech and Signal Processing, pages 4214–4217, 2010. doi: 10.1109/
+   ICASSP.2010.5495701.
+
+Yuhta Takida, Takashi Shibuya, Weihsiang Liao, Chieh-Hsin Lai, Junki Ohmura, Toshimitsu Uesaka,
+   Naoki Murata, Shusuke Takahashi, Toshiyuki Kumakura, and Yuki Mitsufuji. SQ-VAE: Variational
+   Bayes on discrete representation with self-annealed stochastic quantization. In Kamalika Chaudhuri,
+   Stefanie Jegelka, Le Song, Csaba Szepesvari, Gang Niu, and Sivan Sabato, editors, Proceedings of
+   the 39th International Conference on Machine Learning, volume 162 of Proceedings of Machine
+  Learning Research, pages 20987–21012. PMLR, 17–23 Jul 2022. URL https://proceedings.
+   mlr.press/v162/takida22a.html.
+
+Yonglong Tian, Dilip Krishnan, and Phillip Isola. Contrastive multiview coding. In Computer Vision
+  – ECCV 2020: 16th European Conference, Glasgow, UK, August 23–28, 2020, Proceedings, Part
+  XI, page 776–794, Berlin, Heidelberg, 2020. Springer-Verlag. ISBN 978-3-030-58620-1. doi: 10.
+  1007/978-3-030-58621-8_45. URL https://doi.org/10.1007/978-3-030-58621-8_45.
+
+Aaron van den Oord, Oriol Vinyals, and Koray Kavukcuoglu. Neural discrete representation learn-
+   ing. In I. Guyon, U. Von Luxburg, S. Bengio, H. Wallach, R. Fergus, S. Vishwanathan, and
+   R. Garnett, editors, Advances in Neural Information Processing Systems, volume 30. Curran As-
+   sociates, Inc., 2017. URL https://proceedings.neurips.cc/paper_files/paper/2017/
+   file/7a98af17e63a0ac09ce2e96d03992fbc-Paper.pdf.
+
+Yuqing Wang, Zhijie Lin, Yao Teng, Yuanzhi Zhu, Shuhuai Ren, Jiashi Feng, and Xihui Liu.
+   Bridging continuous and discrete tokens for autoregressive visual generation. 2025 IEEE/CVF
+  International Conference on Computer Vision (ICCV), pages 18596–18605, 2025. URL https:
+  //api.semanticscholar.org/CorpusID:277151126.
+
+                                                          11
+Neil Zeghidour, Alejandro Luebs, Ahmed Omran, Jan Skoglund, and Marco Tagliasacchi. Sound-
+   stream: An end-to-end neural audio codec. IEEE/ACM Transactions on Audio, Speech, and Lan-
+   guage Processing, 30:495–507, 2021. URL https://api.semanticscholar.org/CorpusID:
+   236149944.
+
+Heiga Zen, Viet Dang, Robert A. J. Clark, Yu Zhang, Ron J. Weiss, Ye Jia, Z. Chen, and Yonghui
+   Wu. Libritts: A corpus derived from librispeech for text-to-speech. In Interspeech, 2019. URL
+   https://api.semanticscholar.org/CorpusID:102352475.
+
+Jiayou Zhang, Yifan Shen, Guangyi Chen, Le Song, and Eric P. Xing. Dimensional collapse in
+   VQVAEs: Evidence and remedies. In The Thirty-ninth Annual Conference on Neural Information
+   Processing Systems, 2025. URL https://openreview.net/forum?id=vJtnJfS2mQ.
+
+Richard Zhang, Phillip Isola, Alexei A. Efros, Eli Shechtman, and Oliver Wang. The Unreasonable
+   Effectiveness of Deep Features as a Perceptual Metric . In 2018 IEEE/CVF Conference on
+   Computer Vision and Pattern Recognition (CVPR), pages 586–595, Los Alamitos, CA, USA,
+   June 2018. IEEE Computer Society. doi: 10.1109/CVPR.2018.00068. URL https://doi.
+   ieeecomputersociety.org/10.1109/CVPR.2018.00068.
+
+Xin Zhang, Dong Zhang, Shimin Li, Yaqian Zhou, and Xipeng Qiu. Speechtokenizer: Unified speech
+   tokenizer for speech language models. In The Twelfth International Conference on Learning
+   Representations, 2024. URL https://openreview.net/forum?id=AF9Q8Vip84.
+
+Wenhao Zhao, Qiran Zou, Rushi Shah, and Dianbo Liu. Representation collapsing problems in vector
+   quantization, 2024. URL https://arxiv.org/abs/2411.16550.
+
+Wenhao Zhao, Qiran Zou, Rushi Shah, Yudi Wu, Zhouhan Lin, and Dianbo Liu. Early quantization
+   shrinks codebook: A simple fix for diversity-preserving tokenization. ArXiv, abs/2603.17052,
+   2026. URL https://api.semanticscholar.org/CorpusID:286638547.
+
+Chuanxia Zheng and Andrea Vedaldi. Online clustered codebook. In Proceedings of the IEEE/CVF
+   International Conference on Computer Vision (ICCV), pages 22798–22807, October 2023.
+
+Lei Zhu, Fangyun Wei, Yanye Lu, and Dong Chen. Scaling the codebook size of vq-gan
+   to 100,000 with a utilization rate of 99%. In A. Globerson, L. Mackey, D. Belgrave,
+   A. Fan, U. Paquet, J. Tomczak, and C. Zhang, editors, Advances in Neural Information
+   Processing Systems, volume 37, pages 12612–12635. Curran Associates, Inc., 2024. doi:
+  10.52202/079017-0401. URL https://proceedings.neurips.cc/paper_files/paper/
+   2024/file/1716d022edeac750e57a2986a7135e13-Paper-Conference.pdf.
+
+Yongxin Zhu, Bocheng Li, Yifei Xin, Zhihua Xia, and Linli Xu. Addressing representation collapse
+   in vector quantized models with one linear layer. In 2025 IEEE/CVF International Conference on
+   Computer Vision (ICCV), pages 22968–22977, 2025. doi: 10.1109/ICCV51701.2025.02132.
+
+A Proofs for Section 3
+
+A.1 Dense RD-AE flow
+
+We derive (6)–(7) using the notation of Section 3.1. All channel parameters (cj, τj2, Dj, D⋆) are
+treated as constant throughout, consistent with the assumption that the quantizer remains optimal for
+the current latent statistics.
+
+Channel in the eigenbasis. We denote the covariance matrix of the encoder latent space as Σz,
+and write the diagonal decomposition Σz = W1ΣW1⊤ = U ΛU ⊤. In coordinates z˜ = U ⊤z,
+the components z˜j ∼ N (0, λj) are independent, so the rate-R channel of Section 3.1 applies
+coordinatewise with parameters (cj, τj2, Dj) as in (9).
+Returning to the original basis, E[zq | z] = M z with M := U diag(c1, . . . , cd)U ⊤. Since zq,j
+is the MMSE estimate of z˜j, the residual n := z − zq satisfies zq ⊥ n by Gaussianity, with
+n ∼ N (0, U diag(D1, . . . , Dd)U ⊤).
+
+                                                          12
+Joint moments. The decomposition z = zq + n with zq ⊥ n gives
+
+           E[zqzq⊤] = U diag(cjλj)U ⊤ =: Γq, E[zzq⊤] = Γq, E[xzq⊤] = ΣW1⊤M, (18)
+
+where M = U diag(c1, . . . , cd)U ⊤. The first two follow because zq ⊥ n implies E[zzq⊤] = E[zqzq⊤].
+The third uses zq = M z + (noise) and z = W1x, with M symmetric.
+
+Decoder gradient. From Lrec = E∥x − W2zq∥2 = tr Σ − 2 tr(W2E[zqx⊤]) + tr(W2⊤W2Γq), we
+treat the channel parameters (M, Γq) as constant and differentiate:
+
+                    ∇W2 Lrec = −2ΣW1⊤M + 2W2Γq.                                                (19)
+
+Lcom does not depend on W2, so ∇W2 Lcom = 0.
+
+Encoder reconstruction gradient under STE. The straight-through estimator uses ∂zq/∂z := I
+in differentiation. Equivalently, replace zq by the surrogate zqsurr = z + sg(zq − z) = W1x + s where
+s := zq − W1x is treated as a constant. The reconstruction loss becomes
+
+                    LrSeTcE = E∥x − W2W1x − W2s∥2,                                             (20)
+
+identical in value to Lrec but with W1-dependence routed only through W1x. Differentiating in W1
+with s constant,
+
+∇W1 Lrec|STE = −2W2⊤E[(x − W2zq)x⊤] = −2W2⊤Σ + 2W2⊤W2E[zqx⊤],                                  (21)
+
+where the residual x−W2W1x−W2s = x−W2zq uses the true zq. Substituting E[zqx⊤] = M W1Σ,
+
+                    ∇W1 Lrec|STE = 2(W2⊤W2M W1 − W2⊤)Σ.                                        (22)
+
+Encoder commitment gradient. The commitment term Lcom = E∥z − sg(zq)∥2 treats zq as
+constant during differentiation, so it only depends on W1 through z = W1x:
+
+                    Lcom = tr(W1ΣW1⊤) − 2E[z⊤sg(zq)] + const.                                  (23)
+
+Differentiating, ∇W1 tr(W1ΣW1⊤) = 2W1Σ and ∇W1 E[z⊤sg(zq)] = E[sg(zq)x⊤] has population
+
+mean M W1Σ, giving
+
+                    ∇W1 Lcom = 2(W1 − M W1)Σ.                                                  (24)
+
+Assembling. Combining (19), (22), (24), we arrive at the flow in (6)–(7):
+
+W˙ 1 = −2(W2⊤W2M W1 − W2⊤)Σ − 2β(W1 − M W1)Σ,                                                  (25)
+
+W˙ 2 = 2ΣW1⊤M − 2W2Γq.                                                                         (26)
+
+A.1.1 Dense water-level evolution
+
+In the main text, we examined the water-level dynamics under diagonal initialization of W1 and W2
+(Eq. (14), derivation in §A.3), which characterizes how D∗ rises during RD-AE training to remove
+
+modes from the active set . We derive the water-level dynamics under dense initialization here.
+
+Recall that the water-fill constraint  j∈A  1  log2 (λj /D⋆ )  =  R   couples  D⋆  to  the  eigenvalues  of
+                                            2
+
+Σz(t), which themselves evolve through W1(t). To track λ˙ j, differentiate the eigenvalue identity
+
+Σzuj = λjuj and the normalization uj⊤uj = 1:
+
+                    Σ˙ z uj + Σzu˙ j = λ˙ j uj + λj u˙ j ,        uj⊤u˙ j = 0.                 (27)
+
+Left-multiplying by u⊤j and using u⊤j Σz = λjuj⊤ gives
+
+                    λ˙ j = uj⊤Σ˙ z uj ,        Σ˙ z = W˙ 1ΣW1⊤ + W1ΣW˙ 1⊤.                     (28)
+
+The water-level evolution follows by differentiating the rate constraint at fixed active set:
+
+                    D˙ ⋆  =            1 λ˙ j    =   1         uj⊤Σ˙ zuj .                     (29)
+                    D⋆                 k j∈A λj
+                                                     k            λj
+
+                                                        j∈A
+
+Between water-crossings, A and k are constant, and (25)–(29) close the dynamics of (W1, W2, D⋆).
+At a crossing, A updates discretely, k decrements by one, and D⋆ is continuous.
+
+                                                 13
+A.2 RD-AE flow derivation (diagonal case)
+
+We derive the diagonal RD-AE flow (12) stated in Section 3.2. Throughout we assume that W1 =
+diag(uj), W2 = diag(vj). The RD channel of rate R bits acts coordinatewise on z = W1x.
+
+The channel parameters cj, τj2, D⋆ are treated as constant while differentiating the loss, as in §A.1.
+However, cj and D⋆ change over time as the latent variances λj = uj2σj2 evolve, and this coupling is
+derived separately in §A.3.
+
+Key moments. In the diagonal case, the dense decomposition of §A.1 reduces to zj = zq,j + nj
+with nj ∼ N (0, Dj) independent of zq,j, giving
+
+                  E[zq2,j ] = cj λj ,  E[zj zq,j ] = cj λj ,     E[xj zq,j ] = cj uj σj2.            (30)
+
+Decoder gradient. The decoder direct gradient updates. From xˆj = vjzq,j,
+
+∂Lrec  = −2 E (xj − vj zq,j )zq,j      = −2 E[xj zq,j ] − vj E[zq2,j ]  = −2cjujσj2(1 − ujvj), (31)
+ ∂vj
+
+using cjλj = cju2j σj2 in the last step. The commitment term does not depend on vj, so ∂Lcom/∂vj =
+0.
+
+Encoder reconstruction gradient under STE. The straight-through estimator redefines the back-
+ward pass to treat ∂zq,j/∂zj := 1, while the forward pass uses the actual zq,j from the channel.
+Concretely, STE replaces zq,j with a surrogate zqsu,jrr = zj + sg(zq,j − zj), which equals zq,j in
+value but has identity Jacobian in zj. Under this surrogate, the reconstruction xˆj = vjzqsu,jrr satisfies
+∂xˆj/∂uj = vj ∂zj/∂uj = vjxj, and
+
+∂Lrec       =     −2vj E (xj − vj zq,j )xj    = −2vj σj2 − vj E[xj zq,j ]  = −2vjσj2(1 − cjujvj).
+ ∂uj                                                                                                 (32)
+       STE
+
+The value of zq,j inside the residual uses the true channel output, not the surrogate — only the
+
+backward Jacobian is replaced.
+
+Encoder commitment gradient. The commitment term Lcom = E∥z − sg(zq)∥2 treats zq as
+constant during differentiation. Since zj = ujxj, differentiating with respect to uj gives:
+
+∂Lcom       =     2 E (zj − zq,j )xj   = 2 uj σj2 − E[xj zq,j ]  =   2uj σj2(1 − cj )  =      2Dj ,  (33)
+ ∂uj                                                                                           uj
+
+where the last equality uses Dj = λj(1 − cj) = uj2σj2(1 − cj).
+
+Assembling the flow. The gradient flow is u˙ j = − ∂Lrec/∂uj|STE + β ∂Lcom/∂uj and v˙j =
+−∂Lrec/∂vj. Substituting gives
+
+            u˙ j  =  2σj2 vj (1 − cj uj vj )  −  2βDj ,       v˙j = 2σj2 cj uj (1 − uj vj ),         (34)
+                                                   uj
+
+as stated in the main text.
+
+A.3 Water-level dynamics in the diagonal case
+
+Here, we derive (14) from Section 3.2, which characterizes how the reverse water-filling variance
+threshold rises throughout RD-AE training. As described in the main text, this is extremely conse-
+quential: it progressively decreases the active set of modes which are represented by the quantizer.
+
+Given a rate budget R, a classical result [Polyanskiy and Wu, 2025, Ex. I.9] relates the rate-distortion
+water level D⋆ to the eigenvalues λj via the constraint:
+
+                                       j  1   log+2 (λj /D⋆)  =  R,                                  (35)
+                                          2
+
+                                                 14
+We define the set of active modes to be A := {i : λi > D∗}. The sum (36) then reduces to
+
+                                             1  log2(λi/D⋆)      =  R.                             (36)
+                                             2
+
+                                        i∈A
+
+We derive its dependence on ui (equivalently, on λi = u2i σi2) by implicit differentiation.
+
+Rewriting (36) as   i∈A log2 λi − k log2 D⋆ = 2R, where k = |A|, and differentiating in uℓ for
+ℓ ∈ A:
+                                                          k ∂D⋆
+                                     1 · ∂λℓ        −  D⋆ ln 2 · ∂uℓ       =  0.                   (37)
+                                  λℓ ln 2 ∂uℓ
+
+Using ∂λℓ/∂uℓ = 2uℓσℓ2 = 2λℓ/uℓ, this gives
+
+                                        ∂D⋆ 2D⋆                  for ℓ ∈ A.
+                                             =                                                     (38)
+                                        ∂uℓ         k uℓ
+
+For ℓ ∈/ A, mode ℓ does not enter (36) and ∂D⋆/∂uℓ = 0.
+
+The time-derivative form follows by the chain rule along a flow trajectory:
+
+                                  D˙ ⋆          1 ∂D⋆               2        u˙ ℓ .
+                                  D⋆    =              ∂uℓ u˙ ℓ  =                                 (39)
+                                                D⋆                  k ℓ∈A uℓ
+
+                                           ℓ∈A
+
+As active modes grow, D⋆ rises via (36). When D⋆ reaches λj for the weakest active mode, that
+mode transitions to inactive. Once inactive, it remains so: at β = 1, inactive modes are frozen (r˙j = 0
+from (13)), so λj cannot grow back above D⋆.
+
+A.4 Per-mode reduction at β = 1 and balanced init
+
+We specialize the flow to β = 1 and balanced initialization uj(0) = vj(0) = ε. We show that
+(i) balance is preserved on active modes, (ii) the active-mode activation rj = ujvj = u2j obeys a
+Saxe-like logistic, and (iii) inactive modes at balance are frozen.
+
+Balance preservation on active modes. From the flow with β = 1 and j ∈ A:
+
+                   u˙ j − v˙j  =  2σj2vj (1  − cj uj vj ) −  2Dj    −  2σj2cj uj (1  − ujvj).      (40)
+                                                              uj
+
+Evaluating at uj = vj =: aj and using Dj = D⋆ = (1 − cj)λj = (1 − cj)a2j σj2 on active modes,
+
+u˙ j − v˙j uj=vj = 2σj2aj (1 − cj aj2) − 2σj2(1 − cj )aj − 2σj2cj aj (1 − aj2) = 0.                (41)
+
+Hence uj(t) = vj(t) for all t on active modes; write aj(t) for this common value.
+
+Active-mode logistic. At balance, u˙ j = v˙j, so we compute either. From v˙j = 2σj2cjuj(1 − ujvj)
+
+with uj = vj = aj:
+
+                                           a˙ j = 2σj2cj aj (1 − a2j ).                            (42)
+
+With rj = a2j , r˙j = 2aja˙ j, giving
+
+                                  r˙j = 4σj2cj rj(1 − rj) for j ∈ A,                               (43)
+
+which is Saxe’s logistic (4) with timescale 1/(4σj2) stretched to 1/(4σj2cj) by the channel gain.
+
+Inactive modes. For j ∈/ A, cj = τj2 = 0 and Dj = λj = uj2σj2. The flow reduces to
+
+                    u˙ j  =    2σj2vj   −  2uj2σj2  =     2σj2(vj − uj ),     v˙j = 0.             (44)
+                                             uj
+
+At balance uj = vj, u˙ j = 0 and v˙j = 0, so inactive modes at balance are stationary.
+
+                                                       15
+A.5 Plain-AE mode activation (closed form)
+
+We derive the closed-form solution of the plain-AE flow from Saxe et al. [2014] for completeness
+and reference in the warm-up theorem proof. The plain-AE gradient flow from the decoupled loss is
+
+                        u˙ j = 2σj2vj(1 − ujvj),         v˙j = 2σj2uj(1 − ujvj).             (45)
+
+From u˙ j − v˙j = −2σj2(1 − ujvj)(uj − vj), the balance gap uj − vj decays to zero from any initial
+
+condition; in particular, balanced initialization uj(0) = vj(0) = ε is preserved. Writing aj(t) for the
+common value and rj = aj2,
+
+                           a˙ j = 2σj2aj (1 − aj2),      r˙j = 4σj2rj(1 − rj).               (46)
+
+Separating variables, drj/[rj(1 − rj)] = 4σj2 dt, and integrating from rj(0) = ε2 gives
+
+                              rj(t) =  1  +          e 1−ε2 −4σj2t  −1                       (47)
+
+                                                       ε2              .
+
+A.6 Proof of Theorem 1
+
+The proof has three steps: (i) identify the active set at the switch time, (ii) show warmup-inactive
+modes stay frozen, (iii) derive the loss bound.
+
+State at the switch. Plain-AE training from balanced initialization W1(0) = W2(0) = εI preserves
+
+diagonality and balance (§A.5), so at time Twu the weights are W1 = W2 = diag( gj(Twu)) and
+the latent eigenvalues are λj(Twu) = gj(Twu) σj2. Since σj2 is strictly decreasing in j and gj(Twu) is
+strictly decreasing in j (larger σj2 gives faster Saxe activation), λj(Twu) is strictly decreasing in j.
+
+The active set at the switch is therefore a top prefix {1, . . . , m}, where m is the maximal integer satis-
+
+fying the water-fill consistency condition λm(Twu) > D0⋆, with D0⋆ = i≤m λi(Twu) 1/m2−2R/m.
+
+Rearranging  yields  R  >  1  i<m log2(σi2gi/σm2 gm), so m = mwu(Twu, R).
+                           2
+
+Warmup-inactive modes are frozen forever. For j > mwu, mode j is inactive at the switch
+(cj = τj2 = 0) and balanced. By §A.4, u˙ j = v˙j = 0 at balance, so λj is constant. The water level D⋆
+is non-decreasing along the flow (§A.3), so λj < D⋆ for all t ≥ Twu, and mode j remains inactive.
+
+The active set shrinks as a prefix. Active modes have r˙j = 4σj2cjrj(1 − rj) ≥ 0 (§A.4), so λj
+is non-decreasing on the active set. Combined with monotonic D⋆, modes can only exit the active
+
+set, not enter. Since λj remains ordered (larger σj2 drives faster growth, preserving the decreasing
+sequence), the active set at any later time is a prefix {1, . . . , k} with k ≤ mwu. Any surviving mode
+
+converges to rj = 1, giving A∞ = {1, . . . , k∞} with k∞ ≤ mwu and λj = σj2 on A∞.
+
+Loss bound. At final state, the reconstruction loss is
+
+L∞ rec = k∞ D∞ ⋆ +                  σj2 = k∞         i≤k∞ σi2 1/k∞ 2−2R/k∞ +      j>k∞ σj2,  (48)
+
+                              j>k∞
+
+since each surviving mode pays water-fill distortion D∞ ⋆ = δk∞ (R) and each inactive mode pays
+σj2 (the decoder receives zero on inactive coordinates). This is the Shannon distortion of an ide-
+alized scheme that activates the top k∞ modes and ignores the rest. Since k∞ ≤ mwu and the
+Shannon optimal scheme for the top mwu source at rate R activates all mwu modes (with distortion
+mwuδmwu (R) + j>mwu σj2), the k∞-mode scheme is suboptimal, and
+
+                              Lr∞ec ≥ mwu δmwu (R) +                σj2.                     (49)
+
+                                                         j>mwu
+
+                                                     16
+Figure 6: Warmup theorem: predictions vs. simulation. Balanced initialization W1(0) = W2(0) =
+εI with ε = 0.1, β = 1, d = 64, σj2 = j−1, three rates R ∈ {12, 14, 16} bits. (a) Active-mode count
+at convergence. Solid lines: predicted mwu(Twu, R) from (16). Dashed lines: observed k∞ from
+
+simulated RD-AE flow. (b) Reconstruction loss. Solid lines: loss bound from (17). Dashed lines:
+observed Lr∞ec. Dotted horizontal lines mark the Shannon floor D(R) for each rate. As Twu grows,
+predictions and observations both approach the Shannon limit; at small Twu the bound is vacuous
+
+and the observed collapse is severe.
+
+(a) VQGAN on ImageNet-100 (20k)      (b) WavTokenizer on LibriTTS.
+
+Figure 7: Without VQ, real architectures exhibit Saxe-like sequential activation when trained
+with Adam. VQ causes dimensional collapse. Latent effective dimension (deff , 99%-variance
+threshold) during autoencoder and standard VQ-VAE training. In both (a) VQGAN and (b) WavTok-
+enizer, standard VQ training pins latent dimension at 2-4, while dimension rises as modes are learned
+sequentially when training as an autoencoder.
+
+A.6.1 Numerical validation of Theorem 1
+
+Figure 6 compares the theorem to simulation across warm-up durations in the linear RD-AE setting.
+Left panel: mwu(Twu, R) from (16) against the observed final active-set size k∞ in RD-AE simula-
+tion, for R ∈ {12, 14, 16} bits. Right panel: the loss bound (17) against the observed final L∞ rec, with
+the rate-distortion floor D(R) as reference. The figure shows Twu in the regime where the bound is
+informative; at Twu = 0 the bound reduces to D(R) and the observed loss exceeds it. The bound
+tightens as Twu grows, and both k∞ and L∞ rec approach the Shannon limit.
+
+B Experiment Details
+
+B.1 VQGAN Experiments
+
+Architecture and loss. We use the f16 VQGAN encoder–decoder from Esser et al. [2021] with
+the imagenet_vqgan.yaml configuration (128 base channels, multipliers [1, 1, 2, 2, 4], two residual
+blocks per level, self-attention at 16 × 16, 256-channel bottleneck, 256-dimensional codebook
+embedding space). At 128 × 128 input resolution each image is tokenized to an 8 × 8 grid of 64
+discrete tokens. As per the original VQGAN training recipe, the discriminator is disabled for the
+
+                                 17
+first 250k training steps, the remaining loss is L = LL1 + LLPIPS + λcb LVQ with λcb = 1.0 and
+commitment weight β = 0.25, following Esser et al. [2021].
+
+Training. All runs use the default VQGAN optimizer settings: Adam with (β1, β2) = (0.5, 0.9),
+no weight decay, and constant effective learning rate 2.88 × 10−4. We emphasize that any “warm-up”
+referenced in this paper is the AE phase on the model, not an LR schedule. ImageNet-100 runs are
+distributed across 4× A100 40 GB GPUs at batch size 16/GPU (effective batch size 64), completing
+in approximately 5.5 hours of wall-clock time. ImageNet-1K runs are distributed across 2× H200
+GPUs at batch size 8/ GPU (effective batch size 16).
+
+Codebook handling. Vanilla VQGAN initializes the codebook from U(−1/K, 1/K) and updates
+it via straight-through gradients. VQGAN w/ Respawn and all AE Warm-up recipes use k-means
+initialization on encoder outputs (100 Lloyd iterations over the full training set) with EMA updates,
+and respawn any code whose EMA usage (decay 0.99) falls below 0.01 from a random encoder
+output in the current batch.
+
+Data. Our ImageNet-1K experiments are performed at 256 × 256 resolution. Our ImageNet-
+100 experiments sample 20,000 training images uniformly at random from the 100-class subset
+standardized by Tian et al. [2020], and retain the entire 5,000-image validation set. ImageNet-100
+images are center-cropped and resized to 128 × 128.
+
+Evaluation. We report L1 and LPIPS (VGG-16 backbone) as the standard pixel and perceptual
+reconstruction terms; Rec Loss is their sum. CB Util% is the fraction of codes receiving at least one
+assignment on the validation set, and CB Dim is the 99%-variance PCA effective dimension of the
+codebook entries. rFID uses the InceptionV3 backbone.
+
+B.2 WavTokenizer Experiments
+
+Architecture. We use the official WavTokenizer 75 FPS architecture from Ji et al. [2025] with a 512-
+dimensional pre-quantization latent and a single codebook. Unless otherwise noted, all architectural
+and loss hyperparameters are inherited from the released 75 FPS checkpoint configuration, including
+the convolutional encoder/decoder backbone, the multi-period and multi-scale STFT discriminators,
+and the full reconstruction loss suite (time-domain, mel-spectrogram, feature matching, adversarial).
+We vary only the codebook size K ∈ {4096, 8192, 16384, 65536} and the training regime (cold-start
+vs. AE warm-up).
+
+Training. All runs train for 100 epochs on 2× H200 GPUs with a per-GPU batch size of 40; at
+75 FPS this corresponds to 9,000 latent vectors per GPU per batch. The optimizer, learning-rate
+schedule, discriminator schedule, and loss weightings follow the released WavTokenizer recipe for
+the 75FPS model with codebook size 4096. All runs use the same random seed (the WavTokenizer
+default); we did not run multiple seeds due to compute constraints–each run takes approximately 7
+days on 2× H200 GPUs.
+
+AE warm-up training. For warm-start runs, we first train the encoder and decoder as a plain
+autoencoder for 43 epochs, utilizing both reconstruction and discriminator loss. This single warm-up
+checkpoint is reused across all codebook sizes. At epoch 43, we enable quantization: we initialize the
+codebook via scikit-learn k-means on encoder outputs for K ∈ {4096, 8192, 16384}, and fall back
+to random initialization for K = 65536, where k-means becomes prohibitive at this codebook count.
+Training then proceeds for the remaining 57 epochs under the standard recipe with EMA codebook
+updates (decay 0.99) and respawn enabled. We did not sweep over warm-up duration due to compute
+constraints; 43 epochs was chosen as the point at which the latent effective dimension deff visibly
+plateaus in Figure 7b, matching the stopping rule advocated in Section 4.
+
+Codebook respawn. We respawn codes whose EMA usage falls below a codebook-size-dependent
+threshold, aggregating usage counts across both GPUs each epoch for stability at large K. Cold-start
+baselines use the WavTokenizer default threshold of 1.0. Warm-start runs scale the threshold inversely
+with K to keep the expected number of respawned codes per epoch roughly constant:
+
+                                                          18
+Table 3: VQGAN on ImageNet-1K with |C| = 214. L1, LPIPS, and rFID: lower is better. D:
+codebook deff (higher is better). Vanilla VQGAN uses uniform codebook initialization and no
+respawn; VQGAN w/ Respawn adds k-means initialization and respawn; Twu additionally pre-trains
+the encoder–decoder as a plain autoencoder for the indicated number of steps before introducing the
+
+codebook. Bold indicates the best value among VQ models.
+
+Variant    Util% D↑ L1↓ LPIPS↓ rFID↓
+
+Vanilla VQGAN 8.1 4 0.143 0.304 7.91
+
+w/ Respawn 100.0 5 0.136 0.284 7.07
+
+Twu = 1k   100.0 5 0.131 0.280 7.22
+Twu = 6k   100.0 11 0.136 0.268 5.97
+Twu = 10k  100.0 13 0.127 0.260 5.88
+Twu = 20k  100.0 16 0.131 0.260 5.35
+
+Twu = 30k  100.0 18 0.129 0.260 5.37
+
+         Codebook size K  Dead-code threshold
+
+                4,096               1.0
+                8,192               0.5
+               16,384              0.25
+               65,536              0.06
+
+Data. We train on both train-clean-360 and train-other-500 sampled at 24 kHz, with audio clips
+of 3s, following the original WavTokenizer training recipe [Ji et al., 2025]. Validation and model
+selection use 100 randomly sampled batches of combined dev-clean and dev-other; final evaluation
+reports metrics on both LibriTTS test-clean and test-other. For each training run, we select the
+checkpoint with the best validation loss.
+
+Evaluation. We report five reconstruction metrics on test-clean and test-other: mel-spectrogram
+L1 loss (Mel), UTMOS [Saeki et al., 2022], PESQ [Rix et al., 2001], STOI [Taal et al., 2010], and
+voiced/unvoiced F1 (V/UV F1) computed following the methodology of Morrison et al. [2022]. With
+the exception of L1 loss, these match the metrics reported in Ji et al. [2025]. Codebook utilization
+is computed over the full evaluation set, and codebook effective dimension dim(C) is the number
+of PCA components needed to explain 99% of the variance across codebook entries, matching the
+definition used for VQGAN in Appendix C.
+
+C Additional results on VQGAN
+
+Table 3 shows the final codebook utilization, deff, L1, LPIPS, and rFID for our ImageNet-1K
+experiments.
+
+Figure 8 shows the training trajectories for the experiments across all codebook sizes and warm-up
+runs, and Figure 9 shows the effect of the number of AE warm-up steps on final reconstruction loss
+after 100k total training steps. We observe that for all codebook sizes, the effect of adding warm-up
+steps plateaus at around 20k steps, and increasing warm-up duration past this point does not improve
+final loss.
+
+C.1 Water-filling predicts final VQ-VAE codebook dimension
+
+Theorem 1 bounds the surviving codebook dimension by mwu(Twu, R), the number of latent PCA
+components that lie above the Shannon water level at rate R = log2 K. The theorem is stated for the
+linear-Gaussian RD-AE; here we test whether this holds for VQGAN.
+
+Method. For each AE warm-up checkpoint, we compute the PCA spectrum of the pre-quantization
+latent over the full ImageNet-100 (20k) training set. We then compute reverse water-filling at rates
+R ∈ {10, 14, 16} bits, matching the codebook sizes used in Table 1. The number of PCA components
+whose eigenvalue exceeds D⋆ gives the predicted active-mode count mwu. Figure 10 visualizes the
+
+                          19
+Figure 8: VQGAN on ImageNet-100: codebook size × warm-up duration. Training runs spanning
+K ∈ {1k, 16k, 65k} and Twu ∈ {0, 1k, 5k, 10k, 20k, 30k, 40k} steps of AE Warm-up, all with k-
+means init and respawning of the codebook (solid lines), compared with the vanilla VQGAN training
+recipe with random codebook init and no respawn (dashed line). Top row: validation reconstruction
+loss (L1 + LPIPS) during training. Bottom row: codebook effective dimension deff (99% variance
+threshold) during training. Vanilla VQGAN collapses to deff = 2 and hits a K-independent loss floor
+regardless of codebook size. Adding dead code respawn (No Warm-up) partially rescues codebook
+utilization and modestly raises deff , but still plateaus in validation loss well above the warm-up runs.
+Additional AE warm-up steps further increases the codebook effective dimension and lowers the
+reconstruction floor.
+
+Figure 9: AE warm-up vs. codebook-size scaling in VQGAN. Final reconstruction metrics on
+the ImageNet-100 validation set at step 100,000—L1 (left), LPIPS (center), and rFID (right)—as
+a function of AE warm-up length Twu ∈ {0, 1k, 5k, 10k, 15k, 20k, 30k, 40k}, for three codebook
+sizes K ∈ {210, 214, 216}. Twu = 0 corresponds to the VQGAN w/ Respawn baseline (k-means
+initialization plus dead-code respawn, no AE phase). At Twu = 0 the three curves are tightly
+clustered: increasing K by 64× yields only a modest reduction in any of the three metrics. As Twu
+grows, the curves separate into the expected ordering K = 216 < 214 < 210 and the gap between
+them widens, indicating that warm-up not only lowers the reconstruction floor but also restores the
+scaling benefit of a larger codebook. Returns diminish past Twu ≈ 20k, matching the plateau of the
+AE-phase effective-dimension trajectory in Figure 7.
+
+spectrum and water lines at three checkpoints; Figure 11 compares mwu to the trained VQ-VAE
+codebook effective dimension at every (Twu, K) pair.
+
+Key findings. The water-filling prediction sits strictly above the trained codebook dimension in
+all 24 settings, validating the theorem’s bound qualitatively in the nonlinear regime. As predicted,
+the predicted dimension grows with Twu (as more weak modes are learned during AE training) and
+with K (higher rate lowers the water line, admitting more modes). Both trends are reproduced by the
+trained VQ-VAEs.
+
+                                                          20
+Figure 10: AE latent PCA spectrum and water levels at three warmup durations. Gray bars:
+PCA eigenvalues of the pre-quantization latent at AE warmup steps 1k, 20k, and 40k (left to right),
+computed over the full ImageNet-100 (20k) training set. Dashed horizontal lines: Shannon water level
+D⋆ at rates R = log2 K for codebook sizes K ∈ {210, 214, 216}, computed by reverse water-filling
+(Eq. 8) on the displayed spectrum. The number of PCA components above each line is the predicted
+active-mode count mwu(Twu, R) from Theorem 1. Two trends visible across panels: as Twu grows,
+more modes lift above each line (weak modes activate during AE training); at fixed Twu, larger K
+pushes the water line lower and admits more modes.
+
+Figure 11: Water-filling on the AE latent spectrum upper-bounds the trained VQ-VAE codebook
+dimension. For each AE warm-up checkpoint Twu ∈ {0, 1k, 5k, 10k, 15k, 20k, 30k, 40k} and each
+codebook size K ∈ {210, 214, 216} (one panel per K), we compare the water-filling prediction
+mwu(Twu, R) from the AE PCA spectrum (dashed lines) against the codebook effective dimension
+of the corresponding VQ-VAE trained from that checkpoint to 100k total steps (solid lines). The
+predicted dimension lies above the trained dimension at every point and across all three codebook
+sizes: water-filling on the AE latent is an empirical upper bound on what the downstream VQ-VAE
+achieves. Both quantities increase monotonically with Twu, and the gap between them is roughly
+constant.
+
+C.2 VQGAN with β = 0
+
+The linear analysis in Section 3 identified β = 0 as a degenerate case in which inactive modes are not
+strictly frozen: at β = 0, the encoder ODE reads u˙ j = 2σj2vj, which is positive for any vj > 0, so
+inactive modes can in principle grow back into the active set. Figure 12 and Table 4 test this directly
+by removing the commitment term from VQGAN.
+
+Vanilla VQGAN at β = 0. Without commitment loss, codebook utilization drops to 3.7%, 0.3%,
+and 0.0% at K = 210, 214, 216 respectively. The codebook effective dimension is reported as 248–
+254, but this is a degenerate artifact: random codebook initialization spreads codewords across the
+embedding space, and with no commitment term to pull encoder outputs toward existing codes,
+almost no codes are ever assigned. The unassigned codes remain at their random init values, inflating
+the PCA span without improving reconstruction.
+
+Respawn at β = 0. With k-means initialization and dead-code respawn, β = 0 raises the codebook
+dimension at small K (22 vs. 3 at K = 210), as the linear analysis predicts, but at larger K it stays at
+
+                                                          21
+Table 4: ImageNet-100 (20k) warm-up ablation, with β = 0 baselines. L1, LPIPS, and rFID:
+lower is better. Dim: codebook deff (higher = more of the codebook span is used). Bold indicates the
+best value within each codebook size. Vanilla VQGAN uses uniform codebook init and no respawn;
+VQGAN w/ Respawn adds k-means init and respawn; Twu = {1k, . . . , 40k} additionally pre-trains
+the encoder–decoder as a plain autoencoder for the indicated number of steps before introducing the
+codebook. The β = 0 rows remove the commitment loss; without it, vanilla VQGAN collapses to
+near-zero codebook utilization while the encoder is free to span many latent dimensions, and respawn
+alone partially compensates for utilization but still falls short of warm-up at large K. All runs share
+the same 100k-step budget, so warm-up trades VQ steps for AE steps.
+
+                    |C| = 210                            |C| = 214                  |C| = 216
+
+Recipe     Util% Dim↑ L1↓ LPIPS↓ rFID↓ Util% Dim↑ L1↓ LPIPS↓ rFID↓ Util% Dim↑ L1↓ LPIPS↓ rFID↓
+
+Vanilla VQGAN 82.7     2 0.1530  0.4051 87.82 8.0       2 0.1532 0.4083 81.01 2.2      2 0.1525  0.4064 83.59
+                    248 0.2100   0.4959 161.42 0.3   253 0.3856 0.5903 300.06 0.0   254 0.4399   0.5911 368.17
+w/ β = 0 3.7                     0.3885 74.21 99.9                                               0.3626 67.89
+                       3 0.1484  0.3723 78.01 99.8      3 0.1401 0.3717 69.74 47.0     5 0.1395  0.3220 54.54
+w/ Respawn 100.0     22 0.1566   0.3553 69.11 100.0     5 0.1362 0.3383 61.32 98.6     5 0.1300  0.3134 52.55
+                       5 0.1417  0.3425 61.70 100.0     4 0.1340 0.3380 61.86 98.4     5 0.1276  0.2940 47.41
+w/ β = 0 99.8          7 0.1410  0.3391 63.35 99.9      7 0.1286 0.3083 51.43 98.5     7 0.1241  0.2841 47.83
+                       7 0.1406  0.3373 66.97 99.9    10 0.1284 0.3016 51.97 98.0    12 0.1242   0.2817 47.27
+Twu = 1k   100.0     10 0.1416   0.3344 60.91 99.8    12 0.1288 0.2990 51.44 97.7    13 0.1244   0.2806 47.40
+                     11 0.1416   0.3323 61.75 99.8    13 0.1291 0.2965 52.58 97.6    14 0.1248   0.2790 46.70
+Twu = 5k   100.0     14 0.1418   0.3341 61.26 99.8    15 0.1300 0.2946 49.84 97.2    16 0.1255   0.2787 43.89
+                     19 0.1433                        17 0.1314 0.2939 50.59 97.0    18 0.1258
+Twu = 10k  100.0
+
+Twu = 15k  100.0
+
+Twu = 20k  100.0
+
+Twu = 30k  100.0
+
+Twu = 40k  100.0
+
+∼5, like the β = 0.25 baseline. Its reconstruction relative to that baseline is mixed (worse L1 and
+rFID at K = 210, better at K ≥ 214), and performs worse than AE Warm-up at every codebook size.
+
+Role of the commitment loss. The commitment term is intended to stabilize the encoder–codebook
+relationship by anchoring encoder outputs to codeword positions. However, as we show in Section 3,
+this loss term suppresses weak modes and leads to domension collapse. Removing the commitment
+loss prevents the suppression but breaks the stabilization, leading to higher codebook dimension but
+significantly worse reconstruction loss and codebook utilization, as shown in Table 4. AE warm-up
+sidesteps this trade-off entirely: weak modes activate before VQ is introduced, and we see that
+training with warm-up outperforms β = 0 across every codebook size.
+
+D Additional results on WavTokenizer
+
+Figure 13 shows training trajectories for the WavTokenizer runs reported in Table 2.
+
+We notice that, when switching from autoencoder training to VQ training at epoch 43, PESQ sharply
+degrades, but quickly recovers and surpasses the no-warm-up runs.
+
+Cold-start runs plateau in Mel loss quickly, after the first 20–30 epochs. AE Warm-up runs continue
+to improve Mel loss after the quantizer is enabled; the additional training budget appears productive
+only when the latent has enough effective dimension.
+
+                                                     22
+Figure 12: VQGAN on ImageNet-100 (20k) with the commitment term removed. Training curves
+at β = 0 (vanilla and respawn variants, dashed) overlaid on the standard β > 0 runs from Figure 8.
+Rows, top to bottom: validation reconstruction loss (L1 + LPIPS), codebook effective dimension,
+codebook utilization, latent effective dimension. Columns: codebook sizes K ∈ {210, 214, 216}.
+Vanilla VQGAN at β = 0 collapses to near-zero codebook utilization at every K — almost all
+codewords are dead from initialization onward, since without the commitment term pulling the
+encoder toward the codebook, randomly initialized codes are never assigned. Respawn at β = 0
+keeps codes alive and admits a higher latent effective dimension at small K (consistent with the
+linear-theory escape route in Section 3.2), but does not translate to a lower reconstruction floor.
+
+Figure 13: WavTokenizer on LibriTTS: cold-start training fails to benefit from larger codebooks;
+AE Warm-up restores codebook scaling. Cold-start WavTokenizer (blue curves, K ∈ {4k, 8k, 16k})
+versus AE-VQ (warm curves, K ∈ {4k, 8k, 16k, 65k}). From left: validation mel loss, PESQ,
+codebook deff (99% variance). AE Warm-up runs are trained for 43 epochs before introducing VQ.
+Cold-start runs show flat loss and low effective dimension regardless of K; AE-VQ runs show
+monotone improvement with K and substantially higher effective dimension in both latent and
+codebook spaces.
+
+                                                          23
+

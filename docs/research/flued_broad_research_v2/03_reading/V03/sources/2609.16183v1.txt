@@ -1,0 +1,888 @@
+                                        Anatomy of Associative Recall in Fixed-State Recurrences:
+                                          A Matched-State Decomposition, an Interference Wall,
+                                                        and a Curriculum That Breaks It
+
+                                        Julian Boesch 1 2 Andrew Wee 1 2
+
+arXiv:2609.16183v1 [cs.LG] 14 Sep 2026                          Abstract                                             denoiser cells, which natively read the query be-
+                                                                                                                     fore the haystack, show no measurable advantage
+                                              Fixed-state recurrences—linear attention and                           over causal training at ten seeds, and collision-key
+                                              state-space models—are widely reported to lag                          retrieval needs two layers. Finally, arming for re-
+                                              behind attention on associative recall, but whole-                     call is free on an S5 state-tracking guardrail—the
+                                              architecture comparisons cannot say which ingre-                       armed cell is significantly better at every depth
+                                              dient is responsible. We decompose masked multi-                       (p≤0.0044). Together these replace “recurrent
+                                              query recall at a fixed state budget along three                       models are bad at recall” with a measured decom-
+                                              single-knob axes: a short causal convolution, the                      position and two cheap interventions.
+                                              state-transition structure (rank-1 delta rule vs. di-
+                                              agonal), and decay. The convolution dominates,                   1. Introduction
+                                              adding roughly 0.5 recall accuracy in both fam-
+                                              ilies under matched training: comparisons that                   Associative recall—binding key–value pairs in context and
+                                              pit convolution-free cells against a convolution-                retrieving a value when its key reappears—is the capability
+                                              equipped Mamba are measuring the missing con-                    axis on which fixed-state sequence mixers most visibly trail
+                                              volution, not the recurrence. The rank-1 transi-                 attention. A line of work has made this precise: synthetic
+                                              tion beats its diagonal ablation by +0.19/+0.32                  multi-query associative recall (MQAR) separates attention
+                                              at 16/32 pairs, but the margin shrinks to +0.03                  from efficient mixers and predicts much of the language-
+                                              once both cells carry the convolution, and a state-              modeling gap between them (Arora et al., 2023; 2024a), and
+                                              matched Mamba-2 ties the rank-1 cell before                      recall remains the standard lens on what a bounded recurrent
+                                              it is “armed” with one: no architecture-class                    state can and cannot retain (Jelassi et al., 2024; Hsieh et al.,
+                                              claim survives. Cells that solve 32-pair recall                  2024).
+                                              degrade gracefully with load yet fall to chance
+                                              when asked to retrieve just 4 pairs from a haystack              But a modern recurrent cell is not one mechanism. A
+                                              of distractors—flat across sequence lengths and                  Mamba-2 block, for instance, is a diagonal selective state
+                                              transition types. The cause is interference under                transition plus an input-dependent gate plus a short causal
+                                              sparse supervision, not capacity: a distance cur-                depthwise convolution (Gu & Dao, 2023; Dao & Gu, 2024);
+                                              riculum takes the unchanged architecture from                    a Gated DeltaNet block is a rank-1 delta-rule transition plus
+                                              0.021 to 1.000. Training is a lock-in lottery—a                  a learned decay (Yang et al., 2024b;a); RWKV-7 couples
+                                              seed either locks in or does not—and the curricu-                a vector decay with a rank-1 removal term (Peng et al.,
+                                              lum is the lever. Lock-in rises from 1/10 seeds                  2025). Whole-architecture comparisons therefore confound
+                                              to 7/10 (p=0.02); dense supervision adds noth-                   at least three design axes, and the field’s summary judg-
+                                              ing; at L=256 a shaped ramp reopens a bound-                     ments (“DeltaNet-style cells recall well,” “Mamba recalls
+                                              ary the uniform curriculum cannot (4/5 vs. 0/9);                 better than RNNs,” “gating helps”) average over knobs that
+                                              and at L=512, where the ramp itself collapses                    can be toggled independently. Recent causal-intervention
+                                              (0/6), gating it on measured accuracy locks in                   evidence sharpens the concern: Mamba’s induction behav-
+                                              6/6 (p=0.001). Two side results: bidirectional                   ior appears to live in its short convolution rather than its
+                                                                                                               state-space scan (Arora et al., 2025; Parnichkun et al., 2025),
+                                             1Purdue University 2Obit Research. Correspondence                 though this attribution is itself contested once learning rates
+                                        to: Julian Boesch <jboesch@obitmc.com>, Andrew Wee                     are tuned (Okpekpe & Orvieto, 2025). What is missing is a
+                                        <awee@obitmc.com>.                                                     controlled decomposition: all knobs, one harness, one fixed
+                                                                                                               state budget.
+                                        Preprint. Preliminary results, shared for discussion; not peer re-
+                                        viewed.
+
+                                                                                                            1
+Anatomy of Associative Recall in Fixed-State Recurrences
+
+This paper contributes that decomposition, and then uses                   riculum fails everywhere (0/9 trials) but a shaped ramp
+it to re-diagnose two failure modes that the decomposition                 locks in 4/5 seeds (p≈0.005, Fisher), and at L=512 the
+alone does not explain.                                                    time-based ramp itself collapses (0/6) while a success-
+                                                                           gated ramp—one that advances the gap only while mea-
+Contributions.                                                             sured accuracy holds—locks in 6/6 (p=0.0011). These
+                                                                           are the two curriculum-shape contrasts that clear signifi-
+1. A matched-state decomposition of recall, and the con-                   cance.
+    found it resolves (§4). At a fixed recurrent-state budget
+    (1,024 state elements; ∼29k parameters) we toggle one              4. Bidirectional denoisers read twice for free—
+    knob at a time: short convolution × transition struc-                  architecturally; no advantage is measured (§7). The
+    ture (rank-1 vs. diagonal) × decay. The convolution                    backward stream of a bidirectional masked-denoiser cell
+    is the dominant lever and transfers across cell families               sees the query before the haystack, the prefix-encoder
+    (+0.47 delta-rule, +0.44 diagonal at K=32), corrob-                    property that Just-Read-Twice engineers into recurrent
+    orating intervention evidence that Mamba’s recall is                   LMs (Arora et al., 2024b). A collision-key discriminator
+    convolution-borne (Arora et al., 2025; Parnichkun et al.,              (decoys reuse the table’s keys, defeating any lexical
+    2025). We also measure the learning-rate sensitivity that              write gate) tests whether the property confers an
+    Okpekpe & Orvieto (2025) raise. The rank-1 transition                  advantage. At ten seeds it does not: collision training
+    contributes an independent, ablation-grade margin over                 is a bimodal lock-in lottery (bidirectional 3/10 seeds
+    its own diagonal ablation (+0.19/+0.32 at K=16/32,                     solve, causal 1/10; mean difference n.s., p=0.63),
+    10 seeds, rebinding-controlled), but that margin shrinks               and shaped-curriculum training that stabilizes the
+    to +0.034 (p=0.0023) once both cells carry the convo-                  lottery (9/10 lock-in) does so at exact directional
+    lution, and decay’s apparent recall cost dissolves at 20               parity. Four things are robust. Both directions can
+    seeds (p=0.86). Two corrections follow. Comparing                      solve the task; any solving circuit needs two layers
+    convolution-free recurrent cells against a convolution-                (a mark-and-route circuit, since the one-layer version
+    equipped Mamba mismeasures the transition: armed                       collapses); the convolution-free cell never locks in even
+    with the same convolution, a gated delta-rule cell reaches             under the shaped curriculum (0/10 vs. 9/10 on the
+    0.99 at the hardest matched-state setting. The converse                identical recipe, p≈10−4); and curriculum shape is a
+    also holds. A state- and parameter-matched Mamba-2                     powerful direction-agnostic stabilizer (1/10 → 9/10,
+    ties the unarmed rank-1 cell (0.592 vs. 0.653, p=0.88),                p≈6×10−4).
+    so no class claim (“rank-1 > diagonal”) survives.
+                                                                       5. A no-cost guardrail (§8). Arming the cell for recall
+2. Capacity vs. distance, discriminated (§5). Load                         does not hurt S5 state-tracking learnability; at ten seeds
+    (K) produces graceful degradation; distance across                     the armed cell is significantly better at every probed
+    a distractor haystack produces a wall: chance al-                      depth (L ∈ {2, 4, 8, 16}).
+    ready at the shortest tested length—inside the train-
+    ing distribution—identical across delta-rule, selective-           All experiments run on a deliberately small, kernel-free,
+    diagonal, and RWKV-7 transitions, while a 2-layer at-              commodity-GPU harness: pure-PyTorch reference cells, a
+    tention control solves the task at 1.0. This signature,            state-matched pure-PyTorch Mamba-2 comparator, and an
+    completed by the curriculum result below, separates in-            atomic-free two-pass Triton backward that runs on pre-Volta
+    terference under sparse supervision from both capacity             hardware (Appendix A). That is what makes single-knob
+    accounts and decay accounts (Sridhar & Johansen, 2026)             matched-state factorials cheap to replicate. The price is
+    of recurrent retrieval failure.                                    scale: every result here is toy-scale (d ∈ {32, 128}, syn-
+                                                                       thetic tasks), and §9 states the resulting limits explicitly.
+3. The wall is a training-coverage gap, and training in
+    this regime is a lock-in lottery (§6). With the archi-             2. Related Work
+    tecture unchanged, a table-to-query distance curriculum
+    lifts the walled cell from 0.021 (chance) to 1.000—an              Recall in efficient mixers. MQAR and its relatives were
+    existence proof by construction. Ten-seed replication re-          introduced to explain the attention–SSM gap (Arora et al.,
+    frames the attribution as a rate shift and isolates the lever:     2023), and recall-throughput tradeoffs drove a generation of
+    lock-in 1/10 under dense supervision alone vs. 7/10 un-            linear-attention designs (Arora et al., 2024a; Katharopoulos
+    der the distance curriculum (p=0.02, Fisher two-sided);            et al., 2020; Schlag et al., 2021). The delta rule (Yang et al.,
+    adding dense supervision to the curriculum changes noth-           2024b) and its gated variant (Yang et al., 2024a) explicitly
+    ing (6/10), and the causal cell locks in at a similar rate         target recall via key-conditioned replacement; RWKV-7 gen-
+    (5/10). Dense-only training still solves the task outright         eralizes the transition to diagonal-plus-rank-1 (Peng et al.,
+    on one seed. The fix transfers unchanged to 16× state              2025). Our contribution to this line is not a new cell but a
+    (d=128). Length is harder: at L=256 the uniform cur-
+
+                                                                    2
+Anatomy of Associative Recall in Fixed-State Recurrences
+
+controlled decomposition of existing ingredients at matched         the native property confers a measurable advantage over
+state, including the negative result that the rank-1 advantage      matched causal training is open: our ten-seed collision repli-
+over a diagonal ablation does not extend to a class advantage       cation finds no significant directional difference (§7).
+over Mamba-2.
+                                                                    State tracking. Diagonal SSMs and attention are limited on
+Where Mamba’s recall comes from. Causal interventions               group-composition state tracking in ways rank-1-transition
+locate Mamba’s induction in its short convolution (Arora            recurrences need not be (Merrill et al., 2024; Grazzi et al.,
+et al., 2025); effective-state-size analyses likewise find many     2025; Liu et al., 2023; Dele´tang et al., 2023). We use an S5
+linear structures collapse on recall without their convolu-         word problem only as a guardrail (does arming for recall
+tions (Parnichkun et al., 2025). Okpekpe & Orvieto (2025)           cost state-tracking learnability?) and make no expressivity-
+complicate the attribution, showing tuned learning rates can        class claims here.
+recover much of Mamba’s recall without the convolution—a
+learnability confound. Our factorial brings a design the in-        3. Cells, Tasks, and Protocol
+tervention studies lack (single-knob toggles at fixed state, in
+both cell families), though at toy scale. Under matched train-      3.1. The cell zoo
+ing we find the convolution’s contribution large, additive,
+and family-transferable, and we measure the learning-rate           All cells are implemented in one harness as sequence mixers
+sensitivity directly (§4.2).                                        with identical embedding, readout, and training loops; we
+                                                                    call each cell configuration under test an arm. Per head,
+Long-context retrieval failures. That SSM-family mod-               a matrix state St ∈ Rdv×dk is updated by a cell-specific
+els fail needle-in-a-haystack retrieval is well documented          transition; the output is a state readout. We write kt, vt, qt
+(Hsieh et al., 2024; Jelassi et al., 2024; Ben-Kish et al.,         (or rt) for the per-token projections.
+2024); proposed accounts include state capacity and col-
+lapse (Chen et al., 2024), finite-horizon state decay (Sridhar      DeltaNet (rank-1, no decay) applies the delta rule (Schlag
+& Johansen, 2026), and under-explored state distributions at        et al., 2021; Yang et al., 2024b), with input-dependent write
+unseen lengths (Buitrago Ruiz & Gu, 2025). Our haystack             strength βt ∈ (0, 1):
+wall differs from these accounts twice over. Its signature
+is chance at the shortest tested length, flat across lengths,          St = St−1 I − βtktkt⊤ + βt vtkt⊤, ot = Stqt. (1)
+within the training distribution, and transition-independent.
+Its resolution is a training-signal change alone (§6), which        Gated DeltaNet (gated deltanet; rank-1 + decay)
+no purely structural account predicts.                              adds a learned scalar gate αt ∈ (0, 1) (Yang et al., 2024a):
+
+Training-side fixes. Birdie improves SSM retrieval with             St = αt St−1 I − βtktkt⊤ + βt vtkt⊤.  (2)
+reward-driven objectives and mixed training procedures
+(Blouir et al., 2024); Okpekpe & Orvieto (2025) and                 RWKV-7 reference (dg rank; rank-1 + vector decay)
+Buitrago Ruiz & Gu (2025) frame recurrent retrieval and             uses the diagonal-plus-rank-1 transition (Peng et al., 2025):
+length generalization as learnability problems; curricula are
+classical (Bengio et al., 2009). We add the sharpest ver-           At = diag(wt) − (at ⊙ κˆt)κˆ⊤t ,      (3)
+sion of the claim for retrieval distance: a chance→perfect
+existence proof with a single-axis curriculum on an un-             St = St−1At + vtkt⊤,    ot = Strt,    (4)
+changed architecture, its lever attribution (2×2), and its
+failure boundary in length.                                         with data-dependent vector decay wt ∈ (0, 1)dk , removal
+                                                                    key κˆt, and in-context rate at. Its diagonal ablation
+Recurrent denoisers for diffusion LMs. Masked discrete              (dg diag) sets the rank-1 term to zero (at ≡ 0), leav-
+diffusion (Austin et al., 2021; Sahoo et al., 2024) makes           ing At = diag(wt): the same cell, same parameter count,
+the denoiser bidirectional by construction; bidirectional           one knob.
+Mamba denoisers match Transformer DLMs (Singh et al.,
+2025), and RWKV-backbone block diffusion exists (Lin                Mamba-2 reference (mamba2 ref) is a pure-PyTorch
+et al., 2026). Just-Read-Twice (Arora et al., 2024b) showed         state-matched implementation of the Mamba-2 SSD re-
+causal recurrent LMs recover most of the recall gap when            currence (Dao & Gu, 2024): a per-head scalar selective
+the query precedes the context. Our contribution is the ex-         diagonal scan over an explicit state Ht ∈ R , dinner×dstate
+plicit connection: bidirectional denoisers possess the JRT
+property natively, with no prompt repetition and no bespoke         Ht = at Ht−1 + xt bt⊤,  yt = Ht ct,   (5)
+prefix-LM. We add the depth requirement of any circuit
+exploiting it (two layers: mark-and-route) and its apparent         with input-dependent (at, bt, ct) and the standard short
+local-binding requirement (the short convolution). Whether          causal depthwise convolution on its input projections.
+                                                                    mamba2 ref noconv sets the convolution width to 1 (a
+
+                                                                 3
+Anatomy of Associative Recall in Fixed-State Recurrences
+
+true toggle). Because this comparator needs neither Tri-            then a distractor haystack of task-format tokens, then the
+ton nor mamba ssm, the full factorial runs on commodity             query; the answer is a single masked token at the final
+GPUs; its cost is that it under-trains relative to the official     position. Sequence lengths are L ∈ {64, . . . , 512} and
+fused kernel (§9).                                                  chance is 1/54 ≈ 0.019. The query-at-end layout makes
+                                                                    the task 2-hop; all arms get 2 layers and a proper training
+The arming knob. A width-4, strictly causal (left-padded),          budget (the 1-layer version fails for every arm including
+depthwise convolution on the interaction projections—               attention, an under-capacity artifact we exclude).
+(q, k, v) for the delta-rule cells, (v, k, r) for the RWKV-7
+cells—applied pre-activation exactly as in Mamba-2. The             Collision-key variant. As above, but decoy pairs in the
+convolution adds ≈0.5k parameters and zero recurrent                gap reuse the table’s own keys with fresh random values;
+state, so state-matching is preserved. armed gdn :=                 ground truth is the first (table) binding. This defeats any
+gated deltanet + this convolution.                                  lexical write gate: distractors are lexically indistinguishable
+                                                                    from table keys. Floors: value-marginal 1/54 ≈ 0.019; the
+Attention control. A standard bidirectional (or causal,             strongest non-binding positional strategy (emit a random
+where noted) softmax-attention block (Vaswani et al., 2017),        table-position token) scores ≈0.26.
+used as the ceiling for the haystack task (§5) with widened
+heads (head dimension 16). At the constrained-width fac-            S5 guardrail. A running-product word problem over the
+torial setting (d=32) no valid attention control exists at          symmetric group S5: generators are drawn uniformly from
+matched width: the head dimension degenerates, and a two-           the full group (so the answer marginal equals 1/|G| =
+head variant collapses at one layer for a structural reason         1/120 ≈ 0.008 at every depth), each group element is a
+(§9). We therefore do not report attention there.                   single token, and all product slots are masked simultane-
+                                                                    ously (one parallel fill), so no answer token is completable
+Bidirectional variants. For §7, a cell is made bidirectional        from a visible prefix. Composition depths L ∈ {2, 4, 8, 16}
+in the standard masked-denoiser way (Singh et al., 2025):           at d=128. These three design choices matter: they make the
+a paired backward stream runs the same recurrence on the            probe structurally immune to the answer-prior and prefix-
+flipped sequence and the two streams are merged per posi-           leakage confounds that can silently invalidate state-tracking
+tion. armed gdn fwd denotes the causal (forward-only)               probes with multi-token, teacher-forced answers.1
+ablation.
+                                                                    3.4. Statistical protocol
+3.2. State matching
+                                                                    Exploratory sweeps use 3 seeds. Headline ablations are
+The factorial is run at constrained state (d=32, one layer),        hardened: 10 seeds, two-sided permutation tests on mean
+the regime in which recall discriminates between cells. The         gaps, and a rebinding control that evaluates the trained
+rank-1 cells carry dk2 = 322 = 1024 recurrent state elements        model on sequences whose key–value bindings have been
+per head group; the Mamba-2 reference is set to dstate=16           deranged, scoring the original value. A genuine retriever’s
+so that dinner · dstate = 64 · 16 = 1024 elements—matched           rebinding score must collapse toward the floors (it emits
+state, and matched parameters (∼28.9k vs. ∼29.3k). At               the rebound value, not the trained one); a value-salience
+ample state (d=128) every cell solves every setting and             heuristic does not. For recall and state-tracking probes,
+nothing discriminates, which is itself worth reporting: re-         these rules operationalize general lessons on prefix leakage
+call differences among modern cells are a constrained-state         in multi-token targets, answer-prior baselines, and control
+phenomenon.                                                         tasks (Bachmann & Nagarajan, 2024; Holtzman et al., 2021;
+                                                                    Hewitt & Liang, 2019). Where seed outcomes are bimodal
+3.3. Tasks and floors                                               (a seed either “locks in” or does not), we report lock-in
+                                                                    rates (fraction of seeds above threshold) with Fisher exact
+Masked MQAR. Each sequence is a table of K key–value                tests rather than means, since mean±std is meaningless for
+pairs followed by queried keys whose answers are single             bimodal outcomes. Every table caption states its seed count,
+masked tokens, and the model is trained to fill the masks.          and every task quotes its floors (derivations in Appendix C).
+Values are drawn fresh at random per sequence from a 26-
+token range, so no key→value prior exists to memorize.                  1A companion report documents that failure anatomy in a
+K ∈ {8, 16, 32}. Floors: the value-marginal is 1/26 ≈               conversion-evaluation setting; this paper’s probes are immune
+0.038; the strongest no-binding strategy (emit a random             by construction, and we state floors with every result.
+table value) scores ≈0.068. In the hardened protocol we
+also report the table floor 1/K (guess among the K values
+actually present), the floor the naive marginal comparison
+misses.
+
+Haystack retrieval. Each sequence is 4 key–value pairs,
+
+                                                                 4
+Anatomy of Associative Recall in Fixed-State Recurrences
+
+4. A Matched-State Decomposition of Recall                              (+0.26), and the hardened 10-seed rerun (§4.3) confirms
+                                                                        it with controls: +0.191 at K=16 (p=0.0002), +0.319 at
+4.1. The factorial                                                      K=32 (p<10−4). The with-conv quadrant is ablation-grade
+                                                                        as well (same protocol and harness as Table 1, 10 seeds,
+Table 1 ranks all seven arms, next to the ingredients each one          rebinding-controlled): the convolution-equipped pair gives
+carries, at constrained state under the hardest load, K=32.2            0.992 (rank-1) vs. 0.958 (diagonal), +0.034 (p=0.0023) at
+Table 2 gives the full K-sweep (72/72 trials). The next                 K=32. At K=16 all armed arms sit at ceiling (≥ 0.9998,
+subsection reads both tables one knob at a time.                        10 seeds), so the margin is a highest-load phenomenon.
+                                                                        The transition’s contribution is therefore conditional on the
+4.2. Reading the factorial: three separable levers                      convolution: large when the cell lacks local mixing, an order
+                                                                        of magnitude smaller—though still resolvable—once the
+Figure 1 shows the three toggles side by side.                          convolution is present and both cells operate near ceiling.
+
+Axis 1: the convolution (≈ +0.45, family-transferable).                 Axis 3: decay (no measurable cost). The apples-to-
+Hold the recurrence fixed and toggle only the convolu-                  apples comparison within the delta-rule family, at n=20,
+tion. The delta-rule cell moves 0.518 → 0.983 (+0.47;                   is deltanet (no decay) 0.561 vs. gated deltanet
+gated deltanet → armed gdn), and the diagonal cell                      (decay) 0.518 at K=32: p=0.86, with nothing left of the
+moves 0.151 → 0.592 (+0.44; mamba2 ref noconv →                         −0.32 the first three seeds suggested. What the seeds do
+mamba2 ref). Both legs are true within-cell toggles. The                show is bimodality, not a cost. The no-decay cell locks
+convolution is a state-free local primitive, adding no recur-           in on 4/20 seeds (per-seed 0.09–0.93), while the decay
+rent state, yet it is the largest single lever in the factorial         cell never exceeds 0.80 (0/20 lock-ins; range 0.30–0.80);
+and is of similar magnitude in both families. This is con-              decay appears to trade occasional lucky solves for con-
+sistent with intervention evidence that Mamba’s induction               sistency, and neither is a mean-level effect. What is set-
+is convolution-borne (Arora et al., 2025; Parnichkun et al.,            tled is that armed gdn wins with its decay in place, on
+2025), and adds a controlled factorial to it.                           the strength of the convolution plus the delta rule. The
+                                                                        converse claim—that decay buys state-tracking—is like-
+The size of this lever depends on the tuning regime. We                 wise not established: a 10-seed lock-in comparison of
+ran the learning-rate check of Okpekpe & Orvieto (2025)                 gated deltanet vs. deltanet on S5 is directionally
+in our own harness (no-conv arms at {3e-4, 1e-3, 3e-3}, 5               positive but non-significant (p=0.65). One boundary condi-
+seeds each, rebinding-controlled), and per-arm tuning res-              tion comes from the literature: fine-grained (channel-wise)
+cues the delta family but not our diagonal cell. Tuned                  gating can improve recall over scalar gating (Kimi Team,
+no-conv gated deltanet reaches 0.870 at lr 3e-3 (vs.                    2025), so any liability measured here is specific to the scalar-
+0.518 matched), while mamba2 ref noconv peaks at                        decay knob at constrained state.
+0.172 across the sweep, leaving its within-cell convolution
+gap (+0.42) intact under tuning. Re-tuning the armed arms               4.3. The hardened transition ablation, with controls
+as well, all three saturate at lr 3e-3 (armed gdn 0.999,
+armed rank-1 1.000, armed diagonal 0.997; 5 seeds each).                Table 3 reports the 10-seed, rebinding-controlled rerun of
+The tuned-vs-tuned delta-family convolution gap is there-               the transition axis. Three findings:
+fore ≈+0.13 (0.999 vs. 0.870), and the with-conv transition
+margin of +0.034 is a matched-lr statement, since at tuned              1. The within-cell ablation replicates decisively.
+lr both armed cells sit at ceiling (margin ≈0.002). The con-                dg rank > dg diag: +0.191 at K=16 (p=0.0002)
+volution’s contribution is thus optimization-conditional in                 and +0.319 at K=32 (p<10−4), gaps far larger than
+the delta family (large matched, ≈+0.13 tuned) and robust                   seed variance. The rebinding control verifies that
+in the diagonal cell; magnitudes should always be quoted                    what is being measured is binding. The advantage is
+with their tuning regime.                                                   delta-rule-general, not RWKV-7-specific: deltanet
+                                                                            ≈ dg rank at K=32 (p=0.36), both ≫ dg diag.
+Axis 2: the transition (≈ +0.3 without the convolution;
+≈ +0.03 with it). The clean evidence is the within-cell pair            2. No class claim survives. A state- and parameter-
+dg rank vs. dg diag: one architecture, one parameter                        matched Mamba-2 is a diagonal recurrence, and it ties
+count, one switch (the rank-1 term on or off). Without the                  the rank-1 cell at K=16 (p=0.25) and beats it at K=32
+convolution, at 10 seeds, the pair scores 0.653 vs. 0.390                   (0.849 vs. 0.702, p=0.0036). “Rank-1 class > diagonal
+                                                                            class” is false in this data. The diagonal ablation is a
+    2No attention control is reported at this setting: at d=32 with         crippled member of its class, not a representative; the
+8 heads the head dimension degenerates to 4, and a two-head                 correct statement is: within one cell at matched parame-
+variant collapses at one layer because MQAR is an induction-head            ters, the rank-1 transition adds recall capacity per state
+task that needs two attention layers (§9). Attention appears as a
+valid ceiling in the two-layer haystack experiments (§5), with head
+dimension 16.
+
+                                                                     5
+                                            Anatomy of Associative Recall in Fixed-State Recurrences
+
+Table 1. Constrained state, K=32 (hardest setting). Masked recall, mean [min, max] over n=10 seeds (n=20 for the two decay
+arms); these statistics supersede the n=3 K=32 column of Table 2. State-matched throughout (1,024 elements). Floors: value-marginal
+≈ 0.038; no-binding ≈ 0.068. For context: the official fused Mamba-2 kernel on the same protocol measures 0.867 at the state-matched
+dstate=16 in our paired session (0.884 in the earlier cross-session read) and 1.000 at dstate=64; per-arm tuning lifts the matched-state
+number to 0.955 (§4).
+
+                             arm (K=32, d=32)            recall   mean [min, max]  ingredients
+
+                             armed gdn                   0.983     [0.917, 1.000]  rank-1 + decay + conv
+                             dg rank (RWKV-7 rank-1)     0.653     [0.507, 0.874]  rank-1 (vector decay), no conv
+                             mamba2 ref (state-matched)  0.592     [0.196, 0.884]  diagonal + selectivity + conv
+                             deltanet                    0.561     [0.094, 0.927]  rank-1, no decay, no conv
+                             gated deltanet              0.518     [0.296, 0.798]  rank-1 + decay, no conv
+                             dg diag (RWKV-7, rank off)  0.390     [0.251, 0.691]  diagonal (vector decay)
+                             mamba2 ref noconv           0.151     [0.079, 0.191]  diagonal + selectivity, no conv
+
+                             short conv off → on                     rank-1 term off → on  decay off → on
+
+                        1.2  +0.46                                                                 -0.04
+                                                                                                  .56 .52
+masked recall @ K = 32  1.0       .98                                                        delta-rule cell
+
+                        0.8                   +0.44                   +0.26
+                                                      .59                      .65
+                        0.6  .52
+                                                                     .39
+                        0.4
+
+                        0.2                   .15 no-binding
+
+                                                           floor
+
+                        0.0
+
+                             delta-rule cell  diagonal cell          RWKV-7 cell
+
+Figure 1. The three single-knob toggles at K=32 (constrained state; n=10 at K=32 for the five recurrent arms, n=20 for the decay
+pair—values from Table 1). Light bars: ingredient off; dark bars: on. The short convolution is the dominant, family-transferable lever;
+the rank-1 transition adds an ablation-grade within-cell margin (hardened at 10 seeds: +0.319 without the convolution, +0.034 with it;
+Table 3, §4); the decay bar’s apparent cost dissolves at n=20 (p=0.86, §4). Dashed line: strongest no-binding floor (≈ 0.068).
+
+    dimension.                                                       at constrained state the convolution is very nearly the whole
+                                                                     recall story.
+3. The two statements together resolve the folklore.
+    Convolution-free recurrent cells lose to Mamba on re-            The armed cell vs. real Mamba, measured in one session.
+    call because of the convolution, not the recurrence (Axis        We ran the official fused Mamba-2 kernel (state-matched
+    1). And the rank-1 transition looked alternately strong          dstate=16, bf16) through the same probe, session, and Am-
+    and weak across studies because its genuine within-cell          pere GPU as armed gdn, sweeping each arm’s learning
+    effect was being compared across architectures against           rate over a decade ({10−3, 3×10−3, 10−2}, 5 seeds each).
+    cells that carry the other two knobs.                            At the shared default (10−3) the historical cross-study pic-
+                                                                     ture reproduces: official 0.867 [0.792, 0.911] vs. armed
+The armed arms at 10 seeds (rebinding-controlled, same               0.967, so the ≈+0.10 cross-session margin was real at
+harness as Table 1). armed gdn 0.983 (per-seed min                   matched lr. Per-arm tuning compresses but does not close it.
+0.917; rebinding 0.037, at the value-marginal floor), armed          Both arms peak at 3×10−3, where the official kernel reaches
+RWKV-7 (dg rank + conv) 0.992 [0.970, 0.999], armed                  0.955 [0.862, 0.999] and armed gdn 1.000 on every seed,
+diagonal ablation 0.958 [0.870, 0.996]. Within-harness,              a tuned-vs-tuned margin of +0.045 (p=0.016, permutation).
+armed gdn clears mamba2 ref by +0.392 (p=10−5),                      At 10−2 both arms destabilize (official 0.606 with two col-
+and the two armed rank-1 families are statistically indistin-        lapsed seeds; armed 0.330 with four). The reading matches
+guishable (p=0.37): once armed, the delta-rule cell family           the delta-family result above: most of the official cell’s
+does not matter. That an armed diagonal cell reaches 0.958           apparent deficit is optimization-conditional, and a smaller
+is the factorial’s sharpest single number, because it says that      armed margin survives tuning. Within our reference har-
+
+                                                                  6
+                            Anatomy of Associative Recall in Fixed-State Recurrences
+
+Table 2. Full K-sweep, mean masked recall over n=3 seeds              4. Attention is untouched, as expected, because per-token
+(72/72 trials); the K=32 column is superseded by the hardened             KV entries cannot be overwritten by later writes: the
+statistics of Table 1 (deltanet in particular is bimodal, so its          control is exact at every tested length (15/15 trials at
+n=3 mean flatters it). Everything solves K=8; discrimination              1.000).
+grows with load; the no-conv diagonal fails by K=16; the graceful
+decline of the unarmed arms from K=8 to K=32 is the capacity          The diagnosis consistent with all four: interference under
+signature—contrast the haystack wall of §5.                           sparse supervision. The model must learn a selective-write
+                                                                      policy (store table pairs; ignore distractors), but the train-
+arm                         K =8   K =16  K =32                       ing signal—one masked token at the end of the sequence—
+                                                                      gives the write gate almost no gradient. Distractor writes
+armed gdn                   1.000  1.000  0.993                       overwrite the bindings before the query arrives. This ac-
+deltanet                    1.000  1.000  0.769                       count differs from decay-based explanations of SSM re-
+dg rank (RWKV-7)            1.000  0.998  0.639                       trieval failure (Sridhar & Johansen, 2026): a decay account
+mamba2 ref (state-matched)  1.000  0.758  0.641                       predicts distance-dependence and does not predict that a
+gated deltanet              1.000  0.970  0.446                       pure training-signal change can fix the failure at fixed archi-
+dg diag                     1.000  0.835  0.359                       tecture. Section 6 runs exactly that test.
+mamba2 ref noconv           0.582  0.230  0.172
+                                                                      6. The Wall Is a Training-Coverage Gap
+ness, armed gdn clears the under-trained mamba2 ref
+by +0.39.
+
+5. Capacity Curves vs. the Interference Wall                          Same task, same architecture, same budget as Table 4;
+                                                                      only the training signal changes. Under dense supervision,
+The K-sweep (Table 2) shows what a capacity limit looks               each sequence contains N distinct queried pairs and all
+like: everything solves K=8; the unarmed arms decline                 of them are supervised. Under the distance curriculum,
+gracefully to K=32. The haystack task shows something                 the table→query gap is sampled uniformly in [0, max] per
+categorically different—total, immediate, and length-flat             batch, while evaluation is always at max gap. (Exact flags
+(Table 4); Figure 2 juxtaposes the two axes.                          in Appendix B.)
+
+Four properties discriminate the failure mode:                        The existence proof. The headline row of Table 5 is an
+                                                                      existence proof by construction and needs no seed band
+1. It is not capacity. The same cells store 32 competing              to be valid as an existence claim: an unchanged 2-layer
+    bindings at ≥ 0.99 (Table 2) but fail on 4 bindings plus          fixed-state recurrence that sat at chance (0.021) under naive
+    distractors. The state is 8× under-subscribed relative to         training reaches 1.000 on the same task under a distance
+    demonstrated capacity.                                            curriculum. The wall of §5 is therefore a training-coverage
+                                                                      gap, not an architectural limit—for this task, at this length.
+2. It is a wall, not a dip. The failure is already total at           This is the sharpest form of a conclusion that the recent
+    the shortest tested length, inside the training distribu-         literature reaches by other routes: recurrent retrieval failure
+    tion, at table-to-query gaps of only tens of tokens, and it       is substantially a learnability problem (Okpekpe & Orvieto,
+    stays exactly there through 4× the length: means 0.017–           2025; Buitrago Ruiz & Gu, 2025; Blouir et al., 2024).
+    0.019 across L ∈ {64, 128, 256}, with every recurrent
+    trial within [0.014, 0.023] (Table 4). Neither competing          Does it survive off the bench? The curriculum is the one
+    account fits that shape. A capacity limit degrades grace-         result here that makes a deployment-shaped claim, so it is
+    fully, as K does; a decay account (Sridhar & Johansen,            the one we took to a real converted LM. That work is re-
+    2026) predicts degradation that grows with distance, not          ported in a companion paper (Boesch & Wee, 2026): staged
+    chance at minimal distance and not a floor with no length         distillation of an attention teacher into a recurrent bidirec-
+    gradient. There is no distance trend for state decay to           tional diffusion student, at 1.7B and 8B. Here we summarize
+    explain: the binding is never learned, not progressively          only its bearing on the claims above. It replicates the phe-
+    lost. (A 1-layer sweep over L=64–512 was likewise                 nomenon rather than the number: at conversion scale the
+    flat at chance but is excluded as under-capacity for this         curriculum’s effect is again a lock-in rate. Closing the loop
+    2-hop task.)                                                      on the curriculum, so that the gap cap advances only while
+                                                                      retrieval accuracy holds, raises that rate from one partial
+3. Transition richness does not help. GDN’s delta rule,               lock-in in three to 3/3 at 0.94–0.99. The recipe carries to
+    Mamba’s selectivity, and RWKV-7’s removal key wall                8B (2/3 seeds), with recall transfer rising from 0.000 to a
+    identically—at chance at every tested length (n=5 each).          mean of 0.901. Two of this section’s conclusions therefore
+    Whatever is failing is not the state-transition’s expressiv-      hold at four orders of magnitude more parameters: the wall
+    ity.                                                              is a training-coverage gap, and training in this regime is
+
+                                                                   7
+                                            Anatomy of Associative Recall in Fixed-State Recurrences
+
+Table 3. Hardened transition ablation (n=10 seeds; d=32, N =1; the three delta-rule arms are convolution-free, while the
+mamba2 ds16 comparator is a state-matched Mamba-2 that retains its stock short convolution). “Rebound” is accuracy on the
+rebinding control (bindings deranged, original value scored). At K=16 every arm falls to or below the table floor (1/K=0.062); at
+K=32 rebound sits at 0.042–0.073—slightly above the 1/K=0.031 floor but near the value-marginal (0.038) and an order of magnitude
+below trained accuracy. Models emit the rebound value: the recall is genuine key→value binding, not value salience. Permutation tests
+are two-sided on mean gaps; gaps and drops are computed on full-precision values, not the rounded cells shown.
+
+K arm                                           mean [95% CI] lock-in ≥ 0.9 rebound drop
+
+16 dg rank (rank-1)                             0.998 [0.995, 0.999]      10/10  0.024  +0.974
+                                                                          3/10   0.038  +0.769
+16 dg diag (diagonal ablation)                  0.806 [0.721, 0.892]      10/10  0.024  +0.976
+                                                                          10/10  0.024  +0.975
+16 deltanet (rank-1)                            1.000 [0.999, 1.000]
+
+16 mamba2 ds16 (diagonal, matched) 0.999 [0.999, 1.000]
+
+32 mamba2 ds16 (diagonal, matched) 0.849 [0.807, 0.890]                   3/10   0.042  +0.807
+                                                                                 0.051  +0.651
+32 dg rank (rank-1)                             0.702 [0.631, 0.769]      0/10   0.057  +0.566
+                                                                                 0.073  +0.309
+32 deltanet (rank-1)                            0.623 [0.482, 0.741]      1/10
+
+32 dg diag (diagonal ablation)                  0.382 [0.322, 0.450]      0/10
+
+Table 4. The haystack wall, flat in length (n=5 seeds per cell,           table positions when the layout shifts (robust across learn-
+means shown; 2 layers, proper budget; chance ≈ 0.019). The                ing rates and seeds, 7/7 collapse at ≈0.046). Replacing its
+same recurrences that store 32 competing pairs at ≥ 0.99 (Table 2)        learned absolute table with rotary positions—whose atten-
+fail at chance on 4 pairs across a distractor haystack—already at         tion scores are provably shift-invariant—restores the ceiling:
+the shortest tested length, for every transition type, with no trend      rotary attention solves the fixed-layout wall (1.000) and
+through 4× the length: all 45 recurrent trials lie in [0.014, 0.023],     learns under the shifting curriculum (6/10 lock-in lexical,
+straddling chance. The properly headed attention control is exact         7/10 collision-ramp, with most misses graceful rather than
+at every length.                                                          collapsed). The absolute-position collapse is thereby con-
+                                                                          firmed as a position-generalization artifact, not an attention
+arm (2 layers)           L=64   L=128   L=256                             limitation. The shaped-collision recurrent cells’ lock-in rate
+                                                                          (9/10) is statistically indistinguishable from rotary atten-
+attention (head dim 16)  1.000   1.000   1.000                            tion’s (7/10) at these n; the regimes are comparable, not
+armed gdn                0.018   0.018   0.019                            ordered.
+mamba2 ref               0.017   0.019   0.019
+dg rank (RWKV-7)         0.018   0.018   0.018                            (ii) The fix has a length boundary, which shaping re-opens—
+                                                                          stochastically. Width scales cleanly: at d=128 (16× state)
+a lottery whose rate the curriculum’s shape controls. One                 the L=64 collision-plus-curriculum recipe reaches 1.000
+boundary is added there and not visible here: every con-                  unchanged. Length under the uniform-gap curriculum does
+verted model that solves its trained token band reads chance              not: at L=256 (120 colliding decoy pairs vs. 24) every uni-
+on held-out token bands, so what transfers is a binding cir-              form cell is at chance, at both widths, at 4× the step budget,
+cuit over the symbols it trained on.                                      at two learning rates. A shaped (progressive-ramp) curricu-
+                                                                          lum re-opens it. At five seeds the ramp locks in 4/5 (per-
+Lever attribution. At ten seeds the picture is a family of                seed 0.052/0.994/0.996/0.868/1.000) against 0/9 pooled
+lock-in lotteries whose rates the training signal shifts, and             uniform trials across widths, budgets, and learning rates,
+the curriculum is the signal that matters. Dense supervision              p≈0.005 (Fisher, one-sided; the uniform trials pool several
+alone can solve the task (one seed of ten reaches 1.000) but              configurations). This is the first of two curriculum-shape
+has the lowest lock-in rate (1/10). The curriculum raises                 contrasts in this paper that clear significance. So L=256
+it to 7/10 (p=0.02, Fisher two-sided; p=0.01 one-sided),                  is not an architectural interference ceiling; it is the lock-in-
+consistent with the mechanism story: training across gaps                 lottery phenomenon at a longer horizon, with curriculum
+builds the selective-write policy outward from the solvable               shape as a reliable rate lever, and the residual lock-out moti-
+adjacent case. Adding dense supervision to the curriculum                 vating success-gated ramps.
+does not help (6/10; vs. dense-only, p=0.06 two-sided), so
+a denser gradient is not what closes the wall—coverage of                 A further 4× in length then exhausts the open-loop ramp
+the gap is. The causal cell locks in at a similar rate under              outright: at L=512 every ramp trial sits at chance (0/6; bidi-
+the same recipe (5/10 vs. 6/10, n.s.): directional parity,                rectional 0.020/0.020/0.019, causal 0.023/0.018/0.019)
+consistent with the collision replication (§7).                           against 4/5 at L=256. Length is thus itself a rate-killer for
+                                                                          a time-based schedule, which advances on a clock whether
+Two boundaries. (i) The attention ceiling under the cur-                  or not the model is keeping up. Closing the loop removes
+riculum requires position generalization—and with it, exists.
+The absolute-position toy baseline fails to generalize across
+
+                                                                       8
+                                           Anatomy of Associative Recall in Fixed-State Recurrences
+
+                           load: graceful capacity decline                            distance: the wall and its removal
+
+               1.0                            armed GDN                          1.0                                       1.000  1.000
+
+masked recall  0.8                                                                                                  0.822
+                                                                                 0.8
+
+               0.6                            DGMaeatlmteadbNaDe-2et ltraeNf et  0.6
+
+               0.4                            RWKV-7 diag ablation               0.4
+
+               0.2                            Mamba-2 ref, no conv               0.2
+
+               0.0                                                                    0.021 0.021
+                        8
+                                                                                 0.0
+
+                           16                 32                                      naive dense curric. dense+ attention
+
+                           key–value pairs K                                          only only curric.                           (ref.)
+
+Figure 2. Load vs. distance. Left: the K-sweep (Table 2; n=3 seeds)—a graceful, capacity-style decline; the RWKV-7 rank-1 arm (0.639
+at K=32) is omitted for legibility. Right: the haystack wall and its removal for the same bidirectional armed cell at L=64 (Tables 4
+and 5; bars show seed-0 accuracy, while the latter gives the n=10 lock-in rates): naive training sits at chance (dashed line, ≈ 0.019); the
+distance curriculum unlocks the task. Hatched bar: the attention reference on the fixed layout (§6 explains why no attention ceiling is
+reported under the curriculum itself).
+
+Table 5. Curriculum lever attribution, replicated at n=10 seeds (L=64 haystack, 2 layers). Training in this regime converges
+stochastically (§7), so we report lock-in rates (seeds > 0.8) with per-seed values. The chance→1.000 headline is an existence proof by
+construction and does not rest on seed count; the attribution is a rate shift that the curriculum drives: 7/10 vs. 1/10 (p=0.02, Fisher
+two-sided; 6/10 vs. 1/10: p=0.06). Dense supervision on top of the curriculum, and the bidirectional–causal contrast, are both n.s.
+Attention rows: absolute-position n=5, rotary n=10.
+
+                    cell (L=64, 2 layers)  dense curric. lock-in                      per-seed
+
+                    armed gdn (bidir)      4      ✓ 6/10 1.00/0.87/0.88/0.99/0.36/0.45/0.12/0.04/1.00/0.97
+
+                    armed gdn (bidir)      1      ✓ 7/10 0.82/0.13/0.06/1.00/0.92/1.00/0.58/1.00/1.00/1.00
+
+                    armed gdn (bidir)      4      — 1/10 0.02/0.02/0.02/1.00/0.02/0.02/0.02/0.02/0.02/0.02
+
+                    armed gdn fwd (causal) 4      ✓ 5/10 0.84/0.75/0.96/1.00/0.06/0.83/0.62/0.24/0.08/0.96
+
+                    attention (abs. pos.)  4      ✓ 0/5                               all ≈ 0.046
+
+                    attention (rotary)     4      ✓ 6/10                         mean 0.84; range 0.28–1.00
+
+the failure. A success-gated ramp advances the gap cap only                      7. Bidirectional Denoisers Read Twice for Free
+while a running probe-accuracy estimate stays above 0.6,
+and never retreats; it locks in 6/6 seeds at L=512 (per-seed                     Just-Read-Twice (Arora et al., 2024b) showed that recurrent
+0.993, 0.974, 0.973, 0.825, 0.985, 0.976; mean 0.954) un-                        LMs recover most of the recall gap when the query precedes
+der the same architecture, step budget, and task on which the                    the context—either by repeating the prompt (JRT-Prompt)
+time-based ramp scored 0/6 (p=0.0011, Fisher, one-sided).                        or with a bespoke prefix-LM architecture (JRT-RNN). We
+The L=512 boundary was therefore never a length ceiling                          observe that bidirectional masked-denoiser cells have this
+of the two-layer circuit; it was the schedule outrunning the                     property natively: the backward stream reads the query
+model. A companion paper reports the same closed-loop fix                        before the haystack, by construction, in every bidirectional
+at conversion scale (Boesch & Wee, 2026). Both arms are                          diffusion-LM denoiser (Sahoo et al., 2024; Singh et al.,
+n=6, and the claim is scoped: gating dissolves a schedule-                       2025). No prompt repetition, no bespoke architecture. This
+borne boundary, not the token-coverage boundary that paper                       section isolates whether that built-in second read is a real
+adds. Mean-level results should be quoted as established                         mechanism, what circuit implements it, and what it requires.
+at L=64 and, in length, as lock-in rates only.
+                                                                                 The discriminator. The lexical haystack cannot settle the
+                                                                                 question. There the causal cell also lifts under the cur-
+                                                                                 riculum (5/10 seeds lock in, mean 0.63; §6, Table 5), be-
+                                                                                 cause distractors are lexically distinguishable from table
+                                                                                 keys: a causal lexical write gate is learnable in principle,
+
+                                                               9
+Anatomy of Associative Recall in Fixed-State Recurrences
+
+so directionality is a margin there, not a mechanism. The              reading natively (the JRT property causal recurrent LMs
+collision-key variant kills that route, since decoys reuse             must engineer via prompt repetition or prefix-LM encoders),
+the table’s own keys and no lexical gate can separate a dis-           and any circuit exploiting it is necessarily ≥2 layers (mark-
+tractor write from a table write. The theory going in: an              and-route). What these data do not show is that the native
+input-conditioned causal write gate must overwrite on key              property confers a measurable advantage over a causal cell
+reuse (retaining garbage → chance), whereas the backward               trained the same way: at ten seeds the directional difference
+stream reads the query first and its reverse-scan overwrite            is indistinguishable from the lock-in lottery. The natural
+retains the correct first-in-forward binding.                          follow-up is whether shaped training that stabilizes lock-
+                                                                       in also separates the directions. It does not: under the
+Reads (Table 6).                                                       progressive-ramp curriculum, collision lock-in rises from
+                                                                       3/10 to 9/10 (bidirectional) and from 1/10 to 9/10 (causal;
+1. No directional margin at ten seeds. Both arms are lock-             p≈6×10−4 vs. its uniform reference), at exact directional
+    in lotteries (bidirectional locks in 3/10, causal 1/10; the        parity (p=0.76). The question is closed, negatively: in this
+    causal count is threshold-sensitive, since at a 0.6 crite-         task family, query-first reading confers no measurable recall
+    rion both arms lock in 3/10). Means differ by +0.082               advantage even when training is stabilized. The durable
+    (p=0.63). “Bidirectional denoisers get Just-Read-Twice             finding is that curriculum shape is a powerful, direction-
+    for free” is not established as a differential claim at this       agnostic lock-in stabilizer—the second shape contrast in
+    power.                                                             this paper to clear significance.
+
+2. What does survive: solvability, in both directions.                 8. Guardrail: Arming Is Free on State
+    Some seeds of both arms solve collision-key retrieval                 Tracking
+    outright (bidirectional max 1.000; causal max 0.844).
+    The causal existence result is itself informative, because         Does adding a local (finite-window) convolution cost
+    it robustly contradicts the single-cell theory that an input-      the recurrence anything on the axis where recurrences
+    conditioned write gate “must” overwrite on key reuse.              are supposed to shine—state tracking? We compare
+    That strengthens the depth-as-novelty-gate hypothesis:             armed gdn vs. gated deltanet on the S5 running-
+    layer-1 state can encode “this key is already bound,”              product guardrail (§3.3).
+    making layer-2’s gate effectively state-conditioned. We
+    report that as a hypothesis consistent with, but not iso-          We frame this strictly as learnability at fixed depth, not as
+    lated by, these data.                                              a circuit-complexity statement: accuracy falls steeply with
+                                                                       composition depth for both arms, and nothing here bears on
+3. The depth requirement is robust. At one layer both                  asymptotic separations (Merrill et al., 2024; Grazzi et al.,
+    arms collapse to chance. The mechanistic reason is exact.          2025). The design question was narrow—does the recall fix
+    The masked answer occupies the last position, which is             tax the state-tracking axis? The answer is no: the armed cell
+    the first token of the backward scan, so a single backward         wins significantly at all four depths.
+    pass has absorbed nothing by the time it reaches the
+    answer slot. Query-first information exists only at earlier        9. Limitations and Threats to Validity
+    positions and must be routed to the answer by a second
+    layer’s forward stream (mark-and-route). Whatever                  1. The Mamba-2 reference under-trains the official ker-
+    circuit solves this task, it needs two layers.                         nel. mamba2 ref reaches 0.592 at 10 seeds (0.641 at
+                                                                           3) where the official fused Mamba-2 reached 0.884 at
+4. Lock-in is the phenomenon to explain. The same                          the same matched state. The within-harness factorial
+    bimodality appears in the shaped-curriculum length ex-                 is internally valid (all cells, one harness, one budget),
+    tension (§6: ramp seeds solve L=256 at 0.994 or lock                   but absolute margins against a real Mamba are softer.
+    out at 0.05). Curriculum training on interference tasks                The with-conv transition gap is measured ablation-grade
+    converges stochastically. The right statistic is therefore a           within one cell (+0.034, §4), so it does not depend on
+    lock-in rate; mean accuracy is misleading; and differen-               this comparator. The paired measurement is now done in
+    tial claims between arms require far more than ten seeds               one session with a per-arm learning-rate sweep (§4): at
+    at these rates (3/10 vs. 1/10 is p≈0.58 by Fisher exact).              the shared default the cross-session numbers reproduce
+    The convolution-free arm has never locked in (0/10 un-                 (0.967 vs. 0.867), and at each arm’s best lr the margin
+    der the uniform recipe, 0/10 under the shaped ramp),                   is 1.000 vs. 0.955 (p=0.016). Most of the cross-session
+    consistent with the reversed-order-binding account of the              gap was the official arm’s learning rate, and a significant
+    convolution’s role, but the same power caveat applies.                 smaller margin survives tuning.
+
+Implication for diffusion LMs. The architectural obser-                2. Toy scale, single task family. d ∈ {32, 128}, one
+vation stands: bidirectional denoisers possess query-first
+
+                                                                   10
+                                            Anatomy of Associative Recall in Fixed-State Recurrences
+
+Table 6. Collision-key discriminator, hardened (L=64, dense-4 + curriculum, 2 layers; n=10 seeds, rebinding-controlled—the armed
+arms’ rebound sits at the value-marginal floor, while the convolution-free arm’s rebound equals its accuracy: it never binds at all).
+Per-seed accuracies are bimodal: most seeds lock out, some solve outright, so we report lock-in rates (seeds > 0.8) alongside means. The
+bidirectional–causal mean difference is +0.082 (p=0.63, permutation): no directional difference is established at this power. Floors:
+value-marginal ≈ 0.019; strongest non-binding positional strategy ≈ 0.26.
+
+arm (L=64 collision)                                               lock-in mean per-seed range
+
+armed gdn (bidirectional)                                          3/10 0.383 0.023–1.000
+
+armed gdn fwd (causal)                                             1/10 0.301 0.036–0.844
+
+gated deltanet (bidir, no conv) 0/10 0.128 0.017–0.238
+
+1-layer (n=5): both arms chance on every seed (max 0.07)
+
+Table 7. S5 guardrail (d=128; chance ≈ 0.008; internally comparable only). All four rows are ten-seed (mean [min, max], permutation
+
+p). The armed cell is significantly better at every probed depth: arming for recall does not trade away state tracking. The result is
+
+cell-family-general: an armed RWKV-7 cell also beats its unarmed counterpart at both depths (+0.053, p=0.004 at L=8; +0.005,
+p<10−4 at L=16) and is statistically indistinguishable from armed armed gdn (p=0.60/0.10).
+
+S5 depth  armed gdn gated deltanet p
+
+L=2 (n=10) 1.000 [1.000, 1.000] 0.980 [0.945, 1.000] 0.0002
+L=4 (n=10) 0.524 [0.492, 0.637] 0.389 [0.274, 0.514] 0.0014
+L=8 (n=10) 0.214 [0.143, 0.261] 0.152 [0.132, 0.240] 0.0044
+L=16 (n=10) 0.087 [0.072, 0.128] 0.071 [0.070, 0.073] < 10−4
+
+   MQAR configuration per setting, synthetic tasks. The                attention-superiority claims beyond those settings.
+   decomposition’s magnitudes (+0.5 convolution; +0.3
+   transition without the convolution, +0.03 with it; decay        5. Cross-family magnitude comparisons are indicative.
+   unresolved) are specific to constrained state; at ample             mamba2 ref’s decay is scalar-per-head, the RWKV-
+   state everything saturates and the knobs stop mattering.            7 reference uses vector decay, and gated deltanet
+   Claims should be read as mechanism isolation, not de-               uses scalar decay. Within-family toggles are exact; cross-
+   ployment guidance.                                                  family magnitude comparisons (e.g., convolution effect
+                                                                       size in delta vs. diagonal families) carry a parameteriza-
+3. Learning-rate sensitivity. Okpekpe & Orvieto (2025)                 tion caveat.
+   show per-arm learning-rate tuning can rescue no-conv
+   Mamba recall; our sweep (§4.2) confirms this for the            6. Interpretation boundaries we respect. No rank-1-
+   delta family (tuned no-conv gated deltanet 0.870;                   vs-diagonal class claim (§4.3 kills it); no claim that
+   re-tuning the armed arms too narrows the delta-family               decay helps state-tracking (underpowered); no length
+   gap to ≈+0.13) and not for our diagonal cell (0.172 at              extrapolation of the curriculum fix beyond L=64; no
+   its best lr). The sweeps span one decade at 5 seeds; the            circuit-complexity claims from the S5 guardrail; no
+   official kernel’s own tuned optimum is 0.955 (§4).                  bidirectional-vs-causal advantage claim under collision
+                                                                       (n.s. at 10 seeds); the depth-novelty-gating account of
+4. The attention control is valid only where reported.                 the causal arm’s solvability is a hypothesis.
+   Running attention (absolute and rotary) at a healthy
+   head dimension (2 heads, d=32) through the factorial’s          10. Discussion
+   matched one-layer config yields collapse at every K
+   (≈0.11–0.17) with the rebinding control equal to eval           What “recurrent models are bad at recall” decomposes
+   accuracy—the fingerprint of never reading bindings.             into. At matched state, it decomposes into five things: a
+   This is structural. MQAR is an induction-head task and          missing convolution (large, fixable for free in state terms), a
+   induction circuits require two attention layers (Olsson         transition effect (real, within-cell), a decay tax (real, scalar-
+   et al., 2022), while the recurrent cells solve it at depth      gate-specific), an interference failure under sparse supervi-
+   one by writing bindings into state. A depth-matched             sion (fixable by curriculum, within a length boundary), and
+   attention row therefore cannot exist at L=1, and the            a directionality property (bidirectional denoisers get query-
+   valid attention ceilings live in the two-layer regimes,         first reading natively). None of these is “the recurrence
+   where we report them (fixed wall 1.000; lexical cur-            cannot bind.”
+   riculum 6/10; collision-ramp 7/10; L=256 ramp 4/5—
+   parity with the armed cell’s 4/5). This paper makes no          When is a hybrid actually needed? The results re-scope
+                                                                   the standard “add attention layers for retrieval” move. Two
+
+                                                               11
+Anatomy of Associative Recall in Fixed-State Recurrences
+
+of the classic triggers dissolve under cheap interventions:          Acknowledgments
+the unarmed-cell recall deficit (add the convolution) and the
+within-capacity haystack wall (train with a distance curricu-        This work used computing resources provided by the Rosen
+lum). Three things remain as genuine hybrid territory: loads         Center for Advanced Computing (RCAC) at Purdue Univer-
+beyond state capacity (the graceful K-limit), lengths beyond         sity (McCartney et al., 2014).
+the curriculum boundary (L≥256 here, pending shaped cur-
+ricula), and query-conditioned regimes a fixed-state writer          Impact Statement
+cannot anticipate. A hybrid decision made after arming and
+curriculum is a different, and smaller, decision.                    This paper presents controlled, small-scale measurements
+                                                                     aimed at advancing the scientific understanding of sequence-
+For recurrent diffusion LMs. The JRT-for-free result gives           model architectures: which ingredients of efficient recurrent
+bidirectional recurrent denoisers (Singh et al., 2025; Lin           cells support in-context recall, and when training rather than
+et al., 2026) a principled recall story that causal recurrent        architecture is the binding constraint. The main downstream
+LMs lack: the objective itself buys the second read. The             impact, if the findings transfer to scale, is more capable
+requirements are concrete—two layers minimum and a short             linear-time language models at lower inference cost and
+convolution in the backward stream—which makes them                  energy. We see no societal consequences specific to this
+design guidance for this model class rather than folklore.           work beyond those generic to improving machine learning
+The companion paper takes the curriculum half of this story          methods.
+to converted diffusion LMs at 1.7B and 8B (Boesch & Wee,
+2026); whether the query-first mechanism itself carries to           References
+scale is untested.
+                                                                     Arora, A., Rathi, N., Selvam, N. R., Csorda´s, R., Jurafsky,
+A conjecture, and a design question. Within this study, one             D., and Potts, C. Mechanistic evaluation of transformers
+apparent architectural wall dissolved entirely into a training-         and state space models. arXiv preprint arXiv:2505.15105,
+distribution problem, and convergent evidence points the                2025.
+same way for recurrent recall and length generalization
+(Okpekpe & Orvieto, 2025; Buitrago Ruiz & Gu, 2025;                  Arora, S., Eyuboglu, S., Timalsina, A., Johnson, I., Poli,
+Blouir et al., 2024). We state the strong form as a con-                M., Zou, J., Rudra, A., and Re´, C. Zoology: Measuring
+jecture worth falsifying: within the capacity regime of a               and improving recall in efficient language models. arXiv
+fixed-state recurrence, apparent retrieval walls are training-          preprint arXiv:2312.04927, 2023.
+coverage gaps. The length boundary of (ii) above is its
+first direct test—the cell that sits at 0/6 under a time-based       Arora, S., Eyuboglu, S., Zhang, M., Timalsina, A., Alberti,
+ramp at L=512 locks in 6/6 once the ramp is gated on                    S., Zinsley, D., Zou, J., Rudra, A., and Re´, C. Sim-
+measured competence, so that boundary was the schedule,                 ple linear attention language models balance the recall-
+not the circuit. What remains open against the alternative              throughput tradeoff. arXiv preprint arXiv:2402.18668,
+(a genuine interference ceiling of the two-layer circuit) is            2024a.
+whether some length defeats the gated schedule too. Sep-
+arately, decay costs −0.32 on recall here while showing              Arora, S., Timalsina, A., Singhal, A., Eyuboglu, S., Zhao,
+no measured state-tracking benefit at our power (p=0.65);               X., Rao, A., Rudra, A., and Re´, C. Just read twice:
+context-modulated forgetting (Kimi Team, 2025) becomes                  Closing the recall gap for recurrent language models.
+the interesting design axis only if a benefit emerges under             arXiv preprint arXiv:2407.05483, 2024b.
+better-powered tests.
+                                                                     Austin, J., Johnson, D. D., Ho, J., Tarlow, D., and van den
+Reproducibility Statement                                               Berg, R. Structured denoising diffusion models in discrete
+                                                                        state-spaces. arXiv preprint arXiv:2107.03006, 2021.
+All cells, tasks, and controls run in one open harness
+(pure-PyTorch reference cells; a state-matched, kernel-free          Bachmann, G. and Nagarajan, V. The pitfalls of next-token
+Mamba-2 comparator; fp32 paths) on commodity GPUs,                      prediction. arXiv preprint arXiv:2403.06963, 2024.
+including pre-Volta hardware via an atomic-free two-pass
+Triton backward (Appendix A). Appendix B lists the ex-               Ben-Kish, A., Zimerman, I., Abu-Hussein, S., Cohen, N.,
+act commands for every table. Code and result JSONs are                 Globerson, A., Wolf, L., and Giryes, R. DeciMamba:
+publicly available at https://github.com/JIBSIL/                        Exploring the length extrapolation potential of Mamba.
+dualgoose.                                                              arXiv preprint arXiv:2406.14528, 2024.
+
+                                                                     Bengio, Y., Louradour, J., Collobert, R., and Weston, J.
+                                                                        Curriculum learning. Proceedings of ICML, 2009.
+
+                                                                 12
+Anatomy of Associative Recall in Fixed-State Recurrences
+
+Blouir, S., Smith, J. T., and Anastasopoulos, A. Birdie: Ad-        with linear attention. arXiv preprint arXiv:2006.16236,
+  vancing state space models with reward-driven objectives           2020.
+   and curricula. In Proceedings of EMNLP, 2024.
+                                                                  Kimi Team. Kimi linear: An expressive, efficient attention
+Boesch, J. and Wee, A. DreamingGoose: Staged distillation            architecture. arXiv preprint arXiv:2510.26692, 2025.
+   from autoregressive transformers to bidirectional recur-
+   rent diffusion language models. Companion preprint,            Lin, K., Luo, Y., Su, Z., Song, Y., and Rao, A. Triplet-block
+   2026.                                                             diffusion RWKV. arXiv preprint arXiv:2605.25969,
+                                                                     2026.
+Buitrago Ruiz, R. and Gu, A. Understanding and improving
+   length generalization in recurrent models. arXiv preprint      Liu, B., Ash, J. T., Goel, S., Krishnamurthy, A., and Zhang,
+   arXiv:2507.02782, 2025.                                           C. Transformers learn shortcuts to automata. arXiv
+                                                                     preprint arXiv:2210.10749, 2023.
+Chen, Y., Zhang, X., Hu, S., Han, X., Liu, Z., and Sun,
+   M. Stuffed Mamba: State collapse and state capacity            McCartney, G., Hacker, T., and Yang, B. Empowering
+   of RNN-based long-context modeling. arXiv preprint                Faculty: A Campus Cyberinfrastructure Strategy for Re-
+   arXiv:2410.07145, 2024.                                           search Communities. Educause Review, 2014.
+
+Dao, T. and Gu, A. Transformers are SSMs: Generalized             Merrill, W., Petty, J., and Sabharwal, A. The illusion of state
+   models and efficient algorithms through structured state          in state-space models. arXiv preprint arXiv:2404.08819,
+   space duality. arXiv preprint arXiv:2405.21060, 2024.             2024.
+
+Dele´tang, G., Ruoss, A., Grau-Moya, J., Genewein, T., Wen-       Okpekpe, D. and Orvieto, A. Revisiting associative
+   liang, L. K., Catt, E., Cundy, C., Hutter, M., Legg, S.,          recall in modern recurrent models. arXiv preprint
+  Veness, J., and Ortega, P. A. Neural networks and the              arXiv:2508.19029, 2025.
+   Chomsky hierarchy. arXiv preprint arXiv:2207.02098,
+   2023.                                                          Olsson, C., Elhage, N., Nanda, N., Joseph, N., DasSarma,
+                                                                     N., Henighan, T., Mann, B., Askell, A., Bai, Y., Chen,
+Grazzi, R., Siems, J., Franke, J. K., Zela, A., Hutter,             A., et al. In-context learning and induction heads. Trans-
+   F., and Pontil, M. Unlocking state-tracking in linear             former Circuits Thread, 2022.
+   RNNs through negative eigenvalues. arXiv preprint
+   arXiv:2411.12537, 2025.                                        Parnichkun, R. N., Tumma, N., Thomas, A. W., Moro, A.,
+                                                                    An, Q., Suzuki, T., Yamashita, A., Poli, M., and Mas-
+Gu, A. and Dao, T. Mamba: Linear-time sequence                       saroli, S. Quantifying memory utilization with effective
+   modeling with selective state spaces. arXiv preprint              state-size. arXiv preprint arXiv:2504.19561, 2025.
+   arXiv:2312.00752, 2023.
+                                                                  Peng, B., Zhang, R., Goldstein, D., et al. RWKV-7 “Goose”
+Hewitt, J. and Liang, P. Designing and interpreting probes          with expressive dynamic state evolution. arXiv preprint
+  with control tasks. arXiv preprint arXiv:1909.03368,               arXiv:2503.14456, 2025.
+   2019.
+                                                                  Sahoo, S. S., Arriola, M., Schiff, Y., Gokaslan, A., Marro-
+Holtzman, A., West, P., Shwartz, V., Choi, Y., and Zettle-           quin, E., Chiu, J. T., Rush, A., and Kuleshov, V. Simple
+   moyer, L. Surface form competition: Why the highest               and effective masked diffusion language models. arXiv
+   probability answer isn’t always right. arXiv preprint             preprint arXiv:2406.07524, 2024.
+   arXiv:2104.08315, 2021.
+                                                                  Schlag, I., Irie, K., and Schmidhuber, J. Linear transformers
+Hsieh, C.-P., Sun, S., Kriman, S., Acharya, S., Rekesh, D.,          are secretly fast weight programmers. arXiv preprint
+  Jia, F., Zhang, Y., and Ginsburg, B. RULER: What’s the             arXiv:2102.11174, 2021.
+   real context size of your long-context language models?
+   arXiv preprint arXiv:2404.06654, 2024.                         Singh, V., Ostapenko, O., Noe¨l, P.-A., Belilovsky, E.,
+                                                                     and Scholak, T. DiffuMamba: High-throughput dif-
+Jelassi, S., Brandfonbrener, D., Kakade, S. M., and                  fusion LMs with Mamba backbone. arXiv preprint
+   Malach, E. Repeat after me: Transformers are bet-                 arXiv:2511.15927, 2025.
+   ter than state space models at copying. arXiv preprint
+   arXiv:2402.01032, 2024.                                        Sridhar, A. and Johansen, A. Echo: KV-cache-free asso-
+                                                                     ciative recall with spectral Koopman operators. arXiv
+Katharopoulos, A., Vyas, A., Pappas, N., and Fleuret, F.             preprint arXiv:2605.06997, 2026.
+  Transformers are RNNs: Fast autoregressive transformers
+
+                                                              13
+                                            Anatomy of Associative Recall in Fixed-State Recurrences
+Vaswani, A., Shazeer, N., Parmar, N., Uszkoreit, J., Jones,
+
+   L., Gomez, A. N., Kaiser, Ł., and Polosukhin, I. Atten-
+   tion is all you need. Advances in Neural Information
+  Processing Systems, 2017.
+Yang, S., Kautz, J., and Hatamizadeh, A. Gated delta net-
+  works: Improving Mamba2 with delta rule. arXiv preprint
+   arXiv:2412.06464, 2024a.
+Yang, S., Wang, B., Zhang, Y., Shen, Y., and Kim, Y. Par-
+   allelizing linear transformers with the delta rule over se-
+   quence length. arXiv preprint arXiv:2406.06484, 2024b.
+
+                                                                        14
+                                             Anatomy of Associative Recall in Fixed-State Recurrences
+
+A. The Commodity-Hardware Harness
+
+Three engineering choices make the factorial cheap to replicate:
+
+Kernel-free cells. Every arm has a pure-PyTorch reference implementation; the Mamba-2 comparator
+(TinyMamba2RefSSM) implements the SSD recurrence with an explicit dstate and requires neither Triton nor mamba ssm,
+so the full factorial executes on any CUDA GPU (and, slowly, CPU). The kernel size=1 setting neutralizes its convolu-
+tion for the toggle.
+
+Pre-Volta support. The default Triton backward for the RWKV-7-style scan emits .acq rel atomics that ptxas rejects
+below sm 70. An atomic-free two-pass backward reproduces the reference scan’s forward and gradients and runs on Pascal
+(sm 61) at ≈26× the pure-PyTorch reference throughput (≈2,980 vs. ≈113 tok/s at d=256/6 layers/ctx 512), with an
+--fp32 flag for hardware without bf16. The headline experiments in this paper were run on a single GTX 1070.
+
+Determinism and floors. Runs are seed-pinned and resumable; every task ships its floor calculators (value-marginal,
+no-binding, table floor 1/K, positional). The rebinding control is validated by a self-test (--selftest) that confirms the
+derangement logic.
+
+B. Reproduction Commands
+
+Constrained-state factorial and K-sweep (Tables 1, 2). --fp32 is required on pre-bf16 (Pascal) hardware and may be
+dropped on Ampere and newer; it applies to every command below except dg c9 harden.py, which has no such flag:
+
+       python scripts/mqar probe.py --models armed gdn gated deltanet deltanet
+            dg rank ref dg diag ref mamba2 ref mamba2 ref noconv attention
+            --d-model 32 --layers 1 --mamba2-d-state 16 --ks 8 16 32 --seeds 0 1 2 --fp32
+
+Hardened transition ablation with rebinding control (Table 3):
+
+       python scripts/dg c9 harden.py --ks 16 32 --seeds 0 1 2 3 4 5 6 7 8 9
+       python scripts/dg c9 harden.py --selftest
+
+Haystack wall (Table 4):
+
+       python scripts/long retrieval probe.py --models armed gdn dg rank ref mamba2 ref
+       attention
+
+            --seq-lens 64 128 256 512 --pairs 4 --seeds 0 1 --heads 2 --mamba2-d-state 16
+      --fp32
+
+Curriculum and collision-key discriminator (Tables 5, 6); add --collision for the discriminator:
+
+       python scripts/long retrieval probe.py --models armed gdn armed gdn fwd attention
+            --seq-lens 64 --pairs 4 --seeds 0 --steps 3000 --batch 256 --layers 2 --heads 2
+            --dense 4 --curriculum --fp32
+
+S5 guardrail (Table 7):
+
+       python scripts/state tracking probe.py --models armed gdn gated deltanet
+            --group-n 5 --ls 8 16 --d-model 128 --seeds 0 1 2 3 4 5 6 7 8 9 --fp32
+
+C. Floors and Controls, Stated
+
+For each task we report: (i) the value-marginal (probability of the correct value under the answer distribution: 1/26 ≈ 0.038
+for MQAR; 1/54 ≈ 0.019 for haystack/collision; 1/120 ≈ 0.008 for S5, exact because generators are uniform over the
+full group); (ii) the strongest no-binding strategy (MQAR: emit a random table value, ≈0.068; collision: emit a random
+table-position token, ≈0.26); (iii) the table floor 1/K for the rebinding control. No headline number in this paper is
+within 10× of its floor except where explicitly marked as “chance.” The S5 probe additionally masks all product slots
+simultaneously and uses single-token answers, making prefix-completion leakage structurally impossible.
+
+                                                                         15
+

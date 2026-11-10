@@ -1,0 +1,1502 @@
+Functional Alignment Can Mislead: Examining Model Stitching
+
+Damian Smith 1 Harvey Mannering 1 Antonia Marcu 1
+
+                        Abstract                                             Do networks that learn to solve all these
+                                                                          tasks really represent the same information?
+      A common belief in the representational compar-
+      ison literature is that if two representations can           Birdsong
+      be functionally aligned, they must capture simi-
+      lar information. In this paper we focus on model             Clustered-
+      stitching and show that models can be functionally           Noise
+      aligned, but represent very different information.           Stylized
+      Firstly, we show that discriminative models with             ImageNet
+      very different biases can be stitched together. We
+      then show that models trained to solve entirely dif-         ImageNet
+      ferent tasks on different data modalities, and even
+      representations in the form of clustered random             Figure 1. Examples of inputs from 4 different tasks we consider.
+      noise, can be successfully stitched into MNIST or           We show that models trained on the first three tasks can be stitched
+      ImageNet-trained models. We proceed by show-                together with models trained on ImageNet despite depicting very
+      ing that alignments can also be found in the case           different input-level information.
+      of autoencoders where the encoder and decoder
+      are trained on different tasks. We end with a dis-          different, since they also use different input patterns for their
+      cussion of the wider impact of our results on the           predictions. Throughout the paper we refer to input-level
+      community’s current beliefs. Overall, our paper             patterns as “semantic” information.
+      draws attention to the need to correctly interpret
+      the results of such functional similarity measures          We argue that without capturing semantic similarity, some
+      and highlights the need for approaches that cap-            of the existing model comparison measures can end up
+      ture informational similarity.                              considering a network that successfully distinguishes birds
+                                                                  based on their songs to be equivalent to one that successfully
+1. Motivation                                                     distinguishes ImageNet images. In particular, we focus on
+                                                                  model stitching but we argue in our discussion section that
+Measuring representational similarity is a complex task and       the same criticism might be extended to other measures and
+there is no consensus on how it should be done (Sucholut-         hypotheses as well.
+sky et al., 2023). More interestingly, there seems to be no
+consensus on when two representations can be considered           As an alternative to established model comparison methods
+similar. In this paper we do not consider two representations     such as CKA (Kornblith et al., 2019), functional model com-
+to be similar if they do not capture the same information.        parison is gaining increasing attention (Bansal et al., 2021;
+For example, if one model learns to classify birds by their       Hernandez et al., 2022; Klabunde et al., 2025; Csisza´rik
+song and another learns to classify them by their visual ap-      et al., 2021). In this paper we focus on the functional per-
+pearance, we consider those models to be different. Equally,      spective as an emerging direction and will therefore not
+if two models learn to visually classify birds but one of         cover CKA, SVCCA (Raghu et al., 2017), or similar meth-
+them uses the birds’ shape to make predictions, while the         ods. Broadly speaking, the functional perspective argues
+other uses plumage, we would consider those models to be          that two intermediate layers should be considered similar
+                                                                  if they lead to matching outputs. While this perspective
+    1Vision, Learning, and Control (VLC) Research Group, Uni-     seems useful, especially in a classification setting, we argue
+versity of Southampton. Correspondence to: Antonia Marcu          that there is one fundamental problem with deep learning
+<a.marcu@soton.ac.uk>.                                            models which raises questions about its utility: shortcut
+                                                                  learning (Geirhos et al., 2020).
+Proceedings of the 42 nd International Conference on Machine
+Learning, Vancouver, Canada. PMLR 267, 2025. Copyright 2025       Shortcut learning is an umbrella term for learning decision
+by the author(s).
+
+                                                               1
+Functional Alignment Can Mislead: Examining Model Stitching
+
+rules that rely on spurious correlations, causing the model         removing all shape information from the input data to be
+to perform poorly outside of the setting it was trained on.         represented, leaving only colour information. We then stitch
+Geirhos et al. (2020) argue that many challenges in deep            into a model that was trained on shape information alone
+learning boil down to shortcut learning. Moreover, the              and that is unable to make correct predictions based on
+simplicity bias literature argues that SGD-trained models           colour information. We achieve full stitching compatibility
+have a tendency to learn simpler rules (e.g. Valle-Perez            in this case as well. We then show that we can success-
+et al., 2018; De Palma et al., 2019) (often shortcuts) over         fully stitch clustered, random noise into the models we train.
+more complex rules that capture some of the true, salient,          This, therefore, shows that we can easily construct cases
+or intended information. Therefore, there is an increasing          where the models’ stitching compatibility does not reflect
+consensus that models are prone to picking up shortcuts             their informational similarity.
+in the data, whether we are aware of their existence or not.
+As a result, it is important to be able to distinguish between      In the second part of the paper we demonstrate that the
+models that learn different patterns because some could fail        problem is not restricted to simple settings by performing
+to generalise in the wild.                                          similar experiments with more complex, “real-world” data.
+                                                                    For example, we show that we can stitch a model trained
+In this paper we look at model comparison starting from the         on ImageNet (Russakovsky et al., 2015) to one trained to
+understanding that the models we compare have a propen-             recognise bird songs.
+sity for learning shortcuts. In particular, we focus on model
+stitching (Lenc & Vedaldi, 2015), which is an increasingly          Our contributions are:
+popular method for comparing models’ functional similarity.
+Informally, model stitching compares models A and B by                 • We argue that accounting for the extracted input pat-
+“stitching” together the first part of model A (the sender)               terns is of paramount importance when comparing rep-
+with the last part of model B (the receiver) using a linear               resentations, and show that model stitching does not
+transformation referred to as a “stitch”. The stitch is trained           achieve this;
+such that it learns a mapping between representations of
+models A and B. Model A is considered similar to model                 • We show that we can construct problems where stitch-
+B if their stitched combination achieves an accuracy com-                 ing cannot distinguish between models known to have
+parable to that of model B. In other words, model stitching               learned different shortcuts (i.e. they use different infor-
+assesses how compatible two models are from a functional                  mation) (Section 4.1);
+perspective by comparing how the function represented by
+their stitched combination behaves compared to the B func-             • We show that representations that depict entirely differ-
+tion when evaluated at the same input points. Functional                  ent information or even clustered, random noise can be
+compatibility is often taken to indicate that models cap-                 stitched into a trained model, raising further questions
+ture similar information (e.g. Lenc & Vedaldi, 2015; Bansal               about the usefulness of stitching as a measure of model
+et al., 2021; Hernandez et al., 2022).                                    similarity (Section 4.2);
+
+In this paper we design experiments which demonstrate                  • We extend our experiments to more complex, real-
+that the stitching compatibility (or alignment) of models                 world, and benchmark datasets, considering distinct
+is inappropriate for evaluating the extent to which two                   modalities and different tasks for both the discrimina-
+networks capture similar information. Importantly, a model                tive and the generative case (Section 5);
+that learns a spurious correlation can appear to be fully
+compatible with one that learns the intended information.              • And, we end with a discussion of the wider implica-
+Given the prevalence of shortcut learning, we argue that a                tions of our results on functional alignment.
+meaningful model comparison should distinguish between
+models that capture different input patterns.                       The code for our experiments is available at https://gi
+                                                                    thub.com/DHLSmith/stitching.git.
+We first show that models that learn to use different infor-
+mation can easily be stitched together. We start with a toy         2. Model Stitching
+problem where we can bias models towards learning to use
+either colour or shape information. We show that the mod-           Model stitching has seen many variants (e.g. Bansal et al.,
+els are considered similar from a stitching perspective. We         2021; Csisza´rik et al., 2021; Hernandez et al., 2022) since it
+then consider a more challenging setting where we ensure            was first proposed (Lenc & Vedaldi, 2015). For simplicity,
+that the sender uses different information from the receiver,       in this paper we only consider stitching between identical
+and also that its representations do not contain information        architectures and at matching points in the network. Let A≤l
+relevant for the original receiver network. We do this by           denote the composition of all layers in the trained network A
+                                                                    up to and including layer l. Following Bansal et al. (2021),
+
+                                                                 2
+Functional Alignment Can Mislead: Examining Model Stitching
+
+we choose the stitching layer s to be a randomly initialised       all instances of “1” have a green background, etc. We refer
+1 × 1 convolutional layer preceded and followed by batch           to this dataset as “Correlated”.
+normalisation (Ioffe & Szegedy, 2015). Bansal et al. (2021)
+use a convolutional layer as it has restricted expressivity.       We use this problem to show that stitching is unable to dis-
+The untrained stitched model is therefore given by B>l ◦ s ◦       tinguish between models that use different features to make
+A≤l. We then train the stitched model by freezing the parts        the prediction. To do so, we want to simulate a scenario
+taken from the models A (the sender) and B (the receiver)          where training various models leads to each learning a
+and only optimising the stitching layer s. We then report the      different pattern. One possible way of biasing the model
+performance of the stitched model on the test data. If the         towards picking up different rules is to modify the architec-
+test performance of the stitched model is greater or equal         ture. However, modifying the architecture means that we
+to that of the receiver (which becomes the baseline), it is        can’t perform a one-to-one model comparison. For this rea-
+considered that models A and B are compatible at layer l.          son, we choose to modify the training data instead as a way
+                                                                   of biasing the models. We therefore create different variants
+In this paper we focus on ResNet-18 and ResNet-50 (He              of the dataset that lead to the model classifying based on
+et al., 2016) models, but include results for VGG19 (Si-           either colour information alone, shape information alone,
+monyan & Zisserman, 2015) in Appendix D.1. Note that               or different levels of relying on the combination between
+we stitch ResNet models before residual blocks and before          colour and shape.
+the linear classifier. Therefore we refer to stitching before
+the first residual block as stitching “Res Block 1”; before        Importantly, note that we modify the data in such a way
+the second residual block as “Res Block 2”; and stitching          that each model would still perform well (over 98% test
+before the classifier as “Linear”.                                 accuracy) on the original Correlated dataset. This means
+                                                                   that the models could have been trained on the original
+Current stitching interpretation. This work is inspired            Correlated data if we had an appropriate way of biasing
+by Hernandez et al. (2022) who find that stitching can             them in a controlled way through the training procedure
+reach high accuracy even when stitching from later lay-            alone. Below we provide a brief description of the dataset
+ers in Model A to much earlier layers in a Model B. They           versions created (see Figure 2a for visual examples). For
+believe that this could either be because the common intu-         full details on the creation of the datasets, see Appendix A.
+ition about how models process input is wrong, or because
+model stitching is able to match representations which are         Colour MNIST (Correlated): The colour of the back-
+“different from what is expected”. Nonetheless, they con-                ground and class of the digit are correlated.
+clude that functional similarity provides a meaningful way
+of comparing models. Their intuition is that “if two repre-        Digit with Uncorrelated Colour (Digit): Images contain-
+sentations can be used for similar purposes then in some                 ing random combinations of background colour and
+sense they encode similar information” (Hernandez et al.,                digit. Target is given by the digit’s class. Note that the
+2022). This agrees with Bansal et al. (2021) who argue “two              colours were chosen from the same set of colours used
+networks with identical architectures, but very different in-            to generate the Correlated dataset.
+ternal representations, would fail to be stitching connected”.
+                                                                   Colour with Uncorrelated Digits (Colour): Images con-
+We argue that no meaningful conclusion can be drawn from                 taining random combinations of background colour
+analysing the stitch connectivity. When stitching is not suc-            and digit. Target is given by the colour’s class. Im-
+cessful, this could simply be because a good enough map-                 portantly, the model could learn to represent shape
+ping between the representations was not found (Csisza´rik               information, but this cannot help the model classify.
+et al., 2021). We claim that when stitching is successful,
+one cannot conclude that this is necessarily because the rep-      Colour with no Digit (Colour-Only): Images containing
+resentations capture the same information. The next section              background colour and no digit. Target is the colour’s
+shows the latter empirically.                                            class. The model cannot learn to base its predictions
+                                                                         on shape information.
+3. Inducing a Learning Bias Through the Data
+                                                                   For clarity, note that the short version of the dataset’s name
+We choose to compare models on a typical shortcut learning         (e.g. Digit) refers to the part of the input that is correlated
+problem: a variant of colour MNIST (Bahng et al., 2020). In        with the label. We refer to the models by the name of
+essence, colour MNIST adds colour as an additional correla-        the dataset they were trained on. Unless otherwise stated,
+tion between the input variable and the target variable. We        the results are reported on ResNet-18 models. For full
+choose to add colour as a fully-correlated background. For         experimental details see Appendix B.
+example, all instances of digit “0” have a red background,
+
+                                                                3
+     Functional Alignment Can Mislead: Examining Model Stitching
+
+667788
+
+COolnloyur Colour Digit Corr.1.000                                                                                           125       Stitched Model
+                                                  Test Accuracy0.995                                                         100           Correlated
+                                                                                                               Feature Rank                Digit
+        0.990                                                                                                                75        Colour
+        0.985                                                                                                                50        Baseline
+
+        0.980                                                                                                                25
+
+        Res Block 1 Res Block 2 Res Block 3 Res Block 4 Linear Res Block 1 Res Block 2 Res Block 3 Res Block 4 Linear
+
+(a)            (b)                                                                                                                (c)
+
+Figure 2. (a) Two example images for classes ‘6’, ‘7’, and ‘8’ in each dataset type. (b) Stitching test accuracy when stitching at each of
+the 5 layers we consider, for all four types of model stitched into Digit model with Correlated data. Baseline is given by the test accuracy
+of the unstitched Digit model on the Correlated dataset, which is the task we assume to be given. Shaded area covers 100% of results
+range, markers show each result across multiple initialisations. We find that we can achieve stitch compatibility across different layers for
+all the models we consider. (For each stitched Digit model, accuracy remains above its own unstitched baseline) (c) Rank analysis of the
+feature maps output by the receiver’s first layer upon stitching. Shaded areas mark 1 standard deviation.
+
+4. Experiments                                                      includes an uncorrelated digit), the model can only learn
+                                                                    to represent solid colour information. Nonetheless, when
+We start this section by adhering to Bansal et al. (2021)’s         stitching on the original task, we obtain a test accuracy
+original setting. Namely, we assume we are given the task           higher than that of the receiver alone, indicating stitching
+of classifying the Correlated dataset and we want to analyse        compatibility (see Figure C.1a).
+the similarity of multiple models trained to solve this task.
+We show that stitching cannot distinguish between models            Numerical rank. We analyse the rank of the feature maps
+capturing different biases in the data. To rule out the pos-        after the first layer of the receiving network. This is a way
+sibility that the results we observed are due to information        of gauging the linear dependence of the sender’s feature
+leak, we then move away from the original stitching setting         maps as seen through the lens of the receiver’s representa-
+(Section 4.2). We remove from the input (and as a conse-            tion. If two sender representations have similar rank when
+quence, from the sender’s representations) any information          processed by the receiver network, we cannot necessarily
+related to the receiver’s task and manage to achieve stitching      claim that they are perceived in a similar way. We can
+compatibility.                                                      only say that the receiver represents them with a similar
+                                                                    level of linear dependence. However, if they do not have
+4.1. Stitching Cannot Distinguish Between Different                 the same rank, we take that as additional evidence that the
+     Biases                                                         senders have learned different information according to
+                                                                    the receiver. Details of the numerical rank estimation are
+In this section we want to verify if stitching can help distin-     provided in Appendix B.2.1.
+guish between models that learn to classify using different
+information. We start by stitching various senders into the         In Figure 2c we show the rank computed when stitching at
+Digit model (i.e. the digit is correlated with the label and        each of the 5 layers we consider. We find that for stitching
+the background has a random colour). Note that for training         before the 2nd and 3rd residual blocks there is a clear gap
+and evaluating the stitch, we use the Correlated dataset as         between the rank of the processed representations of Digit
+this is the data we assume we have access to, in accordance         with Uncorrelated Colour and those of Correlated, for exam-
+with the typical stitching procedure. All other datasets were       ple. This indicates that when fed into the receiving network,
+created simply to train senders and receivers with different        the representations of Digit with Uncorrelated Colour have
+biases. We find that at all layers, all models we consider can      a different degree of linear dependence from those of Cor-
+easily be stitched into the Digit model (which becomes the          related and therefore are not perceived as equivalent by the
+receiver), obtaining a higher accuracy than that of the orig-       receiver despite both being stitch-compatible.
+inal Digit model (see Figure 2b). That is, even the Colour
+with Uncorrelated Digits model, which learned to classify           The numerical rank of representations provides an estima-
+based on colour information (ignoring shape), appears com-          tion of their compression. Note that alternative estimators of
+patible with the model that learned to classify based on            compression could be considered. Each estimator, including
+shape information only.                                             numerical rank, comes with its limitations. Our objective is
+                                                                    to include additional evidence that the various sender rep-
+Taking this further, we train a model on patches of colour          resentations are not entirely equivalent when processed by
+with no digit (‘Colour-Only’). As opposed to Colour (which          the receiver. Following recent work (e.g. Masarczyk et al.,
+
+                                                                 4
+Functional Alignment Can Mislead: Examining Model Stitching
+
+2023; Feng et al., 2022), we choose to use numerical rank          In light of these results, we argue that models that extract
+to illustrate the difference in compression.                       patterns from significantly different information can, in at
+                                                                   least some cases, be easily stitched together. While it may
+Arguably, in the stitching cases considered so far colour          be argued that the datasets chosen are too simple, it is known
+information could still “leak” through a model that did            that SGD-trained models find simple rules or shortcuts (e.g.
+not learn to use it for classification. The same argument          Valle-Perez et al., 2018; De Palma et al., 2019), and there is
+holds for structured shape information potentially leaking.        no algorithm to decide when stitching is applicable. There-
+We next perform two follow-up experiments: with a re-              fore, models’ stitching compatibility should not be taken
+ceiver model trained only on shape information, we obtain          to mean that they learn similar rules or that they capture
+full stitch compatibility on Colour-Only images (no digit          similar information.
+is depicted, Figure 2a), despite no shape information be-
+ing present in the data; and stitching clustered, random           Note that these last experiments (starting Section 4.2) de-
+noise simulating a sender network’s representation (see Sec-       liberately move away from Bansal et al. (2021)’s original
+tion 4.2) into the receiving network. These experiments            setting. The stitch is now trained and evaluated on a differ-
+strengthen our findings that models can be easily stitched to-     ent task to the one that the receiver was trained on. This
+gether even when they represent very different information.        is necessary in order to rule out the effect of information
+                                                                   leak. This extended setting allows us to emphasise that
+4.2. Representations of Very Different Information Can             stitching alignment can abstract away from the input pat-
+     Be Stitched Together                                          terns that produced the sender’s representations. Because
+                                                                   of this, stitching cannot reliably distinguish between two
+To check whether stitching between dissimilar models is due        models that capture different cues in the data. In the next
+to the sender model “leaking” information expected by the          section, we are going to explore this extended setting fur-
+receiver, we remove all information that could be expected         ther by stitching together models that were trained to solve
+by the receiver from the images we train and evaluate the          different tasks altogether.
+stitch on. Concretely, we stitch Colour-Only models into
+receivers trained on Greyscale MNIST data but this time            5. Other Successful Stitchings: Discriminative
+using Colour-Only data to train and test the stitch. There            Case
+is no digit-like structure in the Colour-Only data which (if
+leaked) could be used by the MNIST receiver. The un-               So far we focused on simple problems which allowed us to
+stitched MNIST models have a baseline accuracy (when               control what information is available to the models. The
+tested with MNIST data) of 99.0 ± 0.1%; at every stitching         remainder of the paper focuses on “harder” problems. We
+layer, the Colour-Only sender increases this to 100% accu-         would like to highlight, however, that in such cases no clear
+racy, resulting in stitching compatibility. In other words,        ground truth exists and constructing arguments based on
+despite the sender representations not containing any digit        what “intuitively makes sense” can be deceptive. We simply
+information at all (as the input does not contain that infor-      offer these as supporting evidence to our well-controlled
+mation in the first place) we are able to successfully stitch      experiments on which all our claims are based.
+those representations into a Greyscale MNIST model.
+                                                                   Note that Bansal et al. (2021) consider the performance of
+Lastly, we stitch clustered, random noise (Clustered-Noise)        the receiver as the baseline. In our previous experiments,
+into the receiver network. We create 10 random vectors             although the sender and the receiver were trained on differ-
+to represent the mean of each of the 10 classes. The vec-          ent datasets they were still trained to be compatible with the
+tors have the same dimensionality as the representations           same task, which is Correlated (both the digit class and the
+that would normally be expected by the stitching layer. For        colour class are correlated with the label). As a reminder,
+each class we create 6K samples by adding random noise             our goal was simply to induce a strong bias towards solv-
+to the mean class vector, obtaining a dataset of the same          ing the task using either the digit or the background colour.
+size as the original Correlated dataset (see Appendix A).          Naturally, when tested on fully correlated data, both models
+Note that we do not use Clustered-Noise to train a sender.         were successfully solving the task.
+Instead, Clustered-Noise simulates the representations of a
+sender network. We then stitch these simulated representa-         In a non-toy setting, when trying to stitch between models
+tions onto the Digit receiver. We can achieve full stitching       that are unlikely to represent the same input patterns, the
+compatibility when using randomly generated represen-              receiver will inevitably perform poorly on the sender’s task.
+tations. As expected, the rank of these representations when       This means that the baseline will usually be very weak. We
+fed into the receiver network is different from that of the        choose to set a higher baseline, which is the performance of
+learned representations (see Figure C.1b). We find similar         the receiver on its own task. For example, in the case when
+results with VGG19 models (see Appendix D.1).                      the ImageNet model is the receiver on Stylized data (which
+
+                                                                5
+             Functional Alignment Can Mislead: Examining Model Stitching
+
+Table 1. Results of stitching various models into and from ImageNet. We highlight in bold the representations that were stitch-compatible.
+Note that “Block X” and “Linear” means that we are stitching before the Xth residual block and the classification layer respectively.
+Despite choosing a more challenging baseline than typically considered for stitching, we are still able to find some models stitch-compatible
+at various layers. *Accuracy results for this baseline are given by Stylized model’s performance on ImageNet data which, although
+atypical, are higher than Stylized model’s performance on the Stylized task (56.18% top-1 and 78.96% top-5 accuracy). Note that with the
+weaker baseline, we find compatibility at all layers.
+
+             Block 1 Block 2 Block 3 Block 4 Block 5 Linear Baseline
+
+ImageNet to  Top-1 58.39       58.61                                 61.53  65.31  70.43 74.34 60.18∗
+  Stylized   Top-5 80.57       80.61                                 83.28  86.13  89.78 91.93 82.60∗
+
+  Stylized   Top-1 10.61       11.23                                 17.60  30.26  45.45 49.17  76.13
+to ImageNet  Top-5 22.65       23.08                                 34.34  52.52  69.57 72.30  92.86
+
+10-class ImageNet Top-1 15.40  19.00                                 25.00  46.20  75.60 88.40  77.98
+                               68.40                                 76.40  88.60  98.60 99.80  96.07
+to Birdsong  Top-5 63.80
+
+Clustered-Noise Top-1 4.77     4.11 96.59                                   100    100 100 76.13
+                                                                                   100 100 92.86
+to ImageNet  Top-5 13.51 11.99 99.77                                        100
+
+we introduce in Section 5.1), the weak baseline would be             which is close to the accuracy we achieve when stitching.
+the performance of the ImageNet model on the Stylized                Note, however, that we achieve stitching compatibility ac-
+data (16.4% top-5 accuracy). We choose the more compet-              cording to the alternative baseline (receiver’s performance
+itive baseline, which is the performance of ImageNet on              on the sender task), which in this case is only 16.4% top-5
+ImageNet data (92.86% top-5 accuracy). There is only one             accuracy. Nonetheless, we choose to consider the more chal-
+exception to this choice of baseline, which we emphasise             lenging baseline and report stitch incompatibility instead.
+when discussing the experiments. For completeness, we                On the other hand, we find that we can achieve stitch-
+include the weaker baseline in Table F.1 but show the more           compatibility at several different layers when stitching
+challenging setting in the main body of the paper.                   ImageNet into Stylized (see Table 1). We see this as ad-
+                                                                     ditional evidence that there are cases in which functional
+Note that since for most of the experiments in this section we       alignment methods such as stitching cannot distinguish be-
+are using a pretrained ImageNet model, we only do one run            tween models with different biases.
+of the experiments. All discriminative models considered in
+this section are ResNet-50. All stitches in this section are         5.2. Clustered-Noise
+trained for 20 epochs using a learning rate of 10−4 and we
+do not perform any hyperparameter tuning for training the            Following the same procedure as in the case of stitch-
+stitches (full training details in Appendix B.4). All results        ing Clustered-Noise to MNIST-trained models, we stitch
+from Section 5.1 up to and including Section 5.4 are collated        Clustered-Noise to a model pretrained on ImageNet. Even
+together in Table 1.                                                 with no hyperparameter tuning, we achieve stitch compati-
+                                                                     bility after the second residual block (see Table 1).
+5.1. Shape and Texture Bias
+                                                                     5.3. Different Extracted Information
+Geirhos et al. (2019) showed that standard-trained ImageNet
+models are biased towards learning texture information.              We next use one dataset and stitch such that we remap its
+They then constructed Stylized ImageNet (Stylized), a ver-           classes. This approach uses just one model and one dataset,
+sion of the ImageNet dataset where local texture is no longer        changing fewer variables than some other experiments. We
+predictive, forcing models to focus on shape information             train a model on greyscale-MNIST, stitch it back together
+(less localised patterns).                                           at a chosen layer, and train the stitch on MNIST data but
+                                                                     with labels offset in a circular shift. The effect of this is
+As a real-world version of our previous shape and colour             that the sender’s representation of, say, digit ‘0’ is stitched
+experiment, we take pretrained ImageNet and Stylized mod-            so that the receiver classifies it as class ‘1’. Yet, an un-
+els and aim to stitch them together. Note that we cannot             stitched model trained on MNIST and presented with an
+successfully stitch Stylized into ImageNet. As we will dis-          image for ‘0’ must represent different information from
+cuss in more detail in Section 7, this is likely due to Stylized     the same model presented with a ‘1’ otherwise it could not
+model’s poor performance on the Stylized task. Stylized              discriminate. Equivalently, in the Colour-Only dataset, red
+only achieves 78.96% top-5 accuracy on the Stylized dataset,         would now be classified as green (see Figure A.1). This
+
+                                                                  6
+                                                  Functional Alignment Can Mislead: Examining Model Stitching
+
+               1.0                                                                    Class Mapping We match classes across datasets. For ex-
+                                                                                            ample, with Fashion-MNIST and MNIST, we might
+Test Accuracy                                               Class offset = 1                pair classes like ‘Bag’→‘0’, ‘Coat’→‘1’, etc. Within
+               0.9                                               Correlated                 each class pair, we match images randomly. The loss
+                                                                 Colour-Only                is the L2 distance between the generated image and the
+                                                                 BW                         corresponding paired image from the other dataset.
+               0.8
+               Res  Block  1  Res  Block  2  Res  Block  3  Res  Block  4  Linear     Embedding Mapping We match embeddings in the latent
+                                                                                            space of the autoencoders. We match the stitched em-
+Figure 3. Test accuracy when stitching a model to itself with the                           beddings of the sender against those of the original
+dataset the model was trained on, but remapping class labels with                           encoder of the receiver and solve this as a linear sum
+an offset of 1 (e.g. an image of ‘7’ is labelled as class ‘8’). Base-                       assignment problem. The loss is then given by the sum
+line performance of Correlated and Colour-Only was 100% while                               of squared distances between mapped embeddings. It
+BW (greyscale-MNIST) was 99%, shown as green dotted line.                                   can effectively be considered that we create a joint
+Shaded regions show full range of results. We again find stitch                             dataset where we pair up each training sample from
+compatibility, especially in the later layers.                                              dataset A (used to train encoder A) with another train-
+                                                                                            ing sample from dataset B (used to train encoder B).
+experiment was successfully repeated for models trained on                                  Training samples are paired up using the encodings (i.e.
+Colour-Only, and Correlated datasets (see Figure 3). The                                    in the embedding space). Specifically, we solve the
+same models can be restitched with different shift offsets                                  linear sum assignment problem in the autoencoders’
+and at different layers (see Appendix E for more details).                                  bottleneck to pair up samples from datasets A and B.
+                                                                                            Passing an image from dataset A through encoder A,
+5.4. Different Tasks and Modalities                                                         the stitch is trained to map it to its corresponding sam-
+                                                                                            ple from dataset B, passed through encoder B.
+We then attempt to stitch a model trained to recognise bird
+songs to a pretrained ImageNet model. For this we use                                 For full experimental details, see B.3. Following Moschella
+a 10-class version of the xeno-canto (Vellinga & Planque´,                            et al. (2022), we perform a qualitative evaluation of the
+2015) dataset. We use publicly available code to create a                             generative stitch. We are able to reconstruct MNIST-like
+version of the dataset with 10 bird classes, preprocess the                           digits from Fashion-MNIST test data using both mappings
+data into spectrograms and train a ResNet-50 to solve the                             we consider (see left-hand side of Figure 4), with clearer im-
+task (full training details in Appendix B.5). The model                               ages obtained for the Embedding Mapping. We then stitch
+achieves 77.98% accuracy on the birdsong recognition task.                            a CIFAR-10 (Krizhevsky, 2009) encoder onto an MNIST
+                                                                                      decoder (see right-hand side of Figure 4) and once again
+To keep in line with the typical stitching regime, we restrict                        obtain depictions of MNIST-like digits.
+the ImageNet dataset to a 10-class version. For simplicity,
+we choose the first 10 classes of ImageNet. In this case,                             Although this setting differs significantly from Bansal et al.
+we once again find we can successfully stitch models, yet                             (2021)’s original stitching proposal, it provides evidence
+their representations are not semantically similar (i.e. do                           that more broadly representations can be aligned without
+not capture the same input patterns).                                                 necessarily representing the same information.
+
+6. Stitching Other Embeddings: Autoencoders                                           7. Discussion and Observations
+
+Following Fumero et al. (2024) and Moschella et al. (2022),                           We believe building tools to meaningfully compare neu-
+we consider the case of mapping representations of autoen-                            ral networks is an important objective in deep learning re-
+coders. Moschella et al. (2022) extend the definition of                              search. Such tools are treated as potential ways of better
+model stitching to the generative case by stitching two au-                           understanding neural networks and therefore can be seen as
+toencoders trained on MNIST from different initialisations.                           part of the Explainable AI puzzle. For example, alignment
+Their intuition is that the two models should be compatible                           between models has been used in the attempt to better un-
+since they are simply trained from different initialisations.                         derstand architectural differences (e.g. Nguyen et al., 2020;
+                                                                                      Raghu et al., 2021), aspects of continual learning (Ramasesh
+We train one autoencoder on MNIST and another one on                                  et al., 2021; Kim & Han, 2023), or training with different
+Fashion-MNIST (Xiao et al., 2017). We take the encoder of                             types of data (e.g. McGuire et al., 2023), or even factors
+Fashion-MNIST and the decoder of MNIST and stitch them                                that contribute to networks’ alignment with human percep-
+together. We consider two approaches to stitching between                             tion (Demircan et al., 2024).
+inputs and reconstructions of two different datasets:
+
+                                                                                   7
+                                        Functional Alignment Can Mislead: Examining Model Stitching
+
+Input
+
+Embedding
+reconstr.
+Class
+reconstr.
+
+Figure 4. Examples of reconstructions when stitching autoencoders trained on different datasets. Left: Fashion-MNIST. Right: CIFAR-10.
+Top to bottom: Inputs given to the stitched autoencoders, reconstructions obtained with the Embedding Mapping method, reconstructions
+obtained with the Class Mapping method. MNIST-like digits are generated from Fashion-MNIST and CIFAR-10 inputs.
+
+The objective of our paper is to more closely analyse one           clustered (but not necessarily using the same information
+such tool proposed to measure similarity and alignment.             to assign samples to a cluster). While this is a straightfor-
+From this perspective, our work fits within the literature          ward observation, we include an experiment to intuitively
+exploring the limitations of representation comparison tools        illustrate this. We take our Clustered-Noise experiment in
+(e.g. Ding et al., 2021; Davari et al., 2023). Most related to      Section 4.2 and increase the level of noise around each clus-
+our work but in the context of Representational Similarity          ter. As we do so, the separability decreases and, as a result,
+Analysis (RSA), Dujmovic´ et al. (2022) construct artificial        the stitching accuracy drops (see Table D.3).
+datasets to argue that RSA cannot distinguish between mod-
+els with “different feature encodings”.                             Therefore, we believe our experiments cast a shadow on
+                                                                    the interpretation of functional alignment. While it might
+Through a range of experiments we have shown that we can            be possible that models converge to a shared understanding
+stitch representations used to solve different tasks using dif-     of reality, we believe our results show that one needs to
+ferent modalities. Alignments between different tasks (e.g.         look beyond functional alignment to support this claim.
+Gygli et al., 2021) and even different modalities (e.g. Rad-        We urge the community to rethink the belief that mapping
+ford et al., 2021; Merullo et al., 2023; Koh et al., 2023) are      between two clustered representations means that models
+not new and have been exploited before, especially between          capture the same aspects about the world. Models that
+text and images in the context of image captioning.                 converge to a shared statistical model of reality might be
+                                                                    functionally compatible, but functionally compatible models
+To explain this type of alignment, which is typically seen as       do not necessarily capture the same patterns in the input.
+an alignment of “semantic concepts”, Huh et al. (2024) pro-
+pose the Platonic Representation Hypothesis. This hypothe-          Lastly, we believe controlled experiments where we can
+sis states that models “are converging to a shared statistical      create models that learn to solve a task using different input
+model of reality in their representation spaces” which makes        cues are important for evaluating model comparison tools
+alignments such as stitching possible. While in the context         more generally. We regard these as necessary for establish-
+of image captioning this argument is intuitive, Huh et al.          ing the validity of hypotheses around both functional and
+(2024) take this hypothesis further and argue that represen-        structural similarity.
+tation alignment more generally, including across different
+tasks and modalities, is explained by representational conver-      Can anything be stitched onto anything? No. We have
+gence. This echoes the Anna Karenina Hypothesis (Bansal             seen throughout the paper that some layers and even some
+et al., 2021) stating that “all successful models end up learn-     models (Section 5.1) cannot be successfully stitched to-
+ing roughly the same internal representations”. Importantly,        gether. There are several potential reasons for this. In some
+note that Huh et al. (2024) simply use functional alignment         cases, this could be a matter of learnability of the stitch.
+as supporting evidence for their hypothesis, but primarily          Note that all the experiments in Section 5 were run with
+focus on structural alignment.                                      the same learning rate, we did not do any hyperparameter
+                                                                    tuning and we only trained the stitch for 20 epochs. In the
+Are our results possible because models reached a shared            case of stitching Clustered-Noise into the ImageNet model
+understanding of reality? No, we strongly disagree that             for example, it might be the case that with slightly longer
+this is applicable here. We have shown that alignments can          training, we would be able to successfully stitch earlier lay-
+be found between ImageNet models and birdsong recog-                ers. This highlights another limitation of stitching which
+nition models, or even Clustered-Noise. It is difficult to          is that when models cannot be stitched together, it is un-
+imagine how there could be a shared understanding of real-          clear whether this is because a good linear mapping was
+ity between these three datasets.                                   not found or because the representations are not linearly
+                                                                    mappable. This is a known issue with model stitching (e.g.
+We believe a more plausible hypothesis is that we were able         Hernandez et al., 2022).
+to align the representations largely because they were well
+
+                                                                 8
+Functional Alignment Can Mislead: Examining Model Stitching
+
+The second reason why we were not able to stitch is because           Where next? We believe that to meaningfully compare rep-
+of the difference in task difficulty and/or original model            resentations we need to be able to both gauge what informa-
+performance and, as a result, achievable separability in the          tion they are encoding and how that information is “mapped
+representational space. For example, in the case of stitching         out” in the embedding space. We have demonstrated that
+Stylized to ImageNet, the Stylized model achieves signifi-            the functional perspective alone, and stitching in particular,
+cantly lower performance on the Stylized dataset than the             cannot do that. Capturing these is of course not straight-
+ImageNet model on the ImageNet dataset. So for the prob-              forward and the lack of ground truth makes this even more
+lems that the models were trained on, there is a big gap              challenging. We believe the field would benefit from care-
+in performance. This could be because Stylized might be               fully constructing controlled benchmark problems rather
+a harder problem to solve altogether but also because as              than advancing based on what is “intuitively expected”. Our
+Geirhos et al. (2019) mention, they did not necessarily train         work proposes a simple scenario for evaluating and reason-
+their Stylized model to achieve competitive performance on            ing about representational differences and similarities but
+the Stylized data. It might be the case that with a better-           it is by no means comprehensive enough for constructing
+performing model on Stylized we would be able to stitch               a sufficiently varied baseline more generally. Nonetheless,
+onto ImageNet but this is beyond the scope of the paper.              it provides a starting point for such a framework which we
+                                                                      believe is of paramount importance if we aim to create tools
+Should stitching then be used as a measure of model                   that capture meaningful differences between models.
+quality? While there might be cases in which stitching is
+insightful, we believe it is difficult to think of what stitching     8. Conclusions
+can tell us about model quality that existing methods don’t
+do already. If we cannot successfully stitch because of an            We showed that networks can use or represent very different
+incompatibility in task performance, this can already be              information, yet classify samples with similar accuracy. Im-
+seen by simply looking at the models’ accuracy on the task.           portantly, the different representations can easily be stitched
+If two models cannot be stitched because the receiver does            together. This leads us to question the usefulness of study-
+not cluster the representations sufficiently well at intermedi-       ing models’ purely functional similarity, and in particular
+ate layers, then we can simply look for direct measures of            their stitching compatibility, to determine whether or not
+representational clustering.                                          they capture similar information. Being able to distinguish
+                                                                      between models that make decisions based on different in-
+Finally, one of the reasons why stitching was proposed and            put patterns is important, especially given the propensity of
+adopted as an alternative to methods like CKA is because it           deep learning models to learn shortcuts. We hope that our
+allows us to identify when a representation is “better” than          work encourages the community to more carefully interpret
+another, rather than simply “different”. We challenge the             the results of model stitching, and understand what it is ac-
+understanding that achieving higher stitching accuracy than           tually responding to. We also hope our work will encourage
+the baseline (receiver’s own accuracy) means the representa-          researchers to focus on creating model comparison tools that
+tion of the sender network is better than that of the receiver.       can reliably capture informational similarity. We propose
+To this end, we simply swap the receivers and the senders             artificial shortcut learning problems as a starting point for
+considered in the previous experiments. In Figure 2b we               reasoning about this in a controlled way.
+observed a higher test accuracy for Colour and Correlated
+compared to the Digit baseline, which would be taken to in-           Acknowledgements
+dicate that their representations are “better” for discriminat-
+ing samples on the problem we consider. However, stitching            The authors acknowledge the use of the IRIDIS X High Per-
+Digit (as sender) into Colour or Correlated (as receivers)            formance Computing Facility, the ECS Alpha Cluster, and
+also leads to higher accuracy for particular layers compared          the Southampton-Wolfson AI Research Machine (SWARM)
+to the baseline (see Table C.1 and Appendix C.1), which is            GPU cluster generously funded by the Wolfson Foundation,
+a contradiction. Finally, we stitch a model with itself (Digit        together with the associated support services at the Univer-
+vs Baseline) and obtain an increase in accuracy (see Fig-             sity of Southampton in the completion of this work. H.M.
+ure C.1a) as well as a change in the rank of representations          is funded by a PhD studentship provided by the School of
+(see Figure C.1b). This further indicates that although the           Electronics and Computer Science. The authors would like
+stitching layer has reduced expressivity compared to a fully-         to thank the members of the VLC research group for useful
+connected stitch, it still cannot be claimed that it simply           discussions, feedback, support, snacks, and good fun.
+aligns the representations of the sender and receiver without
+any additional processing. Therefore, given the contradic-
+tory results, we do not think stitching accuracy is suitable
+for comparing the quality of models’ representations either.
+
+                                                                   9
+Functional Alignment Can Mislead: Examining Model Stitching
+
+Impact Statement                                                      Cho, K., and Oh, A. (eds.), Advances in Neural Informa-
+                                                                      tion Processing Systems, volume 35, pp. 33054–33065,
+This paper presents work whose goal is to advance the field           2022.
+of Machine Learning. There are many potential societal
+consequences of our work, none which we feel must be               Fumero, M., Pegoraro, M., Maiorca, V., Locatello, F., and
+specifically highlighted here.                                        Rodola`, E. Latent functional maps: a spectral framework
+                                                                      for representation alignment. In The Thirty-eighth Annual
+References                                                           Conference on Neural Information Processing Systems,
+                                                                      2024.
+Bahng, H., Chun, S., Yun, S., Choo, J., and Oh, S. J. Learn-
+   ing de-biased representations with biased representations.      Geirhos, R., Rubisch, P., Michaelis, C., Bethge, M., Wich-
+   In International Conference on Machine Learning, 2020.             mann, F. A., and Brendel, W. Imagenet-trained CNNs are
+                                                                      biased towards texture; increasing shape bias improves
+Bansal, Y., Nakkiran, P., and Barak, B. Revisiting model              accuracy and robustness. In International Conference on
+   stitching to compare neural representations. In Ranzato,          Learning Representations, 2019.
+   M., Beygelzimer, A., Dauphin, Y., Liang, P., and Vaughan,
+   J. W. (eds.), Advances in Neural Information Processing         Geirhos, R., Jacobsen, J.-H., Michaelis, C., Zemel, R., Bren-
+   Systems, volume 34, pp. 225–236, 2021.                             del, W., Bethge, M., and Wichmann, F. A. Shortcut learn-
+                                                                      ing in deep neural networks. Nature Machine Intelligence,
+Csisza´rik, A., Ko˝ro¨si-Szabo´, P., Matszangosz, A., Papp,           2(11):665–673, 2020.
+   G., and Varga, D. Similarity and matching of neural
+   network representations. In Ranzato, M., Beygelzimer,           Gygli, M., Uijlings, J., and Ferrari, V. Towards Reusable
+   A., Dauphin, Y., Liang, P., and Vaughan, J. W. (eds.),             Network Components by Learning Compatible Represen-
+  Advances in Neural Information Processing Systems, vol-             tations. Proceedings of the AAAI Conference on Artificial
+   ume 34, pp. 5656–5668, 2021.                                      Intelligence, 35(9):7620–7629, May 2021. ISSN 2374-
+                                                                      3468. doi: 10.1609/aaai.v35i9.16932. Number: 9.
+Davari, M. R., Horoi, S., Natik, A., Lajoie, G., Wolf, G.,
+   and Belilovsky, E. Reliability of CKA as a similarity           He, K., Zhang, X., Ren, S., and Sun, J. Deep residual
+   measure in deep learning. In International Conference              learning for image recognition. In 2016 IEEE Conference
+   on Learning Representations, 2023.                                 on Computer Vision and Pattern Recognition (CVPR), pp.
+                                                                     770–778, 2016. doi: 10.1109/CVPR.2016.90.
+De Palma, G., Kiani, B., and Lloyd, S. Random deep neu-
+   ral networks are biased towards simple functions. In            Hernandez, A., Dangovski, R., Lu, P. Y., and Soljacic, M.
+  Advances in Neural Information Processing Systems, vol-             Model stitching: Looking for functional similarity be-
+   ume 32, 2019.                                                      tween representations. In SVRHM 2022 Workshop @
+                                                                     NeurIPS, 2022.
+Demircan, C., Saanum, T., Pettini, L., Binz, M.,
+   Baczkowski, B., Doeller, C., Garvert, M., and Schulz,           Huh, M., Cheung, B., Wang, T., and Isola, P. Position: The
+   E. Evaluating alignment between humans and neural                  platonic representation hypothesis. In Salakhutdinov, R.,
+   network representations in image-based learning tasks.             Kolter, Z., Heller, K., Weller, A., Oliver, N., Scarlett,
+  Advances in Neural Information Processing Systems, 37:             J., and Berkenkamp, F. (eds.), Proceedings of the 41st
+  122406–122433, 2024.                                               International Conference on Machine Learning, volume
+                                                                      235 of Proceedings of Machine Learning Research, pp.
+Ding, F., Denain, J.-S., and Steinhardt, J. Grounding                 20617–20642. PMLR, 21–27 Jul 2024.
+   representation similarity through statistical testing. Ad-
+   vances in Neural Information Processing Systems, 34:            Ioffe, S. and Szegedy, C. Batch Normalization: Accelerating
+  1556–1568, 2021.                                                    deep network training by reducing internal covariate shift.
+                                                                      In Proceedings of the 32nd International Conference on
+Dujmovic´, M., Bowers, J. S., Adolfi, F., and Malhotra, G.           Machine Learning, pp. 448–456. PMLR, June 2015.
+   Some pitfalls of measuring representational similarity
+   using representational similarity analysis. bioRxiv, pp.        Kim, D. and Han, B. On the stability-plasticity dilemma
+   2022–04, 2022.                                                     of class-incremental learning. In Proceedings of the
+                                                                     IEEE/CVF Conference on Computer Vision and Pattern
+Feng, R., Zheng, K., Huang, Y., Zhao, D., Jordan, M., and            Recognition, pp. 20196–20204, 2023.
+   Zha, Z.-J. Rank diminishing in deep neural networks.
+   In Koyejo, S., Mohamed, S., Agarwal, A., Belgrave, D.,          Klabunde, M., Schumacher, T., Strohmaier, M., and Lem-
+                                                                      merich, F. Similarity of neural network models: A survey
+
+                                                               10
+Functional Alignment Can Mislead: Examining Model Stitching
+
+   of functional and representational measures. ACM Com-                deep learning dynamics and interpretability. Advances in
+   put. Surv., 57(9), May 2025. ISSN 0360-0300. doi:                   Neural Information Processing Systems, 30, 2017.
+  10.1145/3728458.
+                                                                     Raghu, M., Unterthiner, T., Kornblith, S., Zhang, C., and
+Koh, J. Y., Salakhutdinov, R., and Fried, D. Grounding                  Dosovitskiy, A. Do vision transformers see like convolu-
+   language models to images for multimodal inputs and                  tional neural networks? Advances in Neural Information
+   outputs. In International Conference on Machine Learn-              Processing Systems, 34:12116–12128, 2021.
+   ing, pp. 17283–17300. PMLR, 2023.
+                                                                     Ramasesh, V. V., Dyer, E., and Raghu, M. Anatomy of
+Kornblith, S., Norouzi, M., Lee, H., and Hinton, G. Sim-                catastrophic forgetting: Hidden representations and task
+   ilarity of neural network representations revisited. In              semantics. In International Conference on Learning Rep-
+  Proceedings of the 36th International Conference on Ma-               resentations, 2021.
+   chine Learning, pp. 3519–3529. PMLR, May 2019.
+                                                                     Russakovsky, O., Deng, J., Su, H., Krause, J., Satheesh, S.,
+Krizhevsky, A. Learning multiple layers of features from                Ma, S., Huang, Z., Karpathy, A., Khosla, A., Bernstein,
+   tiny images, January 2009.                                           M., Berg, A. C., and Fei-Fei, L. ImageNet Large Scale
+                                                                       Visual Recognition Challenge. International Journal of
+Lenc, K. and Vedaldi, A. Understanding image representa-               Computer Vision (IJCV), 115(3):211–252, 2015. doi:
+   tions by measuring their equivariance and equivalence. In           10.1007/s11263-015-0816-y.
+  Proceedings of the IEEE conference on computer vision
+   and pattern recognition, pp. 991–999, 2015.                       Simonyan, K. and Zisserman, A. Very deep convolutional
+                                                                        networks for large-scale image recognition. In Interna-
+Masarczyk, W., Ostaszewski, M., Imani, E., Pascanu, R.,                 tional Conference on Learning Representations, 2015.
+   Miłos´, P., and Trzcinski, T. The Tunnel Effect: Building
+   Data Representations in Deep Neural Networks. Ad-                 Sucholutsky, I., Muttenthaler, L., Weller, A., Peng, A., Bobu,
+   vances in Neural Information Processing Systems, 36:                A., Kim, B., Love, B. C., Grant, E., Groen, I., Achterberg,
+  76772–76805, December 2023.                                          J., et al. Getting aligned on representational alignment.
+                                                                        arXiv preprint arXiv:2310.13018, 2023.
+McGuire, S., Jackson, S., Emerson, T., and Kvinge, H. Do
+   neural networks trained with topological features learn           Valle-Perez, G., Camargo, C. Q., and Louis, A. A. Deep
+   different internal representations? In NeurIPS Workshop              learning generalizes because the parameter-function map
+   on Symmetry and Geometry in Neural Representations,                  is biased towards simple functions. arXiv preprint
+   pp. 122–136. PMLR, 2023.                                             arXiv:1805.08522, 2018.
+
+Merullo, J., Castricato, L., Eickhoff, C., and Pavlick, E. Lin-      Vellinga, W.-P. and Planque´, R. The Xeno-canto collection
+   early mapping from image to text space. In The Eleventh              and its relation to sound recognition and classification. In
+  International Conference on Learning Representations,                 Cappellato, L., Ferro, N., Jones, G. J. F., and SanJuan,
+   2023.                                                                E. (eds.), CLEF (Working Notes), volume 1391 of CEUR
+                                                                       Workshop Proceedings. CEUR-WS.org, 2015.
+Moschella, L., Maiorca, V., Fumero, M., Norelli, A., Lo-
+   catello, F., and Rodola`, E. Relative representations enable      Xiao, H., Rasul, K., and Vollgraf, R. Fashion-MNIST: a
+   zero-shot latent space communication. In International               novel image dataset for benchmarking machine learning
+  Conference on Learning Representations, 2022.                         algorithms, 2017.
+
+Nguyen, T., Raghu, M., and Kornblith, S. Do wide and deep
+   networks learn the same things? uncovering how neural
+   network representations vary with width and depth. In
+  International Conference on Learning Representations,
+   2020.
+
+Radford, A., Kim, J. W., Hallacy, C., Ramesh, A., Goh, G.,
+  Agarwal, S., Sastry, G., Askell, A., Mishkin, P., Clark, J.,
+   et al. Learning transferable visual models from natural
+   language supervision. In International conference on
+   machine learning, pp. 8748–8763. PMLR, 2021.
+
+Raghu, M., Gilmer, J., Yosinski, J., and Sohl-Dickstein, J.
+   Svcca: Singular vector canonical correlation analysis for
+
+                                                                 11
+                                        Functional Alignment Can Mislead: Examining Model Stitching
+
+   0123456789
+
+                Figure A.1. Colour swatches for the base colour map. Digits are font-based labels here, not MNIST images
+
+A. Datasets
+
+The following variants were created:
+
+MNIST This is simply MNIST data (monochrome handwritten digits) expanded to 3 channels and normalised.
+      There is no target-dependent colour information for the model to learn, so we expect it to recognise the digits based on
+      features such as shape, or the amount of white, or the texture of the white-grey-black edges. It cannot learn to use
+      colours to recognise classes as these are never present.
+      It is possible that kernel weights will learn to rely on the three colour channels always being equal.
+
+Colour MNIST (Correlated) We wanted to provide an opportunity for some semantically different representations to be
+      learned. In this case, having the background colour correlate with the target digit being displayed.
+      We expect that the models trained on Correlated data will mostly learn to rely on the colour. However, they may learn
+      the shapes of the digits, or the amount of white caused by the digit. They may rely on pixels always being at one of two
+      rgb values (white/colour) in any one image, never at an intermediate value. They may learn to rely entirely on a small
+      number of pixels that are never white - e.g. corner pixels.
+      To generate the Correlated dataset, we used the colour MNIST package (Bahng et al., 2020) which uses MNIST data,
+      but changes the colour of the background depending on the digit being represented (Figure A.1). The package snaps
+      any non-zero pixels to white ([255,255,255]). This could be thought of as changing the greyscale information
+      to binary, and indeed reducing the information content as a result. The background colour is changed from black
+      ([0,0,0]) to one of 10 values, always matching the data label.
+      For all of these datasets, to avoid the model learning something as simple as specific RGB values, the base RGB
+      background values are modified by a random 10% per image (such that the colour is always flat, but will vary slightly
+      from image to image within a class). The same variation is injected into the test datasets. This is analagous to requiring
+      that colour is learned in a generalised way.
+
+Digit with Uncorrelated Colour (Digit) To encourage models to learn representations which recognise digits, but cope
+      with different background colours, we created a dataset with digits over laid on backgrounds whose base colours were
+      randomly selected. i.e. the digit does not correlate with the colour.
+      We expect models trained on Digit to learn features like shape. Assuming the randomisation is sufficient, they cannot
+      learn to rely on colour. The choice of base colours and inclusion of colour variation mean that the Digit models cannot
+      learn to rely on a single colour channel or pair of colour channels, and must learn to tolerate a range of colours being
+      used. Nonetheless, they may learn to rely on any or all pixels in an image being one of two colours.
+
+Colour with Uncorrelated Digits (Colour) To encourage representations of colour information, but which are able to
+      tolerate the presence of digits, we generate a dataset in the same way as for Digit but in which the background colour
+      (not the uncorrelated digit) is the target.
+      Models trained on Colour cannot use the digits to classify because they are uncorrelated with the background colours.
+      Successful Colour models may rely on colour being sampled in specific locations which never contain digit pixels (e.g.
+      a corner), or might learn to average across the image. They may learn to rely on the presence of some white pixels as
+      the dataset does not contain any solid-colour images. But they may not be generally immune to non-digit-like patterns
+      of white pixels.
+
+Background Colour Only (Colour-Only) To force the learning of different representations which cannot be related to
+      shape, size, or edge-effects of digits (and which may not be able to tolerate those features), the ‘Colour-Only’ dataset
+
+                                                                        12
+                                        Functional Alignment Can Mislead: Examining Model Stitching
+
+Figure A.2. Simulated “Clustered-Noise” data sample for ResNet-18 at Res Block 2, showing 64 7x7 feature maps. If this represented
+Class 0, all other Class 0 data instances would be noisy versions of this.
+
+      was created in which no digit image is present, only a solid background colour (plus 10% variation). As in ‘Colour’
+      (see Figure 2a), the base colour is the target.
+      The model may learn to rely on the colour in only one region of the image, or to assume the colour is constant
+      everywhere.
+Clustered-Noise (Noise) To produce a high-quality representation, without relying on specific, image-related features, we
+      generate synthetic datasets in the form of Clustered-Noise.
+      Passing an image through the first layers of a sender model produces a set of activations specific to the final layer
+      before the cut. For example, with ResNet-18 cutting just before Res Block 2 of the receiver, the sender output will be
+      64 channels of size 7x7 (Figure A.2.) The synthetic dataset must be matched in shape to the layer it is being stitched
+      at. As such, it has to be regenerated depending on the layer in question. It does not produce images, rather synthetic
+      activations. Each data instance is represented by a point in activation space based on its class, plus a random offset
+      vector. Thus each class is located in a cloud or ϵ-ball. For example, in the Res Block 2 example, each of the ten classes
+      will be centred around a different random point in 3136-dimensions.
+      There is no attempt to create structure within or between the feature maps, and it is not derived from actual activation
+      data. The high-dimensionality means it is likely that the clusters of data points will be highly separable, though this is
+      not enforced and has not been verified.
+      To ensure the same base representations are used for train and test datasets for a given layer or test, a
+      generate_activations() function was created (Alg 1). A train and test dataset can then be generated (Alg 2)
+      and accessed via a dataloader.
+
+B. Experimental details
+
+B.1. Stitching Between Models
+In an extension of the experiments by Bansal et al. (2021), we train models on different special datasets (Section A) and
+then stitch between them, assessing the change in accuracy.
+Hyperparameters for Model Training batch size=128, 4 Epochs, SGD, lr=1e-1, momentum=0.9, weight decay=1e-4.
+
+                                                                        13
+                                        Functional Alignment Can Mislead: Examining Model Stitching
+
+Algorithm 1 Generate Base Activations
+   Procedure GENERATE ACTIVATIONS(num classes, representation shape)
+   for c ← 0 to num classes − 1 do
+      activations[c] ← rand(representation shape)
+   end for
+   return activations
+   End Procedure
+
+Algorithm 2 Generate a dataset (unshuffled)
+   Procedure SYNTHETICDATASET(train, activations, noise)
+   if train then
+      SamplesP erClass ← 6000
+   else
+      SamplesP erClass ← 1000
+   end if
+   for c ← 0 to num classes − 1 do
+      data[c ∗ SamplesP erClass : ((c + 1) ∗ SamplesP erClass)] ← activations[c]
+      targets[c ∗ SamplesP erClass : ((c + 1) ∗ SamplesP erClass)] ← c
+   end for
+   data ← data + noise ∗ randn
+   data ← clamp(data, 0, 1)
+   End Procedure
+
+Hyperparameters for Model Stitching batch size=128, 10 Epochs, SGD, lr=1e-4, momentum=0.9, weight decay=1e-2
+
+Hyperparameters for Noise Stitching batch size=64, 4 Epochs, SGD, lr=1e-4, momentum=0.9, weight decay=1e-2
+
+Two versions of this are performed, one stitching from each different model into the Digit with Uncorrelated Colour receiver
+model, and the other stitching from that model as sender into each of the others. This will allow us to assess the symmetry of
+the stitching process. Recall that models trained on each of the datasets represents a model that could have arisen naturally
+by training on Correlated data, but with the advantage that we know something about features that may (or cannot) be
+learned.
+
+In this experiment, all image datasets are used to train models. Each of the models (including Digit) is then stitched into the
+Digit model at each of 5 points: (e.g. see Figure B.1).
+
+   • Cut before Res Block 1
+
+   • Cut before Res Block 2
+
+   • Cut before Res Block 3
+
+   • Cut before Res Block 4
+
+   • Cut before Linear Layer
+
+The accuracy and rank are then measured using the Correlated test dataset. Accuracy and rank are also measured for the
+whole, unstitched ‘Digit’ model using the Correlated test dataset for comparison. This test configuration is different from
+that used by Bansal et al. (2021) and Hernandez et al. (2022). They used the same dataset for training and testing their
+models. We wanted to examine the case where:
+
+  1. The dataset for training and testing the stitch is correlated (biased) - i.e. it contains class-correlated features other than
+      the intended learning target (the written digit): in general this will be the case, even if unintentionally. Recall that the
+      bias is that the background colour is correlated with the labelled digit.
+
+  2. The sender models are likely to have learned different features from the receiver.
+
+                                                                        14
+          Functional Alignment Can Mislead: Examining Model Stitching
+
+          Training “Colour” model
+
+“Colour”                                                                          Avgpool to
+dataset                                                                       Linear
+
+                                                                  Res Block 4
+                                                    Res Block 3
+                                       Res Block 2
+                         Res Block 1
+             Conv1 to
+
+          maxpool
+
+                                                            Training “Digit” model
+
+                        “Digit”                                                                                                     Avgpool to
+                        dataset                                                                                                 Linear
+
+                                                                                                                    Res Block 4
+                                                                                                      Res Block 3
+                                                                                         Res Block 2
+                                                                           Res Block 1
+                                                               Conv1 to
+
+                                                            maxpool
+
+                        “Colour” sender                                                       “Digit” receiver
+
+          “Correlated”                 Res Block 1  Stitch  Res Block 2                       Res Block 3                 Avgpool to
+             dataset       Conv1 to                                                                                   Linear
+                        maxpool
+                                                                                                           Res Block 4
+
+                                                               Measure
+                                                            Rank
+
+                                          Training & Evaluating Stitch on “Correlated” data
+
+Figure B.1. To illustrate the process, prior to any stitching, one model is trained on Colour dataset and another on the Digit dataset.
+Because it will be used a receiver, the Digit model is then evaluated on the Correlated dataset as a baseline, without any stitch layer. For
+stitching, the Correlated dataset is used: the train dataset for training the stitch, and the test dataset for evaluating functional performance.
+In this example, the Colour model is the sender and the cut is before Res Block 2. The Digit model is the receiver and the stitch layer
+connects just after its Res Block 2. Note that the Rank is measured at the first conv layer of the Digit receiver model
+
+                                                    15
+                                                                        Avgpool toFunctional Alignment Can Mislead: Examining Model Stitching
+                                                                    Linear
+                              “Clustered-Noise”
+                                                        Res Block 4dataset
+                                          Res Block 3
+                           Res Block 2 Measure      Stitch
+
+                       Rank                                                                                     “Digit” model
+               Res Block 1
+   Conv1 toFigure B.2. In this example, the Digit model is the receiver and the cut is before Res Block 2. Note that the Rank is measured at the first
+conv layer of the Digit receiver model. The shape of the ‘Clustered-Noise’ data must match the receiving layer.
+maxpool
+B.2. Stitching from Clustered-Noise
+We train ResNet-18 models for each of the image-based datasets described. For each model, the accuracy is recorded for the
+associated test dataset. The model is cut before the first ResNet block, and prepended with the stitch to create a stitch +
+receiver model. The stitch (only) is then trained on the Clustered-Noise dataset.
+The stitch + receiver model (Figure B.2) is then tested against the synthetic test dataset. This is repeated, cutting before each
+Res Block (a layer comprises 2 Basic Blocks. The skip connections are preserved), and before the final fully-connected
+linear layer. We also record the rank of the activations for the Clustered-Noise test dataset at the first convolutional layer
+in the receiver model after the stitch. This is to provide insight into how the stitched data is “perceived” by the different
+models. Also how that compares to when dataset images are processed by the model. For each test at each stitch point the
+synthetic dataset was regenerated to reduce the likelihood that results are due to one randomly selected set of points having a
+significant structure.
+
+B.2.1. EXAMINING THE RANK
+To gain further insight into how the representations being sent are “perceived” by the receiver, we analyse the rank at the
+first receiver layer. Note, however, that generally analysing the rank of two sets of representations cannot tell us anything
+meaningful about their informational similarity. We are simply arguing that the receiver cannot map the various sender
+representations in an entirely equivalent way if the rank in the first receiving layer is different.
+
+  1. Train several models each on a different, but related dataset. For example, Colour MNIST can create different
+      dataloaders of MNIST digits on coloured backgrounds where the colours correlate or do not correlate with the digit
+      class.
+
+  2. Stitch models to each other such that sender is from layer 1 to L, and receiver is from layer L+1 to Classifier. Train the
+      stitch.
+
+  3. Collect the representations at layer L+1 obtained using the test dataset. For estimating the rank, we follow Masarczyk
+      et al. (2023), who compute the singular values of the sample covariance matrix and threshold these at 1e-3 of the largest
+      singular value.
+
+B.3. Stitching Autoencoders
+We tested whether two autoencoders, trained on different datasets, could be stitched at their bottlenecks. In our experiments
+the stitching is placed immediately after the encoder. Autoencoders are typically trained using reconstruction loss, usually
+
+                                                                        16
+                                        Functional Alignment Can Mislead: Examining Model Stitching
+
+based on L1 or L2 distance between input and output images. However, when the input and output images come from
+different datasets, reconstruction loss becomes inappropriate since the images won’t match. To address this, we use two
+methods for learning to map images from one dataset to another, we refer to these approaches as class mapping and
+embedding mapping.
+
+Class Mapping When datasets have class labels, we can match corresponding classes across datasets. For example, with
+      CIFAR-10 and MNIST, we might pair classes like ‘Airplane’→‘0’, ‘Horse’→‘1’, etc. Within each class pair, we match
+      images randomly. During training, an image from one dataset is passed through its encoder, then through the stitch,
+      and finally through the decoder corresponding to the other dataset to generate an image. Our loss function is then the
+      L2 distance between the generated image and the image that has been paired with our input image.
+
+Embedding Mapping Alternatively we can match points one-to-one in the latent space of the autoencoders and train the
+      stitch to map points from one latent space onto points of the other. This involves first encoding batches from both
+      datasets through the respective encoders, producing features e1 and e2. The encodings e1 are then passed though
+      the stitch, producing features s. We then match points s to points e2 in a one-to-one manner such that the sum of
+      the distances is minimised. This mapping challenge is known as the linear sum assignment problem, which can be
+      efficiently solved using SciPy. Once this mapping has been found, our loss function is simply the sum of squared
+      distances between paired points in s and e2. The full calculation of this loss is detailed in Algorithm 3.
+
+Algorithm 3 One-to-One Autoencoder Stitching (Loss Calculation)
+   Procedure CALCULATE LOSS(AE1, AE2, stitch, dataset1, dataset2)
+   d1 ∼ dataset1
+   d2 ∼ dataset2
+   e1 ← AE1.encoder(d1)
+   e2 ← AE2.encoder(d2)
+   s ← stitch(e1)
+   cost matrix ← P airwiseDistances(s, e2)
+   i, j ← LinearSumAssignment(cost matrix)
+   return cost matrix[i, j]
+   End Procedure
+
+We trained autoencoders to map Fashion-MNIST to MNIST and CIFAR-10 to MNIST using these techniques. The
+architecture of our encoder includes convolutional layers, ReLU activations, and max pooling layers for downsampling.
+Following this, features are flattened and passed through a series of linear layers. The decoder follows the same structure but
+in reverse. The bottleneck is a vector of length 128 for all experiments. All parameters were frozen except for the stitch,
+which connected the encoder of one model to the decoder of the other. All autoencoders were trained for 25 epochs with a
+learning rate of 1e-4 using the Adam optimiser. Embedding Map stitching was trained for 25 epochs using SGD with a
+learning rate of 1e-5, momentum of 0.9, and weight decay of 0.01. The class mapping stitching was trained for 20 epochs
+using SGD with the same parameters except the learning rate was set to 1e-2. The learning rate and total epochs for each
+setting were tuned manually through analysis of the corresponding loss curves.
+
+Results can be seen in Figure 4. We can see that MNIST-like digits can be reconstructed even when inputs are from a
+different dataset. Class Mapping stitching tends to produce blurrier images. This is likely because, within each class pairing,
+images are matched randomly, which leads to an output that is essentially an average of all images in the class. Embedding
+Mapping stitching can produce cleaner MNIST images.
+
+B.4. Stitching on Real-world Datasets
+
+All stitches in Section 5 are trained for 20 epochs using SGD with learning rate and weight decay of 10−4, momentum of
+0.9, batch size of 128.
+
+B.5. Training for Birdsong Recognition
+
+We use publicly available code to train a ResNet-50 for birdsong recognition. We start with a random initialised ResNet-50
+(unlike the original code) and use SGD to train for 20 epochs. We perform a hyperparameter search over the learning rate
+
+                                                                        17
+   Functional Alignment Can Mislead: Examining Model Stitching
+
+Table B.1. Results of stitching two ResNet18 model together at different layers with different amounts of regularization λ. Model A was
+trained to predict the background colour on Colour-MNIST, whereas model B was trained to predict the digit.
+
+     Sender Model Receiver Model λ Block 1 Block 2 Block 3 Block 4 Block 5 Linear
+
+      0.01 99.90% 99.96% 100.00% 100.00% 100.00% 100.00%
+
+A  B  0.1 96.06% 99.09% 99.83% 59.96% 66.07% 99.92%
+
+      1 53.43% 22.23% 49.04% 96.66% 9.74% 9.74%
+
+      0.01 100.00% 100.00% 100.00% 100.00% 100.00% 100.00%
+
+A  A  0.1 98.74% 93.12% 88.16% 85.74% 23.07% 88.97%
+
+      1 54.12% 38.46% 81.59% 86.72% 10.28% 10.28%
+
+(10−4 to 10−1), weight decay (10−4 to 10−3) and momentum values (0.8 to 0.9). We believe that tuning the hyperparameters
+further would neither increase nor decrease the support for the point we are trying to make. If model stitching is a reliable
+model comparison method, it should work for a range of models from high-performing ones all the way to models trained
+without hyperparameter tuning.
+
+For training the final model the following configuration was used: learning rate of 10−2, weight decay of 10−4 and
+momentum of 0.9. Note that in the original manuscript we accidentally reported a higher baseline for the birdsong model.
+However, in terms of layer stitch compatibility, all results remain the same (top-1 compatibility starts before the linear layer
+and top-5 compatibility starts before the 5th residual block).
+
+B.6. Regularizing the Stitch
+
+To explore different types of stitching, we experiment with training a stitching with additional regularization. The first
+network A is a ResNet18 trained on Colour-MNIST digits, but with the label corresponding to the background colour. The
+second network B, also a ResNet18, is trained on the same images, but now the labels correspond to the digit instead of the
+background colour. We will stitch these networks together with a stitch S at layer l such that A is our sender network and B
+is our receiver. For the sake of comparison we will also look at stitching network A into itself.
+
+These stitches will be trained using BCE loss with an additional L1 regularization term on the parameters of the stitch. So
+our loss for this will be:
+
+      L = LBCE + λ∥θS∥1,                                        (1)
+
+where LBCE is our original loss function, λ is a scalar controlling the strength of our regularization, and θS are the
+parameters of the stitch. Results of additional L1 regularization are shown Table B.1 where Block 3, Block 4, and so on
+refer to the layer at which the stitching took place. Percentages refer to accuracy of the final model. When our regularization
+strength is λ = 0.01 we are still able to stitch A into B. This is not true for larger values of λ, but larger values also prevents
+A being stitched into itself, suggesting that the regularization is too strong. In practice, we see that even for λ = 0.01, the
+regularization term still dominates the loss. This demonstrates that even with relatively strong L1 regularization our stitching
+results are still valid.
+
+We repeat this experiment with weight decay and λ both set to 0. Weight decay is L2 regularization, so this setting
+corresponds to training the stitch with no regularization at all. For this setting we achieve above 99% stitching accuracy for
+all layers, suggesting that our results are robust across different types of stitches, both with and without regularization.
+
+C. Different Senders to Digit Receiver under Various Architectures
+
+C.1. ResNet-18: Stitching to Digit
+
+As mentioned in Section 7 and Appendix B we used the Digit with Uncorrelated Colour (Digit) model as both receiver and
+sender in the stitch, and also used Clustered-Noise as a synthetic sender model. Here we present those extended results.
+
+In Table C.1 we can see that the base accuracy of the Digit network is 0.978. When stitching Colour-Only into this, accuracy
+improves to 0.999, indicating that Colour-Only is “better than” Digit. However, the base accuracy (against the same test set
+
+      18
+       Functional Alignment Can Mislead: Examining Model Stitching
+
+       Table C.1. Accuracy of trained ResNet-18 models against ‘Correlated’ dataset (average of 5 initialisations).
+
+                            Acc. with stitch before Res Block 1
+
+       Model         Base Accuracy ‘Digit’ is Receiver ‘Digit’ is Sender
+
+       Correlated    0.999  0.999                                                0.981
+       Digit         0.978  0.995                                                0.996
+       Colour        1.000  0.999                                                1.000
+       Colour-Only   0.686  0.999                                                0.985
+
+1.000                                                                       250                   Stitched Model
+                                                                                                  Correlated
+0.995                                                                       200                   Digit
+Test Accuracy
+                                                              Feature Rank0.990150                Colour
+                                                                                                  Baseline
+0.985                                                                       100                   Colour-Only
+
+0.980                                                                       50                    Noise
+
+Res Block 1 Res Block 2 Res Block 3 Res Block 4 Linear R0es Block 1 Res Block 2 Res Block 3 Res Block 4 Linear
+
+       (a) Accuracy                                                                     (b) Rank
+
+Figure C.1. (a) Test accuracy on Correlated data when the ‘Noise’, and each of the trained ResNet-18 models are stitched into the Digit
+receiver (baseline is the accuracy of the original Digit model on test Correlated data). This extends Figure 2b by including Colour-Only and
+Clustered-Noise. Shaded areas cover 100% of results to highlight the variability. (b) Rank analysis of the stitched models’ representations.
+Shaded areas mark 1 standard deviation.
+
+of Correlated) of the Colour-Only network is 0.686, but when stitching Digit into it as a sender, the accuracy improves to
+0.985, indicating that Digit is “better than” Colour-Only. This contradiction constitutes a problem for the claim that model
+stitching can be used to ascertain relative quality. Note also that stitching the Digit model into itself produces a performance
+improvement from 0.978 to 0.995 which challenges the belief that the 1 × 1 convolution with batchnorms stitch (Bansal
+et al., 2021) does not add capacity.
+
+In Figure C.2 we illustrate the fact that for each initialisation the stitched Digit model outperforms the unstitched baseline.
+Shown on the plot are the highest baseline to the lowest stitch accuracy in one model. Baseline = 0.985, Acc min = 0.986.
+Also show is lowest accuracy of any stitch in any experiment from its baseline. Baseline = 0.978, Acc min = 0.984. All
+stitched Correlated and Colour models perform above all baseline results.
+
+C.2. VGG19: Stitching to Digit
+
+In a variant of the ResNet-18 experiment from 4.1 we stitched from differently biased VGG19 models into ones trained on
+Digit data, using Correlated data to train and test the stitch (repeated for 4 differently initialised models). This is indicative
+of comparing models which have learned different biases and are evaluated on biased data. As can be seen in Figure C.3
+most models show approximately equivalent, or improved performance at all stitch points even though the information
+represented is different.
+
+We believe that being unable, sometimes, to stitch differently biased models is irrelevant: the issue is that if it is sometimes
+possible to form such a stitch then one cannot use stitch-compatibility to identify equivalent information.
+
+C.3. LeNet-like Models: Stitching to Digit
+
+During the rebuttal period we started extending the stitching experiments from Section 4.1 with a LeNet-like architecture
+compatible with 28 × 28 input size. Note that we only train the stitch for 10 epochs so more stitch compatibilities could be
+found. However, for the purpose of our paper it suffices to show that stitching compatibility exists. Results are presented
+in Table C.2
+
+Note that during the rebuttal we also tried stitching randomly initialised senders in the LeNet-like case. For the setting we
+
+                                                                        19
+                                            Functional Alignment Can Mislead: Examining Model Stitching
+
+                                     1.000
+
+                      Test Accuracy  0.995  Min Stitch Gain from Best Baseline
+                                            Min Stitch Gain for Worst Acc
+                                     0.990
+
+                                     0.985
+
+                                     0.980
+
+                                     Res Block 1 Res Block 2 Res Block 3 Res Block 4 Linear
+
+Figure C.2. As in Figure 2b we show the same Correlated, Colour and Digit results. We mark the stitched performance compared with
+baseline as Stitch Gain (i.e. negative Stitch Penalty) for two cases.
+
+               1.000                                                                                     Stitched Model
+
+Test Accuracy  0.995                                                                                     Correlated
+                                                                                                         Digit
+                                                                                                         Colour
+               0.990                                                                                     Colour-Only
+
+               0.985                                                                                     Mix
+                                                                                                         BW
+
+               0.98f0eatures.2 features.10 features.23 features.30 classifier.0
+
+Figure C.3. Accuracy of variously trained VGG19 Sender models stitched into Digit model at 5 different points in the network using
+Correlated dataset. Dashed grey line shows baseline performance of whole Digit model against Correlated dataset. Shaded areas cover
+100% of results to highlight the variability. Mix is a dataset comprising examples from MNIST, Correlated, and Colour-Only. BW is
+greyscale-MNIST
+
+                                            20
+Functional Alignment Can Mislead: Examining Model Stitching
+
+Table C.2. Accuracy (%) when stitching the model trained purely on colour patches (Colour) and the model trained on correlated digit and
+colour (Correlated) with a receiver trained on grayscale MNIST (Digit). Stitching compatibility can be easily found when stitching at at
+least one layer.
+
+Conv 1 Avg Pool 1 Conv2 Avg Pool 2 Reference
+
+  Colour to Digit 76.94    76.68       97.94     97.34       88.19
+Correlated to Digit 79.11  78.66       93.24     92.90       88.19
+
+Table D.1. Accuracy (%) of trained models against same test dataset (average of 3 initialisations). Values shown to aid reading of
+Figure D.1a
+
+Model                             Test Accuracy
+
+‘Correlated’ 100
+
+‘Digit’                           98
+
+‘Colour’                          100
+
+‘Colour-Only’ 100
+
+ran, we found that the trained sender was successfully stitching, whereas the randomly initialised sender failed to stitch.
+Re-running the experiment with different seeds after the rebuttal period we found that there were cases where randomly
+reinitialising also led to a successful stitch. See Appendix G.5 for a discussion on stitching with randomly initialised senders.
+
+D. Further Experiments with Clustered-Noise
+
+D.1. VGG19 Results for Clustered-Noise Senders
+There is a reasonable question about whether ResNet architectures may respond to model stitching in a particular way
+because of the skip connections. To address this, we extended the testing with Clustered-Noise data to include VGG19
+models. 3 initialisations were run. 50 Epochs for model and stitch training: batch size=64, SGD, lr=1e-2, momentum=0.9,
+weight decay=1e-4.
+Each trained model was cut and stitched at the following points. We decided to take a sample rather than testing every
+convolutional layer to reduce experimental duration (Figure D.1a):
+
+   • Whole Model (image data)
+
+   • Cut before features.2 (Noise data)
+
+   • Cut before features.10
+
+   • Cut before features.23
+
+   • Cut before features.30
+
+   • Cut before classifier.0
+
+We record the rank of the activations for the Clustered-Noise test dataset at the first convolutional layer in the receiver model
+after the stitch (Figure D.1b).
+Figure D.1a and Table D.1 show that ‘Digit’ has improved results with stitching in the ‘Clustered-Noise’ dataset. ‘Correlated’
+maintains accuracy. This is in accordance with the results for ResNet.
+Most notably, ‘Colour’ and ‘Colour-Only’ show very varied results with stitching. It is not clear from this limited experiment
+whether that is due to the network not being stitching-compatible with the synthetic Clustered-Noise data, or if it is a
+manifestation of the random variability shown by Csisza´rik et al. (2021) (i.e. stitching from different stitch initialisations
+can yield very different stitching-penalties).
+
+                                                                        21
+Functional Alignment Can Mislead: Examining Model Stitching
+
+1.0                                                                                          RCV Model
+0.9                                                                           300            Correlated
+0.8                                                                                          Digit
+0.7
+
+   Whole features.2features.10features.23features.30classifier.0
+Test Accuracy                                                                 200            Colour
+                                                                Feature Rank                 Colour-Only
+                                                                                             Baseline
+                                                                              100
+
+                                                                              0
+                                                                              features.2 features.10 features.23 features.30 classifier.0
+
+(a) Accuracy                                                                       (b) Rank
+
+Figure D.1. (a) Accuracy of VGG19 models trained on the four dataset variants when Clustered-Noise is stitched at each of 5 different
+points in the model. The first sample shown (‘Whole’) is for the uncut models tested with their own test datasets. Shaded areas cover
+100% of results to highlight the variability. Markers show individual measurements. (b) Ranks of activations just after the stitch from
+Clustered-Noise test dataset. ‘Baseline’ shows ranks at the same points of the uncut ‘Digit’ trained VGG19 models when presented with
+‘Digit’ test data. Shaded areas mark 1 standard deviation.
+
+We carried out a small investigation using the model which performed worst at features.2 stitching. Trying multiple stitch
+initialisations gave accuracies in the range ∼ 40% − 80%. Trying multiple Clustered-Noise dataset initialisations gave
+similar results. Lower and Higher learning rates were also tried with no change. It may be that the training parameters
+are wrong as sometimes a good stitch-training loss increases between epochs, and we did not optimise stitch training
+hyperparameters. However, it may be that some models reach points in the loss landscape which it is hard to match when
+stitching from ‘Noise’ data.
+
+This may represent a difference between ResNet-18 and VGG19 architectures. Two possible reasons (which deserve to be
+investigated) are:
+
+Skip Connections ResNet skip connections may make stitching easier.
+
+Dimensionality VGG19 at features.2 has 64 feature maps of size 32x32, whereas Res Block 2 of ResNet-18 has 64 feature
+      maps of size 7x7. The 1x1 Convolutional stitch layer can only learn to create linear combinations of its input feature
+      maps and it may be harder to create necessary patterns of activation when (in VGG19) the maps have ∼ 21 times as
+      many units.
+
+The most obvious feature of the rank information in Figure D.1b is the difference between ranks in the unstitched ‘Digit’
+network (presented with ‘Digit’ data) and the stitched networks presented with ‘Noise’ data. This demonstrates that being
+stitched to a sender can produce similar functional results in terms of overall accuracy, while internal information is different.
+
+D.2. ResNet-50: Stitching ‘Clustered-Noise’ into ImageNet
+
+It can be argued that Colour MNIST-trained ResNet-18 models can be stitched from ‘Noise’ only because they are simple.
+To investigate this, we use ResNet-50 from torchvision pretrained on IMAGENET1K V1. The model is cut after the avgpool
+layer, before the final fully-connected linear layer, and prepended with the stitch to create a stitch + receiver model. The
+stitch (only) is then trained on the ‘Noise’ dataset, generated for 1000 classes. The stitch + receiver model is then tested
+against the synthetic test dataset. This is repeated, cutting before other ResNet-50 Res Blocks (Table 1). At each Res Block
+from 3 onwards, accuracy exceeded the ImageNet baseline.
+
+The experiment was repeated for some of the later layers for IMAGENET1K V2 (see Table D.2). Top-1 results only. Again,
+at these layers stitch performance exceeded the baseline (80.86%)
+
+D.3. ResNet-18: Increasing the Cluster Size of ‘Clustered-Noise’
+
+In the ‘Noise’ stitching experiments described above (Appendix B.2, D.1, D.2), the radius of each cluster was 0.1, resulting
+in tightly grouped class representations which are likely to be separable. We hypothesise that it is this separability which
+leads to high performance when stitching. To investigate, stitching was repeated with ResNet-18 for one MNIST and one
+
+                                                                        22
+Functional Alignment Can Mislead: Examining Model Stitching
+
+Table D.2. Accuracy of ImageNet pretrained ResNet-50 models (IMAGENET1K V2) against ‘Noise’ dataset. Numbers of epochs adjusted
+to reduce processing time.
+
+                                                  Cut before layer Acc. (%) Epochs
+
+Res Block 3        99.8       3
+
+Res Block 4        100        3
+
+AvgPool            100        10
+
+Linear             100        10
+
+Table D.3. Varying the radius of noise clusters at one stitch point for two trained models. Original model accuracy = MNIST: 98%,
+Colour-Only: 100%
+
+                                                                          Acc. (%)
+
+Radius MNIST Colour-Only
+
+0.5          99.7       99.8
+
+0.9          97.3       97.8
+
+0.99 96.4 96.3
+
+1.0          96.0       96.6
+
+Colour-Only model cut before Res Block 3 for varying noise radii. For each model, the cluster centre positions were kept
+consistent while the data points around them were regenerated. Increasing the Clustered-Noise radius decreased accuracy
+(see Table D.3) meaning that it is possible to tune noise to have a stitching penalty above, below, or matching the original
+network. We argue that representational cluster shape may account for the quality of stitches between real-world networks.
+
+D.4. Misaligned Class Size
+
+During the rebuttal period we experimented with stitching a smaller number of clusters (classes) into the pretrained Stylized
+and ImageNet receivers. We considered 10, 5, and 2 random noise clusters and successfully managed to stitch these into the
+receiver. As expected, the fewer classes represented, the easier it was to achieve stitch compatibility. In the case of stitching
+two classes to the ImageNet model, for example, 100% accuracy was achieved within only one epoch of training.
+
+E. Different Offsets for Remapping Classes
+
+In subsection 5.3 we describe experiments in which a trained network is cut and self-stitched; the original model’s dataset is
+used to train the stitch, but with an offset in the class labels. We present and discuss further results here.
+
+Performance was sometimes reduced in earlier layers (see Figure E.1) for some datasets, but note that Colour-Only could
+sometimes achieve perfect performance even when stitching before Res Block 1.
+
+BW (greyscale-MNIST) always suffered some degradation at early layers, but later in the network was successful. As a short
+investigation, we ran the MNIST offset tests for a single model at all 10 offsets and found similar curves for all offsets other
+than zero. We hypothesise that this is due to different classes having very varied clustering at early layers, but investigating
+this is beyond the scope of this paper.
+
+F. Alternative Baselines
+
+As described in section 5, we present stitching data with reference to both baselines in Table F.1. Note that in the main body
+of the paper we choose the most competitive between the two. While this is usually the performance of the receiver network
+on the receiver task, there exists one exception. Stylized performs better on ImageNet than on Stylized and therefore we
+choose the performance on sender’s task as the baseline. Note that with the alternative baseline we observe full stitch
+compatibility.
+
+                                                                        23
+                                                                 Functional Alignment Can Mislead: Examining Model Stitching
+
+               1.0                                                                 1.0                                                                 1.0
+
+Test Accuracy                                               Class offset = 1                                                    Class offset = 2                                                    Class offset = 3
+               0.9                                               Correlated        0.9                                               Correlated        0.9                                               Correlated
+                                                                 Colour-Only                                                         Colour-Only                                                         Colour-Only
+                                                                 BW                                                                  BW                                                                  BW
+               0.8                                                                 0.8                                                                 0.8
+               Res  Block  1  Res  Block  2  Res  Block  3  Res  Block  4  Linear  Res  Block  1  Res  Block  2  Res  Block  3  Res  Block  4  Linear  Res  Block  1  Res  Block  2  Res  Block  3  Res  Block  4  Linear
+
+                                   (a) Offset 1                                                        (b) Offset 2                                                        (c) Offset 3
+
+Figure E.1. Test accuracy shown for three initialisations of three datasets stitching before each of 5 layers and for different class offsets.
+Shaded regions cover 100% of results to highlight variability
+
+Table F.1. Results of stitching various models into and from ImageNet. We highlight in bold the representations that were stitch-compatible.
+Note that “Block X” and “Linear” means that we are stitching before the Xth residual block and the classification layer respectively.
+Sender Baseline is the performance of the receiver on the given task (sender’s task), while Receiver Baseline is the performance of the
+receiver on the receiver task. *These are the accuracy measurements we obtain when resizing the test samples to 256, as described in the
+paper. We can only match (Geirhos et al., 2019)’s reported top-5 accuracy of 16.4% (with a corresponding 73.8% top-1 accuracy) when
+removing the resize operation.
+
+                                                                        Block 1    Block 2             Block 3               Block 4           Block 5      Linear          Sender                  Receiver
+                                                                                                                                                                           Baseline                 Baseline
+
+                    ImageNet to                   Top-1 58.39                           58.61          61.53                    65.31          70.43 74.34                        60.18                  56.18
+                      Stylized                    Top-5 80.57                           80.61          83.28                    86.13          89.78 91.93                        82.60                  78.96
+
+                      Stylized                    Top-1 10.61                           11.23          17.60                    30.26          45.45 49.17 7.15∗                                         76.13
+                    to ImageNet                   Top-5 22.65                           23.08          34.34                    52.52          69.57 72.30 15.87∗                                        92.86
+
+               10-class ImageNet Top-1 15.40                                            19.00          25.00                    46.20          75.60 88.40                        6.59                   77.98
+                                                                                        68.40          76.40                    88.60          98.60 99.80                        50.40                  96.07
+                    to Birdsong                   Top-5 63.80
+
+                    Clustered-Noise Top-1 4.77                                          4.11 96.59                              100               100 100                            –                   76.13
+
+                    to ImageNet Top-5 13.51 11.99 99.77 100                                                                                       100 100                            –                   92.86
+
+G. Comparison with Randomly Initialised Sender Networks
+
+As part of the evaluation of the potency of the stitching architecture, Bansal et al. (2021) examined the performance when
+stitching from a randomly initialised sender network, showing that stitching penalty increases (accuracy decreases) as one
+stitches at later points in the networks.
+Importantly, note that this is not given as a precondition for the application of stitching to model comparisons. Bansal
+et al. (2021) simply perform this experiment for one of the many architectures they consider as a way of confirming that the
+stitching layer “is not performing learning”. Nonetheless, we examined it in some of our settings. We conclude this series of
+experiments with a discussion (Appendix G.5) on how they align with the perspective presented in this paper.
+
+G.1. ResNet-18: Randomly Initialised Sender to Digit
+
+We extend the setting of Figure C.1 by attempting to stitch randomly initialised (untrained) networks into a Digit receiver
+using Correlated dataset. This was repeated for the same receiver but using a different seed for the random network and
+stitch process (see Figure G.1).
+
+As was seen in Figure C.1a, stitching improves performance relative to the baseline. The randomly initialised models
+perform better than the Digit model, but less well than Correlated, Colour, Colour-Only and Clustered-Noise.
+
+G.2. ResNet-18: Randomly Initialised Sender to BW Receiver with Colour-Only Dataset (and to Colour-Only
+      Receiver with BW Dataset)
+
+In subsection 4.2 we indicated that using Colour-Only senders and stitch training datasets with Greyscale-MNIST receivers
+results in 100% accuracy. For comparison, we tested for a single Greyscale-MNIST receiver stitching a randomly initialised
+
+                                                                        24
+                      Functional Alignment Can Mislead: Examining Model Stitching
+
+               0.995                                        Stitched Model
+                                                            Digit
+Test Accuracy                                               Randomly Initialised
+               0.990                                        Baseline
+
+               0.985
+
+               0.980
+                    Layer 1 Layer 2 Layer 3 Layer 4 Linear
+
+Figure G.1. ResNet-18 trained on Digit compared with stitching from two randomly initialised sender networks. Stitch training and
+evaluation used Correlated dataset. Digit plots are for self-stitching. Baseline is whole Digit model tested with Correlated dataset
+
+          1.0
+
+Test Accuracy  0.9
+
+               0.8    Stitched Model
+
+               0.7    Randomly Initialised
+               0.6    Colour-Only
+                      BW
+
+               Layer 1 Layer 2 Layer 3 Layer 4 Linear
+
+Figure G.2. ResNet-18 trained on Colour-Only stitching from a randomly initialised sender network - compared with a sender trained on
+BW data. Stitch training and evaluation used Greyscale-MNIST (BW) dataset. Also shown is self-stitching with Colour-Only as its own
+sender, also on BW dataset.
+
+sender with Colour-Only data and found that it also achieved 100% accuracy at each layer. The same result was obtained
+self-stitching the same Greyscale-MNIST model as its own sender.
+
+We also did the complementary experiment Colour-Only receiver, and Greyscale-MNIST datasets for the stitching (Fig-
+ure G.2). The Randomly initialised model underperforms relative to the BW sender model as expected, given that the
+BW-trained sender model should be able to separate BW data. It also outperforms the Colour-Only sender stitched into
+itself as a receiver.
+
+G.3. VGG19: Randomly Initialised Sender to Digit with Digit Dataset
+
+For an arbitrarily selected VGG19 model trained on Digit dataset, we found baseline performance was very similar to
+stitching the network to itself at each layer (Figure G.3). By comparison, stitching with Digit dataset from an uninitialised
+sender shows performance degrades with the depth of stitch as expected.
+
+Varying the experiment to more closely mirror the ResNet-18 work in Figure G.1 and the VGG19 work in Figure C.3, we
+find that training the Digit stitch on the Correlated dataset gives an improvement in performance relative to the baseline of
+Digit model tested on Correlated dataset. However, this is outperformed by the uninitialised sender (see Figure G.4).
+
+G.4. Linear Probing Randomly Initialised Senders
+
+To give more perspective on the results obtained in this section, we carry out an additional set of experiments where we
+verify the level of linear separability of representations obtained by passing datasets through randomly initialised senders.
+
+                                                                        25
+                      Functional Alignment Can Mislead: Examining Model Stitching
+
+               0.98
+
+Test Accuracy  0.96
+
+               0.94   Stitched Model
+
+               0.92   Digit
+                      Randomly Initialised
+               0.90 baseline
+
+               features.2 features.10 features.23 features.30 classifier.0
+
+Figure G.3. VGG19 model (trained on Digit) stitched to itself (using Digit dataset) compared with stitching in an uninitialised network
+using the same dataset. Baseline is whole Digit model on Digit dataset.
+
+               1.000
+
+                                            Stitched Model
+Test Accuracy  0.995                        Digit
+                                            Randomly Initialised
+                                            baseline
+               0.990
+
+               0.985
+                  features.2 features.10 features.23 features.30 classifier.0
+
+Figure G.4. VGG19 model (trained on Digit) stitched to itself (using Correlated dataset) compared with stitching in an uninitialised
+network using the same dataset. Baseline is whole Digit model tested with Correlated dataset.
+
+                                      26
+                 Functional Alignment Can Mislead: Examining Model Stitching
+
+   Colour-Only                 Conv 1    Avg Pool 1    Conv2     Avg Pool 2
+Greyscale MNIST
+                             95.33±6.00  98.88±0.76  96.94±2.68  88.20±9.07
+                             95.12±0.85  92.78±0.42  90.04±0.43  86.15±0.91
+
+Table G.1. Test accuracy when probing untrained LeNet-like senders for Colour-Only and Grayscale MNIST data.
+
+   Colour-Only    Block 1     Block 2     Block 3     Block 4     Block 5       Linear
+Greyscale MNIST
+                  100±0.00    100±0.00    100±0.00    100±0.00    100±0.00     100±0.00
+                 97.94±0.07  98.33±0.09  98.26±0.11  97.01±0.21  93.77±0.40   82.88±0.49
+
+Table G.2. Test accuracy when probing untrained ResNet-18 senders for Colour-Only and Grayscale MNIST data.
+
+To do so, we linearly probe these representations. That is, we put the representations through a linear layer and attempt to
+classify these. We train the probe (linear layer) for 20 epochs, using SGD with a momentum of 0.9 and weight decay of
+10−4, learning rate of 10−3, batch size of 128. We perform 5 runs and report the mean and standard deviation.
+
+Note that we did not perform any hyperparameter tuning and it is possible that training for longer or with more carefully
+chosen hyperparameters, a higher degree of linear separability might be found. We simply want to show that good separability
+can be found. We perform these experiments for the Colour-Only and Greyscale MNIST datasets. The results for LeNet-like
+untrained senders are given in Table G.1, while those for untrained ResNet-18 senders can be found in Table G.2.
+
+G.5. Discussion on Randomly Initialised Senders
+
+In this section we have seen that there are cases in which untrained versions of the models we considered can be successfully
+stitched (and also cases in which this was not achieved with the standard hyperparameters and training budget.) Are our
+results diminished by cases where stitching from an untrained model was possible? We believe they further amplify the
+central message of our paper.
+
+Consider the case of putting Colour-Only data through untrained convolutions. As we have seen, there are many cases
+where colour information leaks through untrained convolutions, and representations remain clustered (see Appendix G.4
+where we verify this in a couple of cases with a linear probe). In the light of the experiments in Section 5, we argue that
+stitch compatibility of untrained senders can be understood from the perspective of clustering. As long as a mapping can
+be found, we can abstract away from the information that the representational clusters were originally based on. Whether
+it is birdsongs, natural images, stylised images, random clustered noise, or even colour patches passed through untrained
+convolutions, the stitch need only find a mapping to the receiver. The stitch and receiver become a complex but fixed probe.
+
+                                         27
+

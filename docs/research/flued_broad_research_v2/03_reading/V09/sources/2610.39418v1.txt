@@ -1,0 +1,2298 @@
+arXiv:2610.39418v1 [cs.LG] 29 Oct 2026  LinQuant: Functional Invariances for Low-Precision Linear Recurrences
+
+                                             LINQUANT: FUNCTIONAL INVARIANCES FOR
+                                                LOW-PRECISION LINEAR RECURRENCES
+
+                                                             Neehal Tumma* 1 Philipp Nazari* 2 3 4 5 Rohan Cherukuri1
+                                                                           Daniela Rus1 T. Konstantin Rusch2 4 5
+
+                                                                      1MIT CSAIL 2Max Planck Institute for Intelligent Systems
+                                                                   3ETH Zu¨rich 4Tu¨bingen AI Center 5ELLIS Institute Tu¨bingen
+
+                                                                                   ABSTRACT
+
+                                                   Linear recurrences are emerging as practical alternatives to softmax attention in
+                                                   large language models, appearing in both standalone and hybrid architectures.
+                                                   However, despite their rapid emergence, low-precision inference remains much less
+                                                   developed for these models than for softmax attention. During prefill, chunkwise-
+                                                   parallel algorithms cast much of the recurrence as dense matrix multiplications,
+                                                   suggesting a natural path to low-precision execution. Simply quantizing these
+                                                   operations in their native form, however, can be fragile. In this work, we identify
+                                                   functional invariances that preserve the full-precision computation while making
+                                                   the operands more amenable to quantization. Building on this observation, we intro-
+                                                   duce LinQuant, a framework for low-precision recurrent prefill based on seven such
+                                                   invariances, including rotations, diagonal rescalings, and alternative placements of
+                                                   recurrent decay and write factors. We derive when these transformations remain
+                                                   valid across common recurrence families spanning linear, gated, and delta-rule
+                                                   updates, and show that they provide complementary degrees of freedom for im-
+                                                   proving low-precision accuracy. Finally, we translate this framework to production
+                                                   by augmenting SSDi8, an existing low-precision prefill pipeline for Mamba-2, with
+                                                   the applicable invariances. LinQuant improves perplexity at matched latency on
+                                                   Mamba-2 1.3B, 2.7B, and 8B and Nemotron-H 8B, demonstrating the practical
+                                                   utility of invariance-based quantization for recurrent models.
+
+                                                                                   github.com/ntumm120/LinQuant
+
+                                        1 INTRODUCTION
+
+                                        Linear recurrences offer an efficient, sub-quadratic alternative to softmax attention for sequence
+                                        modeling (Katharopoulos et al., 2020; Dao & Gu, 2024; Yang et al., 2025; Team et al., 2025).
+                                        They summarize past tokens in a fixed-size state, avoiding the growing key-value cache of softmax
+                                        attention, and are increasingly used in both standalone and hybrid language models (NVIDIA, 2025;
+                                        Amini et al., 2025; Peng et al., 2025; Beck et al., 2024). For prefill, these models are typically
+                                        evaluated using chunkwise-parallel algorithms, which process blocks of tokens in parallel through
+                                        dense matrix multiplications while propagating a recurrent state between them (Dao & Gu, 2024;
+                                        Yang & Zhang, 2024). This mirrors the blockwise organization of efficient attention kernels such
+                                        as FlashAttention and makes recurrent prefill naturally amenable to low-precision execution.
+
+                                        Low-precision attention has been studied extensively, with optimized integer and floating-point
+                                        kernels now forming a mature part of the Transformer inference stack (Zhang et al., 2025; Shah et al.,
+                                        2024). In contrast, low-precision kernels for linear recurrences remain largely unexplored. Prior work
+                                        has studied quantization of recurrent models (Xu et al., 2025; Chiang et al., 2025), largely targeting
+                                        the projections and activations surrounding the Mamba-2 recurrence. SSDi8, on the other hand,
+                                        executes the recurrent computation in low precision, demonstrating an efficient INT8 implementation
+                                        specific to Mamba-2 (Kim et al., 2026). We instead study the space more generally, investigating
+                                        low-precision computation across the design space of modern linear recurrent architectures.
+
+                                             *Equal contribution. Correspondence: ntumma@mit.edu.
+
+                                                                                                   1
+LinQuant: Functional Invariances for Low-Precision Linear Recurrences
+
+Table 1: Applicability of the seven invariances introduced in Section 3 to common linear recurrences.
+×: not applicable. ✓: applicable. (✓): applicable under constraints.
+
+Nr. Transformation             LA Mamba-2 GLA DN GDN KDA
+
+(1/7) RQK                      ✓  ✓  (✓) ✓ ✓ (✓)
+(2/7) DQK
+(3/7) RV                       ✓  ✓  ✓×× ×
+(4/7) DV
+                               ✓  ✓  ✓✓✓ ✓
+
+                               ✓  ✓  ✓✓✓ ✓
+
+(5/7) (Γ[→i] )η, (Γ→ [i] )1−η  ×  ✓  (✓) × ✓ (✓)
+
+(6/7)  E[ηi], E1[i−] η         ×  ✓  ✓×✓ ✓
+(7/7)  Bξ[i], B[1i−] ξ
+                               (✓) (✓) (✓) ✓ ✓ ✓
+
+Executing sequence mixers in low-precision can come at the cost of performance. One powerful lever
+to mitigate this is functional invariances. Such transformations preserve the full-precision operator
+while changing the numerics presented to a quantizer. Figure 12 in the appendix illustrates this princi-
+ple through write-factor absorption. We distinguish two broad classes. Mixer-agnostic invariances act
+on the residual stream or individual linear layers and do not depend on the algebra of the sequence
+operator (Xiao et al., 2023; Ashkboos et al., 2024; Liu et al., 2025). Because these transformations are
+largely independent of the mixer, they transfer naturally to recurrent architectures and have already
+been adopted by methods such as MambaQuant and Quamba2 (Xu et al., 2025; Chiang et al., 2025).
+Mixer-specific invariances instead rely on the sequence operator itself, and can be classified as either
+mixer-external or mixer-internal. The former materialize as changes of basis and can be applied
+outside of the sequence-mixer, while the latter are functions of a recurrence’s algorithmic realization
+(Figure 1). Transformer PTQ has exploited such invariances within softmax attention, for example
+through transformations of its query, key, and value representations (Ashkboos et al., 2024; Liu et al.,
+2025). In contrast, the mixer-specific invariances of linear recurrences have yet to be characterized.
+
+Linear recurrences present a qualitatively different invariance structure from softmax attention. Their
+transformations must remain consistent with a state that is updated and carried across chunks, while
+decay, gating, and delta-rule updates impose additional algebraic constraints. At the same time, these
+same mechanisms create new degrees of freedom that have no direct attention analogue. We therefore
+ask which attention-inspired invariances survive in recurrences, what new restrictions arise from the
+recurrent computation, and what additional invariances are unique to linear recurrences. Our main
+contributions are summarized as follows:
+
+  • We introduce LinQuant, a framework for computing low-precision linear recurrences based on
+    both mixer-agnostic and mixer-specific functional invariances, and characterize their applicability
+    across common recurrent architectures.
+
+  • Across a controlled set of linear recurrences, we show how recurrence structure, query-key
+    normalization, quantization scale granularity, and state-storage basis determine which functionally
+    equivalent realization is most robust to low precision.
+
+  • We implement LinQuant in INT8 chunkwise kernels and fuse query–key transformations into
+    SSDi8 without increasing measured prefill latency.
+
+  • We apply LinQuant to production W4A8 models with INT8 recurrent states, improving over
+    SSDi8 on Mamba-2 1.3B, 2.7B, and 8B and Nemotron-H 8B.
+
+2 BACKGROUND AND PRELIMINARIES
+
+2.1 LINEAR RECURRENCES
+
+Causal softmax attention (Vaswani et al., 2017) computes
+
+                                     ot = V1⊤:t softmax K1:tqt/ Dk ,
+
+from queries and keys qt, kt ∈ RDk and values vt ∈ RDv , where Dk and Dv denote the state
+(key/query) and value dimensions, respectively. Linear attention replaces the nonlinear softmax
+
+                                                           2
+LinQuant: Functional Invariances for Low-Precision Linear Recurrences
+
+operator with an unnormalized linear kernel (Katharopoulos et al., 2020). In its simplest form,
+
+associativity allows past keys and values to be summarized in a fixed-size matrix-valued state
+
+St ∈ RDv×Dk ,                     St = St−1 + vtk⊤t ,
+
+                                                       ot = Stqt.
+
+Modern linear recurrences extend this basic update with decay, write gating, and delta-rule correc-
+
+tions (Dao & Gu, 2024; Yang et al., 2024b;a; Team et al., 2025). We capture these axes through the
+
+common recurrence          St = St−1 Λt I − δ βt ktk⊤t + βt vtkt⊤,
+
+                                                                                                         (1)
+
+where βt > 0 (βt ∈ (0, 2) for the delta rule), ∥Λt∥ ≤ 1, and δ ∈ {0, 1} is fixed for a given recurrence.
+
+Equation 1 separates three structural choices.
+
+Decay controls how the previous state is forgotten before new information is written. A scalar gate
+Λt = αtI uses one decay rate per recurrent head (Dao & Gu, 2024; Yang et al., 2025), whereas a
+diagonal gate Λt = diag(αt) allows the decay to vary across state channels (Yang et al., 2024b;
+Team et al., 2025). Write gating scales the new association vtk⊤t . Delta correction (Schlag et al.,
+2021; Yang et al., 2024c) removes the component of the existing state aligned with the current key
+before writing the new association. Together, these choices organize the space of modern recurrences
+as shown in Table 3 in Appendix B.1. We later instantiate this taxonomy as a controlled mixer zoo,
+varying the recurrent update while holding the surrounding model architecture and training setup
+fixed.
+
+2.2 CHUNKWISE-PARALLEL COMPUTATION
+
+Chunkwise implementations parallelize Equation (1) within chunks of C tokens (Dao & Gu, 2024;
+
+Yang & Zhang, 2024; Tumma et al., 2026), while processing chunks sequentially. Chunk [i] contains
+positions iC + 1, . . . , (i + 1)C, with incoming state S[i] := SiC , queries/keys Q[i], K[i] ∈ RC×Dk ,
+and values/outputs V[i], O[i] ∈ RC×Dv . Indices r, s denote positions within chunk [i], and n
+denotes a channel. For example, α[ri] := αiC+r and β[ri] := βiC+r. We collect the write gates in
+B[i] := diag(β[1i], . . . , β[Ci]) ∈ RC×C . Throughout this work, we also refer to matrix multiplications
+as “contractions”. In the following, we lay out chunkwise parallel formulations for the recurrences
+
+covered by Equation (1).
+
+Scalar decay. For no delta correction (δ         = 0) and scalar decay      Λt    = αtI, define the      cumulative
+                    r                            γ[0i→ ] r. The prefix and  tail  vectors Γ[←i] , Γ[→i]  ∈ RC have
+decay γ[si→ ] r :=  u=s+1  α[ui]  and γ[ri]  :=
+
+entries (Γ← [i] )r = γ[ri] and (Γ→ [i] )r = γ[ri→ ] C . Define the causal decay matrix Γ[i] ∈ RC×C , with entries
+
+(Γ[i])rs = γ[si→ ] r for s ≤ r and zero otherwise. The chunkwise parallel realization then reads (Dao &
+
+Gu, 2024)
+
+                    S[i+1] = γ[Ci]S[i] + V⊤[i]B[i](Γ→ [i] ⊙ K[i]),
+
+                    O[i] = (Γ[←i] ⊙ Q[i])S⊤[i] + ((Q[i]K[⊤i]) ⊙ Γ[i])B[i]V[i].
+
+Ddeifaingeonaaclhdanecnaeyl-.wInisethdeiaagbosneanlcdeeocfaydeγl[tsia→ ],ncror:=rectiorun=(sδ+1=α0[ui)],bnuatnwdiγth[ri]d,nia:g=onγa[0li→ ]d,nerc.aTyhΛe stta=ckdeidagp(reαfitx)-,
+and tail-decay now are Γ[←i] , Γ[→i] ∈ RC×Dk , with entries (Γ[←i] )rn = γ[ri],n and (Γ[→i] )rn = γ[ri→ ],nC . For
+
+positive decay gates, the chunkwise parallel form then reads (Yang et al., 2024b; Team et al., 2025)
+
+           S[i+1] = S[i]diag(γ[Ci]) + (B[i]V[i])⊤(Γ→ [i] ⊙ K[i]),
+
+                    O[i] = (Γ[←i] ⊙ Q[i])S[⊤i] + tril((Γ[←i] ⊙ Q[i])(K[i] ⊘ Γ← [i] )⊤)B[i]V[i].
+
+Delta correction. For delta correction (δ = 1) without decay, the chunkwise parallel form reads (Yang
+et al., 2024c)
+
+                                  S[i+1] = S[i] + F[i]⊤K[i],
+
+                                  O[i] = Q[i]S[⊤i] + tril(Q[i]K[⊤i])F[i],
+
+where F[i] are delta-corrected pseudo-values generated by
+
+                    F[i] = (I + tril(B[i]K[i]K[⊤i], −1))−1B[i](V[i] − K[i]S[⊤i]).
+
+Appendix D.1 gives the decaying delta forms (Yang et al., 2025; Team et al., 2025).
+
+                                                 3
+LinQuant: Functional Invariances for Low-Precision Linear Recurrences
+
+               Embedding We        Rrs         R⊤rs           Recurrent     · · · Rrs  R⊤rs          Output Whead              (a)
+                                                                Layer
+
+                                 R⊤rs Wz       Recurrent Layer           Q     DQK RQK                         Linear Recurrence
+
+R⊤rs WQ              DQK RQK                    R−O1 WO Rrs                                                  Local score
+Rr⊤s WK              DQ−1K RQK
+               Conv             Norm /     RO                             K    D−Q1K RQK         Value side  Key side
+               Conv              Gate                                    Λ, β                     (Γ→)η      (Γ→ )1−η
+                                                                                                             E−η Γ→
+                                RV⊤D−V 1                                                         Eη                            Intra-chunk output
+                                                                                                               B1−ξ                        R⊤V DV−1
+R⊤rs Wg                                                                                          Bξ
+Rr⊤s WV Conv
+                     DV RV           Linear                                    DV RV                              State write  State pass
+                                   Recurrence
+                                                              (b)        V                                   activation                 (c)
+                                      R, D axis                                                              quantization
+Rrs  residual        W·  weight                transform  RO  output     η, ξ, σ, τ decay/write                                  dataflow
+     rotation            matrix                               rotation              absorption                                   streams
+
+Figure 1: Architectural overview of a recurrent model at three resolutions: the model, recurrent
+layer, and chunkwise recurrence. Axis transformations and decay/write-factor allocations change the
+operands exposed to quantization. Applicability depends on the recurrence, as detailed in Section 3.
+Style inspired by (Liu et al., 2025, Figure 1).
+
+3 LINQUANT: FUNCTIONAL INVARIANCES FOR LOW-PRECISION
+
+     RECURRENCES
+
+The chunkwise parallel forms in Section 2.2 expose a set of matrix multiplications and a state carried
+between chunks. Importantly, these chunkwise forms are not unique: the same full-precision recur-
+rence can be expressed through functionally equivalent realizations that expose different quantities
+to low precision. LinQuant exploits this freedom. We first define the low-precision realization used
+throughout the paper, then derive seven functional invariances: four axis transformations and three
+absorptions. Table 1 summarizes their applicability; proofs are in Appendix C.
+
+3.1 LOW-PRECISION RECURRENCE REALIZATION
+
+Across the recurrences in Table 3, we find that the chunkwise computation can be organized into four
+matrix contractions: a state write, state read, local score, and intra-chunk output. Together with a
+recurrent state pass between chunks, this decomposition defines the low-precision boundaries we
+study. Consider for example the recurrence underlying Mamba-2. Using the notation of Section 2.2
+and writing Q for quantization, with scale factors implicit, we consider the following low-precision
+chunkwise realization:
+
+                     H[i] = Q(B[i]V[i])⊤Q(Γ[→i] ⊙ K[i]), (state write),
+
+                     S[i+1] = Q(γ[Ci]S[i] + H[i]),                             (state pass),
+                                                                               (state read),
+                        inter   =  Γ← [i]  ⊙                   ⊤
+
+                     O[i]                      Q(Q[i])S[i] ,
+
+                       A[i] = (Q(Q[i])Q(K[i])⊤) ⊙ Γ[i],                        (local score),
+                                                                               (intra-chunk output).
+                        intra
+
+                     O[i] = A[i]Q(B[i]V[i]),
+
+For models that employ the delta-rule, the Gram and WY solve are executed in full precision.
+The incoming-state correction used to form pseudo-values is an additional quantized contraction.
+Delta-rule writes and intra-chunk outputs replace the gated values B[i]V[i] by the pseudo-values F[i]
+computed for the corresponding recurrence. Appendix D.1 provides more details.
+
+LinQuant exploits the fact that functional invariances of these operators generally do not commute
+with quantization Q. These functional invariances fall into two classes: changes of basis, which
+change the representation along the key or value axes, and absorptions, which redistribute decay or
+write factors within an equivalent chunkwise computation. Appendix E.2 studies sensitivity to the
+stored-state and write-side quantization boundaries.
+
+                                                              4
+LinQuant: Functional Invariances for Low-Precision Linear Recurrences
+
+3.2 MIXER-EXTERNAL INVARIANCES: CHANGES OF BASIS
+
+Both the key- and the value axis of the recurrent state St ∈ RDv×Dk expose a choice of basis which
+leaves the full precision recurrence unchanged. We consider two such transformations along each
+axis: orthogonal rotations and positive diagonal rescalings. Notably, changes of basis along the key
+axis must remain compatible with the recurrent dynamics, whereas the value axis admits the same
+equivariance across all recurrences in Equation (1).
+
+(1/7) Key-side rotation. A joint orthogonal rotation of queries and keys,
+
+                           (qt, kt) → (RQK qt, RQK kt), RQK ∈ O(Dk),
+
+preserves query/key inner products and is a standard invariance of full precision softmax attention
+exploited by rotation-based PTQ methods such as QuaRot and SpinQuant (Ashkboos et al., 2024;
+Liu et al., 2025). In low precision, random rotations spread energy across channels, reducing outlier
+concentration and improving quantization robustness.
+
+For a linear recurrence, the invariance holds if RQK Λt = ΛtRQK (Nazari & Rusch, 2026), and
+implicitly applies a change of basis to the state’s key axis, which transforms like St → StRQ⊤K .
+Invariance thus holds with no decay or scalar decay. With diagonal decay, a general rotation does
+not commute with Λt, so the recurrent state cannot be carried in a globally rotated basis. However,
+we can still rotate queries and keys together after applying their decay factors when computing
+within-chunk scores. The recurrent state remains unrotated (Appendix D.1).
+
+In this work, we use random signed Hadamard rotations. Recurrent models may apply per-channel
+causal convolutions and nonlinearities between their input projections and the recurrence, which
+generally do not commute with a dense rotation. We thus apply RQK online after these operations.
+
+(2/7) Key-side rescaling. The key axis also admits a reciprocal diagonal transformation,
+
+                  (qt, kt) → (DQK qt, D−Q1K kt),                    DQK ≻ 0 diagonal,
+
+which likewise preserves query-key inner products. Related rescalings underlie SmoothAttention in
+QServe and, more broadly, methods such as SmoothQuant (Lin et al., 2025; Xiao et al., 2023).
+
+For a linear recurrence, the state implicitly transforms like St → StDQ−1K . Unlike a dense rotation,
+DQK commutes with diagonal decay, making the transformation valid for linear writes under no,
+scalar, or diagonal decay. It does not, however, preserve delta corrected writes.
+
+DQK transports magnitude between queries and keys. In this work, we parameterize DQK = diag(d)
+by dn = (maxt |kt,n|/ maxt |qt,n|)κ, where the maxima are computed over calibration tokens within
+
+each  head.  The  exponent  κ  ∈  [0, 1]  controls  the  rescaling  strength.  Specifically,  κ  =  1  balances  the
+                                                                                                    2
+magnitudes of queries and keys. We leave other parametrizations to future work.
+
+(3/7) Value-side rotation. The value axis admits an analogous orthogonal transformation,
+
+                                        vt → RV vt, RV ∈ O(Dv).
+
+In softmax attention, value rotations are used for KV-cache quantization (Liu et al., 2025). The
+operator, however, is not invariant to value rotations, which have to be undone after the softmax.
+Linear recurrences exhibit the same equivariance. Intuitively, this is because the recurrence acts
+independently along the value axis, which is implicitly rotated like St → RV St.
+
+We note that, compared to softmax attention, the recurrent setting reveals another degree of freedom.
+The state can, in between chunks, either be stored in its canonical basis, Q(St), or in a rotated basis,
+Q(RV St). These realizations are equivalent in full precision but expose different representations to
+Q. Rotated storage is what the rotation produces by itself, whereas canonical storage returns each
+chunk’s write to the original basis before it joins the carried state. This comes at the cost of an inverse
+transform per chunk, and keeps the state in the basis whose per-channel scales fit it.
+
+(4/7) Value-side rescaling. Finally, the value axis admits the positive diagonal analogue
+
+                                     vt → DV vt, DV ≻ 0 diagonal.
+
+The recurrent state transforms accordingly as St → DV St, with the inverse rescaling applied to the
+recurrence output before downstream normalization or other operations that do not commute with it.
+
+                                                         5
+LinQuant: Functional Invariances for Low-Precision Linear Recurrences
+
+If a linear output projection follows the recurrence directly, it can absorb the inverse rescaling. As
+
+with RV , this transformation is valid across all recurrence families considered here.
+
+In this work, we parametrize DV = diag(d) by dp =                  (  Dv   maxt  |vt,j  |)1/Dv  /  maxt  |vt,p|  κ,
+                                                                      j=1
+
+where the maxima are computed over calibration tokens and the product runs over value channels
+
+within each head. This parametrization moves range between value channels. At κ = 1, the ranges of
+
+the value channels are equalized.
+
+3.3 MIXER-INTERNAL INVARIANCES: ABSORPTIONS
+
+The first four invariances discussed in the previous section change the basis along the two axes of the
+recurrent state. The remaining three redistribute multiplicative factors within a chunkwise parallel
+implementation of the recurrence. In particular, decay and write factors can often be divided between
+the two sides of a matrix product without changing the full-precision operator.
+
+(5/7) Scalar-decay absorption. For scalar decay, the tail-decay Γ[→i] can be split between the value
+and key sides of the state write:
+
+       H[i] = ((Γ[→i] )η ⊙ (B[i]V[i]))⊤((Γ→ [i] )1−η ⊙ K[i]),                    η ∈ [0, 1].
+
+Thus, η continuously interpolates between equivalent realizations of the same write. At η = 0, all tail
+decay remains on the keys, which we call key-side decay absorption. At η = 1, it moves entirely
+to the values, giving value-side decay absorption, the endpoint used by SSDi8 (Kim et al., 2026).
+Intermediate values split the decay between the two sides. The same split applies to delta-rule writes,
+replacing B[i]V[i] by the corresponding pseudo-values F[i].
+
+(6/7) Diagonal-decay absorption. Diagonal decay varies across state channels and therefore cannot,
+in general, be transferred entirely to the value side. Nevertheless, we can factor each token’s decay
+into a scalar magnitude and a relative channelwise pattern. This decomposition is not unique: any
+positive scalar factor yields an exact redistribution. Here, we use the channelwise maximum, and
+leave alternative choices to future work.
+
+For diagonal tail decay Γ[→i] , define the per-token scalar magnitude and normalized decay
+
+er[i]  :=  max  (Γ[→i] )rn,        E[i] := diag(e1[i], . . . , eC[i]),     Dt[ia]il := E−[i]1Γ[→i] .
+
+             n
+
+Then the state write can be expressed as
+
+           H[i] = (Eη[i]B[i]V[i])⊤(E1[i−] ηD[tia]il ⊙ K[i]),               η ∈ [0, 1].
+
+Here, η moves the magnitude of the diagonal decay. At η = 0, the standard key-side form is
+recovered. At η = 1, each token’s scalar decay magnitude moves to the value side, while the relative
+channel-dependent decay necessarily remains on the key.
+
+(7/7) Write-factor absorption. For a linear write, the write factor admits an analogous split:
+
+           H[i] = (Bξ[i]V[i])⊤(Γ→ [i] ⊙ B[1i−] ξK[i]),                     ξ ∈ [0, 1].
+
+The endpoints ξ = 1 and ξ = 0 place the write factor entirely on the value and key sides, respectively.
+
+For delta-corrected writes, the write gate also enters the triangular system used to construct the
+pseudo-values. Without decay, split it between the two key factors of the Gram matrix:
+
+           L[(iσ]) := tril((B[σi]K[i])(B1[i−] σK[i])⊤, −1),                σ ∈ [0, 1].
+
+Using Bσ[i] on the corresponding right-hand side yields transformed pseudo-values F[(iσ]) satisfying
+
+                                          F[(iσ]) = Bσ[i−] 1F[i],
+
+where F[i] denotes the pseudo-values produced by the standard formulation in Section 2.2. A second
+parameter τ splits the complementary factor B[1i−] σ between the transformed write operands:
+
+           V([iσ],τ ) = B[(i1]−σ)(1−τ )F[(iσ]),  K[(iσ],τ ) = B[(i1]−σ)τ K[i],
+
+                H[i] = V[(iσ],τ ) ⊤K([iσ],τ ) = F[⊤i]K[i],              τ ∈ [0, 1].
+
+                                          6
+LinQuant: Functional Invariances for Low-Precision Linear Recurrences
+
+100                                                        100
+
+                                      0.1
+ 50
+
+                                     0.01
+   0
+recovered (%)                                                                                             1
+          LDAN
+                  GDM2N                                    50                                             0.1
+                         KGLDAA
+                                                                                                          0.01
+                                 ∆NLL
+                                              LLA+Aβ+β†    0
+                                                      GLGMLA2M++A2ββ++ββ††
+                                                                LALA+β  M2 2+β                                  0      .5         1
+                                                                   recovered (%)M                                      κ
+                                                                                                    ∆NLL
+
+RQK  DQK                   +RQK                   +DQK          RQK     DQK                                     ⟨H,C⟩      ⟨T,T⟩
+                                                                ⟨H,C⟩   ⟨T,C⟩                                   ⟨T,C⟩
+                                           naive
+
+(a) Recurrence structure.  (b) QK norm.                    (c) Scale granularity.  (d) Rescaling exponent.
+
+Figure 2: Key-axis transformations at INT6. (a) Recovered excess NLL by decay and write rule.
+(b) Excess NLL with and without QK normalization (†). Panels (a,b) use ⟨T, C⟩ and κ = 1/2 for
+DQK. (c) Recovery under ⟨H, C⟩ and its change under ⟨T, C⟩, with selected κ. (d) κ sweep, one
+curve per model.
+
+Thus, σ determines how the write factor is distributed inside the Gram construction, while τ de-
+termines how the remaining compensation is distributed in the subsequent write. At τ = 0, the
+compensation remains on the pseudo-values. At τ = 1, it moves to the keys. Setting σ = 1 recovers
+the standard triangular formulation, while σ = 1/2 places square-root write factors on the two Gram
+operands. Appendix C proves these equivalences and extends the construction to decayed delta-rule
+recurrences.
+
+Together, the four changes of basis and three absorptions define seven functional degrees of freedom
+for realizing the same recurrent computation. Their applicability depends on the recurrence structure,
+while their numerical behavior depends on the resulting low-precision representation, which we
+explore in the following section.
+
+4 EXPERIMENTS
+
+In this section, we first evaluate how the invariances discussed in Section 3 affect quantization
+error in a controlled model suite (Section 4.1). We then translate these insights to a production
+setting, evaluating quality on pretrained Mamba-2 and Nemotron-H models and latency on Mamba-2
+(Section 4.2).
+
+4.1 ANALYZING LINQUANT
+
+Model suite. To isolate the impact of each component that comprises the linear recurrence, we set up
+a controlled mixer zoo. All models share the same backbone and training recipe. It consists of Linear
+Attention, Mamba-2, GLA, DeltaNet, Gated DeltaNet, and KDA at 340M and 1.3B parameters,
+trained with 15B and 100B tokens of SlimPajama, respectively. The 340M suite furthermore contains
+models that vary write gating βt and QK normalization. Appendix B.1 gives the full setup.
+
+Quantization settings. We evaluate how the identified invariances affect quantization error using
+WikiText-2 test NLL, comparing against full precision and a naive quantizer without invariance
+transforms. We use the signed Hadamard rotations and diagonal rescalings discussed in Section 3.2,
+calibrated using WikiText-2. Several normalized decaying and delta-rule models already incur little
+quantization error at INT8 with per-channel value scales (Table 7). We therefore use INT6 in the
+controlled study to amplify quantization effects and make the impact of the invariances easier to
+distinguish. INT6 uses a restricted integer range within our INT8 kernels; the production experiments
+use INT8 recurrent computation. The end-of-chunk states are passed in FP32, while quantizing a
+copy to an INT8 readout. Appendix B.1 gives calibration details, and Appendix E reports INT8,
+INT4, 1.3B, and zero-shot results.
+
+Scale geometries. The queries/read-keys and values can be quantized with different granularities,
+denoted by ⟨bQK , bV ⟩. Here, bQK gives the scale-granularity for queries and read-keys, while bV
+gives that of the values. Both can be C (per-channel), H (per head) or T (per-tensor). The scale
+
+                                                        7
+LinQuant: Functional Invariances for Low-Precision Linear Recurrences
+
+100                                                     100                     70
+recovered (%)
+          LDAN                   1
+                  GDM2N
+                         KGLDAA500.1                    50                      35
+
+                                 ∆NLL00.01              0                       0
+                                              LLA+Aβ+β†
+                                                      GLGMLA2M++A2ββ++ββ††LALA+βM2 2+β
+                                                                         M
+                                                                   recovered (%)
+                                                                                                      lost (%)
+
+                                                                                                                             LA
+                                                                                                                                   GDM2N
+                                                                                                                                             GLA
+
+         RV  DV                  +RV +DV                       RV      DV       ⟨H,C⟩ ⟨T,C⟩ ⟨T,T⟩
+                                         naive                ⟨T,C⟩    ⟨T,T⟩      (d) Storage basis.
+
+(a) Recurrence structure.        (b) QK norm.           (c) Scale granularity.
+
+Figure 3: Value-axis transformations at INT6. (a) Recovered excess NLL under ⟨T, T⟩. (b) Excess
+NLL under ⟨T, T⟩ with and without QK normalization (†). (c) Recovery under ⟨T, C⟩ and ⟨T, T⟩.
+(d) Recovery lost by storing the state rotated instead of canonically under RV , relative to naive.
+
+groupings considered are directly influenced by the chunkwise kernels. In a matrix contraction, output-
+channel scales can be applied after the product, whereas scales along the summed dimension must
+enter the contraction. The key axis is contracted in query/key products and state reads. In contrast,
+the value axis remains an output dimension and admits per-channel scales that can be incorporated
+in a kernel’s output scaling without modifying the integer contraction or requiring an additional pass.
+We compare the three scale regimes ⟨H, C⟩, ⟨T, C⟩, and ⟨T, T⟩. In the state write contraction, the key
+dimension stays an outer dimension. We exploit this by quantizing write keys per channel in ⟨H, C⟩,
+where each contraction quantizes its own copy of the keys, so the write can take the finest scale it can
+absorb. In the other two regimes, write keys are quantized per tensor and reused by each contraction.
+
+We next examine key-axis transformations (1-2), value-axis transformations (3-4), and absorptions
+(5-7) on quantization error under different scale-granularities, as well as the choice of storage basis.
+
+(1-2) Key-axis transformations. The benefit of RQK depends on the recurrence structure. With
+no or scalar decay, it rotates the carried state along the key axis and reduces quantization error.
+With diagonal decay, it is restricted to local contractions and provides little benefit (Figure 2a). In
+contrast, DQK commutes with diagonal decay and improves quantization error where applicable.
+QK normalization also reduces quantization error (Figure 2b). Coarsening key scales increases the
+benefit of RQK , while DQK remains useful with per-head scales (Figure 2c). The diagonal rescaling
+is generally best shared between queries and keys (Figure 2d).
+
+(3-4) Value-axis transformations. Both RV               60                      30
+                                                        recovered (%)
+and DV apply to every recurrence. They are                     GLLMGKAA2DDD+++βββNNA
+
+most useful with per-tensor value scales, where                                            key vs. value (%)
+                                                                                                        M2+β
+they recover a large portion of the excess NLL          30                                                   GDN15
+                                                                                                                   GLA+β
+(Figure 3a). The two transformations yield                                                                               KDA
+
+similar gains as value scales are coarsened             0                       0
+
+(Figure 3c). Only RV introduces a choice of
+
+state basis: quantizing the state in the rotated
+
+basis incurs more error than quantizing it in                     Bξ[i]             (Γ→ [i] )η        Eη[i]
+the canonical basis (Figure 3d). While the two          (a) Write gate.
+transformations give similar quality, the cost of                               (b) Decay absorption.
+canonical storage favors DV , which folds into
+
+the quantization scales.                             Figure 4: Absorptions at INT6 under ⟨T, T⟩.
+
+(5-7) Absorptions. We study absorptions in the       (a) Recovered excess NLL from the selected
+coarse-scale regime. Under ⟨T, T⟩, write-gate        write-factor allocation (ξ or (σ, τ )). (b) NLL
+absorption recovers a significant portion of         increase from placing decay on keys (η = 0)
+the excess NLL (Figure 4a). The preferred            rather than values (η = 1), relative to η = 1.
+
+write-gate placement also depends on scale granularity. For gated linear writes, under ⟨T, C⟩ keeping
+
+the gate on values (ξ = 1) is preferred, while the other regimes can favor splitting it between keys
+
+and  values  (Figure  10).  For  delta writes under  ⟨T, T⟩,  the selected settings use σ  ∈  {0,  1  }  and
+                                                                                                   2
+τ = 1 (Figure 11). Compared with the standard WY placement (σ, τ ) = (1, 1) used in Flash Linear
+
+                                                     8
+LinQuant: Functional Invariances for Low-Precision Linear Recurrences
+
+ 1.1time / SSDi8          4                                                                           Dv = Dk
+                                        relative overhead3                               1.1
+   1                                                LA2
+                                                        GLMA21                              1
+  .9                                                           GKDDDNNA0
+       1 4 16 32                                                                           .9
+          batch size                                                        key / value(b) Value rotation.32 64 128 256
+                                                                                                      Dv
+1.3B 2.7B 8B
+ (a) Prefill time.                                                                     Dk = 128 Dk = 64
+                                                                                          (c) Decay side.
+
+Figure 5: (a) End-to-end prefill time of LinQuant (RQK, value-side decay) relative to the matched
+SSDi8 setting, production Mamba-2 (A5000, T = 2048). (b) INT8 zoo kernel with RV and canonical
+storage relative to naive INT8 (A5000, B = H = 8, T = 2048, Dk = Dv = 128). (c) Production
+recurrence latency with decay on keys relative to values (static scales, 64 heads, batch 8).
+
+Attention (Yang & Zhang, 2024), this moves more of the gate factor onto the transformed keys. The
+standard floating-point placement is therefore not always best after quantization. Decay placement
+matters most for scalar decay: with per-tensor value scales, moving scalar decay from values to keys
+increases excess NLL. By contrast, diagonal-decay absorption provides little gain (Figure 4b). We
+conjecture that variation across the diagonal decay, which remains on the keys, matters more than
+its overall magnitude and leave other ways of extracting a factor to future work.
+
+Combined transformations. Combining transformations reduces quantization error more than
+applying them individually (Figure 13 and Tables 5 and 6). At INT6 under ⟨T, T⟩, the selected
+combination recovers roughly twice as much excess NLL as the best single transformation for both
+340M Mamba-2 and LA (Table 5).
+
+Downstream accuracy. The NLL improvements also translate to downstream accuracy for LA. At
+INT8 under ⟨T, C⟩, combining transformations largely closes the gap to full precision for 340M
+LA on both LAMBADA and the six-task average (Table 11). At 1.3B, LA+β recovers most of the
+LAMBADA accuracy lost to naive quantization, though a gap to full precision remains (Table 12).
+
+Kernels. We implement each model’s applicable invariances in a single INT8 Triton chunk kernel
+(Appendix D.2). Rescalings fold into the quantization scales, and absorptions redistribute factors
+between existing operands. Canonical storage under RV requires inverse transforms of the state
+write and local output (Figure 5b). These kernel timings exclude forward rotations performed outside
+the kernel; the production timings below cover end-to-end prefill.
+
+4.2 LINQUANT IN A PRODUCTION SETTING
+
+Production setup. We next apply LinQuant to Table 2: Production WikiText-2 perplexity.
+
+production-scale pretrained Mamba-2 models and SSDi8 uses value-side decay absorption. The
+
+Nemotron-H (Blakeman et al., 2025). Our starting combined transformation is evaluated with decay
+
+point is SSDi8 (Kim et al., 2026), a low-precision on either operand. More results in Table 17.
+
+recurrent prefill pipeline for Mamba-2, which we                                         RQK RQK + DQK
+augment with the applicable LinQuant invariances.
+
+The production Mamba-2 recurrence is most Model                        FP16 SSDi8 value value key
+
+analogous to the no-β, no-QK-normalization           Mamba-2     10.420 10.928 10.860 10.849 10.830
+Mamba-2 model in our mixer zoo. The controlled          1.3B      9.060 9.441 9.379 9.383 9.372
+study therefore points primarily to the key-side        2.7B      7.250 7.620 7.456 7.435 7.437
+changes of basis, RQK and DQK , while its               8B
+fine-grained value scales suggest little need for a
+value-side change of basis. We add these key-side    Nemotron-H
+transformations to SSDi8’s W4A8 projection
+and INT8-recurrence pipeline and evaluate both       Base              6.030 6.338 6.186 6.178 6.175
+
+                                                     Reasoning 8.423 8.921 8.666 8.650 8.670
+
+equivalent placements of scalar decay. Table 2 reports quality. Setup and further results are in
+
+Appendices B.2 and F.
+
+                                      9
+LinQuant: Functional Invariances for Low-Precision Linear Recurrences
+
+Key-side transformations transfer. Across every reported Mamba-2 and Nemotron-H model, RQK
+improves perplexity over the matched SSDi8 setting, while DQK provides an additional gain in
+most configurations (Table 2). Both DQK and RQK are fused into the operand-preparation pass.
+Query–key rotation adds no measurable end-to-end prefill latency on the evaluated Mamba-2 models
+(Figure 5a), while fused rescaling leaves the measured Mamba-2 1.3B layer latency unchanged
+(Table 14). Full results are reported in Appendix F. The SSDi8 pipeline already uses per-channel
+value scales, matching the controlled setting in which RV and DV provide little benefit. Rotated
+state storage performs worse, while canonical storage does not improve over the unrotated baseline
+(Appendix F.1). Since canonical RV adds overhead (Figure 5b), we apply neither value-side
+transformation in the production configuration.
+Kernels. The optimized SSDi8 kernels quantize operands once and reuse their INT8 representations
+across multiple contractions. Kim et al. (2026) place scalar decay on the value side, motivated by
+concerns that key-side decay would require per-position scales and materializing per-head keys. Our
+evaluated key-side configurations achieve comparable perplexity to the value-side configurations
+(Appendix F), and per-head decay can be applied in GPU registers without materializing the expanded
+tensor (Appendix D.2). Their runtime also depends on operand reuse. Moving decay onto an operand
+after its INT8 representation has been formed requires rereading and requantizing the floating-point
+tensor. The cost therefore depends on which operand is affected, its dimension, and how often its
+quantized representation is reused. Figure 5c shows that value-side absorption is faster for the evalu-
+ated Mamba-2 shapes, although the gap narrows and can reverse as the value dimension Dv increases.
+We therefore retain value-side absorption for its lower runtime on the target Mamba-2 geometries.
+
+5 CONCLUSION
+
+In this work, we introduce LinQuant, a framework that exploits seven functional invariances for low-
+precision linear recurrences, and characterize their applicability across a wide range of recurrent mix-
+ers. These consist of mixer-external changes of basis and mixer-internal absorptions, namely alterna-
+tive allocations of decay and write factors between operands. Our controlled study shows their benefits
+depend on recurrence structure, QK normalization, scale granularity, and the basis used to quantize the
+state. Notably, changes of basis and write-gate allocation are particularly effective under coarse scales.
+These findings transfer to production Mamba-2 and Nemotron-H models, where LinQuant improves
+quantization quality. Moreover, on the evaluated Mamba-2 models, query–key rotation adds no mea-
+surable prefill latency. Although our implementation focuses on integer prefill, the introduced invari-
+ances provide a broader design space (e.g. floating-point) for future low-precision implementations.
+
+                                                          10
+LinQuant: Functional Invariances for Low-Precision Linear Recurrences
+
+ACKNOWLEDGEMENTS
+
+This work was supported by the Hector Foundation, Max Planck ETH Center for Learning Systems,
+and the Department of the Air Force Artificial Intelligence Accelerator and was accomplished
+under Cooperative Agreement Number FA8750-19-2-1000. The views and conclusions contained
+in this document are those of the authors and should not be interpreted as representing the official
+policies, either expressed or implied, of the Department of the Air Force or the U.S. Government.
+The U.S. Government is authorized to reproduce and distribute reprints for Government purposes
+notwithstanding any copyright notation herein.
+
+REFERENCES
+
+Alexander Amini, Anna Banaszak, Harold Benoit, Arthur Bo¨o¨k, Tarek Dakhran, Song Duong, Alfred
+   Eng, Fernando Fernandes, Marc Ha¨rko¨nen, Anne Harrington, Ramin Hasani, Saniya Karwa,
+  Yuri Khrustalev, Maxime Labonne, Mathias Lechner, Valentine Lechner, Simon Lee, Zetian
+   Li, Noel Loo, Jacob Marks, Edoardo Mosca, Samuel J. Paech, Paul Pak, Rom N. Parnichkun,
+   Alex Quach, Ryan Rogers, Daniela Rus, Nayan Saxena, Bettina Schlager, Tim Seyde, Jimmy
+   T. H. Smith, Aditya Tadimeti, and Neehal Tumma. Lfm2 technical report, 2025. URL https:
+  //arxiv.org/abs/2511.23404.
+
+Saleh Ashkboos, Amirkeivan Mohtashami, Maximilian L. Croci, Bo Li, Pashmina Cameron, Martin
+   Jaggi, Dan Alistarh, Torsten Hoefler, and James Hensman. QuaRot: Outlier-free 4-bit inference
+   in rotated llms. In Advances in Neural Information Processing Systems, volume 37, 2024. URL
+   https://proceedings.neurips.cc/paper_files/paper/2024/hash/b5b93
+   9436789f76f08b9d0da5e81af7c-Abstract-Conference.html.
+
+Maximilian Beck, Korbinian Po¨ppel, Markus Spanring, Andreas Auer, Oleksandra Prudnikova,
+   Michael Kopp, Gu¨nter Klambauer, Johannes Brandstetter, and Sepp Hochreiter. xlstm: Extended
+   long short-term memory, 2024. URL https://arxiv.org/abs/2405.04517.
+
+Aaron Blakeman, Aarti Basant, Abhinav Khattar, Adithya Renduchintala, Akhiad Bercovich, Alek-
+   sander Ficek, Alexis Bjorlin, Ali Taghibakhshi, Amala Sanjay Deshmukh, Ameya Sunil Maha-
+   baleshwarkar, et al. Nemotron-h: A family of accurate and efficient hybrid mamba-transformer
+   models. arXiv preprint arXiv:2504.03624, 2025.
+
+Makram Chahine, Philipp Nazari, Daniela Rus, and T Konstantin Rusch. The curious case of
+   in-training compression of state space models. arXiv preprint arXiv:2510.02823, 2025.
+
+Hung-Yueh Chiang, Chi-Chih Chang, Natalia Frumkin, Kai-Chiang Wu, and Diana Marculescu.
+   Quamba: A post-training quantization recipe for selective state space models. arXiv preprint
+   arXiv:2410.13229, 2024.
+
+Hung-Yueh Chiang, Chi-Chih Chang, Natalia Frumkin, Kai-Chiang Wu, Mohamed S. Abdelfattah,
+   and Diana Marculescu. Quamba2: A robust and scalable post-training quantization framework for
+   selective state space models, 2025. URL https://arxiv.org/abs/2503.22879.
+
+Tri Dao and Albert Gu. Transformers are ssms: Generalized models and efficient algorithms through
+   structured state space duality. arXiv preprint arXiv:2405.21060, 2024.
+
+Elias Frantar, Saleh Ashkboos, Torsten Hoefler, and Dan Alistarh. GPTQ: Accurate post-training
+   quantization for generative pre-trained transformers. In International Conference on Learning
+   Representations, 2023. URL https://openreview.net/forum?id=tcbBPnfwxS.
+
+Albert Gu and Tri Dao. Mamba: Linear-time sequence modeling with selective state spaces. In First
+   Conference on Language Modeling, 2024. URL https://openreview.net/forum?id=
+   tEYskw1VY2.
+
+Angelos Katharopoulos, Apoorv Vyas, Nikolaos Pappas, and Franc¸ois Fleuret. Transformers are
+   RNNs: Fast autoregressive transformers with linear attention. In Hal Daume´ III and Aarti Singh
+   (eds.), Proceedings of the 37th International Conference on Machine Learning, volume 119 of
+   Proceedings of Machine Learning Research, pp. 5156–5165. PMLR, 13–18 Jul 2020. URL
+   https://proceedings.mlr.press/v119/katharopoulos20a.html.
+
+                                                          11
+LinQuant: Functional Invariances for Low-Precision Linear Recurrences
+
+Hyunwoo Kim, Byoungchan Ko, Minseok Kang, Minwoo Kim, Dongjin Lee, Jaehoon Lee, Sungroh
+  Yoon, and Dahuin Jung. Ssdi8: Accurate and efficient 8-bit quantization for state space duality. In
+  The Fourteenth International Conference on Learning Representations, 2026.
+
+Ji Lin, Jiaming Tang, Haotian Tang, Shang Yang, Wei-Ming Chen, Wei-Chen Wang, Guangxuan
+  Xiao, Xingyu Dang, Chuang Gan, and Song Han. AWQ: Activation-aware weight quantization for
+   on-device llm compression and acceleration. In Proceedings of Machine Learning and Systems,
+  volume 6, 2024. URL https://proceedings.mlsys.org/paper_files/paper/
+   2024/hash/42a452cbafa9dd64e9ba4aa95cc1ef21- Abstract- Conference.
+   html.
+
+Yujun Lin, Haotian Tang, Shang Yang, Zhekai Zhang, Guangxuan Xiao, Chuang Gan, and Song Han.
+   QServe: W4A8KV4 quantization and system co-design for efficient llm serving. In Proceedings of
+  Machine Learning and Systems, volume 7, 2025. URL https://proceedings.mlsys.or
+   g/paper_files/paper/2025/hash/fbe2b2f74a2ece8070d8fb073717bda6-A
+   bstract-Conference.html.
+
+Zechun Liu, Changsheng Zhao, Igor Fedorov, Bilge Soran, Dhruv Choudhary, Raghuraman Krish-
+   namoorthi, Vikas Chandra, Yuandong Tian, and Tijmen Blankevoort. SpinQuant: Llm quantization
+  with learned rotations. In International Conference on Learning Representations, 2025. URL
+   https://openreview.net/forum?id=ogO6DGE6FZ.
+
+Philipp Nazari and T Konstantin Rusch. The key to state reduction in linear attention: A rank-based
+   perspective. arXiv preprint arXiv:2602.04852, 2026.
+
+NVIDIA. Nvidia nemotron 3: Efficient and open intelligence, 2025. URL https://arxiv.or
+   g/abs/2512.20856.
+
+Rom N. Parnichkun, Neehal Tumma, Armin W. Thomas, Alessandro Moro, Qi An, Taiji Suzuki,
+  Atsushi Yamashita, Michael Poli, and Stefano Massaroli. Quantifying memory utilization with
+   effective state-size, 2025. URL https://arxiv.org/abs/2504.19561.
+
+Bo Peng, Ruichong Zhang, Daniel Goldstein, Eric Alcaide, Xingjian Du, Haowen Hou, Jiaju Lin,
+  Jiaxing Liu, Janna Lu, William Merrill, Guangyu Song, Kaifeng Tan, Saiteja Utpala, Nathan Wilce,
+  Johan S. Wind, Tianyi Wu, Daniel Wuttke, and Christian Zhou-Zheng. Rwkv-7 ”goose” with
+   expressive dynamic state evolution, 2025. URL https://arxiv.org/abs/2503.14456.
+
+Imanol Schlag, Kazuki Irie, and Ju¨rgen Schmidhuber. Linear transformers are secretly fast weight
+   programmers, 2021. URL https://arxiv.org/abs/2102.11174.
+
+Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, and Tri Dao.
+   Flashattention-3: Fast and accurate attention with asynchrony and low-precision, 2024. URL
+   https://arxiv.org/abs/2407.08608.
+
+Julien Siems, Timur Carstensen, Arber Zela, Frank Hutter, Massimiliano Pontil, and Riccardo Grazzi.
+   Deltaproduct: Improving state-tracking in linear rnns via householder products, 2025. URL
+   https://arxiv.org/abs/2502.10297.
+
+Lintang Sutawika, Hailey Schoelkopf, Leo Gao, Stella Biderman, Baber Abbasi, Jonathan Tow, et al.
+   Eleutherai/lm-evaluation-harness: v0.4.1, January 2024. URL https://doi.org/10.528
+  1/zenodo.10600400. Software.
+
+Kimi Team, Yu Zhang, Zongyu Lin, Xingcheng Yao, Jiaxi Hu, Fanqing Meng, Chengyin Liu, Xin
+   Men, Songlin Yang, Zhiyuan Li, Wentao Li, Enzhe Lu, Weizhou Liu, Yanru Chen, Weixin Xu,
+   Longhui Yu, Yejie Wang, Yu Fan, Longguang Zhong, Enming Yuan, Dehao Zhang, Yizhi Zhang,
+  T. Y. Liu, Haiming Wang, Shengjun Fang, Weiran He, Shaowei Liu, Yiwei Li, Jianlin Su, Jiezhong
+   Qiu, Bo Pang, Junjie Yan, Zhejun Jiang, Weixiao Huang, Bohong Yin, Jiacheng You, Chu Wei,
+   Zhengtao Wang, Chao Hong, Yutian Chen, Guanduo Chen, Yucheng Wang, Huabin Zheng, Feng
+  Wang, Yibo Liu, Mengnan Dong, Zheng Zhang, Siyuan Pan, Wenhao Wu, Yuhao Wu, Longyu
+   Guan, Jiawen Tao, Guohong Fu, Xinran Xu, Yuzhi Wang, Guokun Lai, Yuxin Wu, Xinyu Zhou,
+   Zhilin Yang, and Yulun Du. Kimi linear: An expressive, efficient attention architecture, 2025.
+   URL https://arxiv.org/abs/2510.26692.
+
+                                                          12
+LinQuant: Functional Invariances for Low-Precision Linear Recurrences
+
+Albert Tseng, Jerry Chee, Qingyao Sun, Volodymyr Kuleshov, and Christopher De Sa. Quip#:
+   Even better llm quantization with hadamard incoherence and lattice codebooks, 2024. URL
+   https://arxiv.org/abs/2402.04396.
+
+Neehal Tumma, Mathias Lechner, Noel Loo, Ramin Hasani, and Daniela Rus. Leveraging low-rank
+   and sparse recurrent connectivity for robust closed-loop control. In The Twelfth International
+  Conference on Learning Representations, 2024.
+
+Neehal Tumma, Noel Loo, and Daniela Rus. Preconditioned deltanet: Curvature-aware sequence
+   modeling for linear recurrences, 2026. URL https://arxiv.org/abs/2604.21100.
+
+Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N Gomez, Łukasz
+   Kaiser, and Illia Polosukhin. Attention is all you need. Advances in neural information processing
+   systems, 30, 2017.
+
+Guangxuan Xiao, Ji Lin, Mickael Seznec, Hao Wu, Julien Demouth, and Song Han. SmoothQuant:
+  Accurate and efficient post-training quantization for large language models. In Proceedings of
+   the 40th International Conference on Machine Learning, volume 202 of Proceedings of Machine
+  Learning Research, pp. 38087–38099. PMLR, 2023. URL https://proceedings.mlr.pr
+   ess/v202/xiao23c.html.
+
+Zukang Xu, Yuxuan Yue, Xing Hu, Zhihang Yuan, Zixu Jiang, Zhixuan Chen, Jiangyong Yu, Chen
+  Xu, Sifan Zhou, and Dawei Yang. Mambaquant: Quantizing the mamba family with variance
+   aligned rotation methods, 2025. URL https://arxiv.org/abs/2501.13484.
+
+Songlin Yang and Yu Zhang. FLA: A Triton-based library for hardware-efficient implementations of
+   linear attention mechanism, January 2024. URL https://github.com/fla-org/flash
+  -linear-attention. Software.
+
+Songlin Yang, Jan Kautz, and Ali Hatamizadeh. Gated delta networks: Improving mamba2 with
+   delta rule. arXiv preprint arXiv:2412.06464, 2024a.
+
+Songlin Yang, Bailin Wang, Yikang Shen, Rameswar Panda, and Yoon Kim. Gated linear attention
+   transformers with hardware-efficient training. In Ruslan Salakhutdinov, Zico Kolter, Katherine
+   Heller, Adrian Weller, Nuria Oliver, Jonathan Scarlett, and Felix Berkenkamp (eds.), Proceedings
+   of the 41st International Conference on Machine Learning, volume 235 of Proceedings of Machine
+  Learning Research, pp. 56501–56523. PMLR, 21–27 Jul 2024b. URL https://proceeding
+   s.mlr.press/v235/yang24ab.html.
+
+Songlin Yang, Bailin Wang, Yu Zhang, Yikang Shen, and Yoon Kim. Parallelizing linear transformers
+  with the delta rule over sequence length. In The Thirty-eighth Annual Conference on Neural
+  Information Processing Systems, 2024c.
+
+Songlin Yang, Jan Kautz, and Ali Hatamizadeh. Gated delta networks: Improving mamba2 with
+   delta rule, 2025. URL https://arxiv.org/abs/2412.06464.
+
+Jintao Zhang, Jia Wei, Haofeng Huang, Pengle Zhang, Jun Zhu, and Jianfei Chen. Sageattention:
+  Accurate 8-bit attention for plug-and-play inference acceleration, 2025. URL https://arxiv.
+   org/abs/2410.02367.
+
+Tao Zhang, Jianchao Tan, Pingwei Sun, Yanqi Yu, Zunhai Su, Zixu Jiang, Yuchen Xie, Xunliang Cai,
+   and Ziqian Zeng. Damp: Decay-aware mixed-precision recurrent-state quantization, 2026. URL
+   https://arxiv.org/abs/2608.27513.
+
+                                                          13
+LinQuant: Functional Invariances for Low-Precision Linear Recurrences
+
+A EXTENDED RELATED WORK
+
+Linear recurrent and hybrid language models. A growing line of work replaces softmax attention
+with recurrent sequence mixers whose state size (Parnichkun et al., 2025) and per-token decode
+cost do not grow with context length. This is achieved by implicitly summarizing past tokens in a
+fixed-size hidden state, instead of explicitly in a KV-cache (Katharopoulos et al., 2020; Schlag et al.,
+2021; Yang et al., 2024b). Selective state-space models such as Mamba and Mamba-2 introduce
+input-dependent recurrent dynamics and hardware-efficient implementations (Gu & Dao, 2024; Dao
+& Gu, 2024).
+
+More expressive recurrences modify how information is retained and written into the hidden state.
+DeltaNet corrects stored associations by removing existing associations from its state (Yang et al.,
+2024c), while Gated DeltaNet combines this correction mechanism with scalar forgetting (Yang
+et al., 2025), and KDA uses channelwise decay (Team et al., 2025). Preconditioned DeltaNet further
+incorporates curvature-aware updates (Tumma et al., 2026), while DeltaProduct enhances the state
+transition operator (Siems et al., 2025). In a recent development, large-scale hybrid models combine
+recurrent and softmax attention layers (Team et al., 2025; Blakeman et al., 2025).
+
+Our work studies how the structure of these different recurrences enables and constrains functional
+invariances. We then leverage these invariances for post-training quantization (PTQ).
+
+PTQ of softmax Transformers. Weight-only PTQ methods such as GPTQ and AWQ reduce
+quantization error through reconstruction-based compensation or channel protection (Frantar et al.,
+2023; Lin et al., 2024). For joint weight and activation quantization, SmoothQuant transfers activation
+range into weights (Xiao et al., 2023), while QServe combines quantization with efficient serving (Lin
+et al., 2025). Rotation-based methods redistribute concentrated energy across channels: QuIP# uses
+Hadamard incoherence processing for weight quantization (Tseng et al., 2024), QuaRot extends
+rotations to weights, activations, and the KV cache (Ashkboos et al., 2024), and SpinQuant learns
+rotations from calibration data (Liu et al., 2025). LinQuant extends the study of functional invariances
+to linear recurrences.
+
+Quantization of recurrent language models. Quamba develops an 8-bit PTQ recipe around sensitive
+selective-scan features and activation outliers (Chiang et al., 2024). MambaQuant uses variance-
+aligned rotations (Xu et al., 2025), while Quamba2 extends PTQ across Mamba and Mamba-2 at
+multiple precisions (Chiang et al., 2025).
+
+SSDi8 targets low-precision execution inside the chunkwise Mamba-2 computation (Kim et al., 2026).
+It reuses quantized keys and queries, absorbs decay into values, and carries an INT8 state, all to
+maintain a persistent INT8 computational path. This decay placement is the value-side endpoint of
+our scalar-decay absorption family. Our production pipeline builds on SSDi8 by adding state-axis
+rotations and rescalings (Section 4.2).
+
+Recurrent-state compression beyond quantization. Chahine et al. (2025) prune the hidden state
+during training by leveraging the free choice of key-axis basis, which we identify as invariance (1).
+Similarly, Nazari & Rusch (2026) leverage the free choice of basis to prune the state of pretrained
+linear recurrences. Low-rank and sparse recurrent connectivity has also been studied outside language
+modeling (Tumma et al., 2024). In LinQuant, we instead retain state dimensions and use equivalent
+representations to improve quantization, addressing a complementary source of recurrent efficiency.
+
+B EXPERIMENTAL SETUP
+
+We give the setup and timing methodology for the controlled study and production setting. Results
+are reported in Appendices E and F.
+
+B.1 CONTROLLED STUDY
+
+Models and training. The 340M zoo contains fifteen recurrence variants, or cells: LA, Mamba-2,
+and GLA with and without write gating and QK normalization, plus DN, GDN, and KDA with QK
+normalization. All models use the FLA implementation (Yang & Zhang, 2024) and share a 24-layer
+architecture with a SwiGLU MLP, an output gate on the mixer, and tied embeddings. At 340M
+
+                                                          14
+LinQuant: Functional Invariances for Low-Precision Linear Recurrences
+
+Table 3: State-update rules for recurrent models in the mixer-zoo design space. Colors identify decay
+and write gating.
+
+                                        model                                                            update
+
+     Linear attention (Katharopoulos et al., 2020)                                 St = St−1 + vtkt⊤
+
+     Mamba-2 (Dao & Gu, 2024)                                                      St = αt St−1 + vtkt⊤
+
+     Gated Linear Attention (GLA) (Yang et al., 2024b) St = St−1 diag(αt) + vtkt⊤
+
+     DeltaNet (Schlag et al., 2021; Yang et al., 2024c) St = St−1 I − βtktkt⊤ + βt vtkt⊤
+
+     Gated DeltaNet (Yang et al., 2025)                                            St = αt St−1 I − βtktkt⊤ + βt vtkt⊤
+
+     Kimi Delta Attention (KDA) (Team et al., 2025) St = St−1 diag(αt) I − βtktkt⊤ + βt vtkt⊤
+
+parameters, the model width is 1024 with 8 heads and Dk = Dv = 128. At 1.3B, the width is 2048
+with 16 heads and the same head dimensions.
+
+Each cell is an instance of Equation (1) with the decay and write rule of Table 3. Appendix D.1
+gives the quantized chunkwise forms. QK normalization applies ℓ2 normalization to qt and kt
+independently within each head.
+
+Every model is trained from scratch on SlimPajama using FLA and a Llama tokenizer, with 15B
+tokens for the 340M models and 100B for the 1.3B models. All runs use sequence length 2048 and
+AdamW with peak learning rate 4 × 10−4, 1024 warm-up steps, and cosine decay to one tenth of the
+peak. We clip gradients at 1.
+
+Quantization. Quantization is symmetric, with static scales calibrated by the maximum absolute
+activation over eight WikiText-2 training windows of 2048 tokens. The state write, state read, and
+local-score contractions use INT8 operands with INT32 accumulation (except the 16-token diagonal
+blocks of the local score under diagonal decay, which compute the decay-weighted dot products in
+FP32 using dequantized queries and keys); the intra-chunk output uses FP16 arithmetic on INT8-
+quantized values. An FP32 state is carried between chunks, and reads consume an INT8 copy with
+one scale per head and value channel, calibrated on the carry. We call this copy the stored state, and
+vary operand precision and stored-state precision separately. INT6 and INT4 configurations restrict
+the integer range of the operands within the same boundaries and kernels. The stored state remains
+INT8 unless stated otherwise. Chunk size is 64, with 16-token sub-blocks for diagonal decay, as in
+FLA.
+
+Evaluation. We evaluate perplexity on WikiText-2 test at sequence length 2048. Transforma-
+tion parameters are selected using cross-entropy on separate WikiText-2 samples. Excess NLL is
+log(PPLquant/PPLFP), and NLL recovered is the difference between the naive quantizer’s NLL
+and that of the transformed configuration. We evaluate zero-shot accuracy with the Language
+Model Evaluation Harness (Sutawika et al., 2024) on LAMBADA, HellaSwag, PIQA, ARC-Easy,
+ARC-Challenge, and WinoGrande.
+
+Transformation selection. We use the diagonal rescaling parameterizations of Section 3.2 and
+
+sweep  κ  ∈   {  1  ,  1  ,  3  ,  1},  including        both  DQK            alone  and   its  composition  with  RQK  on    linear-write
+                 4     2     4
+cells. The full DV sweep is evaluated under shared value scales.
+
+For  decaying    cells,         we  sweep        η  ∈  {0,  1  ,  1  ,  3  ,  1}.  Linear  write-factor  absorption  uses  ξ  ∈  {1,  1  ,  0},
+                                                            4     2     4                                                             2
+                                                      1     0}2.
+while  delta  cells       use      (σ,  τ  )  ∈  {1,  2  ,
+
+We form the stack by combining transformations whose selected settings improve held-out cross-
+entropy by at least 0.003 nats over the naive quantizer. We use canonical state storage unless stated
+otherwise, and retain the naive quantizer if no transformation qualifies.
+
+Timing. We compare the transformation stack with canonical RV against naive INT8 on the A5000,
+A100, and H100 across batch sizes, with T = 2048, H = 8, and Dk = Dv = 128. We report ratios
+of median call times after autotuning and warm-up. Both calls include gate processing, operand
+
+                                                                              15
+LinQuant: Functional Invariances for Low-Precision Linear Recurrences
+
+quantization, and recurrent computation, including preparation for delta cells. Forward rotations
+performed before the call are excluded.
+
+B.2 PRODUCTION SETTING
+
+We evaluate pretrained Mamba-2 and Nemotron-H models using SSDi8’s W4A8 projection and INT8-
+recurrence pipeline. Unless otherwise stated, the matched baseline uses value-side decay absorption,
+static per-(H, Dv) value scales, per-group INT8 keys and queries, and an INT8 fixed-point state pass.
+
+Calibration. The controlled study calibrates activations on WikiText-2 (Appendix B.1). In production,
+static activation scales and DQK are calibrated on 512 Pile sequences of 512 tokens for Mamba-2
+and 2048 tokens for Nemotron-H. The activation scales are measured on the FP16 model with the
+projection-level Hadamard transformations applied; production weight quantization then uses 128
+WikiText-2 training samples with GPTQ after fusing these transformations. Each layer uses maximum
+absolute activation measurements with the same scale axes as the quantized kernel (Algorithm 3). In
+the recurrent core, we observe the raw operands V, K, Q, decay-weighted operands Γ[→i] ⊙V[i], Γ→ [i] ⊙
+K[i], local state contribution H, and chunk product Z = QK⊤.
+
+For DQK, we measure channel maxima of the Mamba-2 key and query streams, conventionally
+denoted B and C, after convolution and SiLU. Rescaling is applied at this same point during inference.
+Moving it before the nonlinear preprocessing would not preserve the function.
+
+Evaluation. We evaluate WikiText-2 test perplexity at sequence length 2048, using the standard
+tokenizer for each model: EleutherAI/gpt-neox-20b for Mamba-2 1.3B and 2.7B, and NVIDIA
+SentencePiece for Mamba-2 8B. Downstream evaluation uses the Language Model Evaluation
+Harness (Sutawika et al., 2024) on SSDi8’s six zero-shot tasks: LAMBADA, HellaSwag, PIQA,
+ARC-Easy, ARC-Challenge, and WinoGrande. For Mamba-2, rows with static-(H, Dv) value-
+side scales run without SSDi8’s output-projection mean correction, as do the tables marked “no
+compensation”; the remaining Mamba-2 rows apply it with step factor 0.15, and the Nemotron-H
+rows with 0.1.
+
+Timing. Unless otherwise indicated, latency measurements use an NVIDIA RTX A5000 with batch
+size B = 8 and sequence length T = 2048. For component measurements, we instantiate a single
+Mamba-2 mixer layer with random weights and time each kernel or sub-operation using CUDA
+events. Each run uses 30 warm-up forward passes for Triton autotuning and allocation, followed by
+200 measured forward passes. We synchronize the stream after each measured forward pass, sum
+calls belonging to the same stage, and report the median stage latency in microseconds.
+
+C THE SEVEN INVARIANCES: STATEMENTS AND PROOFS
+
+We prove the invariances of Section 3 for Equation (1) in exact arithmetic, with positive decay and
+write gates and consistently transformed initial states. Table 1 summarizes their applicability.
+
+(1/7) Key-axis rotation RQK . Let R = RQK be orthogonal and commute with every Λt. With
+qt′ = Rqt, kt′ = Rkt, and S′t−1 = St−1RT, the update and readout satisfy
+
+                            St′ = St−1Λt(I − δβtktktT) + βtvtktT RT = StRT,
+                         S′tqt′ = Stqt.
+Commutation is automatic for absent or scalar decay. For fixed diagonal decay, R must preserve the
+common decay eigenspaces. Transforming the decay itself would generally make it dense. Local
+rotations of both decay-weighted score operands remain valid and leave the carried state unchanged.
+A global key rotation preserves the state quantizer’s scale axes but can change its calibrated maxima.
+
+(2/7) Key-axis rescaling DQK . Let D = DQK ≻ 0 be diagonal, with qt′ = Dqt, kt′ = D−1kt,
+and St′−1 = St−1D−1. Since D commutes with diagonal decay, a linear write gives
+
+St′ = (St−1Λt + βtvtktT)D−1 = StD−1,                                   S′tqt′ = Stqt.
+
+For a delta write, matching the erasure terms requires D−2ktktTD−1 = ktktTD−1, or D2kt = kt,
+excluding a general rescaling. The transformation acts after any QK normalization.
+
+16
+LinQuant: Functional Invariances for Low-Precision Linear Recurrences
+
+(3/7–4/7) Value-axis rotation and rescaling. For any invertible T, set vt′ = Tvt and St′−1 =
+TSt−1. For either write rule and any diagonal decay,
+
+S′t = T St−1Λt(I − δβtktktT) + βtvtktT = TSt,                          T−1o′t = ot.
+
+Choose T = RV or T = DV . Canonical storage undoes T on each chunk’s write and local output.
+Delta pseudo-values additionally require the incoming-state correction in the transformed value basis.
+With per-channel scales, diagonal rescaling cancels because (dpvp)/(dpsp) = vp/sp, where sp is the
+channel scale. Consistently transformed scales therefore leave quantization unchanged, apart from
+finite-precision rounding.
+
+(5/7–7/7) Decay and linear-write absorptions. All three follow from the token-wise identity
+
+c[ri]v[ri](k[ri])T = (cr[i])ηv[ri] (cr[i])1−ηk[ri] T,                  c[ri] > 0.
+
+Apply it to each chunk-write term with c[ri] equal to the scalar tail decay, the diagonal-decay magnitude
+er[i], or the write gate β[ri]. Other factors retain their placement. In particular, the relative channel-
+dependent decay remains on the key. For delta-rule decay absorption, use the corresponding pseudo-
+values in place of gated values.
+
+(7/7) Delta write-factor absorption. Using the interval weights of Section 2.2, define the strictly
+lower-triangular Gram matrix
+
+C[i],rs = 1s<r     K[i],rn K[i],sn γ[si→ ],nr .
+
+                n
+
+Scalar decay is broadcast across channels. Without decay, γ ≡ 1. The gate allocation is a diagonal
+similarity transformation:
+
+               L([iσ]) = B[σi]C[i]B[1i−] σ = Bσ[i−] 1L([i1])B[1i−] σ,
+(I + L[(iσ]))−1B[σi] = Bσ[i−] 1(I + L([i1]))−1B[i].
+
+Writing F[i] := F[(i1]), the complete pseudo-values satisfy
+
+F([iσ]) = (I + L[(iσ]))−1Bσ[i] V[i] − (Γ← [i] ⊙ K[i])S[Ti] = B[σi−] 1F[i].
+
+For the transformed operands of (7/7), the remaining gate powers sum to 1 − σ, giving
+
+V([iσ],τ ) T(Γ→ [i] ⊙ K([iσ],τ )) = F[(iσ]) TB[1i−] σ(Γ[→i] ⊙ K[i])
+                               = FT[i](Γ[→i] ⊙ K[i]).
+
+The same token-wise cancellation preserves the local output. The incoming-state read is unchanged.
+At (σ, τ ) = (1, 1), this recovers the standard WY form (Yang et al., 2024c; 2025; Yang & Zhang,
+2024).
+
+Aside: channel permutations. As an aside, we note that channel permutations within a head also
+preserve the recurrence. On the key axis, the rotation argument applies with a permutation matrix
+P and consistently permuted decay Λt′ = PΛtPT, which remains diagonal. This holds for both
+linear and delta writes. Value-axis permutations follow from the equivariance above, with the inverse
+applied to the output. We do not explore permutations in our study: under our per-tensor, per-head,
+and per-channel quantizers, they only reorder quantized entries and their associated scales, leaving
+quantization error unchanged. They can matter under groupwise quantization, where channel order
+determines which entries share a scale (Zhang et al., 2026).
+
+D LOW-PRECISION REALIZATIONS AND KERNEL IMPLEMENTATION
+
+This appendix describes the quantized chunkwise forms, the controlled and production kernels, and
+the placement and fusion of transformations. Figure 1 provides an architectural overview of these
+transformation locations.
+
+                   17
+LinQuant: Functional Invariances for Low-Precision Linear Recurrences
+
+D.1 QUANTIZED CHUNKWISE FORMS
+
+Section 3.1 gives the scalar-decay linear recurrence underlying Mamba-2. The other five families
+retain its state write, state pass, state read, local score, and intra-chunk output, but form their
+operands differently. Throughout this subsection, Q denotes quantization at the indicated boundary,
+with scale factors implicit. The write, read, and local-score contractions use INT8 operands with
+INT32 accumulation (except the 16-token diagonal blocks of the local score under diagonal decay,
+which compute the decay-weighted dot products in FP32 using dequantized queries and keys), with
+the corresponding scales applied to the accumulated products. The intra-chunk output uses FP16
+arithmetic on INT8-quantized values.
+
+Decay factors. We use the interval weights γ[si→ ] r and stacked prefix and tail weights Γ← [i] , Γ→ [i] from
+Section 2.2.
+
+No decay, linear write (LA). Setting γ ≡ 1 removes all decay factors. With an optional write gate,
+the chunk computation becomes
+
+                H[i] = Q(B[i]V[i])⊤Q(K[i]),
+
+             S[i+1] = S[i] + H[i],             S[i+1] = Q(S[i+1]),
+
+                inter                   ⊤
+             O[i] = Q(Q[i])S[i],
+
+                A[i] = Q(Q[i])Q(K[i])⊤ ⊙ M,
+
+                intra
+
+             O[i] = A[i]Q(B[i]V[i]).
+
+Diagonal decay, linear write (GLA). For positive decay gates, the masked product in Section 2.2
+expands as
+
+                                      ⊤
+
+tril(Γ← [i] ⊙ Q[i])     K[i]           = Mrs          Q[i],rn K[i],sn γ[si→ ],nr .  (2)
+                          Γ← [i]
+                                                       n
+                                           rs
+
+The right-hand side also applies when decay gates are zero. Quantizing the contraction operands for
+positive gates gives
+
+H[i] = Q(B[i]V[i])⊤Q(Γ→ [i] ⊙ K[i]),
+
+S[i+1] = S[i]diag(γ[Ci],1, . . . , γ[Ci],Dk ) + H[i],     S[i+1] = Q(S[i+1]),
+
+   inter  =  Q(Γ← [i]  ⊙             ⊤                                                  (3)
+
+O[i]                      Q[i])S[i],
+
+A[i],rs =       Q Q[i],rnγ[ri],n/γ[ai],n Q K[i],snγ[ai],n/γ[si],n ,
+
+             n
+
+   intra
+
+O[i] = A[i]Q(B[i]V[i]).
+
+where the displayed local score applies to causal pairs s ≤ r. Entries above the causal diagonal
+are zero. The decay lies inside the reduction over channels, as in Equation (2). For cross-block
+scores, the kernel anchors the two decay factors at the first position a of the block containing r, so
+that both γ[ri],n/γ[ai],n and γ[ai],n/γ[si],n are at most one, then quantizes and multiplies the anchored
+operands. Within a block, it uses quantized queries and keys and applies γ[si→ ],nr inside the FP32 sum.
+A query–key rotation can act on the anchored operands in registers, but cannot generally be applied
+once to the unweighted Q and K (Section 3).
+
+Delta write (DeltaNet, GDN, KDA). Delta cells first construct pseudo-values that account for
+interactions among writes and with the incoming state. The Gram matrix, the triangular solve, and the
+WY intermediates are computed in FP32; only the incoming-state correction uses an INT8-quantized
+copy of W[i] against the INT8 copy of the incoming state. For absent or scalar decay, let Γ[i] denote
+
+                                           18
+LinQuant: Functional Invariances for Low-Precision Linear Recurrences
+
+the causal decay mask. The compensated write-factor placement (σ, τ ) gives
+
+             G[i] = tril (B[σi]K[i]) (B[1i−] σK[i])⊤ ⊙ Γ[i], −1 ,                       T[i] = (I + G[i])−1,
+
+             W[i] = T[i]B[σi](Γ← [i] ⊙ K[i]),                U[i] = T[i] B[σi]V[i],
+
+               (σ)                                ⊤
+             F[i] = U[i] − Q(W[i])S[i],
+
+         V([iσ],τ )  =  B([i1]−σ)(1−τ  )     (σ)  ,     K([iσ],τ ) = B[(i1]−σ)τ K[i],
+
+                                          F[i]
+
+Here  U[i],  W[i]    are  WY  intermediates,            and     (σ)  approximates  the  complete       pseudo-values  F([iσ] )
+
+                                                             F[i]
+
+using the quantized incoming-state correction. The transformed write operands V[(iσ],τ), K[(iσ],τ) enter
+
+the chunk step:
+
+                              H[i] = Q(V[(iσ],τ ))⊤Q(Γ[→i] ⊙ K([iσ],τ )),
+
+                             S[i+1] = S[i]P[i] + H[i],                     S[i+1] = Q(S[i+1]),
+
+                                inter  =  Γ← [i]     ⊙                  ⊤  ,
+
+                             O[i]                       Q(Q[i])S[i]
+
+                              A[i] = Q(Q[i])Q(K([iσ],τ))⊤ ⊙ Γ[i],
+
+                                intra  =  A[i]Q(V[(iσ],τ )),
+
+                             O[i]
+
+where P[i] is I for DeltaNet, γ[Ci]I for GDN, and diag(γ[Ci],1, . . . , γ[Ci],Dk ) for KDA. For KDA, both
+the Gram and local-score contractions place the channel-dependent decay inside the reduction, the
+
+local score using the anchored construction of Equation (3) in place of a scalar mask applied after the
+product, and the state read quantizes the decay-weighted query Q(Γ← [i] ⊙ Q[i]). At (σ, τ ) = (1, 1),
+
+with no decay and quantization removed, V[(iσ],τ) = F[i] recovers the pseudo-values in Section 2.2.
+
+Setting  σ  =  1  instead  assigns  B1[i/] 2  to     each  Gram      operand.
+               2
+
+Absorptions. For a linear write with scalar decay, the tail weights Γ→ [i] and write gate B[i] can each
+be split between the two operands before quantization. With elementwise powers of the tail vector
+and broadcasting across channels, the write is
+
+                          Q  (Γ→ [i] )η ⊙ (B[ξi]V[i])        ⊤       (Γ→ [i] )1−η ⊙ (B1[i−] ξK[i])  .
+
+                                                               Q
+
+Here η = 1 and ξ = 1 put the respective factors on the value, while zero puts them on the key.
+Under diagonal decay, only the scalar maximum er[i] = maxn (Γ[→i] )rn moves. The relative channel-
+dependent decay remains on the key. Delta cells use pseudo-values for decay absorption and the
+compensated (σ, τ ) construction for write strength, as proved in Appendix C.
+
+D.2 KERNEL IMPLEMENTATION
+
+Controlled study. Diagonal rescalings are applied to the operands before quantization, and absorp-
+tions redistribute token-wise factors already used by the write. Algorithm 1 shows one chunk step for
+scalar or no decay with canonical state storage. Unused axis transformations are set to the identity.
+Matrices stack tokens as rows, so the rotations of Section 3.2 act by right multiplication with RT.
+
+Here, Qb quantizes operands to b-bit integers and deq restores the associated scales. Scale factors not
+shown explicitly are folded into the surrounding operations. The full-precision carry is S, and Sˆ[i] is
+its INT8 read copy. The tail weights are g, the prefix weights p, the causal decay mask Γ, and the
+chunk decay γC .
+
+                                                          19
+LinQuant: Functional Invariances for Low-Precision Linear Recurrences
+
+Algorithm 1 One INT8 chunk step with LinQuant transformations (per head).
+
+1: once: Q ← QDQK , K ← KDQ−1K , V ← VDV                                                           ▷ rescale operands
+                                                                                                     ▷ rotate operands
+2: once: Q ← QRQT K , K ← KRTQK , V ← VRVT
+                                                                                              ▷ write-gate absorption
+3: if δ = 0 then
+       (K, V) ← (B1[i−] ξK, B[ξi]V)                                                                ▷ decay absorption
+4:                                                                                                          ▷ state read
+
+5: else(K, V) ← (K([iσ],τ), V([iσ],τ)) from Algorithm 2                                                   ▷ local score
+                                                                                                 ▷ intra-chunk output
+6:                                                                                               ▷ restore value basis
+
+7: end if                                                                                          ▷ combine outputs
+                                                                                           ▷ quantize write operands
+8: wk ← g1−η, wv ← gη
+                                                                                                           ▷ state write
+9: O ← p ⊙ deq Qb(Q)Sˆ[Ti]                                                                       ▷ restore value basis
+                                                                                                ▷ carry and read copy
+10: A ← deq Qb(Q)Qb(K)T ⊙ Γ
+
+11: Oloc ← A Qb(V)
+
+12: Oloc ← OlocRV
+
+13: O ← O + Oloc
+
+14: Kˆ , Vˆ ← Qb(wk ⊙ K), Qb(wv ⊙ V)
+
+15: H ← deq(Vˆ TKˆ )
+
+16: H ← RVT H
+17: S ← SγC + H. Sˆ[i+1] ← Q8(S)
+
+The initial rescalings and rotations are fused with quantization; the output is multiplied by DV−1 to
+undo value rescaling. The local path and state write quantize their operands separately. The chosen
+write-gate allocation is used in the local score, intra-chunk output, and state write; the delta-rule
+operands from Algorithm 2 already include it. The state read, local score, and state write use INT8
+operands with INT32 accumulation, while the intra-chunk output uses FP16 arithmetic on quantized
+values. The state is carried in FP32, with an INT8 copy used by the next chunk.
+
+Decay weights are unity for LA and DeltaNet, scalars for Mamba-2 and GDN, and channel-dependent
+vectors for GLA and KDA. Under diagonal decay, only the scalar magnitude er = maxn grn is
+redistributed: wk = g ⊙ e−η and wv = eη. Prefix decay is applied to the query before quantization
+in the state read, and the chunk decay becomes diag(γnC). The local score uses the construction in
+Appendix D.1, including its FP32 computation within each 16-token block. Query–key rotations act
+
+only on the decay-weighted operands of Equation (3), before quantization.
+
+Canonical storage under RV adds matrix products inside the call. Each chunk’s rotated write is
+multiplied by R⊤V before it joins the FP32 carry, and the local output is returned to the original
+
+basis. The state read stays canonical. For canonical storage, delta cells right-multiply the incoming-
+
+state  correction                    ⊤  by  RV⊤  before  subtracting  it  from  U[i],  so  both  terms  use  the  same
+
+                   Q(W[i])S[i]
+
+rotated value basis. With rotated storage, the inverse rotations of the local output and state write are
+
+replaced by one O ← ORV at the end of the chunk. This incurs the accuracy penalty discussed in
+
+Appendix E.1. The canonical delta kernels hold the full state and the Dv × Dv rotation operand per
+
+program.
+
+                                                         20
+LinQuant: Functional Invariances for Low-Precision Linear Recurrences
+
+Algorithm 2 WY preparation with compensated write-factor placement (σ, τ ), per head and chunk.
+M< is the strictly lower causal mask, including scalar decay when present. Diagonal decay is applied
+inside the Gram reduction as described above. The Gram matrix, solve, and WY intermediates
+
+are FP32; Sin is the INT8-quantized incoming state and W[i] is the only quantized operand of the
+preparation. The resulting transformed write operands are used in the chunk step.
+
+1: Kσ[i] ← Bσ[i]K[i], K1[i−] σ ← B[1i−] σ K[i]                                                                     ▷ Gram factors
+                                                                                                            ▷ Gram matrix, fp32
+2: G[i] ← (Kσ[i] (K1[i−] σ)T) ⊙ M<                                                          ▷ unit lower-triangular solve, fp32
+                                                                                                      ▷ WY intermediates, fp32
+3: T[i] ← (I + G[i])−1
+4: W[i] ← T[i](Kσ[i] ⊙ Γ← [i] ), U[i] ← T[i] B[σi]V[i]                                              ▷ incoming-state correction
+                                                                                       ▷ match the rotated value basis of U[i]
+                                           T
+                                                                                                      ▷ complete pseudo-values
+5: C[i] ← Qb(W[i]) Sin
+                                                                                                  ▷ transformed write operands
+6: Canonical RV : C[i] ← C[i]RVT
+
+         (σ)
+
+7: F[i] ← U[i] − C[i]
+
+8:  K[(iσ],τ )  ←  B([i1]−σ)τ K[i],           V([iσ],τ )  ←  B([i1]−σ)(1−τ  )     (σ)
+
+                                                                               F[i]
+
+9: return K([iσ],τ), V[(iσ],τ) for Algorithm 1
+
+Production Mamba-2. The production implementation adds state-axis transformations to SSDi8’s
+dataflow, as summarized in Algorithm 3. The added DQK rescaling is applied as a per-channel
+multiply inside the fused split-and-quantize pass over the convolution output, followed by RQK
+in the same pass. Neither transformation requires a separate kernel launch or memory pass in this
+
+implementation.
+
+Algorithm 3 The Mamba-2 kernel of LinQuant: SSDi8’s dataflow with RQK and DQK . Keys and
+queries are shared by the G groups and read by the H heads. g(h) denotes the group of head h. w
+denotes the within-chunk decay weights (tail factors for the write, prefix factors for the read), and γ[Ci]
+
+denotes the chunk decay.
+
+    Once per layer (the fused pass over the convolution output)
+
+1: K ← KD−Q1K RTQK , Q ← QDQK RTQK . Kˆ ← Q8(K, sK ), Qˆ ← Q8(Q, sQ)                   ▷ per group. The
+   quantized queries and keys are reused by three stages
+
+    Per chunk [i] and head h
+
+2: Vˆ ← Q8(wtail ⊙ V, sV ), tile by tile in registers                                  ▷ decay on the value. Static per-(H, Dv) scale or
+
+    dynamic per tile. Key side: Kˆ ← Q8(wtail ⊙ K) from an fp re-read instead
+
+3: H ← Vˆ TKˆ g(h)                                                             ▷ write: INT8×INT8, INT32 accumulation, one rescale
+
+4: Sˆ[i+1] ← fx(γ[Ci]Sˆ[i]) + Q8(H, sS )                                               ▷ state pass in INT8 fixed point, per-(H, Dv) scale
+
+5: Zˆ ← Q8(Qˆ g(h)Kˆ gT(h))                                  ▷ local score: INT32 accumulation, requantized per group
+
+6: O ← wpref ⊙ deq(Qˆ g(h)Sˆ[Ti]) + (deq(Zˆ ) ⊙ Γ)V ▷ read on INT8. Intra-chunk output fp16, the scale of Zˆ
+   folded into Γ
+
+Transformation placement and rotation fusion. We implement the online rotations using struc-
+tured signed Hadamard transforms. Forward rotations are fused into kernels that already materialize
+the activations. The query–key rotation joins the split-and-quantize kernel after convolution. The
+value rotation joins value quantization. The inverse value rotation must restore the original basis
+before an incompatible downstream operation. In our Mamba-2 implementation, the gated RMSNorm
+after the recurrence normalizes across the full hidden dimension. We therefore apply the per-head
+inverse rotation at the end of the recurrence-output kernel, before this normalization.
+
+Applying decay in registers. Keys are shared by groups, while decay weights can differ across
+heads. A direct implementation of key-side absorption could therefore materialize a larger, head-
+indexed tensor of weighted keys. Our write kernel avoids this intermediate tensor. Each program
+loads its group’s key tile and its head’s decay weights, then forms the weighted entries in registers:
+
+                                               kr′ ,n = wh,r kg(h),r,n,
+
+                                                          21
+LinQuant: Functional Invariances for Low-Precision Linear Recurrences
+
+The weighted tile is quantized and clipped before the INT8 tensor-core contraction. Programs
+for heads in the same group read the same underlying key tile and apply their own weights, so
+head-specific values never need to be stored as an expanded floating-point tensor.
+
+E CONTROLLED-STUDY RESULTS
+
+This appendix reports the controlled-study results for Section 4.1, using the setup in Appendix B.1.
+We organize them by key-axis transformations (1/7–2/7), value-axis transformations (3/7–4/7), and
+absorptions (5/7–7/7), followed by compact quality summaries, precision controls, and downstream
+accuracy. The complete numerical grids and per-task breakdowns are retained in the supplementary
+source.
+
+E.1 INDIVIDUAL TRANSFORMATIONS
+
+Key-axis transformations (1/7)-(2/7). Figure 6 shows the response to query–key rescaling, with
+separate panels for cells and curves for scale regimes. The query-key rescaling sweep tests both range
+balancing and its composition with rotation.
+
+               100   LA   LA+β   M2                                    M2+β
+
+recovered (%)  0
+
+               −100
+
+               −200
+                         0 .5 1 0 .5 1 0 .5 1 0 .5 1
+
+               100   GLA  GLA+β  LA†                                   LA+β†
+
+recovered (%)  0
+
+               −100
+
+               −200
+                         0 .5 1 0 .5 1 0 .5 1 0 .5 1
+
+               100   M2†  M2+β†  GLA†                                  GLA+β†
+
+recovered (%)  0
+
+               −100
+
+               −200
+                         0 .5 1 0 .5 1 0 .5 1 0 .5 1
+
+                          rescaling exponent κ of DQK
+
+                          ⟨H,C⟩  ⟨T,C⟩ ⟨T,T⟩
+                          DQK    DQK with RQK
+
+Figure 6: Response to the exponent κ of DQK , alone (solid) and composed with RQK (dashed,
+hollow), per linear cell and regime, INT6-quantized operands, INT8 stored state: percent of the naive
+excess NLL recovered. At κ = 0 the dashed curve is RQK alone.
+
+Value-axis transformations (3/7)-(4/7). Figure 7 shows the value-rescaling sweep, with separate
+panels for cells and curves for scale regimes. The value-rescaling sweep isolates the role of scale
+granularity: consistent per-channel scales absorb the rescaling, while shared scales allow it to change
+quantization error.
+
+                                                          22
+LinQuant: Functional Invariances for Low-Precision Linear Recurrences
+
+               100    LA                               LA+β                M2             M2+β              GLA
+
+recovered (%)  50
+
+               0
+
+                      0 .5 1 0 .5 1 0 .5 1 0 .5 1 0 .5 1
+
+               100    GLA+β                            DN                  GDN            KDA               LA†
+
+recovered (%)  50
+
+               0
+
+                      0 .5 1 0 .5 1 0 .5 1 0 .5 1 0 .5 1
+
+               100    LA+β†                            M2†                 M2+β†          GLA†              GLA+β†
+
+recovered (%)  50
+
+               0
+                   0 .5 1 0 .5 1 0 .5 1 0 .5 1 0 .5 1
+                                                        rescaling exponent κ of DV
+                                                            ⟨H,C⟩ ⟨T,C⟩ ⟨T,T⟩
+
+Figure 7: Response to the exponent κ of DV , percent of the naive excess NLL recovered: per-channel
+
+scales absorb a consistent diagonal rescaling, whereas shared scales allow the exponent to change the
+
+error.  The    full   grid  κ  ∈  {  1  ,  1  ,  3  ,  1}  was  run  only  under  coarse  scales  ⟨T,  T⟩.
+                                     4     2     4
+
+State-storage basis. Figure 8 compares canonical and rotated storage for every cell at INT6. The
+stored state uses one scale per head and value channel. A value rotation mixes these channels before
+quantization, changing the range covered by each scale. The largest benefit from canonical storage
+occurs in LA. Decaying and delta-rule cells are much less sensitive, although the sign and size of the
+difference depend on the configuration.
+
+        lost (%)100
+                      LA10
+                             LA+β0
+                                      M2
+                                            M2+β−10
+                                                     GLA
+                                                           GLA+β
+                                                                      DN
+                                                                             GDN
+                                                                                     KDA
+                                                                                              LA †
+                                                                                                    LA+β †
+                                                                                                             M2 †
+                                                                                                                    M2+β †
+                                                                                                                            GLA †
+                                                                                                                                  GLA+β †
+
+                                                            ⟨H,C⟩ ⟨T,C⟩ ⟨T,T⟩
+
+Figure 8: Full storage-basis control for the 340M zoo. Excess NLL of rotated minus canonical storage
+under RV , as a percentage of each model’s naive excess NLL, per scale regime, INT6-quantized
+operands. Positive values favor canonical storage. Values use rounded per-configuration perplexities.
+
+                                                          23
+LinQuant: Functional Invariances for Low-Precision Linear Recurrences
+
+Canonical value-rotation overhead. Table 4 compares the transformation stack with canonical
+RV against naive INT8 across GPUs at a fixed batch size, complementing Figure 5b. The timing
+methodology and boundaries are given in Appendix B.1.
+
+Table 4: Canonical value-rotation overhead across GPUs: median INT8 kernel time for the trans-
+formation stack with RV relative to naive INT8 (1×: equal time). B = H = 8, T = 2048, and
+Dk = Dv = 128; methodology is in Appendix B.1.
+
+                               Recurrence RTX A5000 A100-SXM4 H100
+
+                               LA                     1.61              1.24 1.60
+                               Mamba-2
+                               GLA                    1.42              1.42 1.60
+                               DN
+                               GDN                    1.36              1.72 1.59
+                               KDA
+                                                      3.37              10.56 2.43
+
+                                                      2.84              7.90 2.27
+
+                                                      1.88              4.99 1.77
+
+Absorptions (5/7)-(7/7). The absorption sweeps compare where token-wise factors enter the
+
+quantized computation. Scalar-decay placement has relatively small effects in the deployment-
+
+oriented regimes (Figure 9). For gated linear writes, the value-side endpoint ξ = 1 performs best
+
+under ⟨T, C⟩, while the other regimes can favor an interior split. For the delta cells under coarse
+
+scales,        the  selection  procedure  moves  the  compensation  to  the  keys  (τ  =  1)  and  chooses  σ  ∈  {0,  1  },
+                                                                                                                       2
+with small differences between placements. The individual curves make clear how these conclusions
+
+depend on the cell and scale regime.
+
+               25   M2                    M2+β              GLA                    GLA+β           GDN
+
+recovered (%)  0
+
+               −25
+
+               −50
+                       0 .5 1 0 .5 1 0 .5 1 0 .5 1 0 .5 1
+
+               25   KDA                   M2†         M2+β†                        GLA†            GLA+β†
+
+recovered (%)  0
+
+               −25
+
+               −50
+                       0 .5 1 0 .5 1 0 .5 1 0 .5 1 0 .5 1
+
+                                                      decay allocation η (0: keys, 1: values)
+
+                                                                ⟨H,C⟩ ⟨T,C⟩ ⟨T,T⟩
+
+Figure 9: Response to the decay allocation η (decay on the key at 0, on the value at 1) for the decaying
+cells, INT6 operands and INT8 stored state: percent of the naive excess NLL recovered, one curve
+per scale regime. Placing scalar decay on the keys raises the excess by 21–27 % on M2+β and GDN
+under ⟨T, T⟩. Diagonal decay and the per-channel-value regimes stay within a few percent.
+
+                                                      24
+LinQuant: Functional Invariances for Low-Precision Linear Recurrences
+
+                         LA+β        M2+β                              GLA+β
+               0
+recovered (%)
+               −100
+
+               −200                  0 .5 1      0 .5 1
+                         0 .5 1           M2+β†      GLA+β†
+                              LA+β†
+recovered (%)
+                    0
+
+               −100
+
+               −200
+                         0 .5 1 0 .5 1 0 .5 1
+
+                             write-factor allocation ξ (1: all on the value)
+
+                                       ⟨H,C⟩ ⟨T,C⟩ ⟨T,T⟩
+
+Figure 10: Write-factor allocation on the six gated linear models, with INT6 operands and INT8
+stored state: Bξ[i] multiplies values and B[1i−] ξ multiplies keys. Percent of the naive excess NLL
+recovered. Each curve shows one scale regime. † marks models without QK normalization.
+
+               100   DN              GDN                               KDA
+
+recovered (%)  0
+
+                                   −100
+                                             0 .5 1 0 .5 1 0 .5 1
+
+                                                             Gram exponent σ
+
+                                                            ⟨H,C⟩ ⟨T,C⟩ ⟨T,T⟩
+                                                         τ = 1 τ = 0.5 τ = 0
+
+Figure 11: Delta write-factor allocation with INT6 operands and INT8 stored state. Curves vary the
+Gram exponent σ at fixed τ , which allocates the remaining factor between the transformed write
+operands: solid τ = 1, dashed τ = 1/2, dotted τ = 0. Percent of the naive excess NLL recovered.
+Each colour denotes one scale regime.
+
+E.2 COMBINED TRANSFORMATIONS AND PRECISION CONTROLS
+
+Figure 13 compares the two shared-key regimes at INT6. Key scales are held fixed and only value
+scales change, from per channel on the left to per tensor on the right. State-axis transformations can
+help in either panel, whereas the larger value-axis gains emerge when values share a scale.
+
+Scale granularity and combined transformations. Figures 2c and 3c isolate the effects of coars-
+ening key and value scales. Tables 5 and 6 summarize INT6 quality at both model sizes, retaining
+every recurrence reported in the corresponding full grids. Coarse value scales particularly affect the
+delta-rule models; value-axis transformations recover much of this loss. Combining transformations
+can improve further, although the selected stack does not outperform every individual setting in every
+configuration.
+
+                                                          25
+LinQuant: Functional Invariances for Low-Precision Linear Recurrences
+
+‖H ̂− H‖F/‖H‖F1.0                     Q(Fa)⊤ Q(Ka)
+
+                                      Q(Fa)⊤ Ka
+                                      Fa⊤ Q(Ka)
+              0.5
+
+              0.0  0  0.5                                              1
+
+value-side                                                             key-side
+                      gate allocation a (Fa = B −aF, Ka = B aK)
+
+Figure 12: Write error of DeltaNet 340M against the gate allocation a (σ = 1−a, τ = 1; Fa = B−aF ,
+Ka = BaK via the matched solve), with INT6 static per-tensor write scales recalibrated per allocation
+on the calibration split. Relative Frobenius error of the quantized write against the full-precision
+H = F ⊤K, quantizing both operands (solid), the corrected values only, or the keys only (dashed).
+
+Per-head medians over 256 held-out WikiText-2 chunks at layers 3, 9, 15 and 21; the curve is the
+median over all heads and the band the interquartile range. Here, a = 0 is value-side absorption and
+a = 1 is key-side absorption.
+
+                      per-channel     per-tensor
+
+       LA
+   LA+β
+
+       M2
+   M2+β
+
+     GLA
+ GLA+β
+
+       DN
+    GDN
+    KDA
+
+     LA†
+  LA+β†
+
+     M2†
+  M2+β†
+
+   GLA†
+GLA+β†
+
+                      RQK
+                         DQK
+
+                              RV
+                                 DV
+
+                                     η
+                                         write
+                                             stack
+                                                     RQK
+                                                         DQK
+                                                             RV
+                                                                 DV
+
+                                                                     η
+                                                                         write
+                                                                             stack
+
+                      −100 −50     0           50                                100
+
+                                recovered (%)
+
+Figure 13: Percentage of the naive quantizer’s excess NLL recovered per cell and invariance at its
+selected setting (negative: the invariance increases the loss), shared keys with per-channel values
+(left) and with per-tensor values (right).
+
+Each individual invariance uses its held-out-selected parameters. “Best single” is the lowest reported
+test perplexity among these individual settings, including either storage basis for value rotation but
+excluding compositions. It is a descriptive oracle comparison, not a selection rule. The stack retains
+the original held-out selection and canonical storage.
+
+Precision sensitivity. Table 7 contrasts INT8 and INT4. With per-channel value scales, several
+normalized decaying and delta-rule models are already close to full precision at INT8, leaving little
+room for a promoted transformation. At INT4, the stack can reduce perplexity substantially but does
+not consistently recover full-precision quality. The gap is particularly large with coarse value scales
+in the 1.3B zoo.
+
+The write-scale control in Table 8 shows no improvement from dynamic scaling in the tested configu-
+rations. These experiments use 4-bit integer ranges within INT8 kernels; deployment below INT8
+therefore requires both a more accurate quantization scheme and an efficient sub-byte implementation.
+
+                                                          26
+LinQuant: Functional Invariances for Low-Precision Linear Recurrences
+
+Table 5: INT6 WikiText-2 perplexity for the 340M zoo. Keys use per-tensor scales; value scales
+are per channel ⟨T, C⟩ or per tensor ⟨T, T⟩. Best single is the descriptive comparison defined in the
+text; the stack is selected on held-out data and uses canonical storage. A dash denotes no reported
+promoted stack. †: no QK normalization.
+
+                            ⟨T, C⟩                                     ⟨T, T⟩
+
+Recurrence  FP Naive Best single Stack Naive Best single Stack
+
+LA          17.117  25.706  19.428  18.097   30.694                    23.151 18.138
+LA+β        16.688  19.631  17.499  17.089   28.381                    19.773 17.388
+Mamba-2     15.553  16.029  15.722  15.605   16.446                    16.036 15.633
+Mamba-2+β   15.420  15.595  15.485  15.449   16.230                    15.609 15.473
+GLA         15.104  15.651  15.302  15.302   16.048                    15.646 15.309
+GLA+β       15.308  15.540  15.418  15.415   16.046                    15.547 15.440
+DeltaNet    15.678  15.925  15.778  15.769   20.323                    16.138 15.871
+GDN         15.004  15.168  15.055  15.042   17.064                    15.236 15.103
+KDA         14.489  14.846  14.843           15.837                    14.885 14.906
+                                          –
+
+LA†         17.230  24.916  18.079  18.071    31.582                   22.486 18.336
+LA+β†       16.980  30.719  21.042  20.738   100.247                   35.441 20.429
+Mamba-2†    16.721  20.842  17.086  16.848    21.479                   17.506 16.924
+Mamba-2+β†  16.189  17.665  16.306  16.264                             17.213 16.326
+GLA†        16.070  20.282  16.740  16.739    18.844                   17.168 16.907
+GLA+β†      15.891  19.222  16.834  16.838    20.977                   17.873 16.647
+                                              20.523
+
+Table 6: INT6 WikiText-2 perplexity for the 1.3B zoo. Keys use per-tensor scales; value scales are
+per channel ⟨T, C⟩ or per tensor ⟨T, T⟩. Best single is the descriptive comparison defined in the
+text; the stack is selected on held-out data and uses canonical storage. A dash denotes no reported
+promoted stack.
+
+                            ⟨T, C⟩                                     ⟨T, T⟩
+
+Recurrence  FP Naive Best single Stack Naive Best single Stack
+
+LA+β        10.276  12.101  10.768  10.625   148.173                   12.588  10.842
+Mamba-2+β    9.755   9.839   9.805   9.789    12.687                    9.895   9.802
+GLA+β        9.189   9.307   9.267   9.260    10.115                    9.316   9.263
+DeltaNet     9.917           9.979   9.973    46.639                   10.406  10.111
+GDN          9.727  10.050   9.751   9.752    11.401                    9.867   9.788
+KDA          9.460   9.784   9.593        –   10.741                    9.642   9.653
+                     9.603
+
+State precision and write-scale controls. Table 9 separates state-read error from error fed back
+through the carry. Keeping the read state in floating point reduces error most strongly in accumulating
+recurrences. Carrying the requantized state into subsequent updates adds error beyond that of an
+INT8 read copy. The INT6 comparison retains all 340M recurrences at a fixed scale policy.
+
+Refining write-key scales alone does not resolve the error from coarse read keys (Table 10). At INT6
+it recovers part of the loss in linear-write models, with much smaller effects in delta-rule models.
+INT32 local-score accumulation and the FP16 intra-chunk output product remain fixed in these
+controls.
+
+E.3 DOWNSTREAM ACCURACY
+
+Tables 11 and 12 retain LAMBADA and the six-task average for every reported recurrence. The stack
+largely closes the gap to full precision for 340M LA and gated LA. At 1.3B, gated LA recovers most
+of the LAMBADA accuracy lost to naive quantization, although a gap remains. The other normalized
+recurrent models change little under this INT8 setting.
+
+                            27
+LinQuant: Functional Invariances for Low-Precision Linear Recurrences
+
+Table 7: Precision sensitivity on WikiText-2. INT8 uses per-channel value scales; INT4 includes both
+value-scale policies. Keys use per-tensor scales throughout. The stack is held-out-selected; dashes
+denote no reported promoted stack. Quantized settings retain the FP32 carry and INT8 read copy. †:
+no QK normalization.
+
+                     INT8, ⟨T, C⟩ INT4, ⟨T, C⟩ INT4, ⟨T, T⟩
+
+Recurrence   FP Naive Stack Naive Stack Naive Stack
+
+340M         17.117  19.482  17.265    73.226      24.736              498.768   32.750
+             16.688  17.541  16.798    83.120      22.495              726.570   73.118
+ LA          15.553  15.612  15.561    25.812      16.427               85.441   17.141
+ LA+β        15.420  15.443            21.059      16.070                        16.748
+             15.104  15.124        –   32.431      20.587               55.010   21.214
+ Mamba-2     15.308  15.322        –   24.896      18.766               88.884   19.410
+ Mamba-2+β   15.678  15.698        –   24.523      17.685               70.122   20.072
+             15.004  15.019        –   20.540      16.098              168.077   17.421
+ GLA         14.489  14.511        –   28.732                           82.814   30.205
+ GLA+β       17.230  17.797        –  314.039            –             111.449   66.355
+             16.980  18.744  17.388   515.217      37.950              436.488   94.058
+ DeltaNet    16.721  16.911  17.902   316.762      69.456              663.576   25.470
+             16.189  16.266  16.735   202.732      23.555              362.199   22.110
+ GDN         16.070  16.282  16.194   173.810      18.344              285.469   54.814
+             15.891  16.009  16.099   172.781      46.248              263.196   45.162
+ KDA                         15.935                42.062              244.264
+ LA†
+ LA+β†
+ Mamba-2†
+ Mamba-2+β†
+ GLA†
+ GLA+β†
+
+1.3B         10.276  10.763  10.349        60.518  13.987              4185.731  44.904
+ LA+β         9.755   9.774        –       11.767  10.185               295.661  10.971
+ Mamba-2+β    9.189   9.205        –       12.509  10.786               160.470  11.423
+ GLA+β        9.917   9.934        –       13.753  11.322               957.275  15.235
+ DeltaNet     9.727   9.731        –       11.916  10.329               424.986  16.016
+ GDN          9.460   9.467        –       20.150  19.877               352.929  25.376
+ KDA
+
+Table 8: WikiText-2 perplexity for the static and dynamic per-chunk write-scale controls at INT4,
+with per-head read-key scales and INT8 stored states (340M models).
+
+            Model    Static write scales   Dynamic write scales
+
+            LA                       22.7                      26.2
+            Mamba-2                  16.1                      16.4
+            GDN                      18.4                      18.8
+
+                             28
+LinQuant: Functional Invariances for Low-Precision Linear Recurrences
+
+Table 9: State-precision control at INT6 for all 340M recurrences, with per-head keys, per-channel
+values, and no invariance transforms. FP state leaves the state unquantized; INT8 read quantizes
+a read copy while retaining an FP32 carry; INT8 carry feeds the requantized state into subsequent
+updates. Entries are WikiText-2 perplexities. †: no QK normalization.
+
+Recurrence FP model FP state INT8 read INT8 carry
+
+LA          17.117  19.954      22.349                                 23.963
+LA+β        16.688  17.373      18.209                                 19.118
+            15.553  15.763      15.795                                 15.914
+Mamba-2     15.420  15.518      15.524                                 15.545
+Mamba-2+β   15.104  15.307      15.312                                 15.360
+            15.308  15.457      15.456                                 15.566
+GLA         15.678  15.870      15.867                                 16.012
+GLA+β       15.004  15.120      15.122                                 15.153
+            14.489  14.760      14.764                                 14.861
+DeltaNet    17.230  18.294      18.502                                 19.443
+            16.980  20.621      21.446                                 22.277
+GDN         16.721  17.106      17.115                                 17.328
+            16.189  16.384      16.391                                 16.577
+KDA         16.070  18.087      18.091                                 18.326
+LA†         15.891  16.709      16.703                                 16.818
+LA+β†
+Mamba-2†
+Mamba-2+β†
+GLA†
+GLA+β†
+
+Table 10: Write-key scale control at INT6 for all 340M recurrences, with an FP32 carry and INT8
+read copy. Read keys keep per-tensor scales. Shared uses the same per-tensor keys for reads and
+writes; fine write uses a separate per-channel write-key quantizer. No invariance transforms are
+applied. Entries are WikiText-2 perplexities; † marks no QK normalization.
+
+                    Per-channel values Per-tensor values
+
+Recurrence  FP Shared Fine write Shared Fine write
+
+LA          17.117  25.706      22.422   30.694                        26.380
+LA+β        16.688  19.631      18.312   28.381                        26.888
+            15.553  16.029      15.796   16.446                        16.242
+Mamba-2     15.420  15.595      15.536   16.230                        16.161
+Mamba-2+β   15.104  15.651      15.325   16.048                        15.678
+            15.308  15.540      15.463   16.046                        15.952
+GLA         15.678  15.925      15.916   20.323                        20.261
+GLA+β       15.004  15.168      15.145   17.064                        17.059
+            14.489  14.846      14.787   15.837                        15.766
+DeltaNet    17.230  24.916      20.597   31.582                        25.976
+            16.980  30.719      29.583  100.247                        92.325
+GDN         16.721  20.842      20.215   21.479                        20.817
+            16.189  17.665      17.380   18.844                        18.460
+KDA         16.070  20.282      19.788   20.977                        20.411
+LA†         15.891  19.222      18.182   20.523                        19.410
+LA+β†
+Mamba-2†
+Mamba-2+β†
+GLA†
+GLA+β†
+
+                            29
+LinQuant: Functional Invariances for Low-Precision Linear Recurrences
+
+Table 11: Zero-shot accuracy for the 340M zoo with INT8 operands and ⟨T, C⟩ scales. The six-task
+average includes LAMBADA, HellaSwag, ARC-e, ARC-c, PIQA, and WinoGrande, with normalized
+accuracy for HellaSwag and ARC-c. A dash denotes an unreported stack evaluation. †: no QK
+normalization.
+
+            LAMBADA               Six-task average
+
+Recurrence  FP Naive Stack FP Naive Stack
+
+LA          0.267  0.042  0.258   0.398  0.356                         0.395
+LA+β        0.283  0.095  0.268   0.400  0.367                         0.398
+            0.324  0.310  0.316   0.410  0.409                         0.409
+Mamba-2     0.316  0.307          0.413  0.412
+Mamba-2+β   0.335  0.331       –  0.419  0.417                              –
+            0.332  0.328       –  0.416  0.415                              –
+GLA         0.273  0.283       –  0.402  0.406                              –
+GLA+β       0.361  0.349       –  0.418  0.413                              –
+            0.341  0.339       –  0.413  0.413                              –
+DeltaNet    0.266  0.242       –  0.397  0.391                              –
+            0.273  0.150  0.250   0.400  0.372                         0.394
+GDN         0.290  0.283  0.222   0.402  0.401                         0.380
+            0.304  0.299  0.286   0.405  0.405                         0.401
+KDA         0.302  0.301  0.298   0.406  0.406                         0.404
+LA†         0.314  0.311  0.302   0.406  0.406                         0.405
+LA+β†                     0.311                                        0.405
+Mamba-2†
+Mamba-2+β†
+GLA†
+GLA+β†
+
+Table 12: Zero-shot accuracy for the 1.3B zoo with INT8 operands and ⟨T, C⟩ scales. The six-task
+average includes LAMBADA, HellaSwag, ARC-e, ARC-c, PIQA, and WinoGrande, with normalized
+accuracy for HellaSwag and ARC-c. A dash denotes an unreported stack evaluation.
+
+            LAMBADA               Six-task average
+
+Recurrence FP Naive Stack FP Naive Stack
+
+LA+β        0.465  0.169  0.408   0.507  0.447                         0.493
+Mamba-2+β   0.480  0.469       –  0.522  0.521                              –
+GLA+β       0.531  0.518       –  0.544  0.545                              –
+DeltaNet    0.454  0.458       –  0.505  0.508                              –
+GDN         0.511  0.505       –  0.535  0.532                              –
+KDA         0.522  0.514       –  0.540  0.538                              –
+
+                          30
+LinQuant: Functional Invariances for Low-Precision Linear Recurrences
+
+F PRODUCTION RESULTS
+
+This appendix reports the production results for Section 4.2. Setup and timing methodology are
+given in Appendix B.2. We compare with the official SSDi8 release, then examine query–key
+transformations, value rotation, and decay allocation. Compact quality and downstream summaries
+follow.
+
+F.1 ABLATIONS
+
+Comparison with the official SSDi8 release. Our implementation closely matches the official
+SSDi8 release in perplexity and prefill latency across the three Mamba-2 sizes (Table 13). Both use
+value-side absorption, static per-(H, Dv) scales, and no recurrent rotation.
+
+Small numerical differences remain in the fixed-point decay gate and FP32 rounding of the fused
+quantizers. For Nemotron-H, where no official SSDi8 implementation is available, the matched
+baseline uses our implementation of this setting.
+
+Table 13: Mamba-2 baseline validation on WikiText-2. Quantized rows use W4A8 projections, value-
+side static-(H, Dv) absorption, no rotation, and no compensation. Full-model prefill is measured on
+the A5000 at B = 8, T = 2048.
+
+                Method                                             1.3B          2.7B    8B
+
+                WikiText-2 perplexity                             10.42          9.06   7.25
+                FP16                                              10.923         9.430  7.629
+                SSDi8 W4A8 (official implementation)              10.928         9.441  7.620
+                Value-side baseline (our re-implementation)
+                                                                   616           1184   2563
+                Prefill latency (ms)                               609           1163   2542
+                SSDi8 W4A8 (official implementation)
+                Value-side baseline (our re-implementation)
+
+Query–key rotation and diagonal rescaling. Query–key rotation lowers perplexity at both decay
+endpoints and under both scale policies, with the largest gains at 8B (Table 16). The endpoints remain
+close in quality after rotation.
+
+The  exponent  sweep  favors  κ  =  1  ,  with  1  close  behind  (Table   14).  Incorporating  rescaling  into  the
+                                    2           4
+existing kernel leaves measured layer latency unchanged, whereas a separate elementwise operation
+
+adds overhead.
+
+Table 14: Production query–key rescaling controls. Top: WikiText-2 perplexity with static value-side
+decay absorption. Bottom: Mamba-2 1.3B layer latency at B = 1, relative to the baseline without
+rescaling. A dash denotes an unreported absolute time.
+
+                Rescaling exponent κ                                1.3B                  8B
+
+                1/4                                              10.858                7.435
+                1/2                                              10.849                7.435
+                3/4                                              10.866                7.441
+
+                Implementation                            Latency (ms)     Relative latency
+
+                Without rescaling                                  1.498                 1.00
+                Fused rescaling                                    1.498                 1.00
+                Separate elementwise rescaling                                           1.04
+                                                                        –
+
+Value rotation. With full-precision projections and the production pipeline’s per-channel value
+scales, storing the state in a value-rotated basis increases perplexity from 10.496 to 10.533 (Table 15).
+Canonical storage gives 10.497, essentially matching the unrotated baseline.
+Figure 14 shows that value-rotation error grows in later layers with small recurrence outputs. This
+suggests a role for the RMSNorm between the recurrence and output projection: normalizing a small
+
+                                                          31
+LinQuant: Functional Invariances for Low-Precision Linear Recurrences
+
+Table 15: Value-rotation diagnostics on Mamba-2 1.3B: WikiText-2 perplexity with full-precision
+projections and an INT8 fixed-point state. Canonical storage is evaluated by fake quantization.
+
+                      Transformation and state basis  FP projections
+
+                      No rotation                              10.496
+                      RV , rotated storage                     10.533
+                      RV , canonical storage                   10.497
+
+output can amplify its quantization error before it enters the residual stream. Canonical storage avoids
+the measured perplexity penalty but still requires inverse transforms. Since it provides no quality gain
+under the production scale policy, LinQuant leaves the value axis unchanged.
+
+                                                                                 250
+                      Mamba-2 Output ErrorNo rot.
+                      0.20                                    Mamba-2 Output Mag.RRQVK200
+                      0.15                                                       150
+
+                      0.10                                                       100
+                                                                                 50
+
+                      0.05  0 10 2L0ayer30 40                                    0
+
+Figure 14: Per-layer relative error against the FP16 recurrence output, alongside its magnitude, for
+three rotation settings with rotated state storage. Value-rotation error grows in later layers with small
+recurrence outputs. Section F.1 discusses the interaction with RMSNorm.
+
+Decay allocation. We compare decay placement along two axes: quantization quality and execution
+cost. Table 16 compares key- and value-side configurations under static and dynamic scales, with
+and without query–key rotation. Static value-side runs omit the output-projection mean correction
+used by the other configurations (Appendix B.2), so the static comparison does not isolate decay
+placement. Figure 15 isolates the affected kernel stage, and Figure 5c varies the operand dimensions.
+
+Table 16: Mamba-2 W4A8 absorption endpoint and rotation ablation, WikiText-2 perplexity,
+mean ± std over four calibration sets, random Hadamard RQK , without DQK . Static value-side runs
+omit output-projection mean correction; the other configurations include it.
+
+Decay on Granularity        1.3B                      2.7B                                  8B
+                                                                                                   RQK
+                      None        RQK      None             RQK                       None
+
+Value  static-(H, Dv) 10.928 ±0.004 10.860 ±0.007 9.441 ±0.017 9.379 ±0.011 7.620 ±0.009 7.456 ±0.009
+Value  dynamic-(H, 1) 10.894 ±0.005 10.829 ±0.012 9.433 ±0.006 9.371 ±0.012 7.642 ±0.013 7.447 ±0.008
+
+Key    static-(H, Dk) 10.925 ±0.003 10.849 ±0.008 9.424 ±0.016 9.367 ±0.011 7.601 ±0.009 7.455 ±0.006
+
+Key    dynamic-(H, 1) 10.884 ±0.008 10.828 ±0.010 9.424 ±0.011 9.360 ±0.004 7.634 ±0.009 7.444 ±0.009
+
+The endpoints have similar perplexity under the tested scale policies (Table 16). Without rotation,
+key-side absorption is slightly better in each comparison. Static scales are per channel on the absorbed
+operand, while dynamic scales are per (chunk, H, 1) and computed inside the kernel. These results
+support either placement on quality grounds, consistent with the limited sensitivity to scalar-decay
+placement at INT8 in the zoo.
+
+                                                          32
+LinQuant: Functional Invariances for Low-Precision Linear Recurrences
+
+                                         Mamba-2 1.3B
+
+                      latency (ms)  1.8
+
+                                    1.2
+
+                                    0.6
+
+                                    0.0        val    va′l  key     ′
+                                        SSDi8
+                                                                 key
+
+                                         chunk scan         other
+                                         chunk state
+
+Figure 15: Per-stage Mamba-2 1.3B recurrence latency at B = 8, T = 2048: the SSDi8 setting (our
+matched value-side baseline) and key-/value-side configurations with RQK and static or dynamic (′)
+
+scales.
+
+Key-side absorption need not materialize a head-expanded tensor. Each thread block loads its group’s
+keys and applies head-specific decay in registers (Appendix D.2). The remaining difference is in the
+state write, which reloads the absorbed operand in floating point before weighting and quantizing it.
+Figure 15 shows that the other stages are unchanged.
+
+Value-side absorption is faster for the tested Mamba-2 geometry, where Dk = 128 and Dv = 64
+(Figure 15). Dynamic scales add cost on the key side because finding the maximum requires another
+pass over the weighted operand. Figure 16 extends the comparison across batch size and sequence
+length.
+
+        Mamba-2 1.3B                                                            Mamba-2 1.3B
+
+latency (ms)8                                                                8
+                                                               latency (ms)4
+  2                                                                          4
+  1
+0.5                                                                          2
+
+                                                                             1
+
+     1  4 8 16 32                                                               256 512 1k 2k
+
+        batch size                                                              sequence length
+
+        FP16        value                                                       FP16  value
+
+        SSDi8 key                                                               SSDi8 key
+
+Figure 16: Mamba-2 1.3B recurrence latency against batch size at T = 2048 (left) and against
+sequence length at B = 32 (right) for FP16, the official SSDi8 implementation, and the value- and
+key-side configurations with static scales and RQK. SSDi8 and the value-side configuration have
+similar latency once launch overhead no longer dominates.
+
+The geometry sweep in Figure 5c shows that wider values can reverse the preferred endpoint at
+Dk = 64, while the key-side penalty persists across the tested widths at Dk = 128. Operand
+dimensions and the kernel’s accumulation and rescaling layout therefore both influence the cost of
+decay placement.
+
+F.2 QUALITY AND DOWNSTREAM SUMMARIES
+
+Table 17 reports the static-scale configurations used in the main comparison, retaining calibration
+variability for Mamba-2 and both decay endpoints for the combined transformation. Dynamic-scale
+endpoint comparisons remain in Table 16. The complete configuration grid and per-task breakdowns
+are retained in the supplementary source.
+
+                                               33
+LinQuant: Functional Invariances for Low-Precision Linear Recurrences
+
+Table 17: Production quality with static scales and W4A8 projections. Perplexity is mean ± standard
+deviation over four calibration sets for Mamba-2 (rows without a ± are single runs) and a single
+run for Nemotron-H. Avg. is the six-task average from the default calibration run. Value and Key
+denote the decay-absorption endpoint, with per-channel scales on that operand. The official SSDi8
+implementation is available only for Mamba-2.
+
+Configuration         WikiText-2 PPL Avg.
+
+Mamba-2 1.3B                        10.420                             0.595
+ FP16                        10.923 ±0.007                             0.588
+ SSDi8 (official)            10.860 ±0.007                             0.590
+ Value: RQK                  10.849 ±0.011                             0.588
+ Value: RQK + DQK            10.830 ±0.007                             0.589
+ Key: RQK + DQK
+
+Mamba-2 2.7B                        9.060                              0.638
+ FP16                               9.430                              0.626
+ SSDi8 (official)            9.379 ±0.011                              0.629
+ Value: RQK                  9.383 ±0.007                              0.627
+ Value: RQK + DQK            9.372 ±0.003                              0.630
+ Key: RQK + DQK
+
+Mamba-2 8B                          7.250                              0.707
+ FP16                               7.629                              0.696
+ SSDi8 (official)            7.456 ±0.009                              0.703
+ Value: RQK                  7.435 ±0.008                              0.699
+ Value: RQK + DQK            7.437 ±0.004                              0.697
+ Key: RQK + DQK
+
+Nemotron-H Base              6.030 0.758
+                             6.186 0.751
+ FP16                        6.178 0.753
+ Value: RQK                  6.175 0.753
+ Value: RQK + DQK
+ Key: RQK + DQK
+
+Nemotron-H Reasoning         8.423 0.731
+                             8.666 0.727
+ FP16                        8.650 0.728
+ Value: RQK                  8.670 0.728
+ Value: RQK + DQK
+ Key: RQK + DQK
+
+Table 18 summarizes LAMBADA and the six-task average for the rescaled configurations. The two
+decay endpoints have similar downstream accuracy. Perplexity improvements do not imply uniform
+gains in task accuracy, as the comparison with the unrescaled configurations in Table 17 shows.
+
+Table 18: Downstream accuracy for the static production configurations with RQK + DQK . Both
+endpoints use per-channel scales on the absorbed operand. Mamba-2 uses the default calibration set.
+The six-task average follows Table 17.
+
+                      LAMBADA Six-task average
+
+Model                 Value Key Value                                         Key
+
+Mamba-2 1.3B          0.644  0.645  0.588                              0.589
+Mamba-2 2.7B          0.675  0.684  0.627                              0.630
+Mamba-2 8B            0.706  0.704  0.699                              0.697
+Nemotron-H Base       0.729  0.727  0.753                              0.753
+Nemotron-H Reasoning  0.660  0.660  0.728                              0.728
+
+Hadamard signs. Table 19 isolates deterministic versus random Hadamard signs under static
+value-side absorption. Random signs improve five of the six query–key rotation comparisons shown;
+the exception is the small WikiText-2 difference at 8B. The main experiments use random signs.
+Additional endpoint and scale combinations are retained in the full source grids.
+
+                      34
+LinQuant: Functional Invariances for Low-Precision Linear Recurrences
+
+Table 19: Hadamard-sign control with W4A8 projections, static value-side decay absorption, and no
+diagonal rescaling. Entries are single-calibration-run perplexities, distinct from the multi-calibration
+means above. Det. and Rand. apply deterministic and random-signed query–key Hadamard rotations.
+
+Model         Dataset No rotation Det. Rand.
+
+Mamba-2 1.3B  WikiText-2      10.930  10.882                           10.857
+Mamba-2 1.3B  Pile             7.415   7.397                            7.382
+Mamba-2 2.7B  WikiText-2       9.420   9.400                            9.374
+Mamba-2 2.7B  Pile             6.572   6.557                            6.555
+Mamba-2 8B    WikiText-2       7.619   7.463                            7.467
+Mamba-2 8B    Pile             6.293   6.213                            6.206
+
+                          35
+

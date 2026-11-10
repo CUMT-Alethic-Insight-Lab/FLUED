@@ -1,0 +1,640 @@
+                                        DynaKRAG: A Unified Framework for Learnable Evidence Control in Multi-Hop
+                                                                       Retrieval-Augmented Generation
+
+                                        Chenyu Zhou1, Yaqi Wu1∗, Xiaolei Guo1∗, Jiaqi Huang1, Xianfa Zhang2, Junxu Zhang2, Zhuo Yu2,
+                                                                           Zhubo Shi3, Jianghao Lin1†, Dongdong Ge1
+
+                                                                                                1Shanghai Jiao Tong University
+                                                                                         2Shanghai Aircraft Manufacturing Co., Ltd.
+
+                                                                                                        3Tongji University
+                                                                                       {chenyuzhou, linjianghao, ddge}@sjtu.edu.cn
+
+arXiv:2607.06507v2 [cs.CL] 22 Aug 2026                                Abstract                               support to stop. The next step is therefore a control deci-
+                                                                                                             sion over an evolving evidence state: the system must decide
+                                           Multi-hop retrieval-augmented generation (RAG) acquires ev-       whether to continue along the retrieval frontier, reformulate
+                                           idence sequentially, with each document contributing sup-         the query, expand around a bridge entity, request a missing
+                                           porting facts, bridge entities, query refinements, or sufficient  fact, check sufficiency, or stop and answer.
+                                           evidence for answering. Evidence acquisition can involve it-
+                                           erative retrieval, query reformulation, evidence assessment,      From Method-Specific Adaptive RAG
+                                           and sufficiency checking. We introduce DynaKRAG, a uni-                  to Unified Evidence Control
+                                           fied evidence-action framework that learns a shared state-
+                                           conditioned policy for coordinating these operations. At each     Existing Adaptive RAG                   Fixed, method-specific pipelines
+                                           step, a deterministic validity layer constructs the executable
+                                           action set, a learned continuation gate selects between answer    Routing-based Control
+                                           generation and further evidence acquisition, and a learned
+                                           advantage scorer ranks feasible evidence operations by their                          direct answer                    Fragmented
+                                           predicted gain relative to immediate answer generation. The                                                              pipelines
+                                           selected operation updates the shared state and may en-                               retrieve
+                                           able additional operations. Across HotpotQA, 2Wiki, and
+                                           MuSiQue with Qwen2.5-7B, GPT-4o-mini, and Llama-3.1-              question router     iterative           ...
+                                           8B, DynaKRAG ranks first among the compared methods in                                retrieve
+                                           both EM and F1 for all nine dataset–backbone pairs. Rela-
+                                           tive to matched-backbone baseline method, DynaKRAG im-            Retrieve–rewrite loop                   answer        Method-
+                                           proves F1 in every pair while achieving total-token efficiency                                                           specific
+                                           gains of 10.1–34.3% and retrieval-call efficiency gains of                                           ...                 control
+                                           15.1–43.4%, establishing Pareto dominance under these mea-
+                                           sures. With Qwen2.5-7B, terminal evidence compression fur-         retrieve rewrite retrieve                             Growing
+                                           ther improves answer quality across all three datasets while                                                           token cost
+                                           reducing the context passed to final answer generation by         Judge-guided retrieval
+                                           54.4%–71.5%. These results demonstrate that unified, state-
+                                           conditioned evidence control supports strong answer quality,                                              ...
+                                           efficient retrieval, and compact answer-generation contexts.
+                                                                                                             retrieve check      gap retrieve             answer
+                                                             Introduction
+                                                                                                             DynaKRAG            Unified state-conditioned evidence control
+                                        Retrieval-augmented generation (RAG) grounds language
+                                        models in external sources of evidence (Lewis et al. 2020),                              select action from               Learnable
+                                        but multi-hop questions challenge the standard retrieve-then-                                Valid actions                controller
+                                        generate abstraction. The first useful passage rarely com-
+                                        pletes the answer; instead, it changes the information need. It      question  shared                                     retrieve more ×
+                                        may expose a bridge entity, reveal a missing relation, indicate                                                           rewrite query ×
+                                        that the current query is misdirected, or provide sufficient                   evidence state
+                                                                                                                                                                  bridge expand ✔
+                                            ∗These authors contributed equally.                                   ✔ Unified      update
+                                            †Corresponding author.                                           ✔ Learnable model                                      ...
+                                        Copyright © 2027, Association for the Advancement of Artificial
+                                        Intelligence (www.aaai.org). All rights reserved.                    ✔ Token-Efficiency
+
+                                                                                                                                       bridge expand execute
+
+                                                                                                             Figure 1: Method-specific adaptive RAG pipelines (top) ver-
+                                                                                                             sus the unified DynaKRAG controller (bottom), which com-
+                                                                                                             poses state-valid operations over a shared evidence state.
+
+                                                                                                                Adaptive RAG methods address parts of this problem by
+                                                                                                             allowing intermediate results to guide subsequent retrieval
+and reasoning (Trivedi et al. 2023; Jeong et al. 2024). Recent     should be executed. After acquisition terminates, an optional
+systems further introduce useful behaviors such as query           terminal compressor constructs a compact, answer-focused
+reformulation, evidence critique, sufficiency checking, and        context for the final generator (Xu, Shi, and Choi 2024; Li
+gap-directed retrieval (Jiang et al. 2023; Su et al. 2024; Asai    et al. 2025a; Jeong et al. 2025). To isolate the contribution
+et al. 2024; Yan et al. 2024; Li et al. 2026a,b). However,         of adaptive evidence control from that of terminal compres-
+these behaviors are still largely embedded in method-specific      sion, we report both uncompressed and compressed operat-
+pipelines. Each pipeline prescribes its own transition struc-      ing points.
+ture, limiting how different evidence operations can be com-
+pared, composed, and learned within a shared decision pro-            We make three contributions.
+cess (Figure 1, top). For example, a system that can decide
+whether to retrieve again may not consider query rewriting or       • We formulate adaptive multi-hop evidence acquisition as
+bridge expansion, while a sufficiency module may identify a           a unified evidence-action framework in which heteroge-
+missing fact without comparing the available ways to acquire          neous RAG strategies are represented as atomic oper-
+it. These systems therefore instantiate different solutions to        ations and shared state transitions rather than isolated,
+the same underlying problem: selecting the most appropriate           method-specific pipelines.
+executable evidence operation as the state evolves.
+                                                                    • We develop a learned controller that combines deter-
+   The choice of operation also determines computational              ministic action validity, learned continuation, and stop-
+cost. Adaptive RAG trajectories may repeatedly invoke re-             normalized action advantages to coordinate both whether
+trievers and language models, while different operations con-         evidence acquisition should continue and which valid op-
+sume different amounts of computation. Additional context             eration should be executed. The controller is trained us-
+can improve evidence coverage, but it can also introduce dis-         ing supporting-evidence and answer-improvement signals
+tractors, expand downstream prompts, and spend tokens on              while relying only on observable state features at infer-
+redundant information. A larger retrieval budget is therefore         ence time.
+not a reliable substitute for better control. An effective adap-
+tive RAG system should allocate computation to operations           • We evaluate DynaKRAG on three multi-hop QA
+whose expected benefit justifies their cost, avoid invalid or         benchmarks and three answer-generation backbones.
+low-value transitions, and stop once the available evidence is        DynaKRAG achieves the best EM and F1 scores across
+sufficient. This motivates evaluating the quality–compute op-         all nine dataset–backbone settings. Relative to S2G-RAG
+erating points exposed by an evidence-control policy rather           with matched backbones, it consistently achieves higher
+than reporting only a single accuracy point. We accordingly           F1 while using fewer total tokens and retrieval calls. A
+report answer quality together with token use, retrieval calls,       controller trained on Qwen2.5-7B also transfers directly
+and language-model calls, and examine performance under               to GPT-4o-mini and Llama-3.1-8B without additional
+controlled retrieval caps.                                            policy training, while the compressed and uncompressed
+                                                                      configurations expose complementary quality–compute
+   We introduce DynaKRAG, a unified learning frame-                   operating points.
+work for adaptive evidence acquisition (Figure 1, bot-
+tom). DynaKRAG represents heterogeneous RAG behav-                                      Related Work
+iors, including frontier retrieval, gap-directed retrieval, query
+rewriting, bridge-entity expansion, sufficiency checking, and      Multi-hop evidence acquisition. Retrieval-augmented
+stopping, as atomic operations over a shared evidence state.       generation grounds language-model predictions in external
+A deterministic validity layer first removes operations whose      non-parametric evidence (Lewis et al. 2020; Huang et al.
+prerequisites are unmet or whose budgets are exhausted. A          2026). Multi-hop benchmarks such as HotpotQA, 2Wiki-
+learned continuation gate then decides whether the trajec-         MultiHopQA, and MuSiQue extend this setting to questions
+tory should stop or continue. Conditional on continuing, a         whose answers depend on evidence distributed across docu-
+learned advantage scorer ranks feasible nonterminal opera-         ments and reasoning steps (Yang et al. 2018; Ho et al. 2020;
+tions by their predicted gain relative to answering from the       Trivedi et al. 2022). As intermediate facts reveal new entities
+current state. Executing the selected operation updates the        and relations, the information needed at a later hop may be
+shared state and may enable different operations at the next       unavailable from the original query alone. Multi-hop dense
+step, turning fixed RAG pipelines into composable sequential       retrieval addresses this dependency by conditioning later re-
+decisions.                                                         trieval on previously acquired evidence (Xiong et al. 2021),
+                                                                   establishing evidence acquisition as a trajectory that evolves
+   Training uses two complementary supervision signals.            with the partial solution state.
+We derive action-level targets from changes in supporting-
+evidence recall and train the continuation gate using the im-      Iterative and adaptive retrieval. Subsequent work devel-
+provement obtained by completing a trajectory rather than          ops several mechanisms for steering this trajectory. ReAct es-
+answering from an intermediate prefix. Supporting-evidence         tablishes the broader paradigm of interleaving reasoning with
+annotations and reference answers are used only to construct       external actions (Yao et al. 2023). IRCoT interleaves retrieval
+training labels; at inference time, the controller relies ex-      with generated reasoning, while Self-Ask turns composi-
+clusively on features of the observable evidence state. The        tional questions into searchable follow-up questions (Trivedi
+resulting policy jointly determines whether evidence acqui-        et al. 2023; Press et al. 2023). CoRAG learns multi-step
+sition should continue and which currently valid operation         retrieval chains through iterative query reformulation (Wang
+                                                                   et al. 2025; Zhuang et al. 2024; Fang, Meng, and MacDonald
+2025), and RQ-RAG trains models to rewrite, decompose, or         experiments, a controller trained on one answer backbone is
+disambiguate queries (Chan et al. 2024). A complementary          used with other answer backbones without retraining.
+line of work adapts retrieval timing and strategy. FLARE and
+DRAGIN trigger retrieval from generation-time information            Formally, DynaKRAG constructs an evidence trajectory
+needs (Jiang et al. 2023; Su et al. 2024; Yao et al. 2025; Baek   τ = (s0, a0, s1, a1, . . . , aT −1, sT ). The initial state s0 con-
+et al. 2025), while Adaptive-RAG routes questions among           tains the question and an empty evidence history. At step t,
+retrieval regimes according to estimated complexity (Jeong        the state st summarizes all information observable at infer-
+et al. 2024; Tang et al. 2025; Guan et al. 2026). These meth-     ence time, including retrieved documents, query and action
+ods make retrieval responsive to the evolving reasoning pro-      history, retrieval-frontier statistics, detected bridge entities,
+cess, but each controller focuses on a particular decision, such  and any missing-information feedback. A deterministic va-
+as constructing the next query, determining retrieval timing,     lidity layer maps this state to an executable action set A(st).
+or selecting a retrieval strategy. Reinforcement learning has     The learned controller then considers only these valid actions
+also been explored for multi-turn search and information-         and selects at ∈ A(st), while executing at produces the next
+seeking agents (Jin et al. 2025; Song et al. 2025; Wu et al.      state st+1. Because a transition can reveal a new gap, entity,
+2025; Jiang et al. 2025; Zhao et al. 2026; Zheng et al. 2025;     or sufficiency judgment, it can also change which actions are
+Li et al. 2025b). Recent surveys and benchmarks have be-          available at the next step.
+gun to systematize this broader space of LLM agents and
+agentic information seeking (Zhang et al. 2024; Xi et al.            Acquisition terminates either when the con-
+2026, 2025; Zhou et al. 2026), while skill-centric methods        troller selects stop_answer or when an executed
+synthesize, represent, and retrieve reusable agent capabili-      sufficiency_check confirms that the accumulated
+ties (Wang et al. 2026; Yu et al. 2026; Ding et al. 2026). In     evidence is sufficient. Otherwise, the controller continues
+contrast to these trajectory-level RL methods, DynaKRAG           until the step cap. The budget-sensitivity experiments
+learns a lightweight one-step advantage ranker over a con-        additionally impose an explicit retrieval-call cap. The
+strained action set, without rollouts or trajectory-level reward  accumulated evidence is optionally compressed into an
+optimization.                                                     answer-focused context and passed to G. Under this
+                                                                  formulation, query construction, operation selection, and
+Evidence diagnosis and action-level control. Recent sys-          retrieval depth become trajectory-level decisions rather
+tems increasingly use accumulated evidence to guide sub-          than fixed hyperparameters. The remainder of this section
+sequent computation. CRAG evaluates retrieval quality and         defines the evidence-action framework, explains how the
+invokes corrective processing (Yan et al. 2024; Joren et al.      state-conditioned policy is learned, and describes terminal
+2025), while Self-RAG learns retrieval and critique deci-         compression and inference.
+sions through reflection tokens (Asai et al. 2024). S2G-RAG
+predicts evidence sufficiency and converts structured evi-        Unified Evidence-Action Framework
+dence gaps into subsequent retrieval queries (Li et al. 2026a;
+Yang et al. 2025; Park, Cho, and Lee 2025; Chen et al.            The evidence state contains the question, retrieved docu-
+2026); PAR2-RAG combines breadth-first evidence cover-            ments, the frontier cursor in the initial ranking, the latest
+age with depth-first refinement and sufficiency control (Li       query, an optional missing-information description, a suf-
+et al. 2026b; Lee, Jeong, and Hwang 2025). Taken together,        ficiency result, action history, and accumulated cost. Both
+existing systems support frontier expansion, query reformu-       learned models observe only inference-time quantities de-
+lation, gap-directed retrieval, diagnosis, and stopping. How-     rived from this state (the full feature list appears in the supple-
+ever, these operations are usually studied within separate,       mentary material). Gold answers, answer scores, supporting
+method-specific pipelines, and it remains unclear how a sys-      facts, and support recall are never used as runtime features.
+tem should choose among them as its evidence state evolves.
+DynaKRAG addresses this decision problem directly: the               Seven atomic operations are defined, six of which par-
+current evidence state determines the executable operations,      ticipate in the evidence-control loop. Four produce new ev-
+and a learned advantage scorer selects among them as the          idence: retrieve_more (R) advances the existing re-
+trajectory unfolds.                                               trieval frontier; gap_query (G) generates a query for an
+                                                                  identified missing fact; rewrite_query (W) reformu-
+                         Method                                   lates the current query using accumulated evidence; and
+                                                                  bridge_entity_expand (B) retrieves around entities
+Overview and Problem Formulation                                  detected in the evidence. sufficiency_check (S) asks
+                                                                  G whether the accumulated evidence supports an answer.
+We consider multi-hop question answering with a question          A positive judgment terminates acquisition, whereas a neg-
+q, a corpus D, a retriever R, and an answer generator G.          ative judgment records the missing information and en-
+Unlike standard RAG, which commits to a fixed retrieval           ables gap-directed retrieval. stop_answer (T ) allows
+depth or a prescribed iterative routine, our setting allows       the controller to terminate acquisition directly without in-
+the system to choose a different evidence operation after         voking another evidence operation. The seventh operation,
+each state update. The objective is to acquire sufficient sup-    compress_answer_evidence (C), is applied once af-
+port for answering q while avoiding invalid, redundant, or        ter acquisition terminates in the full configuration and is
+unproductive operations. DynaKRAG instantiates a unified          recorded in the action trace. We handle this component out-
+evidence-action controller without replacing R or G; in our       side the learned ranking process and analyze it separately
+                                                                  from the acquisition policy.
+TRAINING ONLY                            State-Action Transition Supervision
+
+  Gold support       States \x35\xd8\x35\xd8                                            retrieve  \x35\xd8\x35\xd8                            Action-
+      label only           query                                                                                Advantage
+                           docs                                           check     \x35\xd82                                                           Advantage
+                           gap                                                                                    Labels                            Model
+                           history
+                                                                          gap       \x35\xd83                           \x35\xd8(\x35\xd8\x35\xd8, \x35\xd8)
+
+                                                                          rewrite   \x35\xd84
+
+                                                                          bridge    \x35\xd85
+
+                                           Continuation Supervision
+
+Trajectory Prefixes              Prefix vs. Final Answer F1                         Continuation Labels                       Continuation Model
+                                   \x35\xd8\x35\xd8\x35\xd8,𝒑\x8f\xdc  \x35\xd8\x35\xd8\x35\xd8\x35\xd8\x35\xd8\x35\xd8\x35\xd8                                             = 1 (continue)
+   \x35\xd8\x35\xd8, \x35\xd8\x35\xd8, …, \x35\xd8\x35\xd8                                                                                = 0 （stop)
+
+INFERENCE-TIME EVIDENCE CONTROL                   State Update
+                                                    s\x35\xd8 s\x35\xd8+1
+                                                                                            Value Ranking  Execute \x35\xd8\x35\xd8         if sufficiency                No
+                                           Continuation                                    1.                                      check           Evidence
+                  Validity                 model \x35\xd8\x35\xd8(\x35\xd8)                                     2.                                                    Sufficient？
+Evidence States    Mask           Valid                                                    3.
+          \x35\xd8\x35\xd8                     Action                                                    4.                                                              Yes
+                                                                                           5.              Retriever R        Generator G
+        query                       \x35\xd8\x35\xd8                                                     6.                                           check /   Compress
+        docs                                                                                                       retrieves            query /
+        gap                                                                        𝒏\x35\xd8 \x35\xd8(\x35\xd8\x35\xd8)                          docs              answer
+        history
+                                                                                                           if stop answer     Answer
+
+Figure 2: Overview of DynaKRAG training and inference. The framework learns an advantage model and a continuation model
+for hard gating. Gated actions are ranked and executed until stopping, positive sufficiency, or the control horizon.
+
+   Not every action is meaningful in every state. We con-                           For each logged prefix state, we execute every valid action
+struct A(st) before scoring. Reformulation and sufficiency                          once and record the resulting state and support recall. This
+actions require retrieved evidence, gap querying requires a                         ensures that all valid actions from the same state are evalu-
+known gap, bridge expansion requires a bridge candidate,                            ated on a consistent scale. The result is a supervised one-step
+and retrieval actions require remaining retrieval budget. This                      regression target rather than a trajectory-level Bellman value.
+hard validity layer prevents undefined or redundant transi-
+tions. The learning component only needs to decide whether                             Executing the selected action produces the next evidence
+to continue and rank the executable operations.                                     state. retrieve_more advances the initial ranking, while
+                                                                                    targeted actions issue a gap-focused, rewritten, or bridge-
+Learning a State-Conditioned Control Policy                                         entity query to the dense index: the gap-focused query uses
+                                                                                    the recorded missing-information description, the rewritten
+The controller compares valid operations by their advantage                         query reformulates the latest query, and the bridge query
+over stopping. Let U (s) = SR(s) denote train-time sup-                             expands a detected bridge entity. Each retrieval-producing
+port utility, where SR(s) is the recall of the gold supporting                      action merges the top unseen documents into the evidence
+documents under the current state, and let T +(s, a) be the                         state. A sufficiency_check either confirms answer
+effective post-action state. We define                                              readiness and terminates the trajectory or records a missing-
+                                                                                    information description that enables subsequent gap-directed
+uλ,β(s, a) = U (T +(s, a))−λI[a ̸= astop]U (s)−βcexec(a),                           retrieval. After a negative judgment, the updated diagnostic
+                                                                     (1)            state conditions the next policy decision.
+
+where λ controls the opportunity cost of continuing and β                           Continuation model and stop suppression. The continu-
+weights execution cost. For acquisition, T + contains the                           ation model determines whether a stop_answer candidate
+newly retrieved evidence; for stopping, T +(s, astop) = s;                          should terminate acquisition. Its training labels compare the
+and for sufficiency checking, it is the diagnostic state that                       answer quality at each prefix with the quality achieved af-
+either supports termination or exposes a gap for targeted re-                       ter completing the trajectory. The continuation target marks
+trieval. Because a sufficiency check adds no evidence, its                          prefixes whose answers are still inadequate but can improve
+effective utility is modeled as U (s) + ρ(s)(1 − U (s)), where                      substantially through further acquisition. The premature-stop
+ρ(s) estimates the value of the gap it may expose; the result-                      target identifies cases where stopping early would prevent
+ing target is given in the supplementary material. We train                         a successful completion. The gate comprises a continuation
+on the advantage over stopping:                                                     model, an answer-gain regressor, and a premature-stop model
+                                                                                    that operate on observable state features. After validity and
+Aλ,β(s, a) = uλ,β(s, a) − uλ,β(s, astop),  (2)                                      budget filtering, the gate is evaluated only when stopping
+                                                                                    and an affordable nonterminal action are both available. If
+A(s, astop) = 0.                                                                    the gate votes to continue, stop_answer is removed from
+                                                                                    the candidate set, and if it votes to stop, only stop_answer
+We fit a regressor Aθ(s, a) to rank valid actions on this com-
+mon scale. Training targets are computed counterfactually.
+Algorithm 1 DynaKRAG Inference                                   Together, they cover compositional, comparison, bridge-
+                                                                 comparison, and inference questions with two to four hops.
+ 1: Input: question q, corpus D, retriever R, generator G        Split sizes and structures are reported in the appendix.
+ 2: Output: answer y
+ 3: s ← InitState(q)                                             Metrics. We report normalized Exact Match (EM) and
+ 4: for t = 0, . . . , T − 1 do                                  token-level answer F1, with F1 as the primary answer-quality
+ 5: A ← FilterBudget(ValidActions(s), s)                         metric. For iterative methods, we additionally record total
+ 6: if A \ {stop_answer} = ∅ then                                token consumption (prompt and completion tokens summed
+ 7: break                                                        over all model calls in a run), retrieval calls, and language-
+ 8: end if                                                       model calls to evaluate efficiency. Supporting-evidence re-
+ 9: if stop_answer ∈ A then                                      call is used to construct training targets and diagnose retrieval
+10: A ← ContinuationGate(s, A)                                   behavior. For compression analysis, we separately report to-
+11: end if                                                       kens in the final answer-generation prompt. This final-prompt
+12: a ← arg maxa′∈A Aθ(s, a′)                                    measure counts only the context inspected by the final answer
+13: if a = stop_answer then                                      call, unlike the end-to-end total-token measure.
+14: break
+15: end if                                                       Baselines. We compare against fixed-K RAG (Lewis et al.
+16: s ← Execute(a, s; D, R, G)                                   2020) and controlled implementations of IRCoT (Trivedi
+17: end for                                                      et al. 2023), S2G-RAG (Li et al. 2026a), CoRAG (Wang et al.
+18: // Optional terminal evidence compression.                   2025), Adaptive-RAG (Jeong et al. 2024), PAR2-RAG (Li
+19: if CompressionEnabled() then                                 et al. 2026b), CRAG (Yan et al. 2024), and Self-Ask+Search
+20: s ← Compress(s; G)                                           (Press et al. 2023). The baselines span static, iterative, adap-
+21: end if                                                       tive, corrective, and decomposition-based retrieval methods.
+22: y ← Generate(q, Evidence(s); G)                              We report CoRAG with three retrieval steps (CoRAG-s3)
+23: return y                                                     in all dataset–backbone pairs. Fixed-K reports the strongest
+                                                                 fixed retrieval depth among settings that do not use gold
+is retained. The advantage scorer then ranks the remaining       evidence.
+candidates. The process stops when it reaches the budget
+limit or completes four steps. The supplementary material        Implementation details. We evaluate Qwen2.5-7B-
+provides further details on the targets, features, data balanc-  Instruct (Qwen Team et al. 2024), GPT-4o-mini, and Llama-
+ing, and calibration.                                            3.1-8B-Instruct as answer-model backbones. Within each
+                                                                 backbone, all methods use the same corpus, retrieval re-
+Terminal Evidence Compression                                    sources, and evaluation pipeline. We train dataset-specific
+                                                                 action-advantage and continuation models on 1,000 train-
+After acquisition terminates, the full DynaKRAG configu-         ing examples disjoint from each reported evaluation split.
+ration applies answer-focused evidence compression. The          Supporting-evidence annotations supervise action advan-
+compressor asks G to extract a small set of mutually sup-        tages, while prefix-to-final answer improvement supervises
+porting snippets from the accumulated documents, and the         continuation. Questions, rather than individual prefixes, are
+final answer is generated from the compressed state. This ter-   split 80/20 for fitting and calibration; prefix counts are re-
+minal operation is excluded from the action-advantage target     ported in the supplementary material. Inference uses only ob-
+in Equation 1 and evaluated by ablation.                         servable state features. Both models are trained on Qwen2.5-
+                                                                 7B-Instruct trajectories and transferred to GPT-4o-mini and
+Inference Procedure                                              Llama-3.1-8B-Instruct without additional policy training.
+                                                                 Each random forest contains 300 estimators and uses a mini-
+   Algorithm 1 summarizes inference. The validity layer first    mum leaf size of 8. For each dataset, we independently train
+removes actions that cannot be executed, the continuation        the controller models three times and report the mean per-
+gate resolves whether stopping is admissible, and the advan-     formance across the resulting runs.
+tage scorer ranks the resulting candidate set.
+                                                                    Inference uses deterministic decoding. Main runs add up
+                     Experiments                                 to three documents per retrieval operation, allow at most four
+                                                                 acquisition or control steps, and retain at most 12 documents
+We evaluate the full system in terms of answer quality, com-     in the final context. Targeted actions query a BGE-large-
+ponent contributions, retrieval-budget sensitivity, and perfor-  en-v1.5 dense index (Xiao et al. 2023) and retain unseen
+mance across question structures.                                documents in score order. The full system applies terminal
+                                                                 evidence compression before answer generation.
+Experimental Setup
+                                                                 Main Results
+Datasets. We evaluate DynaKRAG on HotpotQA (Yang
+et al. 2018), 2Wiki (Ho et al. 2020), and MuSiQue (Trivedi       Table 1 establishes a consistent accuracy lead: DynaKRAG
+et al. 2022) on their complete official evaluation splits.       ranks first among the compared systems in both EM and
+                                                                 F1 in every dataset–backbone pair (9/9 for each metric),
+                                                                 so the gains are not limited to token-overlap F1. Qwen F1
+    Backbone          Method              HotpotQA                      2Wiki                   MuSiQue
+Qwen2.5-7B
+GPT-4o-mini      Fixed-K          EM↑     F1↑ Tok.↓              EM↑       F1↑   Tok.↓  EM↑     F1↑       Tok.↓
+Llama-3.1-8B     IRCoT
+                 S2G-RAG          0.3958  0.5177    1892.3      0.3177  0.3757  3088.9  0.1518  0.2553   2918.3
+                 CoRAG-s3         0.4339  0.5617    1723.5      0.3514  0.4308  2441.8  0.1862  0.2889   2109.6
+                 Adaptive-RAG     0.4425  0.5710    2807.3      0.3818  0.4621  3543.5  0.1936  0.2999   3886.8
+                 PAR2-RAG         0.4282  0.5573    2814.3      0.3490  0.4273  3675.8  0.1858  0.2848   3263.6
+                 CRAG             0.3862  0.5042    1596.4      0.2976  0.3557  2180.0  0.1647  0.2579   2160.4
+                 Self-Ask+Search  0.3779  0.4952    3053.6      0.3071  0.3691  3971.2  0.1448  0.2480   3755.6
+                 DynaKRAG         0.4181  0.5445    1720.1      0.3437  0.4099  2375.4  0.1676  0.2740   2479.5
+                                  0.4043  0.5273    3302.0      0.3494  0.4345  4565.5  0.1974  0.2998   4761.8
+                 Fixed-K          0.4732  0.5998    2373.1      0.4587  0.5340  3077.9  0.1986  0.3061   3082.3
+                 IRCoT
+                 S2G-RAG          0.4170  0.5781    1745.1      0.4152  0.5204  3097.8  0.1899  0.3279   2763.6
+                 CoRAG-s3         0.4485  0.6083    1545.7      0.4878  0.6188  2217.1  0.2453  0.3870   1939.6
+                 Adaptive-RAG     0.4498  0.6095    1766.0      0.4972  0.6258  2641.3  0.2280  0.3691   3091.2
+                 PAR2-RAG         0.4496  0.6108    2569.7      0.4912  0.6173  3286.8  0.2482  0.3872   3046.0
+                 CRAG             0.3419  0.4783    1120.4      0.3636  0.4311  1504.6  0.1928  0.3172   1789.1
+                 Self-Ask+Search  0.3918  0.5502    2776.0      0.4173  0.5354  3536.9  0.1887  0.3241   3477.4
+                 DynaKRAG         0.4406  0.5951    1355.4      0.4734  0.5856  1830.5  0.2151  0.3578   2020.7
+                                  0.4404  0.6023    3432.1      0.4740  0.6075  4525.7  0.2449  0.3876   4570.0
+                 Fixed-K          0.4922  0.6218    1588.5      0.5545  0.6391  2169.0  0.2635  0.3977   2499.9
+                 IRCoT
+                 S2G-RAG          0.3029  0.4311    1799.4      0.1489  0.2444  3025.8  0.0695  0.1461   2814.2
+                 CoRAG-s3         0.3252  0.4466    1657.1      0.2901  0.3730  2249.4  0.1316  0.2126   2049.1
+                 Adaptive-RAG     0.3517  0.4761    2843.0      0.2976  0.3725  3369.2  0.1146  0.1973   3848.5
+                 PAR2-RAG         0.3284  0.4499    2576.3      0.2577  0.3341  3135.5  0.0956  0.1690   2945.1
+                 CRAG             0.3215  0.4395    1197.2      0.2476  0.3116  1706.6  0.0952  0.1719   1749.8
+                 Self-Ask+Search  0.3156  0.4321    3035.5      0.2499  0.3168  3551.4  0.0881  0.1674   3333.6
+                 DynaKRAG         0.3564  0.4770                0.3087  0.3668  1192.2  0.1076  0.1980   1477.9
+                                  0.3211  0.4354     968.8      0.2774  0.3552  4454.7  0.0935  0.1685   4000.1
+                                  0.3742  0.4876    3525.1      0.3201  0.3933  2915.0  0.1514  0.2391   3254.6
+                                                    1868.6
+
+Table 1: Accuracy and token use on the full evaluation splits. The Qwen-trained controller transfers to the other backbones. Tok.
+is mean token use (↓); Fixed-K reports prompt rather than total tokens and is excluded from token rankings. Bold/underline:
+best/second best per backbone.
+
+Variant          Learned Learned                                   The Qwen-trained policy also transfers without modifica-
+                 adv. rank cont. HQA 2Wiki MuS                  tion to Llama-3.1-8B-Instruct, with no target-backbone re-
+                                                                training. Its F1 scores of 0.4876, 0.3933, and 0.2391 lead the
+DynaKRAG (full) ✓   ✓ 0.5998 0.5340 0.3061                      strongest same-backbone baselines by 1.06, 2.03, and 2.65
+                    ✓ 0.5722 0.5127 0.2937                      points. Ranking first in all six non-Qwen settings demon-
+Uniform-valid    ×  × 0.5919 0.5318 0.2992                      strates effective transfer to both backbones beyond the one
+                    × 0.5762 0.5156 0.2957                      used to collect the controller’s training trajectories.
+Fixed horizon    ✓
+                                                                   The largest gain occurs on 2Wiki compositional ques-
+Uniform + fixed  ×                                              tions, where DynaKRAG improves over fixed-K by 24.31
+                                                                F1 points; the analyses below examine this structure sensi-
+No sufficiency   ✓  ✓ 0.5835 0.4623 0.2800                      tivity and the contributions of individual components.
+                    ✓ 0.5826 0.4963 0.3008
+No compression   ✓                                              Quality and efficiency relative to S2G-RAG. S2G-RAG
+                                                                is a strong iterative comparator whose total-token ac-
+Table 2: Qwen2.5-7B factorized F1 ablations. ✓/× de-            counting matches DynaKRAG’s. In all nine matched pairs,
+note learned/uniform advantage ranking and learned/fixed-       DynaKRAG has higher F1, 10.1–34.3% fewer total tokens,
+horizon continuation; other components are fixed. The last      and 15.1–43.4% fewer retrieval calls, thus Pareto-dominating
+two rows remove the indicated component from the full           S2G-RAG under these measures. The execution-cost setting
+model. Bold/underline: best/second best per dataset.            is reported in the appendix.
+
+reaches 0.5998, 0.5340, and 0.3061 on HotpotQA, 2Wiki,          Complementary operating points. The uncompressed
+and MuSiQue—gains of 2.88, 7.19, and 0.62 points over           Qwen variant reaches F1 scores of 0.5826, 0.4963, and
+the strongest controlled baseline. GPT-4o-mini F1 reaches       0.3008 with 31.5–38.8% fewer tokens than S2G-RAG. It ex-
+0.6218, 0.6391, and 0.3977, with gains of 1.10, 1.33, and 1.01  ceeds S2G-RAG on all three datasets. Terminal compression
+points. The strongest baseline varies across settings (S2G-
+RAG, CoRAG-s3, CRAG, IRCoT, or Self-Ask+Search), so
+these deltas differ from the S2G-RAG comparison below.
+                HotpotQA  2Wiki              MuSiQue                                         DynaKRAG (full)                            Uniform-valid
+
+                +0.0173             +0.0244                                                  MuSiQue (hop count) MuSiQue (support count)
+                          +0.0985
+           0.6  +0.0885
+
+Answer F1  0.4                               +0.0826              Mean retrieval actions  2  2.81                                       2.89
+                                                        -0.0155                                  2.55                                      2.48
+
+                                                                                                         3.01                                    2.82
+                                                                                                              2.62                                  2.55
+
+                                                                                                                      3.06                                3.00
+                                                                                                                           2.59                               2.62
+
+                                                                                                                                                                    3.06
+                                                                                                                                                                       2.59
+
+           0.2                                                                            0
+                                                                                              2-hop 3-hop 4-hop
+           0.0                                                                                                                          1 2 3 4+
+                   123
+                          123                123                                             2Wiki (question type) 2Wiki (support count)
+
+                          Retrieval cap
+
+Figure 3: F1 under retrieval-call caps; stars mark best cap.                              2  2.87                                       2.52
+                                                                                                2.52                                           2.46
+                                                                                                      1.66
+                                                                                                         2.25                                               2.87
+                                                                                                                                                                   2.52
+                                                                                                               2.91
+                                                                                                                   2.56
+
+                                                                                                                         2.92
+                                                                                                                            2.56
+
+moves to a higher-quality point: F1 rises by 1.72, 3.77, and                               0                                            2              4+
+0.53 points while the final-answer prompt shrinks by 54.4%,                               Bridge cC.ompaCr.ompos. Infer.
+66.3%, and 71.5%. Full statistics appear in the supplement.
+                                                                  Figure 4: Mean retrieval actions (R+G+W+B) by question
+Ablation Studies                                                  structure. DynaKRAG scales with MuSiQue hops and 2Wiki
+                                                                  type; uniform-valid remains nearly flat. The 2Wiki 4+ bucket
+Table 2 factorizes learned advantage ranking and learned          is bridge-comparison.
+continuation in a 2×2 design. Uniform-valid action selection
+replaces learned advantage ranking; fixed horizon disables                                                      Joint
+learned continuation and disallows early stop_answer                                         Fixed-K uniform No suff. No comp.
+while a valid nonterminal action remains. All four cells hold
+the validity layer, action set, prompts, budgets, and terminal                            Compositional +24.3 +14.0 +16.9                        +1.2
+compression fixed. The full model performs best on all three
+datasets. Replacing learned advantage ranking with uniform-                               Bridge comp. +13.0                      -2.3     -0.6  +4.9
+valid selection while retaining learned continuation reduces
+F1 by 2.76, 2.13, and 1.24 points on HotpotQA, 2Wiki, and                                 Comparison +7.9                         -0.3     -0.9  +7.8
+MuSiQue, respectively. Disabling learned continuation while
+retaining advantage ranking produces smaller drops of 0.79,                                  Inference +7.7                       +4.1  +4.1     +2.5
+0.22, and 0.69 points.
+                                                                  Figure 5: Full-controller ∆F1 gains over four comparators
+   The remaining rows retain both learned mechanisms. Re-         on 2Wiki, by question type. Joint uniform disables learned
+moving sufficiency checking lowers F1 by 1.63, 7.17, and          ranking and continuation; No suff./comp. remove the respec-
+2.61 points, while removing terminal compression lowers           tive components.
+it by 1.72, 3.77, and 0.53 points. The sufficiency gap is a
+combined trajectory-level effect, since removing the probe        than inherited from the validity layer. Support-count buckets,
+also disables gap-directed queries. Removing compression          a coarser structure axis available on both datasets, show the
+defines the lower-cost operating point above.                     same pattern.
+
+Diagnostic Analyses                                               Question-structure results. Figure 5 breaks down per-
+                                                                  formance on the full 2Wiki development set, which has
+Retrieval-budget sensitivity. Figure 3 reports F1 under           2,751 bridge-comparison, 3,040 comparison, 5,236 compo-
+controlled retrieval-call caps. HotpotQA and 2Wiki improve        sitional, and 1,549 inference questions. Relative to fixed-K,
+from one to three calls. The main runs cap control steps          DynaKRAG gains 12.97, 7.95, 24.31, and 7.68 F1 points on
+at four rather than retrieval calls, so an example may issue      these four groups, respectively. The largest gain occurs on the
+a fourth retrieval. Within a given budget, DynaKRAG can           compositional group, where several facts must be assembled
+allocate calls among frontier expansion, gap queries, and         across steps. Because Joint uniform disables both learned
+bridge expansion as the evidence state changes, rather than       components jointly, it does not isolate their individual con-
+repeating a single retrieval operation.                           tributions and is used only for descriptive structure analysis;
+                                                                  it does not replace the factorial ablation in Table 2.
+Adaptive retrieval allocation. The learned controller
+adapts how much retrieval it spends to the structure of              On MuSiQue, the full method obtains F1 scores of 0.3694,
+the question (Figure 4). Retrieval rises monotonically from       0.2691, and 0.1798 on the 1,252 two-hop, 760 three-hop,
+MuSiQue two-hop to four-hop questions (2.81 to 3.06 calls),       and 405 four-hop questions, respectively. The corresponding
+while on 2Wiki, comparison questions receive only 1.66 re-
+trieval actions versus about 2.9 for the remaining types. The
+uniform-valid comparator allocates nearly the same budget
+in every bucket (2.25–2.62), so this variation is learned rather
+S2G-RAG scores are 0.3568, 0.2562, and 0.2060.                  Huang, J.; Chen, J.; Lin, J.; Qin, J.; Feng, Z.; Zhang, W.;
+                                                                and Yu, Y. 2026. A Comprehensive Survey on Retrieval
+                       Conclusion                               Methods in Recommender Systems. ACM Transactions on
+                                                                Information Systems, 44(1): 1–43.
+We introduced DynaKRAG, a controller that decides how
+to gather and use evidence for multi-hop RAG. Instead of        Jeong, S.; Baek, J.; Cho, S.; Hwang, S. J.; and Park, J. 2024.
+following a fixed pipeline, it chooses valid actions as the     Adaptive-RAG: Learning to Adapt Retrieval-Augmented
+evidence changes and decides when to answer. Across three       Large Language Models through Question Complexity. In
+datasets and three answer models, DynaKRAG achieves the         Proceedings of the 2024 Conference of the North American
+best EM and F1 in all nine settings. It also outperforms the    Chapter of the Association for Computational Linguistics:
+baseline method while using fewer tokens and retrieval calls.   Human Language Technologies, 7036–7050.
+Terminal compression further improves answer quality by
+giving the answer model a shorter, more focused context.        Jeong, Y.; Kim, J.; Lee, D.; and Hwang, S.-w. 2025. EC-
+Our analyses show that better results come from choosing        oRAG: Evidentiality-guided Compression for Long Context
+useful actions and stopping at the right time, rather than      RAG. In Findings of the Association for Computational
+simply retrieving more documents.                               Linguistics: ACL 2025, 26607–26628. Vienna, Austria: As-
+                                                                sociation for Computational Linguistics.
+                       References
+                                                                Jiang, P.; Xu, X.; Lin, J.; Xiao, J.; Wang, Z.; Sun, J.; and
+Asai, A.; Wu, Z.; Wang, Y.; Sil, A.; and Hajishirzi, H.         Han, J. 2025. s3: You Don’t Need That Much Data to Train
+2024. Self-RAG: Learning to Retrieve, Generate, and Cri-        a Search Agent via RL. In Proceedings of the 2025 Confer-
+tique through Self-Reflection. In International Conference      ence on Empirical Methods in Natural Language Process-
+on Learning Representations.                                    ing, 21599–21617. Suzhou, China: Association for Compu-
+                                                                tational Linguistics.
+Baek, I.; Chang, H.; Kim, B.; Lee, J.; and Lee, H. 2025.
+Probing-RAG: Self-Probing to Guide Language Models in           Jiang, Z.; Xu, F.; Gao, L.; Sun, Z.; Liu, Q.; Dwivedi-Yu, J.;
+Selective Document Retrieval. In Findings of the Association    Yang, Y.; Callan, J.; and Neubig, G. 2023. Active Retrieval
+for Computational Linguistics: NAACL 2025, 3287–3304.           Augmented Generation. In Proceedings of the 2023 Confer-
+Albuquerque, New Mexico: Association for Computational          ence on Empirical Methods in Natural Language Processing,
+Linguistics.                                                    7969–7992.
+
+Chan, C.-M.; Xu, C.; Yuan, R.; Luo, H.; Xue, W.; Guo, Y.;       Jin, B.; Zeng, H.; Yue, Z.; Yoon, J.; Arik, S. O.; Wang, D.;
+and Fu, J. 2024. RQ-RAG: Learning to Refine Queries for         Zamani, H.; and Han, J. 2025. Search-R1: Training LLMs
+Retrieval Augmented Generation. In Conference on Lan-           to Reason and Leverage Search Engines with Reinforcement
+guage Modeling.                                                 Learning. In Second Conference on Language Modeling.
+
+Chen, W.; Zhao, L.; Zheng, Z.; Hou, H.; and Xu, T. 2026.        Joren, H.; Zhang, J.; Ferng, C.-S.; Juan, D.-C.; Taly, A.;
+STRIDE: Strategic Iterative Decision-Making for Retrieval-      and Rashtchian, C. 2025. Sufficient Context: A New Lens
+Augmented Multi-Hop Question Answering. In Proceedings          on Retrieval Augmented Generation Systems. In Inter-
+of the 49th International ACM SIGIR Conference on Re-           national Conference on Learning Representations, volume
+search and Development in Information Retrieval, 202–212.       2025, 20310–20334.
+ACM.
+                                                                Lee, D.; Jeong, Y.; and Hwang, S.-w. 2025. From Token to
+Ding, L.; Guo, Z.; Lu, B.; Zhou, C.; Zhou, Y.; Zhang, W.; Lin,  Action: State Machine Reasoning to Mitigate Overthinking
+J.; and Ge, D. 2026. Skill2Query: Exploiting Skill Structure    in Information Retrieval. In Findings of the Association
+to Generate Pseudo-Queries for Agent Skill Retrieval. arXiv     for Computational Linguistics: EMNLP 2025, 7048–7064.
+preprint arXiv:2608.16071.                                      Suzhou, China: Association for Computational Linguistics.
+
+Fang, J.; Meng, Z.; and MacDonald, C. 2025. Ki-                 Lewis, P.; Perez, E.; Piktus, A.; Petroni, F.; Karpukhin, V.;
+RAG: Knowledge-Driven Iterative Retriever for Enhancing         Goyal, N.; Kuttler, H.; Lewis, M.; Yih, W.-t.; Rocktäschel, T.;
+Retrieval-Augmented Generation. In Proceedings of the 63rd      Riedel, S.; and Kiela, D. 2020. Retrieval-Augmented Gen-
+Annual Meeting of the Association for Computational Lin-        eration for Knowledge-Intensive NLP Tasks. In Advances in
+guistics (Volume 1: Long Papers), 18969–18985. Vienna,          Neural Information Processing Systems. ArXiv:2005.11401.
+Austria: Association for Computational Linguistics.
+                                                                Li, M.; Zou, J.; Lv, X.; Zhang, C.; and Zhou, G. 2026a. S2G-
+Guan, X.; Zeng, J.; Meng, F.; Xin, C.; Lu, Y.; Lin, H.; Han,    RAG: Structured Sufficiency and Gap Judging for Iterative
+X.; Sun, L.; and Zhou, J. 2026. DeepRAG: Thinking to            Retrieval-Augmented QA. ArXiv:2604.23783.
+Retrieve Step by Step for Large Language Models. In Inter-
+national Conference on Learning Representations, volume         Li, X.; Wang, R.; Wang, Y.; Guo, M.; Li, C.; Sheng, T.;
+2026, 117056–117071.                                            Ravi, S.; and Roth, D. 2026b. PAR2-RAG: Planned Active
+                                                                Retrieval and Reasoning for Multi-Hop Question Answering.
+Ho, X.; Nguyen, A.-K. D.; Sugawara, S.; and Aizawa, A.          ArXiv:2603.29085.
+2020. Constructing A Multi-Hop QA Dataset for Compre-
+hensive Evaluation of Reasoning Steps. In Proceedings of        Li, Y.; Gu, J.-C.; Wu, D.; Chang, K.-W.; and Peng, N. 2025a.
+the 28th International Conference on Computational Lin-         BRIEF: Bridging Retrieval and Inference for Multi-hop Rea-
+guistics, 6609–6625.                                            soning via Compression. In Findings of the Association
+                                                                for Computational Linguistics: NAACL 2025, 5464–5485.
+Albuquerque, New Mexico: Association for Computational          eds., Advances in Neural Information Processing Systems,
+Linguistics.                                                    volume 38, 120957–120985. Curran Associates, Inc.
+
+Li, Y.; Luo, Q.; Li, X.; Li, B.; Cheng, Q.; Wang, B.; Zheng,    Xi, Y.; Lin, J.; Xiao, Y.; Zhou, Z.; Shan, R.; Gao, T.; Zhu,
+Y.; Wang, Y.; Yin, Z.; and Qiu, X. 2025b. R3-RAG: Learn-        J.; Liu, W.; Yu, Y.; and Zhang, W. 2026. A Survey of Large
+ing Step-by-Step Reasoning and Retrieval for LLMs via Re-       Language Model-Based Search Agents. In Proceedings of the
+inforcement Learning. In Findings of the Association for        64th Annual Meeting of the Association for Computational
+Computational Linguistics: EMNLP 2025, 10491–10507.             Linguistics (Volume 1: Long Papers), 8244–8279.
+Suzhou, China: Association for Computational Linguistics.
+                                                                Xi, Y.; Lin, J.; Zhu, M.; Xiao, Y.; Ou, Z.; Liu, J.; Wan, T.;
+Park, J.; Cho, S.; and Lee, J.-Y. 2025. Stop-RAG: Value-        Chen, B.; Liu, W.; Wang, Y.; Tang, R.; Zhang, W.; and Yu,
+Based Retrieval Control for Iterative RAG. NeurIPS 2025         Y. 2025. InfoDeepSeek: Benchmarking Agentic Information
+Workshop on Multi-Turn Interactions in Large Language           Seeking for Retrieval-Augmented Generation. arXiv preprint
+Models; arXiv:2510.14337, arXiv:2510.14337.                     arXiv:2505.15872.
+
+Press, O.; Zhang, M.; Min, S.; Schmidt, L.; Smith, N. A.;       Xiao, S.; Liu, Z.; Zhang, P.; Muennighoff, N.; Lian, D.; and
+and Lewis, M. 2023. Measuring and Narrowing the Com-            Nie, J.-Y. 2023. C-Pack: Packed Resources for General Chi-
+positionality Gap in Language Models. In Findings of the        nese Embeddings. ArXiv:2309.07597.
+Association for Computational Linguistics: EMNLP 2023,
+5687–5711.                                                      Xiong, W.; Li, X. L.; Iyer, S.; Du, J.; Lewis, P.; Wang, W. Y.;
+                                                                Mehdad, Y.; Yih, W.-t.; Riedel, S.; Kiela, D.; and Oğuz, B.
+Qwen Team; Yang, A.; Yang, B.; Zhang, B.; Hui, B.; Zheng,       2021. Answering Complex Open-Domain Questions with
+B.; Yu, B.; Li, C.; Liu, D.; Huang, F.; Wei, H.; et al. 2024.   Multi-Hop Dense Retrieval. In International Conference on
+Qwen2.5 Technical Report. ArXiv:2412.15115.                     Learning Representations.
+
+Song, H.; Jiang, J.; Min, Y.; Chen, J.; Chen, Z.; Zhao, W. X.;  Xu, F.; Shi, W.; and Choi, E. 2024. RECOMP: Improv-
+Fang, L.; and Wen, J.-R. 2025. R1-Searcher: Incentivizing       ing Retrieval-Augmented LMs with Context Compression
+the Search Capability in LLMs via Reinforcement Learning.       and Selective Augmentation. In International Conference
+arXiv preprint arXiv:2503.05592.                                on Learning Representations, volume 2024, 43478–43502.
+
+Su, W.; Tang, Y.; Ai, Q.; Wu, Z.; and Liu, Y. 2024. DRA-        Yan, S.-Q.; Gu, J.-C.; Zhu, Y.; and Ling, Z.-H. 2024. Correc-
+GIN: Dynamic Retrieval Augmented Generation based on            tive Retrieval Augmented Generation. ArXiv:2401.15884.
+the Real-time Information Needs of Large Language Models.
+In Proceedings of the 62nd Annual Meeting of the Associa-       Yang, D.; Zeng, L.; Rao, J.; and Zhang, Y. 2025. Know-
+tion for Computational Linguistics (Volume 1: Long Papers),     ing You Don’t Know: Learning When to Continue Search
+12991–13013.                                                    in Multi-round RAG through Self-Practicing. In Proceed-
+                                                                ings of the 48th International ACM SIGIR Conference on
+Tang, X.; Gao, Q.; Li, J.; Du, N.; Li, Q.; and Xie, S.          Research and Development in Information Retrieval, 1305–
+2025. MBA-RAG: a Bandit Approach for Adaptive Retrieval-        1315. ACM.
+Augmented Generation through Question Complexity. In
+Proceedings of the 31st International Conference on Com-        Yang, Z.; Qi, P.; Zhang, S.; Bengio, Y.; Cohen, W. W.;
+putational Linguistics, 3248–3254. Abu Dhabi, UAE: Asso-        Salakhutdinov, R.; and Manning, C. D. 2018. HotpotQA:
+ciation for Computational Linguistics.                          A Dataset for Diverse, Explainable Multi-Hop Question An-
+                                                                swering. In Proceedings of the 2018 Conference on Empiri-
+Trivedi, H.; Balasubramanian, N.; Khot, T.; and Sabharwal,      cal Methods in Natural Language Processing, 2369–2380.
+A. 2022. MuSiQue: Multihop Questions via Single-Hop
+Question Composition. Transactions of the Association for       Yao, S.; Zhao, J.; Yu, D.; Du, N.; Shafran, I.; Narasimhan,
+Computational Linguistics, 10: 539–554.                         K.; and Cao, Y. 2023. ReAct: Synergizing Reasoning and
+                                                                Acting in Language Models. In International Conference on
+Trivedi, H.; Balasubramanian, N.; Khot, T.; and Sabharwal,      Learning Representations.
+A. 2023. Interleaving Retrieval with Chain-of-Thought Rea-
+soning for Knowledge-Intensive Multi-Step Questions. In         Yao, Z.; Qi, W.; Pan, L.; Cao, S.; Hu, L.; Liu, W.; Hou, L.;
+Proceedings of the 61st Annual Meeting of the Association       and Li, J. 2025. SeaKR: Self-aware Knowledge Retrieval for
+for Computational Linguistics, 10014–10037.                     Adaptive Retrieval Augmented Generation. In Proceedings
+                                                                of the 63rd Annual Meeting of the Association for Computa-
+Wang, J.; Zhou, C.; Fu, Z.; Wang, J.; Liu, W.; Zhang, W.; and   tional Linguistics (Volume 1: Long Papers), 27022–27043.
+Lin, J. 2026. Skills on the Fly: Test-Time Adaptive Skill Syn-  Vienna, Austria: Association for Computational Linguistics.
+thesis for LLM Agents. arXiv preprint arXiv:2605.16986.
+                                                                Yu, A.; Zhou, C.; Xu, T.; Guo, Z.; Shan, R.; Fu, Z.; Wang,
+Wang, L.; Chen, H.; Yang, N.; Huang, X.; Dou, Z.; and           J.; Liu, W.; Yu, Y.; Zhang, W.; and Lin, J. 2026. LatentSkill:
+Wei, F. 2025. Chain-of-Retrieval Augmented Generation. In       From In-Context Textual Skills to In-Weight Latent Skills for
+Advances in Neural Information Processing Systems.              LLM Agents. arXiv preprint arXiv:2606.06087.
+
+Wu, J.; Li, B.; Fang, R.; Yin, W.; Zhang, L.; Wang, Z.; Tao,    Zhang, W.; Liao, J.; Li, N.; Du, K.; and Lin, J. 2024. Agentic
+Z.; Zhang, D.-C.; Xi, Z.; Tang, R.; Jiang, Y.; Xie, P.; Huang,  Information Retrieval. arXiv preprint arXiv:2410.09713.
+F.; and Zhou, J. 2025. WebDancer: Towards Autonomous In-
+formation Seeking Agency. In Belgrave, D.; Zhang, C.; Lin,      Zhao, Q.; Wang, R.; Xu, D.; Zha, D.; Bowen, M.; Wang,
+H.; Pascanu, R.; Koniusz, P.; Ghassemi, M.; and Chen, N.,       Z.; Jia, S.; Liu, L.; and Wang, X. 2026. R-Search: Em-
+                                                                powering LLM Reasoning with Search via Multi-Reward
+Reinforcement Learning. In Findings of the Association for
+Computational Linguistics: ACL 2026, 38030–38046. San
+Diego, California, United States: Association for Computa-
+tional Linguistics.
+
+Zheng, X.; An, K.; Wang, Z.; Wang, Y.; and Wu, Y. 2025.
+StepSearch: Igniting LLMs Search Ability via Step-Wise
+Proximal Policy Optimization. In Proceedings of the 2025
+Conference on Empirical Methods in Natural Language Pro-
+cessing, 21805–21830. Suzhou, China: Association for Com-
+putational Linguistics.
+
+Zhou, C.; Chai, H.; Chen, W.; Guo, Z.; Shan, R.; Song, Y.;
+Xu, T.; Yang, Y.; Yu, A.; Zhang, W.; Zheng, C.; Zhu, J.;
+Zheng, Z.; Zhang, Z.; Lou, X.; Zhang, C.; Fu, Z.; Wang, J.;
+Liu, W.; Lin, J.; and Zhang, W. 2026. Externalization in LLM
+Agents: A Unified Review of Memory, Skills, Protocols and
+Harness Engineering. arXiv preprint arXiv:2604.08224.
+
+Zhuang, Z.; Zhang, Z.; Cheng, S.; Yang, F.; Liu, J.; Huang, S.;
+Lin, Q.; Rajmohan, S.; Zhang, D.; and Zhang, Q. 2024. Ef-
+ficientRAG: Efficient Retriever for Multi-Hop Question An-
+swering. In Proceedings of the 2024 Conference on Empir-
+ical Methods in Natural Language Processing, 3392–3411.
+Miami, Florida, USA: Association for Computational Lin-
+guistics.
+

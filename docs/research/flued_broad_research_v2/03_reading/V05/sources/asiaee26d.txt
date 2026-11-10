@@ -1,0 +1,1102 @@
+                       Certified Interventional Fidelity:
+Anytime-Valid, Adaptive Evaluation of Causal Claims in Mechanistic
+
+                                  Interpretability
+
+                                                 Amir Asiaee1
+1Department of Biostatistics, Vanderbilt University Medical Center, Nashville, TN 37232, USA
+
+                        Abstract                                computation of a trained model [Olah et al., 2020, Geiger
+                                                                et al., 2025]. A central move in recent interpretability has
+     Mechanistic interpretability often evaluates expla-        been the shift from observational probes to interventional
+     nations by intervening on a model: swapping hid-           evaluations: we modify internal states, paths, or mechanisms
+     den states, patching activations, ablating compo-          and ask whether the resulting behavior supports a proposed
+     nents, or comparing a compressed model to the              mechanistic explanation.
+     original one. These experiments are usually sum-
+     marized by a point estimate, even though the eval-         The explanations being evaluated usually fall into two broad
+     uation may be monitored while it runs or adapted           classes. The first class consists of abstraction or reduction
+     toward suspected failures. This makes it hard to           fidelity claims: a simpler object, such as a high-level causal
+     tell whether a reported fidelity or patching effect        model, compressed network, pruned network, or circuit, is
+     is a stable causal claim or a consequence of finite        claimed to preserve the relevant causal behavior of the orig-
+     sampling and evaluation choices.                           inal model. Causal abstraction and interchange intervention
+     We introduce Certified Interventional Fidelity             accuracy (IIA) are canonical examples [Geiger et al., 2021,
+     (CIF), a statistical layer for interventional inter-       2025]; recent work on mechanism transformations places
+     pretability evaluations. CIF first writes the quantity     structured neural compression in the same interventional-
+     being reported as a causal estimand: an expectation        fidelity setting [Asiaee, 2026]. The second class consists
+     of a bounded score over a stated input distribution        of component-effect claims: a set of heads, neurons, paths,
+     and a stated intervention distribution. It then pro-       or edges is claimed to causally support a behavior. Activa-
+     vides confidence intervals and anytime-valid confi-        tion patching, path patching, causal tracing, circuit ablation,
+     dence sequences for this estimand, including under         and many circuit-discovery evaluations belong to this class
+     adaptive intervention sampling via bounded mix-            [Meng et al., 2022, Goldowsky-Dill et al., 2023, Zhang and
+     ture importance weighting. We instantiate CIF with         Nanda, 2024]. Causal scrubbing and circuit-completeness
+     Hoeffding-style sequences and variance-adaptive            evaluations sit near the boundary: depending on the reported
+     betting sequences, the latter reducing certification       score, they can be viewed either as testing a reduced ex-
+     cost by 10–30× in our experiments. On MNIST                planation’s fidelity or as measuring the effect of selected
+     abstractions and GPT-2 Small IOI circuits, CIF cer-        components [Chan et al., 2022].
+     tifies high-fidelity claims, shows when apparent
+     method differences are not statistically supported,        The missing piece: statistical validity. Despite the causal
+     and makes sensitivity to the intervention distribu-        framing, evaluation practice is often informal. A typical
+     tion explicit.                                             workflow is: sample a few thousand input pairs/prompt pairs;
+                                                                sample a few thousand interventions; report a single scalar
+1 INTRODUCTION                                                  metric. But interpretability workflows are inherently sequen-
+                                                                tial and adaptive: we monitor results, adjust evaluation sets,
+Deep neural networks can match or exceed human per-             and hunt for counterexamples. Without uncertainty quan-
+formance, but understanding how they compute remains            tification and without accounting for adaptivity, it is easy
+challenging. Mechanistic interpretability aims to provide       to overstate fidelity, mis-rank methods, or miss rare but
+explanations that are faithful simplifications of the internal  important failure modes.
+
+                                                                We propose Certified Interventional Fidelity (CIF), a sta-
+                                                                tistical layer for turning these interventional evaluations into
+
+Proceedings of the 42nd Conference on Uncertainty in Artificial Intelligence (UAI 2026), PMLR 337:210–227.
+certified claims. CIF is deliberately organized around the          • We introduce adaptive CIF, which supports failure-
+workflow an evaluator already follows: choose what pop-                directed sampling while preserving the target estimand
+ulation of inputs and interventions the claim is about, run            through bounded mixture importance weighting.
+the interventions, and report what can be concluded with
+uncertainty. The framework makes three design choices.              • We provide algorithms for certification, paired compar-
+                                                                       ison, adaptive sampling, and one-sided stopping rules,
+  1. Make the target explicit. Every reported score is writ-           together with a reporting checklist for applying CIF to
+      ten as an expectation over a declared input distribu-            new interventional evaluations.
+      tion and intervention distribution. This separates the
+      scientific question being evaluated from the sampling         • We evaluate CIF on MNIST neural abstractions and
+      procedure used to estimate it.                                   GPT-2 Small IOI circuits, showing that it can certify
+                                                                       high-fidelity claims, identify statistically unsupported
+  2. Report uncertainty that survives monitoring. CIF                  method differences, and expose sensitivity to the inter-
+      uses anytime-valid confidence sequences, which re-               vention distribution.
+      main valid if the evaluator checks the result repeatedly
+      or stops when the evidence is strong enough [Howard        2 BACKGROUND AND NOTATION
+      et al., 2021, Waudby-Smith et al., 2024].
+                                                                 2.1 A RUNNING NEURAL-NETWORK SCM
+  3. Permit adaptive evaluation without changing the
+      claim. The sampler may focus over time on likely           We use a small feedforward network as a running example.
+      failures or high-impact interventions, while bounded       Write its computation as
+      mixture importance weighting preserves the original
+      target estimand [Horvitz and Thompson, 1952, Ville,           H1 = f1(X), H2 = f2(H1), Y = f3(H2),
+     1939].
+                                                                 where X is the random input drawn from an evaluation dis-
+Positioning relative to closest prior work. CIF connects         tribution D, H1 and H2 are hidden activations, and Y is the
+three lines of work: causal abstraction and interventional in-   output prediction or score vector. The corresponding deter-
+terpretability [Geiger et al., 2025], recent diagnoses of unre-  ministic SCM is M = (U, V, F): U = {X} supplies the
+liable mechanistic-interpretability evaluation [Méloux et al.,   exogenous input, V = {H1, H2, Y } contains the endoge-
+2025], and off-policy confidence sequences for adaptively        nous variables, and F = {f1, f2, f3} contains the structural
+sampled data [Karampatziakis et al., 2021]. The distinc-         equations [Pearl, 2009, Geiger et al., 2021, Asiaee, 2026].
+tion is that CIF turns existing interventional interpretability  A realized input is denoted x. There is no extra randomness
+metrics into explicit causal estimands and then supplies         inside the network; for fixed x and a fixed intervention i, the
+finite-sample, anytime-valid uncertainty guarantees for their    resulting activations and output are deterministic.
+evaluation. Extended related work is given in Appendix A.
+                                                                 In this view, an intervention changes one or more structural
+Contributions. The central contribution is a reformula-          equations. Setting a neuron to zero is a hard intervention on
+tion: interventional evaluations of mechanistic explanations     a coordinate of H2; replacing the computation of a group
+can be treated as sequential causal-inference problems. Ab-      of units by an affine map is a soft intervention; patching an
+straction/reduction fidelity claims and component-effect         activation from a clean run into a corrupted run replaces
+claims ask different scientific questions, but their empir-      the value of an internal variable during that forward pass.
+ical evaluations share the same statistical form: sample an      We write State(M, x, i) for the realized assignment of the
+input and an intervention, compute a bounded score, and          endogenous variables after running model M on input x un-
+estimate the population mean of that score. CIF attaches         der intervention i. It is a vector of values, not a distribution;
+uncertainty guarantees to this population claim rather than      it becomes random only when X and I are sampled.
+to a method-specific point estimate.
+                                                                 2.2 CLASS I: ABSTRACTION AND REDUCTION
+   • We express two broad classes of interpretability eval-            FIDELITY
+      uations, abstraction/reduction fidelity and component-
+      effect recovery, as bounded causal estimands over in-      In the first class, the explanation is itself a simpler causal
+      puts and interventions.                                    object. The low-level model ML is the original network.
+                                                                 The high-level model MH is a candidate explanation pro-
+   • We give fixed-budget confidence intervals and anytime-      duced by some abstraction or reduction method: for example
+      valid confidence sequences for these estimands, us-        a hand-written causal model, a pruned network, an affine
+      ing both transparent Hoeffding bounds and variance-        compressed network, or a circuit treated as a reduced mecha-
+      adaptive betting sequences [Waudby-Smith and Ram-          nism. CIF does not construct MH ; it evaluates the candidate
+      das, 2024].                                                MH together with the correspondence maps supplied by
+
+211
+the method. Two maps specify how the objects are supposed patching, causal tracing, and many circuit-ablation studies
+
+to correspond:                                                   have this form.
+
+  τ : States(ML) → States(MH ), ω : IH → IL.                     Example 2: activation patching for recovery. Let X =
+                                                                 (Xclean, Xcorr) be a clean/corrupted prompt pair, and let
+The state map τ translates low-level activations into high-      I = S denote the component set being restored, such as a
+level variables. In the running example, if MH keeps a           set of heads, neurons, paths, or residual-stream locations.
+subset S of second-layer units, then τ (h2) = h2,S. If MH        The patched run follows the corrupted prompt except that
+uses a learned affine compression, then τ (h2) = Ah2 +           the activations at S are copied from the clean run. If S is
+b. The intervention map ω translates an intervention on          fixed, then Π is a point mass; if the evaluation samples many
+the high-level variables into the corresponding intervention     candidate components, Π records how those components are
+inside the original network. Thus τ maps states, while ω         chosen. As in Example 1, Π is not a new causal semantics:
+maps interventions. The form of ω is method-dependent and        it is the population of intervention tests over which the
+is part of the abstraction being evaluated.                      reported metric is averaged.
+
+The fidelity claim is interventional: MH should match ML         2.4 BOUNDED INTERVENTIONAL SCORES AND
+not only on ordinary inputs, but under corresponding ma-               ESTIMANDS
+nipulations of their internal variables. Schematically,
+                                                                 The two classes differ scientifically, and CIF does not force
+       τ (State(ML, X, ω(I))) ≈ State(MH , X, I).                them to use the same score. What they share is the statisti-
+                                                                 cal form: sample an input and an intervention, compute a
+CIF evaluates this comparison through an output-level or         bounded interventional score, and estimate its expectation.
+score-level discrepancy, which is the quantity available in
+most mechanistic-interpretability experiments. The display       Fidelity estimands. For abstraction/reduction fidelity, fix
+is pointwise in realized inputs and interventions; the distri-   a bounded discrepancy d : Y × Y → [0, 1] and define
+butions enter when we average the resulting scores.
+                                                                    Z := d Outcome(ML, X, ω(I)),
+Example 1: interchange interventions for abstraction                                       Outcome(MH , X, I) ∈ [0, 1]. (1)
+fidelity. Let X be a source input, X′ a donor input, and
+M ∈ {0, 1}k a random mask over the high-level coordinates        Then the interventional risk is R := E(X,I)∼D×Π[Z], and
+of MH . A sampled high-level intervention is I = (M, X′).        fidelity is F := 1 − R. Here small Z means small disagree-
+It replaces the selected abstract coordinates in the source      ment, so larger F means higher fidelity.
+run by their values from the donor run. The mapped low-
+level intervention ω(I) performs the corresponding swap in       Recovery/effect estimands. For component-effect evalu-
+ML: for a subset abstraction it swaps the original neurons       ations, the bounded score may already be oriented so that
+indexed by the retained coordinates; for a subspace or affine    larger is better. For activation patching, let g(·) be a scalar
+abstraction it applies the low-level operation specified by the  behavior score, such as the indirect-object-identification
+abstraction map. The mask is therefore not an input mask;        (IOI) logit difference. Write gclean(X), gcorr(X), and
+it indexes an internal intervention. CIF then asks whether       gpatch(X, I) for the score on the clean run, corrupted run,
+these matched interventions produce similar outcomes in          and patched run. A normalized patching recovery is
+ML and MH .
+                                                                 ∆(I, X) := clip[0,1]  gpatch(X, I) − gcorr(X)  ∈ [0, 1].
+The intervention distribution Π is the sampling rule for these                          gclean(X) − gcorr(X)
+tests; a typical choice is Mj i.∼i.d. Bernoulli(p) and X′ ∼
+Ddonor. Changing p changes the claim being certified: p =        Here ∆ = 0 means the patch recovers none of the clean
+0.1 asks for fidelity under mild coordinate swaps, whereas       behavior, while ∆ = 1 means full recovery. CIF certifies
+p = 0.5 asks for fidelity under a much more severe family        the direct mean µ := E(X,I)∼D×Π[∆]. Appendix B gives
+of interventions.                                                additional method mappings in this notation.
+
+2.3 CLASS II: COMPONENT-EFFECT AND                               3 CERTIFIED INTERVENTIONAL
+      RECOVERY CLAIMS                                                FIDELITY
+
+In the second class, the explanation is not a separate high-     Once an interventional metric has been chosen, the evalua-
+level model. Instead, it is a claim that some internal com-      tion problem is statistical: estimate and certify its population
+ponent, path, or circuit causally supports a behavior of the     value from a finite number of neural-network runs, while
+original network. The evaluation intervenes on ML itself
+and measures a bounded effect. Activation patching, path
+
+                212
+avoiding overconfidence from monitoring, adaptation, and             3.2 ANYTIME-VALID CONFIDENCE SEQUENCES
+selection. CIF addresses four recurring tasks: (P1) finite-                (CSS)
+sample uncertainty quantification with guaranteed confi-
+dence intervals; (P2) sequential experimentation, where the          Interpretability evaluations are often monitored while they
+evaluator may inspect results and stop early; (P3) adaptive          run: after 100, 500, or 1,000 interventions, we may decide
+failure-directed sampling, where later interventions focus           whether to stop, continue, or inspect failures. Fixed-n confi-
+on observed weaknesses; and (P4) selection and multiple              dence intervals do not protect this workflow. A confidence
+comparisons across many candidate components, circuits,              sequence (Cn)n≥1 satisfies P(∀n ≥ 1 : θ ∈ Cn) ≥ 1 − δ,
+or abstractions.                                                     so it remains valid under arbitrary stopping and repeated
+                                                                     monitoring [Howard et al., 2021].
+We write all targets in a common bounded-mean form.
+Fix an evaluation design: an input distribution D, a target          A simple construction spends the error probability over time.
+intervention distribution Π, and a bounded interventional            Let δn = 6δ/(π2n2) and bn = log(2/δn)/(2n).
+score Y ∈ [0, 1]. CIF estimates and certifies the population
+mean θ := E(X,I)∼D×Π[Y (X, I)]. For abstraction fidelity,            Theorem 1 (Anytime Hoeffding confidence sequence via
+Y = Z and θ = R, with fidelity F = 1 − R. For recovery               spending). With the above spending schedule, with proba-
+or component-effect metrics, Y = ∆ and θ = µ. Thus the               bility at least 1 − n≥1 δn = 1 − δ, for all n ≥ 1 simulta-
+statistical machinery below is written for θ; translating back       neously, θ ∈ [θn − bn, θn + bn].
+to F or µ only changes the final one-sided certification rule.
+                                                                     Certification via one-sided bounds. Write Un = θn + bn
+The section adds inferential machinery in the order it is            for the upper confidence bound (UCB) and Ln = θn − bn
+needed in practice. Fixed-budget intervals address (P1)              for the lower confidence bound (LCB). To certify fidelity
+when the sample size is fixed before looking at results. Con-        F ≥ F0, apply the CS to R and stop when 1 − Un(R) ≥ F0.
+fidence sequences address (P2) by remaining valid under              To certify recovery µ ≥ µ0, apply the CS to µ and stop
+repeated monitoring and data-dependent stopping. Impor-              when Ln(µ) ≥ µ0. The confidence-sequence guarantee
+tance weighting addresses (P3) without changing the target           makes either stopping rule valid even though the stopping
+distribution Π. Betting confidence sequences keep the same           time is data-dependent.
+anytime guarantees but reduce certification cost when the
+observed variance is small. Paired inference and multiplicity        3.3 ADAPTIVE FAILURE-DIRECTED SAMPLING
+control address (P4). Ordinary fixed-n central-limit-theorem               VIA BOUNDED IMPORTANCE SAMPLING
+intervals can be useful when n is large and committed in
+advance, but CIF emphasizes finite-sample, anytime-valid             The previous subsections assume interventions are sampled
+guarantees because interpretability evaluations are often            from the target distribution Π. In practice, once failures
+monitored and adapted while they run.                                appear, we may want to sample more interventions like them.
+                                                                     This can find counterexamples faster, but a naive average
+3.1 FIXED-BUDGET CONFIDENCE INTERVALS                                under the adaptive sampler estimates the wrong population.
+                                                                     CIF uses importance weighting to keep the estimand tied to
+This is the right tool when the number of intervention tests         the original Π.
+
+n is fixed in advance. Draw (Xt, It) i.∼i.d. D × Π, compute          Adaptive intervention policies. At time t, after observing
+                                                                     the history Ht−1, choose a proposal distribution qt(· | Ht−1)
+Yt = Y (Xt, It) ∈ [0, 1], and let θn := n−1  n    Yt  .              over interventions and sample It ∼ qt. The proposal may
+                                             t=1                     depend arbitrarily on prior observations, enabling counterex-
+                                                                     ample mining, but it must be chosen before observing the
+Proposition 1 (Hoeffding confidence interval for a bounded           current score Yt.
+interventional mean). For any δ ∈ (0, 1), with probability
+at least 1 − δ, |θn − θ| ≤ log(2/δ)/(2n).
+
+For fidelity, this interval is applied to R and transformed to       Mixture proposals to bound weights. Let Π be the tar-
+F = 1 − R; for patching recovery, it is applied directly to
+µ. If Yt is Bernoulli, as in 0–1 disagreement for IIA, exact         get intervention distribution and q˜t any adaptive auxiliary
+binomial intervals can also be used.                                 proposal. Define the mixture qt := (1 − α) Π + α q˜t for α ∈
+                                                                     (0, 1). Then the importance weight wt := Π(It)/qt(It) ≤
+Compute planning. To achieve half-width ε at confidence              1/(1 − α) := Wmax, so weights remain bounded even when
+1−δ, Hoeffding requires n ≥ log(2/δ)/(2ε2). This is useful           q˜t is highly concentrated.
+when the forward-pass budget is fixed in advance, but it does
+not justify checking repeatedly and stopping when the result         Weighted estimator. The Horvitz–Thompson-style es-
+looks favorable.
+                                                                     timator [Horvitz     and  Thompson,  1952]  is  θnIS  :=
+
+                                                                     n−1  n    wt  Yt  .
+                                                                          t=1
+
+                                                                213
+Lemma 1 (Unbiasedness under adaptive proposals). For                Importance-weighted extension. For ordinary i.i.d. eval-
+any adaptive sequence (qt) with full support wherever Π >           uation, set Bt = Yt and the betting CS targets θ. For
+0, E[θnIS] = θ. Moreover, Mn := tn=1(wtYt − θ) is a                 adaptive CIF with weights wt ≤ Wmax, set Bt = Yt :=
+martingale w.r.t. the history filtration.                           wtYt/Wmax ∈ [0, 1], run the betting CS on Bt to obtain
+                                                                    an interval for E[Bt] = θ/Wmax, and scale back. Because
+Theorem 2 (Anytime-valid CS under adaptive sampling).               betting adapts to the empirical variance of Bt, the Wmax fac-
+Assume Yt ∈ [0, 1], wt ≤ Wmax almost surely, inputs                 tor no longer acts as a fixed multiplier on the radius; when
+Xt i.∼i.d. D, and the proposal qt is Ht−1-measurable. With          Var(wtYt) is small, the betting CS can be much tighter than
+δn = 6δ/(π2n2) and bnIS := Wmax log(2/δn)/(2n),                     Hoeffding.
+we have with probability at least 1 − δ, for all n ≥ 1,
+θ ∈ [θnIS − bnIS, θnIS + bInS].                                     Algorithm 1 only requires a streaming tracker: after each
+                                                                    intervention, update with the observed score and optional
+Choosing the proposal. The mixture rate α controls an               importance weight, then query lower and upper confidence
+efficiency tradeoff. Larger α gives the auxiliary proposal          bounds. Hoeffding and betting CSs therefore serve as inter-
+more influence, which can expose rare failures sooner, but it       changeable evaluation layers.
+also increases Wmax = 1/(1−α) and can widen worst-case
+bounds. This choice affects efficiency, not the estimand: as        3.5 COMPARING TWO EXPLANATIONS WITH
+long as the weights are used, the target remains the original              PAIRED, ANYTIME-VALID INFERENCE
+θ under Π. For transparency, adaptive evaluations should re-
+port α, describe the auxiliary proposal, and compare against        When comparing two abstractions, circuits, or component
+an i.i.d. baseline when certification cost is a central claim.      sets, evaluate both on the same sampled (Xt, It). The paired
+                                                                    difference Dt = Yt(1) − Yt(2) ∈ [−1, 1] often has much
+3.4 VARIANCE-ADAPTIVE CONFIDENCE                                    lower variance than two separate estimates. The same CS
+      SEQUENCES VIA BETTING                                         machinery applies to E[Dt] after rescaling the range, and
+                                                                    one can stop early when a one-sided CS excludes 0.
+The Hoeffding-style CSs above are simple and transpar-
+ent, but conservative: the radius depends only on n and the         3.6 MULTIPLE COMPARISONS AND SELECTION
+range of observations, not on the empirical variance. For
+importance-weighted observations, this conservatism intro-          The previous guarantees are for a single pre-specified esti-
+duces a multiplicative Wmax penalty that can make adaptive          mand. When scanning K components, circuits, or abstrac-
+sampling slower than i.i.d. sampling. Betting CSs keep any-         tions and selecting the best-looking result, uncorrected in-
+time validity while adapting to the observed variance.              tervals are optimistic. Simple options are to: (i) allocate
+                                                                    δ/K to each component (Bonferroni), (ii) use sequential
+Betting-based confidence sequences [Waudby-Smith and                “peeling” (stop sampling clearly suboptimal candidates), or
+Ramdas, 2024] address this conservatism by adapting to              (iii) use anytime-valid false discovery rate methods [Wang
+the empirical variance of the data. To avoid overloading            and Ramdas, 2022]. In the experiments we recommend re-
+notation, let Bt ∈ [0, 1] denote the bounded observation            porting both naive point estimates and Bonferroni-corrected
+passed to the betting tracker. The key idea is to construct a       CSs to show how selection affects confidence.
+capital process for each candidate mean m ∈ [0, 1]:
+                                                                    Algorithms. Algorithm 1 summarizes the adaptive two-
+K0(m) = 1,                      n                                   sided loop for a generic bounded score Y . Algorithm 2 gives
+                                                                    one-sided certification; the user supplies whether larger or
+            Kn(m) = 1 + λt(Bt − m) , (2)                            smaller values are favorable.
+
+                              t=1                                   Proofs of the formal statements in this section are given
+                                                                    in Appendix C. A short reporting checklist is provided in
+where λt is a “bet” chosen based on past data. By Ville’s           Appendix D.
+inequality, if E[Bt | Ht−1] = m under the candidate mean,
+then P(∃ n : Kn(m) ≥ 1/δ) ≤ δ, so the confidence set                4 EXPERIMENTS
+Cn = {m : Kn(m) < 1/δ} is an anytime-valid CS.
+                                                                    We evaluate CIF in four settings: a controlled MNIST ab-
+We use the Online Newton Step (ONS) betting strategy,               straction benchmark, a GPT-2 circuit evaluation on the IOI
+which sets                                                          task, a sensitivity analysis over intervention distributions and
+                                                                    metrics, and a coverage check under repeated monitoring.
+λn+1 = clip[−c,c] λn + η gn/An ,                                    The first two settings test whether confidence sequences can
+
+gn  =            Bn −m    ,  An = An−1 + gn2 ,
+            1+λn (Bn −m)
+
+with λ1 = 0, A0 = 1, η = 2/(2 − log 3) ≈ 2.22, and
+c = 1/2. In practice, we find Cn as an interval [Ln, Un]
+via bisection on (2), evaluating log Kn(m) in O(n) per
+candidate.
+
+                                                               214
+Algorithm 1 CIF with adaptive sampling (two-sided CS)                                       1.0                                         Hard pruning, k=256, p=0.5
+                                                                                            0.8
+Require: target distribution Π; mixture rate α; confi-               CS width (2 × radius)  0.6                                                        i.i.d. / Hoeffding
+                                                                                            0.4                                                        i.i.d. / Betting
+     dence δ; target half-width ε; adaptive proposal builder                                0.2                                                        Adaptive / Hoeffding
+                                                                                            0.0                                                        Adaptive / Betting
+     q˜t(· | Ht−1)                                                                                                                                      ∝ √ log n / n
+                                                                                                                    102
+1: n ← 0, θ ← 0
+
+2: while true do
+
+3: n ← n + 1
+
+4: build q˜n(· | Hn−1) (e.g., AtP*/gradients or past fail-
+
+     ures)                                                                                                               103            104
+
+5: qn ← (1 − α)Π + αq˜n                                                                                                  Sample size n
+
+6: sample (Xn, In) ∼ D × qn, compute Yn ∈ [0, 1]                     Figure 1: Confidence-sequence width versus forward passes
+                                                                     for hard pruning at k = 256, p = 0.5. Solid curves use
+7: wn ← Π(In)/qn(In)                                                 Hoeffding CSs; dashed curves use betting CSs. Blue denotes
+                                                                     i.i.d. sampling, orange denotes adaptive mixture sampling
+8:   update    θ    ←  θ  +  1  wnYn − θ                             with α = 0.3, and the gray dotted curve shows a log n/n
+                             n                                       reference rate.
+
+9:   set    δn ← 6δ/(π2n2)      and  bnIS  ←    1   log(2/δn )
+                                              1−α        2n
+
+10: if bInS ≤ ε then
+
+11:         break
+
+12: end if
+
+13: end while
+
+14: return certified interval [θ − bInS, θ + bInS]                   tured pruning (zeroing coordinates and removing the cor-
+                                                                     responding columns from the downstream weight matrix),
+Algorithm 2 CIF-Certify: one-sided certification                     (ii) soft interventions via affine mechanism replacement
+                                                                     (merging neurons using learned affine maps and compiling
+Require: target distribution Π; confidence δ; target θ0; di-         the result into a smaller dense network), (iii) a variance-
+     rection larger/smaller-is-better                                based pruning baseline (removing coordinates with low-
+                                                                     est activation variance across the training set), and (iv) a
+ 1: run CIF to maintain [θn − bn, θn + bn]                           random pruning baseline. For each abstraction, we retain
+ 2: if larger-is-better and θn − bn ≥ θ0 then                        k ∈ {64, 128, 256} of the 512 hidden units (additional prun-
+ 3: return Certified                                                 ing levels are reported in Appendix E), yielding 12 reported
+ 4: end if                                                           abstraction pairs. We evaluate under interchange interven-
+ 5: if smaller-is-better and θn + bn ≤ θ0 then                       tions: for each trial we draw a pair (x, x′) of MNIST images
+ 6: return Certified                                                 and a binary swap mask m ∈ {0, 1}k (each coordinate
+ 7: end if                                                           swapped independently with probability p = 0.5), then
+ 8: if budget exhausted then                                         compare the predictions of ML and MH under the corre-
+ 9: return Not certified                                             sponding interventions [Geiger et al., 2021].
+10: end if
+
+certify useful interventional claims at realistic forward-pass       Metrics. The main score is the disagreement indicator
+budgets; the latter two check that the reported conclusions          Z ∈ {0, 1}, so F = 1 − E[Z] is interchange intervention
+are stable to design choices and valid under the sequential          accuracy. We also use bounded KL and L2 discrepancies in
+workflows CIF is meant to support.                                   the sensitivity analysis (E3). For each method and compres-
+                                                                     sion level, we report: (a) confidence sequences for F , and
+4.1 E1: CERTIFIED IIA FOR PRUNED AND                                 (b) the stopping time, measured in forward passes, to certify
+      TRANSFORMED ABSTRACTIONS                                       F ≥ F0 for F0 ∈ {0.90, 0.95, 0.99}.
+
+The first experiment evaluates abstraction fidelity under in-        Adaptive proposal. For the adaptive runs, the auxiliary
+terchange interventions. The goal is not to declare one com-         proposal places more mass on coordinates with larger down-
+pression method universally best, but to ask which claims            stream weight norm, q˜t(j) ∝ ∥W:,j∥2. We mix this proposal
+can be certified once uncertainty is reported.                       with the target Bernoulli-mask distribution using α = 0.3.
+                                                                     Appendix F compares this static proposal with a history-
+Setup. We use a three-layer MLP (784 → 512 → 512 →                   updated failure proposal and sweeps α.
+10) trained on MNIST to > 98% test accuracy, following the
+architecture used in prior structured-mechanism work [Asi-           Results. Figure 1 illustrates the main inferential pattern.
+aee, 2026]. We construct abstractions at the second hidden           Hoeffding widths depend only on sample size and range,
+layer using four methods: (i) hard interventions via struc-          whereas betting intervals shrink with the empirical variance
+                                                                     of the observed scores.
+
+                                                                215
+                                                                                                            30 ×       Method          k = 64 k = 128 k = 256
+
+Speedup (nHoeffding / nBetting)  101                                                                        10 ×       Hard pruning    0.105  0.104   0.105
+                                                                                    threshold F0 = 0.9                 Soft interv.    0.462  0.483   0.559
+                                                                                    threshold F0 = 0.95                Variance-based  0.364  0.493   0.689
+                                                                                                                       Random          0.278  0.401   0.521
+                                                                                                  no speedup
+                                 100                                Variance-based  Random                             Table 1: Estimated fidelity F at p = 0.5 (n = 5,000, Hoeffd-
+                                                      Soft interv.                                                     ing CS, 1−δ = 0.95; half-width 0.046). No configuration
+                                                                                                                       certifies F ≥ 0.90. Bold indicates the highest fidelity in the
+                                                                                                                       row block.
+
+Figure 2: Certification-cost ratio nHoeffding/nBetting for each                                                        Method k F n (F ≥ 0.90) Speedup
+method at k = 256, p = 0.1, under i.i.d. sampling. Each run
+stops when the lower confidence bound on F exceeds the                                                                                 Hoeff. Bet.
+target F0. Hard pruning is omitted because it never certifies;
+dotted reference lines mark 10× and 30×.                                                                               Soft int. 64 0.929 — 1,813       ∞
+                                                                                                                       Soft int. 128 0.956 3,393 131  25.9×
+At the aggressive swap probability p = 0.5, no non-identity                                                            Soft int. 256 0.984 1,219 93   13.1×
+abstraction reaches the certification threshold F ≥ 0.90                                                               Var.-based 64 0.633 — —
+(Table 1). This is a useful negative result: under large coordi-                                                       Var.-based 128 0.917 — 4,725     —
+nate swaps, point estimates alone would still rank methods,                                                            Var.-based 256 0.990 1,141 64    ∞
+but CIF shows that none supports a high-fidelity claim at                                                              Random 256 0.954 3,549 249     17.8×
+this threshold. A paired comparison between soft interven-                                                                                            14.3×
+tions and random pruning at k = 256 further shows why
+interval choice matters: the estimated difference is −0.033,                                                           F ≥ 0.95 certification:
+with Hoeffding radius 0.067 and betting radius 0.016.                                                                  Soft int. 256 0.984 9,849 342 28.8×
+                                                                                                                       Var.-based 256 0.990 6,888 252 27.3×
+At the milder swap probability p = 0.1, several abstractions
+become certifiable (Table 2). Variance-based pruning at k =                                                            Table 2: Certification at p = 0.1 (n up to 10,000, i.i.d.,
+256 certifies F ≥ 0.90 in 64 forward passes with betting,                                                              1 − δ = 0.95). “—” means the threshold is not certified
+compared with 1,141 under Hoeffding. Soft interventions                                                                within budget. Bold indicates the fastest certification time
+at k = 256 show the same pattern: certification requires                                                               for each threshold.
+93 versus 1,219 samples for F ≥ 0.90, and 342 versus
+9,849 samples for F ≥ 0.95. Figure 2 summarizes these                                                                  Setup. We use GPT-2 Small (12 layers, 12 heads, 768-
+reductions at k = 256.                                                                                                 dimensional residual stream; ∼124M parameters) on the
+                                                                                                                       Indirect Object Identification (IOI) task [Wang et al., 2023].
+Adaptive sampling is not uniformly faster for certification.                                                           In this task, the model must complete sentences of the form
+In this high-fidelity regime, the adaptive mixture roughly                                                             “When Mary and John went to the store, John gave a drink
+doubles the sample count for variance-based pruning at k =                                                             to” with the indirect object (“Mary”). The behavior score
+256 (131 samples versus 64 under i.i.d. betting). Appendix F                                                           is the IOI logit difference g = logit(IO) − logit(S), where
+shows the complementary case: adaptive proposals are more                                                              IO is the indirect object and S is the subject. We evaluate
+useful for finding failures than for certifying already high                                                           circuits discovered via ACDC [Conmy et al., 2023], attribu-
+fidelities.                                                                                                            tion patching [Syed et al., 2024], and AtP* [Kramár et al.,
+                                                                                                                       2024], as well as the hand-identified IOI circuit from Wang
+Tables 1 and 2 give the corresponding fidelity estimates and                                                           et al. [2023]. Patching interventions restore a set of nodes S
+stopping times.                                                                                                        from clean to corrupted prompts, following best practices
+                                                                                                                       [Zhang and Nanda, 2024, Hanna et al., 2024]. We use the
+4.2 E2: CERTIFIED PATCHING EFFECTS AND                                                                                 clipped recovery score ∆ from Section 2.4; CIF certifies
+      CIRCUIT COMPLETENESS IN                                                                                          µ = E[∆], where larger values mean more recovery of the
+      TRANSFORMERS                                                                                                     clean behavior.
+
+The second experiment evaluates component-effect claims                                                                Results. Figure 3 shows that all evaluated circuits have
+in a transformer. Here each intervention requires a full GPT-                                                          high recovery estimates, µˆ ∈ [0.959, 0.972]. The distinction
+2 Small forward pass, so certification cost is central.                                                                is inferential: at n = 2,000, Hoeffding radii are about 0.070,
+                                                                                                                       while betting radii are about 0.005. Thus the same point
+                                                                                                                       estimates lead to much sharper lower confidence bounds
+                                                                                                                       under betting.
+
+                                                                                                                  216
+                                                                                                                                      1.05
+
+Normalised patching effect μ̂  1.0                                            95%                                                     1.00
+                               0.8                                            90%
+                               0.6                                            80%                   μ̂ with CS error bars
+                               0.4
+                               0.2                                            Circuit size                                            0.95           Hoeffding                                                    95%
+                               0.0 0                                                 3 heads                                          0.90           Betting                                                      90%
+                                                                                     7 heads
+                                                                                     9 heads                                          0.85                                                                        80%
+                                                                                     11 heads                                                                                                             13
+                                                                                     13 heads                                         0.80
+                                                                                                                                                  3
+                                      250  500  750  1000 1250 1500 1750 2000                                                                                        7  9                11
+
+                                                Sample size n (prompt pairs)                                                                                    Circuit size (number of attention heads)
+
+Figure 3: Confidence sequences for patching recovery µ on                                           Figure 4: Point estimate µˆ and confidence sequence at n =
+the IOI task with GPT-2 Small. Each curve corresponds to a                                          2,000 as a function of IOI circuit size. Solid curves show
+circuit of increasing size (3–13 heads). Lighter bands show                                         Hoeffding CSs; dashed curves show betting CSs.
+Hoeffding CSs; darker bands show betting CSs (1 − δ =
+0.95).                                                                                                                                1.0                                                                 0--1 loss
+
+            Circuit µˆ n (µ ≥ 0.90) n (µ ≥ 0.95)                                                    Fidelity F̂ (with CS error bars)                                                                      Clipped KL
+
+                                 Hoeff. Bet. Hoeff. Bet.                                                                              0.8                                                                 Clipped L2
+
+            3 heads 0.964 — 110 — 840                                                                                                 0.6
+            7 heads 0.959 — 118 — 1,545
+            9 heads 0.970 1,973 104 — 413                                                                                             0.4
+            11 heads 0.971 1,954 104 — 369
+            13 heads 0.972 1,875 102 — 357                                                                                            0.2
+
+Table 3: Certification of IOI circuits (GPT-2 Small, i.i.d.,                                                                          0.0            0.1        0.2     0.3              0.4              0.5
+1−δ = 0.95). “—” means the threshold is not certified within
+n = 2,000.                                                                                                                                                      Mask swap probability p
+
+                                                                                                    Figure 5: Sensitivity of certified fidelity to swap probability
+                                                                                                    p and discrepancy metric d. At p ≤ 0.2, the confidence
+                                                                                                    sequences overlap; at p = 0.5, they separate.
+
+Table 3 reports the resulting stopping times. The full 13-                                          sequences and check whether point-estimate differences
+head circuit certifies µ ≥ 0.90 at n = 102 and µ ≥ 0.95 at                                          survive uncertainty quantification.
+n = 357 under betting; under Hoeffding, the correspond-
+ing requirements are n = 1,875 and more than the 2,000-                                             Results. Figure 5 shows point estimates and confi-
+sample budget. Even the 3-head name-mover circuit certifies                                         dence sequences across four swap probabilities p ∈
+µ ≥ 0.90 in 110 samples under betting.                                                              {0.05, 0.1, 0.2, 0.5} and three discrepancy metrics (0–1 loss,
+                                                                                                    clipped KL, clipped L2). At mild perturbation (p ≤ 0.2),
+Figure 4 plots recovery against circuit size at n = 2,000.                                          the three metrics yield overlapping CSs: F ∈ [0.94, 0.99]
+Under betting, the lower confidence bound ranges from                                               with CS width 0.067, so metric choice has no statistically de-
+0.953 for the 7-head circuit to 0.966 for the 13-head circuit,                                      tectable effect. At p = 0.5, the metrics separate: the 0–1 loss
+suggesting diminishing returns after the core name-mover                                            gives F = 0.674 while the clipped KL gives F = 0.578,
+heads are included.                                                                                 and their CSs do not overlap (gap ≈ 0.03). At aggressive
+                                                                                                    perturbation levels, the choice of discrepancy function can
+4.3 E3: SENSITIVITY TO INTERVENTION                                                                 therefore change qualitative conclusions; CIF makes that
+      DISTRIBUTION AND METRIC CHOICE                                                                dependence visible by reporting intervals rather than only
+                                                                                                    point estimates.
+CIF certifies a metric under a declared intervention distri-
+bution. This experiment checks how much the conclusion                                              4.4 E4: COVERAGE VALIDATION
+changes when that design choice changes.
+
+Setup. We fix a model and circuit and evaluate under                                                Finally, we validate coverage under i.i.d. sampling, adaptive
+multiple Π: different corruption baselines (for patching),                                          sampling, and an aggressive peeking protocol (500 runs
+different mask strengths (for interchange), and different be-                                       per configuration; full details in Appendix G). Hoeffding
+havior metrics (probability vs logit difference vs KL) [Zhang                                       CSs achieve empirical coverage 1.000 in all configurations.
+and Nanda, 2024]. For each setting, we report confidence                                            Betting CSs range from 0.930 to 1.000, always at or above
+
+                                                                                               217
+the nominal 1 − δ while using less excess coverage.            Hoeffding-style CSs are simple and transparent but conser-
+                                                               vative: their width depends only on n and the weight bound
+5 DISCUSSION AND LIMITATIONS                                   Wmax, not on the empirical variance of the observed scores.
+                                                               Betting CSs (Section 3.4) adapt to the data and reduce certi-
+Choosing the target distribution Π. CIF makes explicit         fication cost by 10–30× in our experiments, from thousands
+that fidelity is defined relative to a choice of intervention  of forward passes to tens or low hundreds. This makes CIF-
+distribution. We recommend reporting results across a small    based certification practical even for expensive models like
+family of Π (e.g., weak vs strong interventions), and us-      GPT-2, where additional forward passes are costly.
+ing adaptive CIF to probe likely failures without biasing
+headline metrics.                                              The immediate next step is replacing the Bonferroni correc-
+                                                               tion in component scanning (Section 3.6) with e-value-based
+Boundedness and clipping. Our simplest guarantees as-          FDR control [Wang and Ramdas, 2022], which integrates
+sume bounded discrepancies/effects. For unbounded quan-        natively with anytime-valid inference and matters most for
+tities (e.g., raw logit differences), one can either clip to   hierarchical and per-component circuit scans, where Bonfer-
+a bounded range or use variance-adaptive CSs under ad-         roni is most lossy; extending CIF to multi-layer abstractions
+ditional assumptions [Howard et al., 2021]. In particular,     and richer attention-based interventions is the next challenge.
+sub-Gaussian and sub-exponential variants of time-uniform      CIF is deliberately a verification layer, the estimation side
+CSs [Howard et al., 2021], and asymptotic CSs [Waudby-         of the estimation/identification divide [Imbens and Rubin,
+Smith et al., 2024], extend the same anytime-valid work-       2015], but its anytime-valid bounds are natural controllers
+flow to unbounded estimands. Clipping is often acceptable      for discovery: integrated into automated circuit-discovery
+in interpretability because extreme outliers can reflect out-  procedures [Conmy et al., 2023, Syed et al., 2024, Kramár
+of-distribution interventions rather than meaningful causal    et al., 2024], they can prune low-fidelity candidates early
+effects.                                                       and reallocate evaluation budget toward contenders, turning
+                                                               certification from a post-hoc check into an active component
+What CIF does not solve. CIF certifies estimates for a         of the search.
+given metric and distribution. It does not guarantee that
+the chosen metric captures the desired notion of mecha-        Acknowledgements
+nistic truth. However, CIF makes it harder to overclaim
+by p-hacking sample sizes or adaptively searching with-        AA was partly supported by the Patient-Centered Outcomes
+out accounting for uncertainty. More fundamentally, CIF        Research Institute (PCORI) under award ME-2023C1-
+addresses the estimation problem of reliably estimating a      32148 and the National Institute of Mental Health under
+causal estimand from finite data [Imbens and Rubin, 2015],     award R01MH139379.
+but not the identification problem of whether the chosen
+abstraction captures the causal structure of interest.         Reproducibility. All experiments, tables, and fig-
+                                                               ures in this paper can be reproduced with the
+6 CONCLUSION AND FUTURE                                        code, data-processing scripts, and notebooks avail-
+    DIRECTIONS                                                 able at https://github.com/AsiaeeLab/
+                                                               certified-interventional-fidelity.
+We have introduced Certified Interventional Fidelity (CIF), a
+statistical framework that provides anytime-valid confidence   REFERENCES
+sequences for interventional interpretability metrics under
+both fixed and adaptive sampling regimes. CIF treats inter-    Amir Asiaee. Causal mechanism reduction: Mechanism
+ventional metrics (interchange intervention accuracy, patch-      replacement for neural network pruning and abstraction.
+ing effects, circuit completeness scores) as formal causal        arXiv preprint arXiv:2602.24266, 2026.
+estimands and wraps their evaluation with sequential infer-
+ence guarantees that remain valid under arbitrary stopping,    Sander Beckers, Frederick Eberhardt, and Joseph Y. Halpern.
+repeated monitoring, and adaptive counterexample hunting.         Approximate causal abstractions. In Ryan P. Adams and
+CIF has a small interface: discrepancies must be bounded (or      Vibhav Gogate, editors, Proceedings of The 35th Uncer-
+clipped to a bounded range), and the tracker can be applied       tainty in Artificial Intelligence Conference, volume 115
+as an evaluation layer around any existing interventional         of Proceedings of Machine Learning Research, pages
+interpretability analysis.                                        606–615. PMLR, 22–25 Jul 2020.
+
+A key practical finding is that the choice of CS construc-     Sander L. Beckers and Joseph Y. Halpern. Abstracting
+tion can change certification cost by an order of magnitude.      causal models. In Proceedings of the 33rd AAAI Con-
+                                                                  ference on Artificial Intelligence (AAAI-19), pages 2678–
+                                                                  2685, 2019. doi: 10.1609/aaai.v33i01.33012678.
+
+218
+Lawrence Chan, Adrià Garriga-Alonso, Nicholas                    Peter Grünwald, Rianne de Heide, and Wouter M. Koolen.
+   Goldowsky-Dill, Ryan Greenblatt, Jenny Nitishinskaya,            Safe testing. Journal of the Royal Statistical Society Se-
+  Ansh Radhakrishnan, Buck Shlegeris, and Nate Thomas.              ries B: Statistical Methodology, 86(5):1091–1128, 2024.
+   Causal scrubbing: a method for rigorously testing                doi: 10.1093/jrsssb/qkae011.
+   interpretability hypotheses. 2022. AI Alignment Forum /
+   Redwood Research.                                             Michael Hanna, Sandro Pezzelle, and Yonatan Belinkov.
+                                                                    Have faith in faithfulness: Going beyond circuit overlap
+Arthur Conmy, Augustine Mavor-Parker, Aengus Lynch,                when finding model mechanisms. In First Conference on
+   Stefan Heimersheim, and Adrià Garriga-Alonso. Towards           Language Modeling (COLM), 2024.
+   automated circuit discovery for mechanistic interpretabil-
+   ity. In Advances in Neural Information Processing Sys-        Wassily Hoeffding. Probability inequalities for sums of
+   tems, volume 36, 2023.                                           bounded random variables. Journal of the American
+                                                                   Statistical Association, 58(301):13–30, 1963. doi: 10.
+Jacob Dunefsky, Philippe Chlenski, and Neel Nanda.                 1080/01621459.1963.10500830.
+  Transcoders find interpretable LLM feature circuits. In
+  Advances in Neural Information Processing Systems, vol-        D. G. Horvitz and D. J. Thompson. A generalization of sam-
+   ume 37, 2024.                                                    pling without replacement from a finite universe. Journal
+                                                                    of the American Statistical Association, 47(260):663–685,
+Atticus Geiger, Hanson Lu, Thomas Icard, and Christo-              1952. doi: 10.1080/01621459.1952.10483446.
+   pher Potts. Causal abstractions of neural networks. In
+  Advances in Neural Information Processing Systems, vol-        Steven R. Howard, Aaditya Ramdas, Jon McAuliffe, and
+   ume 34, pages 9574–9586, 2021.                                  Jasjeet Sekhon. Time-uniform, nonparametric, nonasymp-
+                                                                    totic confidence sequences. The Annals of Statistics, 49
+Atticus Geiger, Zhengxuan Wu, Hanson Lu, Josh Rozner,              (2):1055–1080, 2021. doi: 10.1214/20-AOS1991.
+   Elisa Kreiss, Thomas Icard, Noah Goodman, and Christo-
+   pher Potts. Inducing causal structure for interpretable neu-  Guido W. Imbens and Donald B. Rubin. Causal Infer-
+   ral networks. In Kamalika Chaudhuri, Stefanie Jegelka,           ence for Statistics, Social, and Biomedical Sciences: An
+   Le Song, Csaba Szepesvari, Gang Niu, and Sivan Sabato,          Introduction. Cambridge University Press, 2015. doi:
+   editors, Proceedings of the 39th International Conference       10.1017/CBO9781139025751.
+   on Machine Learning, volume 162 of Proceedings of
+  Machine Learning Research, pages 7324–7338. PMLR,              Nikos Karampatziakis, Paul Mineiro, and Aaditya Ramdas.
+  17–23 Jul 2022.                                                   Off-policy confidence sequences. In Proceedings of the
+                                                                   38th International Conference on Machine Learning, vol-
+Atticus Geiger, Zhengxuan Wu, Christopher Potts, Thomas             ume 139 of Proceedings of Machine Learning Research,
+   Icard, and Noah Goodman. Finding alignments between              pages 5301–5310. PMLR, 2021.
+   interpretable causal variables and distributed neural repre-
+   sentations. In Francesco Locatello and Vanessa Didelez,       János Kramár, Tom Lieberum, Rohin Shah, and Neel
+   editors, Proceedings of the Third Conference on Causal           Nanda. AtP*: An efficient and scalable method for lo-
+  Learning and Reasoning, volume 236 of Proceedings                 calizing LLM behaviour to components. arXiv preprint
+   of Machine Learning Research, pages 160–187. PMLR,               arXiv:2403.00745, 2024.
+   01–03 Apr 2024.
+                                                                 Aleksandar Makelov, Georg Lange, and Neel Nanda. Is
+Atticus Geiger, Duligur Ibeling, Amir Zur, Maheep Chaud-            this the subspace you are looking for? An interpretability
+   hary, Sonakshi Chauhan, Jing Huang, Aryaman Arora,               illusion for subspace activation patching. In International
+   Zhengxuan Wu, Noah Goodman, Christopher Potts, and              Conference on Learning Representations, 2024.
+  Thomas Icard. Causal abstraction: A theoretical founda-
+   tion for mechanistic interpretability. Journal of Machine     Riccardo Massidda, Atticus Geiger, Thomas Icard, and Da-
+  Learning Research, 26(83):1–64, 2025.                            vide Bacciu. Causal abstraction with soft interventions.
+                                                                    In Mihaela van der Schaar, Cheng Zhang, and Dominik
+Nicholas Goldowsky-Dill, Chris MacLeod, Lucas Sato, and            Janzing, editors, Proceedings of the Second Conference
+  Aryaman Arora. Localizing model behavior with path                on Causal Learning and Reasoning, volume 213 of Pro-
+   patching. arXiv preprint arXiv:2304.05969, 2023.                 ceedings of Machine Learning Research, pages 68–87.
+                                                                    PMLR, 11–14 Apr 2023.
+Jason Gross, Rajashree Agrawal, Thomas Kwa, Euan Ong,
+   Chun Hei Yip, Alex Gibson, Soufiane Noubir, and               Maxime Méloux, François Portet, and Maxime Peyrard.
+   Lawrence Chan. Compact proofs of model performance               Mechanistic interpretability as statistical estimation: A
+  via mechanistic interpretability. In Advances in Neural          variance analysis. arXiv preprint arXiv:2510.00845,
+  Information Processing Systems, volume 37, 2024.                  2025.
+
+219
+Kevin Meng, David Bau, Alex Andonian, and Yonatan Be-            Kevin Ro Wang, Alexandre Variengien, Arthur Conmy,
+   linkov. Locating and editing factual associations in GPT.        Buck Shlegeris, and Jacob Steinhardt. Interpretability
+   In Advances in Neural Information Processing Systems,            in the wild: a circuit for indirect object identification in
+  volume 35, 2022.                                                  GPT-2 small. In International Conference on Learning
+                                                                   Representations (ICLR), 2023.
+Joseph Miller, Bilal Chughtai, and William Saunders. Trans-
+   former circuit faithfulness metrics are not robust. In First  Ruodu Wang and Aaditya Ramdas. False discovery rate
+  Conference on Language Modeling, 2024.                            control with e-values. Journal of the Royal Statistical
+                                                                   Society Series B: Statistical Methodology, 84(3):822–852,
+Chris Olah, Nick Cammarata, Ludwig Schubert, Gabriel                2022. doi: 10.1111/rssb.12489.
+   Goh, Michael Petrov, and Shan Carter. Zoom in: An
+   introduction to circuits. Distill, 2020. doi: 10.23915/       Ian Waudby-Smith and Aaditya Ramdas. Estimating means
+   distill.00024.001. https://distill.pub/2020/circuits/zoom-       of bounded random variables by betting. Journal of the
+   in.                                                             Royal Statistical Society Series B: Statistical Methodol-
+                                                                    ogy, 86(1):1–27, 2024. doi: 10.1093/jrsssb/qkad009.
+Judea Pearl. Causality: Models, Reasoning, and Inference.
+   Cambridge University Press, 2 edition, 2009.                  Ian Waudby-Smith, David Arbour, Ritwik Sinha, Edward H.
+                                                                    Kennedy, and Aaditya Ramdas. Time-uniform central
+Aaditya Ramdas, Peter Grünwald, Vladimir Vovk, and                  limit theory and asymptotic confidence sequences. The
+   Glenn Shafer. Game-theoretic statistics and safe anytime-       Annals of Statistics, 52(6):2613–2640, 2024. doi: 10.
+  valid inference. Statistical Science, 38(4):576–601, 2023.       1214/24-AOS2408.
+   doi: 10.1214/23-STS894.
+                                                                 Zhengxuan Wu, Atticus Geiger, Thomas Icard, Christopher
+Paul K. Rubenstein, Sebastian Weichwald, Stephan Bongers,           Potts, and Noah D. Goodman. Interpretability at scale:
+  Joris M. Mooij, Dominik Janzing, Moritz Grosse-                   Identifying causal mechanisms in alpaca. In Advances
+  Wentrup, and Bernhard Schölkopf. Causal consistency               in Neural Information Processing Systems, volume 36,
+   of structural equation models. In Proceedings of the             2023.
+  33rd Conference on Uncertainty in Artificial Intelligence
+  (UAI), 2017.                                                   Fred Zhang and Neel Nanda. Towards best practices of acti-
+                                                                   vation patching in language models: Metrics and methods.
+Glenn Shafer. Testing by betting: A strategy for statisti-          In International Conference on Learning Representations,
+   cal and scientific communication. Journal of the Royal           2024.
+  Statistical Society Series A: Statistics in Society, 184(2):
+  407–431, 2021. doi: 10.1111/rssa.12647.
+
+Claudia Shi, Nicolas Beltran-Velez, Achille Nazaret, Car-
+   olina Zheng, Adrià Garriga-Alonso, Andrew Jesson, Mag-
+   gie Makar, and David M. Blei. Hypothesis testing the
+   circuit hypothesis in LLMs. In Advances in Neural Infor-
+   mation Processing Systems, volume 37, 2024.
+
+Aaquib Syed, Can Rager, and Arthur Conmy. Attribution
+   patching outperforms automated circuit discovery. In Pro-
+   ceedings of the 7th BlackboxNLP Workshop: Analyzing
+   and Interpreting Neural Networks for NLP, 2024.
+
+Jesse Vig, Sebastian Gehrmann, Yonatan Belinkov, Sharon
+   Qian, Daniel Nevo, Yaron Singer, and Stuart Shieber. In-
+  vestigating gender bias in language models using causal
+   mediation analysis. In Advances in Neural Informa-
+   tion Processing Systems, volume 33, pages 12388–12401,
+   2020.
+
+Jean Ville. Étude critique de la notion de collectif. Gauthier-
+  Villars, Paris, 1939.
+
+Vladimir Vovk and Ruodu Wang. E-values: Calibration,
+   combination, and applications. The Annals of Statistics,
+  49(3):1736–1754, 2021. doi: 10.1214/20-AOS2020.
+
+220
+                              Certified Interventional Fidelity:
+      Anytime-Valid, Adaptive Evaluation of Causal Claims in Mechanistic
+
+                                         Interpretability
+                                  (Supplementary Material)
+
+                                                                 Amir Asiaee
+                                                         Department of Biostatistics
+                                                   Vanderbilt University Medical Center
+                                                         Nashville, TN 37232, USA
+
+A EXTENDED RELATED WORK
+
+A.1 CAUSAL ABSTRACTION AND INTERVENTIONAL INTERPRETABILITY
+
+Causal abstraction relates causal models at different granularities through state and intervention maps, with exact and
+approximate notions of commutativity [Rubenstein et al., 2017, Beckers and Halpern, 2019, Beckers et al., 2020, Massidda
+et al., 2023]. Interchange interventions operationalize these ideas in neural networks, yielding IIA as a graded faithfulness
+metric [Geiger et al., 2021, 2022, 2024, 2025]. Wu et al. [2023] show that distributed alignment search scales causal
+abstraction methods to large language models, making interchange interventions practical beyond small controlled settings.
+A second strand uses causal mediation analysis inside neural networks. Vig et al. [2020] trace gender bias through
+transformer layers; activation patching, path patching, and causal tracing build on the same interventional logic [Meng et al.,
+2022, Goldowsky-Dill et al., 2023, Zhang and Nanda, 2024]. Causal scrubbing tests interpretability hypotheses through
+behavior-preserving resampling interventions [Chan et al., 2022].
+
+A.2 CIRCUIT DISCOVERY AND SCALABLE APPROXIMATIONS
+
+Automated circuit discovery methods attempt to localize important components with fewer interventions [Conmy et al.,
+2023, Syed et al., 2024, Kramár et al., 2024, Hanna et al., 2024]. Dunefsky et al. [2024] show that transcoders enable
+finer-grained circuit analysis than sparse autoencoders alone, increasing the number of hypotheses that require evaluation.
+These methods motivate CIF because they often scan many candidates and refine hypotheses adaptively, precisely the setting
+where fixed-sample point estimates can be misleading.
+Recent work also studies the reliability of circuit evaluation itself. Makelov et al. [2024] identify an “interpretability illusion”
+in subspace activation patching, where apparently causal results arise from dormant pathways rather than the intended
+subspace. Miller et al. [2024] show that circuit faithfulness metrics are sensitive to the ablation method, complicating
+cross-study comparisons. Shi et al. [2024] develop formal hypothesis tests for circuit claims, and formal verification
+approaches provide complementary guarantees [Gross et al., 2024]. CIF complements these efforts by adding sequential,
+anytime-valid uncertainty quantification to adaptive interpretability workflows.
+
+A.3 MECHANISM TRANSFORMATIONS AND COMPRESSION AS CAUSAL OPERATIONS
+
+Recent work views a trained network as an SCM and interprets structured pruning as a hard intervention with an
+interventional-risk objective; soft interventions correspond to affine mechanism replacements and can be compiled exactly
+into a smaller dense network [Asiaee, 2026]. CIF serves a different role: it does not propose new abstractions, but certifies
+the interventional fidelity of a proposed abstraction, compression, or circuit.
+
+                                                                       221
+A.4 SEQUENTIAL INFERENCE AND CONFIDENCE SEQUENCES
+
+Ramdas et al. [2023] survey confidence sequences, e-values, and safe testing under the umbrella of game-theoretic statistics.
+CIF draws most directly on the nonparametric confidence sequences of Howard et al. [2021], which underlie our Hoeffding
+baseline, and the betting-based sequences of Waudby-Smith and Ramdas [2024], whose ONS strategy we use in Section 3.4.
+Safe testing [Grünwald et al., 2024, Shafer, 2021] and e-values [Vovk and Wang, 2021] provide related tools for optional
+stopping and evidence accumulation. The e-value false-discovery-rate methods of Wang and Ramdas [2022] are a natural
+replacement for Bonferroni correction when scanning many components.
+
+In the bandits literature, Karampatziakis et al. [2021] develop off-policy confidence sequences with importance weighting,
+the closest statistical predecessor to adaptive CIF’s mixture-importance-sampling layer. Concurrently, Méloux et al. [2025]
+diagnose variance and reliability issues in mechanistic interpretability evaluations; CIF provides one way to turn that
+diagnosis into certified evaluation practice.
+
+A.5 IMPORTANCE SAMPLING AND ADAPTIVE MONTE CARLO
+
+Importance sampling and Horvitz–Thompson estimators enable unbiased estimation under distribution shift [Horvitz and
+Thompson, 1952]. The potential-outcomes framework for causal inference [Imbens and Rubin, 2015] motivates treating
+interventional effects as estimands: each intervention defines a potential outcome, and the interventional risk R averages
+these outcomes under Π. CIF combines bounded-weight mixture proposals with martingale-based, anytime-valid bounds
+that remain valid when the proposal adapts over time.
+
+B ADDITIONAL CIF METHOD MAPPINGS
+
+Table 4 is organized by method family, with the claim class indicating what kind of mechanistic claim that family typically
+evaluates. Some circuit methods appear near the boundary depending on whether the reported score treats the circuit as a
+reduced mechanism to be faithful to the full model or as a component set whose causal effect is being measured.
+
+Bernoulli IIA. When Z = 1{yLω(I)(x) ≠ yHI (x)} indicates disagreement, R = P(Z = 1) and F = 1 − R = P(Z = 0)
+is interchange intervention accuracy. Exact binomial confidence sequences can also be used; the betting CS in Section 3.4
+already adapts to the low variance of such observations.
+
+Patching recovery. For activation or path patching, the patched run follows the corrupted prompt except that selected
+activations are copied from the clean run. With behavior score g, the bounded recovery ∆ ∈ [0, 1] measures the fraction of
+the clean-corrupted score gap recovered by the patch, and CIF certifies µ = E[∆].
+
+C PROOFS
+
+We collect here the proofs of all formal results stated in the main text.
+
+C.1 PROOF OF PROPOSITION 1 (HOEFFDING CONFIDENCE INTERVAL FOR A BOUNDED
+       INTERVENTIONAL MEAN)
+
+Proof. The random variables Y1, . . . , Yn are i.i.d. with Yt ∈ [0, 1] and E[Yt] = θ. By Hoeffding’s inequality [Hoeffding,
+1963, Howard et al., 2021], for any ϵ > 0,
+
+        P  1n                                          ≤ 2 exp −2nϵ2 .
+           n Yt − θ > ϵ
+           t=1
+
+Setting the right-hand side equal to δ gives ϵ =  log(2/δ)/(2n), and substituting θn = n−1  n    Yt  completes  the
+                                                                                            t=1
+
+proof.
+
+                                                  222
+C.2 PROOF OF THEOREM 1 (ANYTIME HOEFFDING CS VIA SPENDING)
+
+Proof. The proof proceeds by a union bound over the fixed-sample Hoeffding inequality (Proposition 1) applied at each
+sample size n.
+
+For each n ≥ 1, Proposition 1 with confidence parameter δn gives
+
+                                     P |θn − θ| >         log(2/δn)        ≤ δn.
+                                                              2n
+
+Define bn = log(2/δn)/(2n). By a union bound,
+
+                                                             ∞                           ∞
+
+                       P ∃ n ≥ 1 : |θn − θ| > bn ≤ P |θn − θ| > bn ≤ δn.
+
+                                                          n=1                            n=1
+
+The spending schedule δn = 6δ/(π2n2) sums to δ, so
+
+                              P ∀ n ≥ 1 : θ ∈ [θn − bn, θn + bn] ≥ 1 − δ.
+
+Since the event {∀n ≥ 1 : θ ∈ Cn} holds uniformly over time, the CS remains valid under any possibly data-dependent
+stopping time T : if θ ∈ Cn for all n, then in particular θ ∈ CT .
+
+C.3 PROOF OF LEMMA 1 (UNBIASEDNESS UNDER ADAPTIVE PROPOSALS)
+
+Proof. Fix time t and condition on the history Ht−1 = σ(X1, I1, Y1, . . . , Xt−1, It−1, Yt−1). Given Ht−1, the proposal qt
+is deterministic, Xt ∼ D is independent of the history, and It ∼ qt(· | Ht−1).
+
+By the tower property of conditional expectation,
+
+                       E[wtYt | Ht−1] = E   Π(It)   ·  Y  (Xt,  It)  Ht−1
+                                            qt(It)
+
+                                     = EXt∼D        EIt ∼qt  Π(It)   ·  Y  (Xt,  It)  Xt, Ht−1
+                                                             qt(It)
+
+                                                                Π(I )
+                                     = EXt∼D I∈I qt(I) · qt(I) · Y (Xt, I)
+
+                                     = EXt∼D              Π(I) · Y (Xt, I)
+
+                                                    I ∈I
+
+                                     = EX∼D, I∼Π[Y (X, I)] = θ.                                                       (3)
+
+The full-support condition ensures the ratio is well-defined, and the cancellation qt(I)Π(I)/qt(I) = Π(I) restores the target
+intervention distribution. In the continuous case, sums are replaced by integrals.
+
+Taking unconditional expectations gives E[wtYt] = θ for all t, hence E[θnIS] = θ.
+
+For the martingale property, M0 = 0 and E[Mn − Mn−1 | Hn−1] = E[wnYn − θ | Hn−1] = 0, so (Mn)n≥0 is a
+martingale.
+
+C.4 PROOF OF THEOREM 2 (ANYTIME-VALID CS UNDER ADAPTIVE SAMPLING)
+
+Proof. By Lemma 1, Mn =  n    (wtYt  −  θ)  is  a  martingale.  Since   0  ≤  wtYt    ≤  Wmax  almost  surely,  each  martingale
+                         t=1
+
+difference has conditional range width at most Wmax. Hoeffding–Azuma for martingales with bounded conditional ranges
+
+gives, for any ϵ > 0,
+
+                                                                      2ϵ2
+                                     P(|Mn| > ϵ) ≤ 2 exp − nWm2 ax .
+
+                                                          223
+Setting ϵ′ = ϵ/n gives
+
+                        P |θnIS − θ| > ϵ′                2n ϵ′2  .
+                                           ≤ 2 exp − Wm2 ax
+
+Thus for each fixed n, P(|θnIS − θ| > bInS) ≤ δn, where bInS = Wmax log(2/δn)/(2n).
+
+The same union bound over all n ≥ 1 as in Theorem 1 yields
+
+                                                                                                            ∞
+
+                        P ∀ n ≥ 1 : θ ∈ [θnIS − bnIS, θnIS + bnIS] ≥ 1 − δn = 1 − δ.
+
+                                                                                                           n=1
+
+D PRACTICAL REPORTING CHECKLIST
+
+   • State D (data/prompt distribution), Π (intervention distribution), and the bounded score being averaged, such as a
+      discrepancy Z or recovery score ∆.
+
+   • Report a confidence sequence, not just a point estimate.
+   • If you sample adaptively, report α and confirm that you used mixture importance sampling.
+   • When scanning many components, either correct for multiple comparisons or clearly state that reported intervals are
+
+      post-selection and optimistic.
+
+E E1 CERTIFICATION AT ADDITIONAL PRUNING LEVELS
+
+Table 5 extends Table 2 to the remaining pruning levels k ∈ {32, 384, 512} (p = 0.1, i.i.d., 1 − δ = 0.95, n up to 10,000).
+At k = 32 no method reaches certifiable fidelity (Fˆ < 0.83 everywhere). At k = 512 no units are removed, so all four
+methods coincide with the identity abstraction and certify at identical cost. The betting-vs-Hoeffding pattern of Table 2
+persists at every level where certification is possible.
+
+F ADAPTIVE VERSUS I.I.D. SAMPLING: MATCHED COMPARISON AND α-SWEEP
+
+This appendix reports auxiliary adaptive-sampling studies that inform the efficiency discussion.
+
+Matched three-way comparison. In the E1 setting, we compare three samplers under the betting CS (δ = 0.05, α = 0.3
+for both adaptive arms): (i) i.i.d. sampling from Π; (ii) the static proposal q˜(j) ∝ ∥W:,j∥2 of Section 3.3; and (iii) a history-
+updated proposal that, after each batch of 100 samples, refits a smoothed per-coordinate failure rate q˜t(j) ∝ (sj +1)/(nj +2),
+where sj and nj are the cumulative disagreement count and visit count of coordinate j. Two regimes are tested on five
+matched seeds each: low-fidelity exclusion (soft interventions, k = 256, p = 0.5, where Fˆ5000 ≈ 0.55; the task is to certify
+F < 0.70) and borderline certification (variance-based pruning, k = 128, p = 0.1, where Fˆ ≈ 0.92; the task is to certify
+F ≥ 0.90).
+
+Table 6 and Figure 6 report stopping times. The pattern is asymmetric. For failure-finding, the history-updated proposal
+(median 118, IQR 101–129) beats the static proposal on every seed (median 201, IQR 151–219) and is competitive with
+i.i.d. (median 88, IQR 86–150; the history proposal wins 3 of 5 matched seeds with a tighter IQR). For certification, every
+adaptive proposal loses to i.i.d. sampling: medians 3,800 (history, IQR 806–4,031) and 1,708 (static) versus 1,217 (i.i.d.).
+All samplers converge to the same Fˆ in both regimes, consistent with Lemma 1. We do not have a formal result for this
+direction-dependence; the observed pattern matches the one-sided importance-sampling intuition described in Section 3.3.
+
+Sweep over the mixture rate α. On the borderline-certification configuration of Table 2 (variance-based pruning, k = 256,
+p = 0.1, betting CS, three seeds per point), we sweep α ∈ {0, 0.1, 0.2, 0.3, 0.5, 0.7} with the static proposal. Figure 7
+shows median certification cost with IQR bars. For F0 = 0.90 the medians are 64, 96, 101, 121, 156, and 255 samples;
+for F0 = 0.95 they are 223, 190, 199, 240, 328, and 575. The non-monotonicity at small α is within three-seed noise;
+the slowdown above α = 0.3 is systematic and matches the Wmax = 1/(1 − α) weight-inflation bound (at α = 0.7,
+Wmax = 3.33 and certification at F0 = 0.95 is 2.6× slower than i.i.d.).
+
+                                                                       224
+                      Low-fidelity exclusion                                                                      7000             Borderline certification
+                                                                                                                  6000
+350                                                                                                               5000    i.i.d. static adaptive history adaptive
+300                                                                                                               4000
+250                                                                                                               3000
+200                                                                                                               2000
+150                                                                                                               1000
+100
+                                                                                                                       0
+              i.i.d. static adaptive history adaptive
+n to exclude F ≥ 0.70
+                                                                                           n to certify F ≥ 0.90
+
+Figure 6: Stopping times across five matched seeds per sampler (boxes: IQR; dots: individual seeds). Left: low-fidelity
+exclusion (n to certify F < 0.70). Right: borderline certification (n to certify F ≥ 0.90; note the static-adaptive outlier at
+n = 6,824). History-updated adaptive sampling helps failure-finding (left) and hurts certification (right).
+
+              600       threshold F0 = 0.90
+                        threshold F0 = 0.95
+
+              500
+
+n to certify  400
+
+              300
+
+              200
+
+              100
+
+                   0.0  0.1  0.2                       0.3                                                                0.5  0.7
+
+                                                       mixture rate α (α = 0: i.i.d.)
+
+Figure 7: Median certification cost versus mixture rate α (variance-based pruning, k = 256, p = 0.1, betting CS; three seeds
+per point; bars: IQR). F0 is the certification threshold: each run terminates when the lower confidence bound on F exceeds
+F0.
+
+G E4: COVERAGE VALIDATION DETAILS
+
+Setup. In the MNIST MLP setting (E1), we fix one abstraction and estimate R across 500 independent runs under three
+protocols: i.i.d. sampling from Π, adaptive mixture sampling with α = 0.3, and aggressive peeking, where the interval is
+checked after every 10 samples and the run stops at the first exclusion of a pre-specified value. For each protocol, we record
+whether the true R (estimated by Monte Carlo with 105 i.i.d. samples) falls inside the confidence sequence at the stopping
+time.
+
+Results. Table 7 reports empirical coverage for Hoeffding and betting CSs across three confidence levels. Hoeffding
+coverage is 1.000 in every configuration, reflecting the conservatism of the range-based bound. Betting coverage ranges
+from 0.930 to 1.000, always at or above the nominal guarantee while leaving less unused error budget.
+
+                                                       225
+Claim class    Method family             Mechanistic claim         Intervention family / sampling Certified quantity
+                                                                   rule
+
+Abstraction / reduc- Causal abstraction, in- A high-level causal model pre- Source input, donor input, and F = 1 − E[Z]
+
+tion fidelity  terchange interventions, serves the intervention behavior mask over abstract variables;
+
+               IIA [Geiger et al., 2021, of the original network.  Π samples masks and donors.
+
+               2025]
+
+Abstraction / reduc- Structured pruning, A reduced network or trans- Coordinate, mechanism, or F = 1 − E[Z] or
+
+tion fidelity  affine         mechanism formed mechanism preserves rel- group interventions; Π sam- bounded risk
+
+               replacement, neural evant causal behavior, not only ples masks, groups, donors, or
+
+               compression [Asiaee, ordinary predictions.          perturbation strengths.
+
+               2026]
+
+Abstraction / reduc- Causal scrubbing [Chan A hypothesis identifies which Resampling interventions gen- Behavior mismatch
+
+tion fidelity  et al., 2022]             variables are causally relevant for erated by the hypothesis; Π or degradation
+
+                                         behavior preservation.    samples examples and resam-
+
+                                                                   pling choices.
+
+Boundary case  Circuit completeness A selected circuit functions as a Restore, ablate, or compare Fidelity F or recov-
+               / circuit faithfulness reduced mechanism for the be- selected nodes/edges under ery µ
+
+               [Wang et al., 2023, havior, or as a component set prompt distributions.
+
+               Hanna et al., 2024, with high causal effect.
+
+               Miller et al., 2024, Shi
+
+               et al., 2024]
+
+Component effect / re- Activation patching, A component causally supports Clean/corrupted prompt pair µ = E[∆]
+
+covery         causal tracing [Vig et al., a behavior because restoring it plus component set S; Π may
+
+               2020, Meng et al., 2022, recovers the clean behavior. be a point mass or a sampler
+
+               Zhang and Nanda, 2024]                              over components.
+
+Component effect / re- Path   patching A directed path or edge set car- Clean/corrupted prompt pair Recovery                or
+
+covery         [Goldowsky-Dill           ries a causal effect between up- plus path or edge set E; Π clipped effect
+
+               et al., 2023]             stream and downstream compo- samples paths or fixes a dis- mean
+
+                                         nents.                    covered path set.
+
+Component effect / re- Ablation studies [Wang Removing or corrupting a compo- Node, head, edge, or feature Bounded degrada-
+
+covery         et al., 2023, Miller et al., nent changes behavior, indicating set plus ablation baseline; Π tion or effect
+
+               2024]                     causal relevance.         samples components, prompts,
+
+                                                                   or baselines.
+
+Discovery plus evalu- ACDC, attribution A search procedure proposes can- Candidate-dependent propos- Same CIF es-
+
+ation          patching, AtP*, re- didate components or circuits; als over nodes, edges, or timands after
+
+               lated circuit-discovery a separate evaluation estimates paths; selection may require selection
+
+               methods [Conmy et al., their causal effect or fidelity. multiple-comparison correc-
+
+               2023, Syed et al., 2024,                            tion.
+
+               Kramár et al., 2024,
+
+               Hanna et al., 2024]
+
+Table 4: Extended mapping of common interventional interpretability and reduction evaluations into CIF. The common
+requirement is to declare the input distribution D, intervention distribution Π, and bounded per-intervention score.
+
+                                                 226
+Method                               k       Fˆ n (F ≥ 0.90) n (F ≥ 0.95)
+
+                                                   Hoeff. Bet. Hoeff. Bet.
+
+Soft interv.                         32 0.824 — — — —
+
+Soft interv.                         384 0.989 1,081 93 6,746 233
+
+Hard pruning                         32 0.102 — — — —
+
+Hard pruning                         384 0.101 — — — —
+
+Variance-based                       32 0.494 — — — —
+
+Variance-based                       384 0.997 933 64 4,973 125
+
+Random                               32 0.196 — — — —
+
+Random                               384 0.988 1,081 64 7,239 228
+
+Identity (k = 512, all methods) 512 1.000 889 64 4,172 125
+
+Table 5: Certification at additional pruning levels (p = 0.1, i.i.d., 1 − δ = 0.95). “—” = not certified within n = 10,000. At
+k = 512 nothing is pruned, so all methods reduce to the identity abstraction and share one row.
+
+Exclusion n (median, IQR)              i.i.d.        Static adaptive    History adaptive
+Certification n (median, IQR)
+                                  88 (86–150)        201 (151–219)       118 (101–129)
+                               1,217 (763–3,263)  1,708 (1,501–3,007)  3,800 (806–4,031)
+
+Table 6: Matched five-seed comparison of samplers in the two E1 regimes (betting CS, α = 0.3). Low-fidelity exclusion:
+soft interventions, k = 256, p = 0.5, certify F < 0.70. Borderline certification: variance-based pruning, k = 128, p = 0.1,
+certify F ≥ 0.90.
+
+Sampling regime                1−δ      Hoeffding        Betting
+
+i.i.d. (α = 0)                 0.99     Coverage Std     Coverage Std
+Adaptive (α = 0.3)             0.99
+Aggressive peeking             0.99     1.000     0.000  1.000         0.000
+i.i.d. (α = 0)                 0.95     1.000     0.000  1.000         0.000
+Adaptive (α = 0.3)             0.95     1.000     0.000  0.992         0.004
+Aggressive peeking             0.95
+i.i.d. (α = 0)                 0.90     1.000     0.000  0.998         0.002
+Adaptive (α = 0.3)             0.90     1.000     0.000  1.000         0.000
+Aggressive peeking             0.90     1.000     0.000  0.966         0.008
+
+                                        1.000     0.000  0.996         0.003
+                                        1.000     0.000  0.996         0.003
+                                        1.000     0.000  0.930         0.011
+
+Table 7: Empirical coverage over 500 runs with n = 2,000 samples per run. Hoeffding is conservative in all configurations;
+betting remains at or above nominal coverage while producing tighter intervals.
+
+                                        227
+

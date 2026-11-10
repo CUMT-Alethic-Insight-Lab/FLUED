@@ -1,0 +1,914 @@
+arXiv:2602.04556v2 [cs.CL] 8 May 2026   Rethinking Weight Tying: Pseudo-Inverse Tying for
+                                                    LM Stable Training and Updates
+
+                                                            Jian Gu1, Aldeida Aleti1, Chunyang Chen2, and Hongyu Zhang3
+
+                                                            1Monash University, jian.gu,aldeida.aleti@monash.edu
+                                                             2Technical University of Munich, chun-yang.chen@tum.de
+
+                                                                      3Chongqing University, hyzhang@cqu.edu.cn
+
+                                                                                   Abstract
+
+                                                 Weight tying is widely used in compact language models to reduce parameters by
+                                                  sharing the token table between the input embedding and the output projection.
+                                                  However, parameter sharing alone does not guarantee a stable token interface:
+                                                  during training, the correspondence between encoding tokens into hidden states
+                                                  and decoding hidden states into logits can drift, worsening optimization sensitivity
+                                                  and weakening explainability probes that rely on a meaningful vocabulary-space
+                                                  decoder. We propose Pseudo-Inverse Tying (PIT), which synchronizes embedding
+                                                  and unembedding as coupled projections of a shared latent token memory, guar-
+                                                  anteeing a pseudo-inverse-consistent interface throughout training. PIT maintains
+                                                  an orthonormal shared memory, obtained by polar initialization from a source
+                                                  checkpoint for continued pretraining or by random orthonormal initialization for
+                                                  from-scratch pretraining, and introduces a learned symmetric positive definite
+                                                  hidden-space transform parameterized via a Cholesky factor. The output head
+                                                  applies this transform to hidden states before the vocabulary projection, while
+                                                  the embedding applies the inverse transform to token vectors using stable triangu-
+                                                  lar solves, avoiding explicit pseudo-inverse recomputation and vocabulary-sized
+                                                  auxiliary parameters. Beyond improving training stability, PIT provides a cleaner
+                                                  substrate for logit-lens-style and vocabulary-space explainability probes by keeping
+                                                  the input and output token geometries synchronized. We evaluate PIT on on-device
+                                                  models spanning 256M-1.3B parameters. The results show that PIT improves
+                                                  continued-pretraining stability, enforces near-exact token-interface consistency
+                                                  across settings, and yields more predictable lightweight adaptation after contin-
+                                                  ued pretraining, while from-scratch pretraining reveals a trade-off between strict
+                                                  interface consistency and unconstrained optimization.
+
+                                       1 Introduction
+
+                                       Compact language models are increasingly deployed in resource-constrained settings, such as on-
+                                       device assistants, private enterprise endpoints, and edge applications, where latency, memory footprint,
+                                       and deployment simplicity are first-class constraints. In this regime, practitioners often rely on
+                                       parameter sharing and lightweight output heads to keep both training and inference practical. A
+                                       widely adopted technique is weight tying [1, 2], which reuses the input embedding as the output
+                                       projection, typically via a transpose. Weight tying reduces parameters and often improves sample
+                                       efficiency, making it especially attractive for small and medium-scale models.
+
+                                       Despite its practical success, standard weight tying only loosely couples the two ends of the token
+                                       interface. It enforces shared parameters, but it does not explicitly control the geometric compatibility
+                                       between encoding discrete tokens into continuous hidden states and decoding hidden states back
+                                       into token logits. This distinction matters because the embedding-unembedding pair is the model’s
+
+                                       Preprint.
+token interface: a bottleneck through which all symbolic information enters and leaves the residual
+stream. During training, the effective encoding and decoding maps can become subtly misaligned,
+especially when optimization is sensitive or when the tokenizer introduces a large vocabulary.
+We refer to this phenomenon as token-interface drift. In practice, drift can surface as unstable
+optimization, heightened sensitivity to learning-rate schedules, and brittle behavior under post-
+training modifications that assume a stable token-aligned geometry.
+
+Token-interface stability is also a prerequisite for reliable explainability probes that interpret hidden
+states through the vocabulary space. Mechanistic interpretability tools such as the logit lens decode
+intermediate residual-stream states with the model’s unembedding, implicitly treating the output
+head as a semantic coordinate system for layerwise analysis [3, 4]. Related vocabulary-space probes,
+editing diagnostics, and adaptation analyses make a similar assumption: a hidden-state direction
+should have a stable token-level meaning when it is decoded. When the token interface drifts, the same
+hidden-space displacement can be read through a changing output geometry, making intermediate
+predictions, causal traces, and post-training updates harder to compare across layers or checkpoints.
+
+This motivation aligns with the emerging view of intrinsic interpretability, which aims to build
+transparency directly into model architectures and computations rather than relying only on post-hoc
+approximations. A recent survey organizes this direction around design paradigms such as functional
+transparency, concept alignment, representational decomposability, explicit modularization, and
+latent sparsity induction [5]. PIT contributes to this agenda at the token-interface level. Instead of
+adding an external explainer after training, PIT makes the embedding and unembedding mutually
+consistent by construction, so vocabulary-level probes such as the logit lens operate on a more stable
+and geometrically aligned decoder. This does not by itself solve interpretability, but it removes a
+source of avoidable ambiguity from analyses that depend on vocabulary directions.
+
+We propose Pseudo-Inverse Tying (PIT), a simple and principled mechanism that enforces a pseudo-
+inverse-consistent token interface throughout training. PIT synchronizes the embedding and unembed-
+ding by constructing them as coupled projections of a shared latent token memory: the two matrices
+are derived from the same underlying representation through an invertible coupling. This design
+guarantees that decoding acts as a left-inverse of encoding in the model’s hidden space, so the token
+interface remains aligned rather than drifting during optimization. We implement the coupling with a
+learnable symmetric positive definite transform, parameterized via a Cholesky factor, which provides
+expressive cross-dimension mixing while remaining well-conditioned and independent of vocabulary
+size. To obtain a canonical shared memory, PIT uses thin polar decomposition for continued pretrain-
+ing from a source checkpoint and random orthonormal initialization for from-scratch pretraining. It
+applies the coupling transform to hidden states in the output head and uses stable triangular solves to
+map token vectors through the inverse transform, avoiding repeated pseudo-inverse recomputation or
+vocabulary-sized auxiliary parameters.
+
+We evaluate PIT on compact LMs spanning 256M-1.3B parameters across continued pretraining,
+from-scratch pretraining, and lightweight downstream adaptation. In continued pretraining, PIT
+improves training loss and perplexity for the diverse Granite and Qwen3 models we test while
+preserving comparable runtime. Across both continued and from-scratch settings, it enforces near-
+exact input-output semantic alignment by construction. The from-scratch and adaptation results are
+more nuanced: the strict interface constraint can trade off against unconstrained optimization, but
+it provides a clear stabilizing bias for continued-pretraining checkpoints and makes post-training
+behavior easier to diagnose.
+
+To summarize, our contributions are as follows:
+
+        • We identify token-interface drift as a practical limitation of standard weight tying in com-
+           pact and large-vocabulary language models, with implications for optimization stability,
+           explainability probes, and post-training controllability.
+
+        • We propose Pseudo-Inverse Tying (PIT), a shared-memory parameterization that synchro-
+           nizes the input embedding and output projection by construction.
+
+        • We present an efficient and deployment-friendly realization of PIT based on polar canon-
+           icalization and a learned positive-definite transform, avoiding repeated pseudo-inverse
+           computation and vocabulary-sized auxiliary parameters.
+
+                                                           2
+        • We evaluate PIT across model scales, tokenizers, and training regimes, showing improved
+           continued-pretraining stability, near-exact token-interface consistency, and more predictable
+           lightweight adaptation after continued pretraining.
+
+2 Related Work
+
+Weight Tying and Token Interfaces. Sharing the input embedding and the output projection (weight
+tying) is a long-standing practice in neural language modeling, motivated by parameter efficiency
+and improved generalization [1, 2]. Classic tying typically reuses the token embedding matrix as
+the output classifier (often via transpose), providing a simple coupling between token encoding and
+token decoding. However, standard tying does not explicitly enforce a stable token interface during
+training: the geometry connecting input token vectors, hidden states, and output logits can drift under
+optimization, scaling, or post-training modifications. Pseudo-Inverse Tying (PIT) strengthens this
+coupling by constructing the embedding and unembedding as synchronized projections of a shared
+latent token memory, ensuring an explicitly pseudo-inverse-consistent interface throughout training.
+
+LM Training and Updates. A growing line of work studies how to update language models reliably,
+including targeted rewriting of factual associations and controlled downstream adaptation. Model
+editing methods such as ROME [6] and its scalable extension MEMIT [7] demonstrate that specific
+factual behaviors can be modified via structured weight updates, while highlighting practical diffi-
+culties such as interference, spillover, and sensitivity to representation drift. More broadly, many
+deployment-centric workflows (continual training, patching, and lightweight adaptation) rely on
+predictable mappings between hidden states and token logits to measure progress and validate updates.
+PIT complements these directions by stabilizing the token interface at the architectural level, reducing
+a source of training-time drift that can otherwise amplify the unpredictability of post-training updates.
+
+LM Mechanistic Interpretability. Mechanistic interpretability and representation analysis often decode
+intermediate activations back into vocabulary space to probe what a model “knows” at different depths.
+The logit lens popularized layerwise decoding by applying the model’s unembedding to intermediate
+residual-stream states [3], and subsequent frameworks formalized transformer computations as
+compositions of interpretable components and circuits [4]. These analyses implicitly assume that
+the token interface remains meaningful and comparably scaled across layers and across training
+checkpoints. By enforcing a pseudo-inverse-consistent interface through synchronized projections,
+PIT improves the reliability of intermediate decoding and provides a cleaner substrate for layerwise
+semantic analyses.
+
+Optimization with Orthogonality Constraints. PIT uses an orthonormal shared token memory (a
+Stiefel-constrained matrix) so that pseudo-inverse consistency holds by construction. Enforcing
+orthogonality with low overhead is closely related to classical optimization on matrix manifolds [8]
+and practical feasible methods for orthogonality-constrained optimization [9]. In our setting, orthogo-
+nality is not an end goal; rather, it serves as a computationally convenient mechanism to maintain a
+well-defined shared memory and a mathematically guaranteed token interface across training and
+updates.
+
+3 Preliminaries
+
+3.1 Semantic Property in Latent Space
+
+Next-token prediction creates a simple but revealing interface between discrete tokens and continuous
+hidden states. A token is read in through Win, transformed layer by layer into a latent representation,
+and then converted back to a distribution over the vocabulary through Wout. This makes it natural to
+describe what the model “means” by a token using objects that live in latent space.
+
+Recent work on LM semantics [10, 11, 12] promotes a geometric viewpoint where each vocabulary
+label corresponds to a distinguished latent vector, so that tokens have explicit representatives inside
+the model. On the input side, these representatives are already visible, since each row of Win is
+how the model instantiates a token internally. On the output side, the LM head defines how hidden
+states are interpreted as vocabulary scores, and we can place output labels into the same latent-space
+coordinates by mapping them back through the Moore-Penrose pseudoinverse.
+
+                                                           3
+Let V be LM vocabulary size and d the model dimension, with V ≫ d. We denote the input
+embedding matrix by Win ∈ RV ×d and the unembedding matrix by Wout ∈ Rd×V . This yields two
+
+vocabulary-indexed collections of latent vectors
+
+Bin = Win ∈ RV ×d,                                   (1)
+
+Bout = Wo+ut ∈ RV ×d,                                (2)
+
+where (·)+ denotes the Moore-Penrose pseudoinverse.
+
+Figure 1: Two perspectives of token semantics in the residual stream: input-side (Bin) vs. output-side
+(Bout, Logit Lens).
+
+Figure 1 visualizes these collections as colored dots, one per vocabulary label, together with an
+arbitrary hidden state shown as a dark dot. The left panel shows the input-side perspective induced
+by Bin. The right panel shows the output-side perspective induced by Bout, which is essentially the
+same linear readout used by LogitLens when it probes intermediate hidden states. When these two
+perspectives are not aligned, the same latent direction can correspond to different token meanings
+depending on whether we interpret it through the input interface or the output interface.
+
+Given such vocabulary representatives, the scores of a hidden state can be understood geometrically
+as comparisons to all vocabulary anchors. One can view the pre-softmax scores as induced by
+distances or similarities between the hidden state and the anchor set. Numerically this recovers the
+standard matrix-multiplication logits, but the geometric language is helpful for understanding how
+emphasizing or suppressing a particular semantic meaning corresponds to moving a representation
+toward or away from specific anchors. In Figure 1, the dashed connections from the dark dot to
+colored dots depict these comparisons.
+
+This geometry also provides a lens on the forward pass itself. Given a sequence t1, t2, . . . , tn, the
+model uses the last token tn as the medium through which it predicts tn+1. Let f0, f1, . . . , fm denote
+the hidden states of this medium token across an m-layer transformer, where f0 is the embedding
+lookup and fm is the final-layer representation used for prediction. As the representation flows
+through layers, its nearest or most compatible vocabulary anchors may change, yielding a layer-by-
+layer evolution of its implied meaning. We refer to this evolution as a semantic transition, and the
+sequence {fℓ}ℓm=0 records a transition trace of how next-token prediction emerges through depth.
+
+3.2 Token-Interface Consistency and Weight Tying
+
+The geometric picture above depends not only on representations fℓ, but also on the token interface
+that defines the vocabulary anchors themselves. If the anchors used to read tokens in and the anchors
+used to read predictions out are synchronized, then token meanings are consistent across the model’s
+input and output boundaries. Algebraically, this synchronization corresponds to the input-side and
+output-side anchor sets agreeing, which can be expressed as Win ≜ Wo+ut.
+
+Figure 2 illustrates this process as a trajectory of the medium token across layers. By comparing
+each fℓ to the vocabulary anchors in the corresponding latent space, we can associate each layer
+with the token meaning that is most strongly supported at that depth. When the latent semantics are
+stable, this transition is smooth and interpretable. When the latent semantics drift, the same geometric
+neighborhood can correspond to different labels at different layers, making the transition appear
+erratic.
+
+In practice, most language models parameterize Win and Wout independently, or tie them by a
+transpose. Transpose tying reduces parameters, but it does not in general enforce a pseudo-inverse
+
+                                                           4
+Figure 2: Layerwise semantic transition (transition trace) of the medium token during next-token
+prediction, under a stable vs. drifting token interface.
+
+relationship, and therefore does not guarantee that Bin and Bout stay aligned. When this misalignment
+grows during pretraining, the model effectively uses one coordinate system to write tokens into the
+network and a slightly different one to read them out. Figure 2 shows how such a mismatch manifests
+across depth. Under transpose tying, the semantic geometry drifts from layer to layer, visualized as
+shifting color bands, and the medium token can appear to “change its nearest meaning” even when its
+trajectory is smooth in raw hidden-state space. In contrast, when the input and output interfaces are
+synchronized, the anchor set remains stable across layers, and the semantic transition of the medium
+token is measured against a consistent vocabulary geometry.
+
+A seemingly direct remedy would periodically recompute a pseudoinverse with SVD and retie the
+matrices, but doing so is computationally expensive and can be numerically brittle at scale. Motivated
+by the token-interface viewpoint and the layerwise effects highlighted in Figure 2, we instead seek
+to maintain input-output semantic synchronization throughout training by enforcing a structural
+consistency condition at the interface itself
+
+                               Wout E ≈ Id,                      (3)
+
+where E ∈ RV ×d is the embedding and Wout ∈ Rd×V is the unembedding. The key goal is to
+achieve Eq. (3) by construction rather than by a soft regularizer, while keeping the method stable and
+practical for large-scale pretraining. This is the core motivation for Pseudo-Inverse Tying, which we
+introduce next.
+
+4 Approach: Pseudo-Inverse Tying
+
+We generalize standard weight tying into a shared-memory view: both embedding and unembedding
+
+are derived from a single shared token memory and two coupled inverse transforms. Concretely, we
+introduce a shared memory matrix Z ∈ RV ×d and an invertible transform T ∈ Rd×d, and define
+
+                               E = Z T −1,         Wout = T Z⊤.  (4)
+
+Eq. (4) can be understood as pseudo-inverse tying via shared projection: Z stores token semantic
+
+memories as rows, while T specifies a learnable change of metric that is applied to the input and
+output sides through T −1 and T .
+
+If Z has orthonormal columns,  Z⊤Z = Id,
+
+                                                                 (5)
+
+then pseudo-inverse consistency holds exactly:
+
+Wout E = (T Z⊤)(ZT −1) = T (Z⊤Z) T −1 = Id.                      (6)
+
+                                                5
+Therefore, PIT reduces the problem of maintaining Eq. (3) to two structural requirements: Z stays on
+the Stiefel manifold, and T remains invertible. In this work, we choose T to be symmetric positive
+definite (SPD).
+
+4.1 Polar Decomposition for Shared Memory
+
+In practice, we start from either a source-checkpoint embedding or a random Gaussian initialization,
+each represented as an arbitrary tall matrix Z˜ ∈ RV ×d. To satisfy Eq. (5) in a numerically stable and
+
+canonical way, we use the thin polar decomposition:
+
+Z˜ = U H, U ⊤U = Id, H ≻ 0.                                                 (7)
+
+We then set the shared memory to the orthonormal factor:
+
+Z ← U.                                                                      (8)
+
+Polar decomposition is convenient because it separates an orthonormal basis from a symmetric
+positive definite scale/mixing component, aligning with our goal of disentangling shared token
+memory from the learnable metric.
+
+We use two initialization regimes. (i) In continued pretraining, the Transformer parameters are
+initialized from an existing checkpoint and PIT is enabled for the continued-pretraining run. In this
+case, Z is initialized from the checkpoint embedding via polar decomposition. (ii) In from-scratch
+pretraining, all model parameters are initialized randomly and PIT is enabled throughout training. In
+this case, Z is initialized from a random Gaussian matrix followed by polar decomposition or thin
+QR.
+
+Initialization for continued pretraining. Let E0 ∈ RV ×d be the embedding table from the source
+checkpoint. We compute E0 = U H and set Z ← U . A simple practice is to initialize T ← I and
+learn T during training.
+
+Initialization for from-scratch pretraining. We sample Z˜ ∼ N (0, 1)V ×d and compute its polar or
+thin QR factorization to obtain an orthonormal Z satisfying Eq. (5).
+
+4.2 Full SPD Transform for Pseudo-Inverse Tying
+
+Constraint on T . We learn T as a full symmetric positive definite matrix:
+
+T ≻ 0.                                                                      (9)
+
+Choosing T to be SPD ensures invertibility, improves numerical stability, and provides richer
+expressivity than diagonal or basis-diagonal scaling: a full SPD transform can represent both scaling
+and mixing through its eigenstructure.
+
+Parameterization by Cholesky. We parameterize T via a Cholesky factor:
+
+T = LL⊤,                                                                    (10)
+
+where L is lower-triangular with strictly positive diagonal. In implementation, we learn unconstrained
+entries of L and enforce Lii > 0 using a softplus or exponential, optionally with a mild clamp for
+conditioning.
+
+Efficient Forward Computation. PIT does not require materializing E and Wout as standalone
+parameters; instead, both are computed from (Z, T ). Given hidden states h ∈ RBT ×d (batch size B,
+sequence length T ), logits are computed as
+
+logits(h) = h Wout = h (T Z⊤).                                              (11)
+
+We implement Eq. (11) as two matrix multiplications:
+
+g ← h T ∈ RBT ×d, logits ← g Z⊤ ∈ RBT ×V .                                  (12)
+
+The embedding lookup for token indices t uses
+
+et = zt T −1,                                                               (13)
+
+where zt is the t-th row of Z. To avoid explicitly forming T −1, we compute et via Cholesky solves
+using L from Eq. (10), which is more stable in mixed precision.
+
+                                               6
+5 Experiments
+
+We evaluate PIT under continued pretraining, from-scratch pretraining, and lightweight post-training
+
+updates. PIT constructs the embedding and unembedding as coupled projections of a shared token
+memory using an orthonormal memory Z ∈ RV ×d and a learned SPD transform T ∈ Rd×d:
+
+                         E = ZT −1,     Wout = T Z⊤,
+
+which guarantees a pseudo-inverse-consistent token interface (WoutE = Id) whenever Z⊤Z = Id
+and T is invertible. Our experiments are designed to answer three questions. (i) Does PIT improve
+training stability and convergence at fixed compute. (ii) Does it better preserve input-side vs. output-
+side semantics throughout training. (iii) Does this translate into more predictable performance under
+lightweight post-training updates.
+
+For pretraining, we report learning curves and fixed-budget training metrics. For interface analysis,
+we report deterministic semantic-alignment diagnostics computed from trained checkpoints.
+
+5.1 Experimental Setups
+
+Baselines. We compare PIT with conventional transpose tying, shortened as TT.
+
+Models. We evaluate two groups of models. The first group contains diverse checkpoints for continued
+pretraining, including Granite [13] and Qwen3 [14], each with base and instruct variants. The second
+group contains scaled models for both continued and from-scratch pretraining: openly released
+Cerebras-GPT [15] models at 256M, 590M, and 1.3B parameters, and Llama-like models at 303M,
+613M, and 1.2B parameters that we train from random initialization. Compared with GPT-2 [16],
+Cerebras-GPT better fits our controlled continued-pretraining setting because it uses tied embeddings,
+a no-bias LM head, and a consistent layer design across scales. Together, these models span on-device
+to edge-server scales and allow us to test when structural token-interface constraints are most useful.
+
+5.2 Weight Tying for LM Continued Pretraining
+
+Table 1 summarizes continued-pretraining results for Granite and Qwen3 checkpoints. Across all
+four checkpoints, PIT achieves lower final training loss and perplexity than TT under comparable
+runtime. The improvement is largest for the Granite checkpoints, where PIT roughly halves training
+perplexity relative to TT, and remains visible for Qwen3 despite its larger vocabulary and different
+checkpoint family. The runtime differences are small relative to the total run time: PIT is slightly
+faster for Granite4-350M-Base and Qwen3-0.6B-Base, while slightly slower for the instruct variants.
+This pattern suggests that the added hidden-space transform is not the dominant cost; performance
+differences are primarily driven by optimization behavior rather than raw throughput.
+
+Table 1: Effects of weight tying on LM continued pretraining for diverse models.
+
+Model                    Method Training Loss ↓ Training PPL ↓ Runtime ↓
+
+Granite4-350M-Base       TT             3.482         32.517  2h 03m
+                         PIT            2.760         15.796  2h 01m
+
+Granite4-350M-Instruct   TT             3.527         34.011  2h 01m
+                         PIT            2.636         13.964  2h 13m
+
+Qwen3-0.6B-Base          TT             3.526         33.976  3h 50m
+                         PIT            3.336         28.111  3h 47m
+
+Qwen3-0.6B-Instruct      TT             3.539         34.416  3h 48m
+                         PIT            3.237         25.469  3h 58m
+
+Analysis. The continued-pretraining results support the central claim that stabilizing the token
+interface can reduce optimization friction after checkpoint initialization. PIT improves loss more
+strongly for Granite than for Qwen3, which is plausible because the benefit depends on how much
+input-side and output-side token geometry in the source checkpoint has drifted before the continued-
+pretraining run. The instruct checkpoints also benefit, indicating that the effect is not limited to base
+models. At the same time, the gains should not be read as a universal throughput advantage: PIT’s
+computational overhead is small but nonzero, so its practical value comes from better convergence
+and a more stable interface at approximately fixed wall-clock cost.
+
+                                     7
+5.3 Results on Loss Dynamics
+
+We track training loss and perplexity as a function of tokens seen and compare optimization speed at
+fixed token budgets. Figure 3 shows representative pretraining loss curves on FineWeb-Edu 10B over
+the first 10k steps. The comparison highlights the early continued-pretraining regime: PIT is stable
+from the beginning, while TT exhibits a transient loss increase before recovering. This behavior is
+consistent with an interface mismatch being amplified by large early gradients when a checkpoint is
+exposed to a new corpus.
+
+Figure 3: Representative continued-pretraining loss curves. PIT remains stable and reaches lower
+loss, while TT shows an early transient increase consistent with token-interface mismatch during the
+initial optimization phase.
+
+Analysis. The loss curves suggest that PIT primarily improves the conditioning of the token interface
+rather than merely adding capacity. Because the embedding and head are algebraically coupled,
+updates to hidden states are decoded through a synchronized vocabulary geometry throughout training.
+This is most visible at the start of continued pretraining, when the model must adapt to new data
+while preserving useful token semantics from the source checkpoint. The curve-level evidence
+complements the final losses in Table 1: PIT not only ends lower, but also avoids the unstable early
+behavior observed under TT.
+
+5.4 Results on Token-Interface Consistency
+
+We next measure interface consistency directly. Given an embedding E and an unembedding Wout, a
+natural scalar diagnostic is the deviation from a left-inverse condition
+
+∆TI = ∥WoutE − Id∥F ,                          (14)
+
+where smaller is better and 0 indicates a perfectly consistent token interface.
+
+Let Bin, Bout ∈ RV ×d denote input-side and output-side semantic bases. For standard models, we
+extract them as the orthonormal factors from thin polar decompositions of the embedding matrix
+and the transposed unembedding matrix, computed in FP32. For PIT, Bin and Bout coincide with the
+shared orthonormal memory Z by construction up to numerical precision. We compare Bin and Bout
+using three metrics, each with 0 meaning perfect agreement: cosine distance, Procrustes error, and
+principal angle.
+
+Table 2 reports input-side vs. output-side semantic alignment after continued pretraining on the
+diverse checkpoints. PIT reduces cosine distance and Procrustes error to numerical zero and keeps
+principal angles near zero, while TT leaves measurable alignment errors.
+
+Analysis. These diagnostics capture the mechanism that loss alone cannot isolate. TT can still learn
+useful language-model behavior, but its input-side and output-side semantic bases need not remain
+aligned; the Qwen3 checkpoints show larger TT angles than the Granite checkpoints, suggesting
+that drift can be model-family dependent. PIT removes this degree of freedom by construction,
+so the semantic bases used to encode and decode tokens remain synchronized throughout training.
+
+                                            8
+Table 2: Token-interface consistency of weight tying on LM continued pretraining for diverse models.
+
+Model                   Method Cosine Distance ↓ Procrustes Error ↓ Principal Angle ↓
+
+Granite4-350M-Base      TT   0.0089  0.1333  0.0106 rad
+                        PIT  0.0000  0.0000  0.0021 rad
+
+Granite4-350M-Instruct  TT   0.0084  0.1293  0.0085 rad
+                        PIT  0.0000  0.0000  0.0020 rad
+
+Qwen3-0.6B-Base         TT   0.0165  0.1774  0.0611 rad
+                        PIT  0.0000  0.0000  0.0024 rad
+
+Qwen3-0.6B-Instruct     TT   0.0165  0.1778  0.0750 rad
+                        PIT  0.0000  0.0000  0.0023 rad
+
+This deterministic alignment explains why PIT is especially relevant for post-training updates and
+interpretability tools that rely on stable vocabulary directions: the same hidden-space displacement is
+less likely to be read through a changing output geometry.
+
+6 Discussion
+
+PIT can be viewed as a strict generalization of classic weight tying. When the transform is the identity,
+PIT reduces to an orthonormal form of tying, with E = Z and Wout = Z⊤. With a learned invertible
+transform, the embedding and unembedding paths become computationally asymmetric but remain
+pseudo-inverse consistent: WoutE = (T Z⊤)(ZT −1) = Id when Z⊤Z = Id. Thus, Z acts as a
+shared token memory, while T specifies the hidden-space metric used to enter and leave that memory.
+
+This construction gives compact language models an inductive bias beyond parameter sharing.
+Standard transpose tying saves parameters, but it does not ensure that input-side and output-side token
+geometries remain synchronized during optimization. PIT enforces this alignment by construction.
+Our experiments reflect this distinction: in continued pretraining, PIT improves loss across diverse
+checkpoints and drives semantic-basis alignment errors to numerical precision, whereas TT leaves
+measurable interface drift. The from-scratch results also clarify the boundary of the benefit: PIT is
+not always the strongest raw optimization bias from random initialization, but it yields a cleaner and
+more controllable interface once a model is being continued, adapted, or analyzed.
+
+The main practical value is a more predictable token interface. LoRA, patching, editing, and
+explainability probes often interpret hidden-space changes through the output vocabulary. If the
+unembedding geometry has drifted from the input embedding, vocabulary-space effects become
+harder to anticipate. PIT provides a stable bridge between hidden states and token probabilities,
+making token-level behavior easier to inspect and control. This is especially relevant to logit-lens-
+style analysis and related vocabulary-space probes, where intermediate representations are projected
+through the output head.
+
+PIT has modest overhead. It adds a hidden-size transform and triangular solves, while the dominant
+cost typically remains the vocabulary projection. In practice, the important implementation choices
+are to keep the shared memory close to orthonormal, keep the transform invertible, and perform
+solves in FP32 when training in mixed precision.
+
+7 Conclusion
+
+We introduced Pseudo-Inverse Tying (PIT), a shared-memory parameterization that synchronizes a
+language model’s input embedding and output projection through an orthonormal token memory and
+a learned invertible transform. PIT enforces a stable token interface by construction while avoiding
+explicit pseudo-inverse recomputation and vocabulary-sized auxiliary parameters.
+
+Experiments show that PIT improves continued-pretraining stability and enforces near-exact input-
+output semantic alignment across settings. The results also reveal a useful boundary: from-scratch
+pretraining can favor the flexibility of conventional tying, while continued-pretraining and lightweight
+adaptation benefit from PIT’s more predictable token geometry. Overall, PIT reframes weight tying as
+an interface-design problem, offering a practical route toward more stable and controllable compact
+language models.
+
+                                                           9
+References
+
+ [1] Hakan Inan, Khashayar Khosravi, and Richard Socher. Tying word vectors and word classifiers:
+      A loss framework for language modeling. arXiv preprint arXiv:1611.01462, 2016.
+
+ [2] Ofir Press and Lior Wolf. Using the output embedding to improve language models. In Pro-
+      ceedings of the 15th Conference of the European Chapter of the Association for Computational
+      Linguistics: Volume 2, Short Papers, pages 157–163, 2017.
+
+ [3] nostalgebraist. Interpreting gpt: The logit lens. LessWrong post, 2020. Accessed 2026-01-16.
+
+ [4] Nelson Elhage, Neel Nanda, Catherine Olsson, Tom Henighan, Nicholas Joseph, Ben Mann,
+      Amanda Askell, Yuntao Bai, Anna Chen, Tom Conerly, Nova DasSarma, Dawn Drain, Deep
+      Ganguli, Zac Hatfield-Dodds, Danny Hernandez, Andy Jones, Jackson Kernion, Liane Lovitt,
+      Kamal Ndousse, Dario Amodei, Tom Brown, Jack Clark, Jared Kaplan, Sam McCandlish, and
+      Chris Olah. A mathematical framework for transformer circuits. Transformer Circuits Thread,
+      2021. https://transformer-circuits.pub/2021/framework/index.html.
+
+ [5] Yutong Gao, Qinglin Meng, Yuan Zhou, and Liangming Pan. Towards intrinsic interpretability
+      of large language models: A survey of design principles and architectures. arXiv preprint
+      arXiv:2604.16042, 2026.
+
+ [6] Kevin Meng, David Bau, Alex Andonian, and Yonatan Belinkov. Locating and editing factual
+      associations in gpt. Advances in neural information processing systems, 35:17359–17372, 2022.
+
+ [7] Kevin Meng, Arnab Sen Sharma, Alex Andonian, Yonatan Belinkov, and David Bau. Mass-
+      editing memory in a transformer. arXiv preprint arXiv:2210.07229, 2022.
+
+ [8] P-A Absil, Robert Mahony, and Rodolphe Sepulchre. Optimization algorithms on matrix
+      manifolds. Princeton University Press, 2008.
+
+ [9] Zaiwen Wen and Wotao Yin. A feasible method for optimization with orthogonality constraints.
+      Mathematical Programming, 142(1):397–434, 2013.
+
+[10] Jian Gu, Aldeida Aleti, Chunyang Chen, and Hongyu Zhang. Vocabulary-defined semantics:
+      Latent space clustering for improving in-context learning. arXiv preprint arXiv:2401.16184,
+      2024.
+
+[11] Jian Gu, Aldeida Aleti, Chunyang Chen, and Hongyu Zhang. A semantic-aware layer-freezing
+      approach to computation-efficient fine-tuning of language models. In Findings of the Association
+      for Computational Linguistics: ACL 2025, pages 8019–8033, 2025.
+
+[12] Jian Gu, Aldeida Aleti, Chunyang Chen, and Hongyu Zhang. Beyond neural incompatibility:
+      Cross-scale knowledge transfer in large language models through latent semantic alignment. In
+      Findings of the Association for Computational Linguistics: ACL 2026, 2026.
+
+[13] Kate Soule and Dave Bergmann. Ibm granite 4.0: Hyper-efficient, high performance hybrid
+      models for enterprise, Nov 2025.
+
+[14] An Yang, Anfeng Li, Baosong Yang, Beichen Zhang, Binyuan Hui, Bo Zheng, Bowen Yu,
+      Chang Gao, Chengen Huang, Chenxu Lv, et al. Qwen3 technical report. arXiv preprint
+      arXiv:2505.09388, 2025.
+
+[15] Nolan Dey, Gurpreet Gosal, Hemant Khachane, William Marshall, Ribhu Pathria, Marvin Tom,
+      Joel Hestness, et al. Cerebras-gpt: Open compute-optimal language models trained on the
+      cerebras wafer-scale cluster. arXiv preprint arXiv:2304.03208, 2023.
+
+[16] Gokul Yenduri, Gautam Srivastava, Praveen Kumar Reddy Maddikunta, Rutvij H Jhaveri,
+      Weizheng Wang, Athanasios V Vasilakos, Thippa Reddy Gadekallu, et al. Generative pre-
+      trained transformer: A comprehensive review on enabling technologies, potential applications,
+      emerging challenges, and future directions. arXiv preprint arXiv:2305.10435, 2023.
+
+[17] Guilherme Penedo, Hynek Kydlícˇek, Anton Lozhkov, Margaret Mitchell, Colin A Raffel,
+      Leandro Von Werra, Thomas Wolf, et al. The fineweb datasets: Decanting the web for the finest
+      text data at scale. Advances in Neural Information Processing Systems, 37:30811–30849, 2024.
+
+                                                          10
+[18] Edward J Hu, Yelong Shen, Phillip Wallis, Zeyuan Allen-Zhu, Yuanzhi Li, Shean Wang,
+      Lu Wang, Weizhu Chen, et al. Lora: Low-rank adaptation of large language models. ICLR,
+      1(2):3, 2022.
+
+[19] Jacob Austin, Augustus Odena, Maxwell Nye, Maarten Bosma, Henryk Michalewski, David
+      Dohan, Ellen Jiang, Carrie Cai, Michael Terry, Quoc Le, et al. Program synthesis with large
+      language models. arXiv preprint arXiv:2108.07732, 2021.
+
+[20] Karl Cobbe, Vineet Kosaraju, Mohammad Bavarian, Mark Chen, Heewoo Jun, Lukasz Kaiser,
+      Matthias Plappert, Jerry Tworek, Jacob Hilton, Reiichiro Nakano, et al. Training verifiers to
+      solve math word problems. arXiv preprint arXiv:2110.14168, 2021.
+
+[21] Mark Chen. Evaluating large language models trained on code. arXiv preprint arXiv:2107.03374,
+      2021.
+
+[22] Arkil Patel, Satwik Bhattamishra, and Navin Goyal. Are nlp models really able to solve simple
+      math word problems? arXiv preprint arXiv:2103.07191, 2021.
+
+A Technical Design and Details
+
+A.1 Model Architectures and Scaling Targets
+
+              Model       Params Embed % L dmodel nh nkv                  dff
+
+              Llama-0.3B 303 M     10.8% 24 1024 16                       4 2816
+              Llama-0.6B 613 M      6.7% 32 1280 20                       5 3584
+              Llama-1.2B 1.17 B     4.4% 40 1600 24                       6 4480
+
+Table 3: Architectural targets for Llama-like models used in from-scratch pretraining, with vocabulary
+size V =32,000, gated GQA with dhead=64, and SwiGLU.
+
+We evaluate three Llama-like decoder-only Transformer variants selected to align with compact
+on-device and edge-server parameter regimes while using a modern efficient block design. All models
+share: (i) a fixed tokenizer with vocabulary size V = 32,000, (ii) tied input/output embeddings for
+the TT baseline or the PIT shared-memory parameterization, (iii) grouped-query attention (GQA)
+with a gated attention output, (iv) SwiGLU feed-forward networks, and (v) a parallel Transformer
+block where the attention and MLP branches are computed in parallel and their outputs are combined
+in the residual stream.
+
+Attention (Gated GQA). We fix head dimension dhead = 64, hence nh = dmodel/64 query heads. We
+
+use GQA with
+
+                     nkv  =  nh ,  dkv  =    nkv dhead    =  dmodel .             (15)
+                             4                                 4
+
+The attention output is modulated by a lightweight learnable channel-wise gate, whose parameter
+
+count is negligible relative to the projection matrices.
+
+MLP (SwiGLU). We use SwiGLU with intermediate width
+
+                                        8
+                                   dff ≈ 3 dmodel,                                (16)
+
+rounded up to a kernel-friendly multiple of 256. This preserves the standard compute and parameter
+budget relative to a 4dmodel GeLU MLP while benefiting from gating.
+
+Parameter accounting. With tied embeddings or PIT shared memory, the token-interface parameter
+budget is dominated by V dmodel plus, for PIT, the additional hidden-space transform. Ignoring small
+terms such as biases and treating gating as negligible, the dominant per-layer parameters are:
+
+                     Pattn ≈ 2d2 + 2d dkv,                Pmlp ≈ 3d dff,          (17)
+
+with d ≡ dmodel. Reported parameter counts additionally include LayerNorm scale and shift parame-
+ters; positional embeddings are omitted for clarity.
+
+                                        11
+A.2 Implementation Details
+
+Shared memory Z. PIT requires Z⊤Z = Id. For continued pretraining, we compute a thin polar
+decomposition of the source checkpoint embedding matrix and take the orthonormal factor as Z. For
+from-scratch pretraining, we initialize Z as a random Stiefel matrix, implemented by applying thin
+QR or polar decomposition to a random Gaussian matrix. Unless otherwise noted, we freeze Z after
+initialization, so interface adaptation happens through the learned SPD transform. If training Z is
+desired, we maintain Eq. (5) via polar retraction applied once per optimizer step:
+
+                            Z ← Z˜ (Z˜⊤Z˜)−1/2,                                           (18)
+
+with all SPD operations performed in FP32 and an optional ridge ϵI for numerical safety.
+
+SPD transform T . We parameterize T ≻ 0 via a Cholesky factorization T = LL⊤ with positive
+diagonal, where the diagonal is mapped by softplus or exp(·) to enforce positivity. We learn T
+through L and compute triangular solves in FP32 for numerical stability. To keep T well-conditioned,
+we optionally clamp the diagonal of L within a reasonable range; this is not required by Eq. (6), but
+it improves robustness in large-scale mixed-precision runs. Optional regularizers on log det T or on
+the diagonal scale of L can be added, although our default setup relies on the SPD parameterization
+and standard optimization.
+
+Efficient computation. We compute logits as (hT )Z⊤, avoiding explicit formation of Wout. For
+embedding lookup, we retrieve token rows zt from Z and apply T −1 via triangular solves instead of
+an explicit inverse. This preserves the intended pseudo-inverse relationship while keeping overhead
+close to standard tying.
+
+Checkpointing and deployment. To stay consistent with standard weight-tying practice, we checkpoint
+(Z, T ) and reconstruct E and Wout on load using Eq. (4) when materialized matrices are needed.
+This reduces redundant storage and keeps the tying relationship explicit.
+
+Implementation decision (m = d). While PIT can be extended to a higher-dimensional shared
+memory, in this work we fix the shared-memory dimension to the hidden size for simplicity and
+fair comparison to standard language models: (i) it keeps the embedding and head dimensionality
+unchanged; (ii) it preserves the asymptotic cost of the vocabulary projection; and (iii) it avoids
+introducing extra capacity that could confound the effect of pseudo-inverse tying.
+
+B More Results
+
+B.1 Weight Tying for LM From-Scratch Pretraining
+
+We pretrain on FineWeb-Edu [17] using its official 10B-token subset, which matches the data scale
+targeted by compact LMs. We use checkpoint-native tokenizers in continued pretraining and a fixed
+tokenizer in from-scratch pretraining. All pretraining runs use AdamW, a fixed context length of 1K
+tokens, and gradient accumulation to reach the same global batch size within each comparison. We
+report final training loss, training perplexity, and runtime at fixed token budgets.
+
+Analysis. The scaled-model results show a regime-dependent trade-off. For from-scratch pretraining,
+TT reaches lower loss and perplexity across all three Llama-like models, suggesting that PIT’s
+strict interface constraint can be too restrictive during early representation formation from random
+initialization. For continued pretraining, PIT improves GPT-256M and GPT-1.3B and slightly
+underperforms TT on GPT-590M, while maintaining similar or slightly lower runtime. These results
+refine the main-message interpretation: PIT is most reliable when it regularizes an existing token
+interface during continued pretraining, whereas from-scratch optimization may benefit from the
+additional freedom of conventional tying before a stable semantic geometry has emerged.
+
+Results on Token-Interface Consistency. Table 5 reports input-side vs. output-side semantic alignment
+for the scaled from-scratch and continued-pretraining models. The alignment results are consistent
+with the main experiments: PIT keeps cosine and Procrustes errors at numerical zero and reduces
+principal angles to near-zero values, while TT exhibits nontrivial drift. The from-scratch TT models
+have larger alignment errors than the continued-pretraining GPT models, indicating that unconstrained
+early optimization can produce stronger separation between input and output semantic bases even
+
+                            12
+Table 4: Effects of weight tying on from-scratch pretraining and continued pretraining for scaled
+models.
+
+                Stage Model                 Method Training Loss ↓ Training PPL ↓ Runtime ↓
+
+                From-Scratch    Llama-0.3B  TT       2.875  17.722  1h 14m
+                   Pretraining              PIT      3.915  50.166  1h 15m
+
+                                Llama-0.6B  TT       3.599  36.554  1h 50m
+                                            PIT      4.027  56.101  1h 51m
+
+                                Llama-1.2B  TT       2.907  18.303  3h 43m
+                                            PIT      4.174  64.984  3h 44m
+
+                                GPT-256M    TT       2.311  10.080  1h 24m
+                                            PIT      2.304  10.015  1h 21m
+                Continued
+                   Pretraining  GPT-590M    TT       3.523  33.892  2h 03m
+                                            PIT      3.714  41.027  2h 00m
+
+                                GPT-1.3B    TT       3.025  20.593  3h 53m
+                                            PIT      2.821  16.789  3h 50m
+
+Table 5: Token-interface consistency of weight tying on from-scratch pretraining and continued
+pretraining for scaled models.
+
+Stage Model                     Method Cosine Distance ↓ Procrustes Error ↓ Principal Angle ↓
+
+From-Scratch    Llama-0.3B      TT               0.1241     0.4925  0.1121 rad
+   Pretraining                  PIT              0.0000     0.0000  0.0024 rad
+
+                Llama-0.6B      TT               0.0810     0.3978  0.0808 rad
+                                PIT              0.0000     0.0000  0.0025 rad
+
+                Llama-1.2B      TT               0.0610     0.3459  0.0476 rad
+                                PIT              0.0000     0.0000  0.0028 rad
+
+                GPT-256M        TT               0.0619     0.3497  0.0448 rad
+                                PIT              0.0000     0.0000  0.0024 rad
+Continued
+   Pretraining  GPT-590M        TT               0.0315     0.2500  0.0344 rad
+                                PIT              0.0000     0.0000  0.0025 rad
+
+                GPT-1.3B        TT               0.0301     0.2444  0.0416 rad
+                                PIT              0.0000     0.0000  0.0032 rad
+
+when it achieves lower raw training loss. Thus, Table 4 and Table 5 together show the key trade-off:
+PIT buys a stable token interface, but that stability is most beneficial when the training goal values
+controllability and continuation rather than maximum from-scratch optimization flexibility.
+
+B.2 Effects of Weight Tying on Downstream Adaptation
+
+We study lightweight adaptations using LoRA [18], where we fine-tune LMs on MBPP [19] for code
+and GSM8K [20] for math, then evaluate out-of-domain transfer on HumanEval [21] for code and
+SVAMP [22] for math. We report exact-match accuracy.
+
+To keep the comparison controlled, we use the same LoRA configuration across methods at each
+scale. The key hypothesis is not that PIT changes what the model can ultimately represent, but that
+a more consistent token interface makes small, low-rank updates easier to apply without inducing
+unintended shifts in how hidden states are read out as tokens. This should matter most for transfer,
+where robustness to distribution shift is often limited by brittle reliance on a particular decoding
+geometry.
+
+Analysis. The adaptation results are mixed, and the pattern differs by training regime. For continued-
+pretraining checkpoints, PIT is modestly better in most cells, with the largest gains appearing
+on harder transfer settings such as HumanEval and SVAMP. This is consistent with the idea that
+stabilizing how hidden states map back to vocabulary items can make low-rank updates less brittle
+and reduce unintended shifts in decoding behavior. For from-scratch checkpoints, TT is slightly
+better across the board in this set of runs. A plausible explanation is that these checkpoints still
+benefit from the extra degrees of freedom implicit in transpose tying, while PIT’s stricter interface
+constraint can mildly limit how the update reshapes the token readout. Overall, PIT looks most useful
+
+                                                 13
+Table 6: Performance of weight tying on from-scratch and continued-pretraining checkpoints for
+downstream adaptation.
+
+Stage Model                 Method MBPP ↑ HumanEval ↑ GSM8K ↑ SVAMP ↑
+
+                Llama-0.3B  TT   16.2  8.7   13.5  10.1
+                            PIT  15.6
+From-Scratch                           8.2   13.1  9.6
+   Pretraining
+                Llama-0.6B  TT   24.8  15.9  21.1  17.0
+                            PIT  24.2
+                                       15.4  20.6  16.6
+
+                Llama-1.2B  TT   33.6  24.1  31.0  26.4
+                            PIT  32.9
+                                       23.6  30.4  25.8
+
+                GPT-256M    TT   18.7  10.3  16.9  12.4
+                            PIT  19.5
+Continued                              11.6  17.3  13.5
+   Pretraining
+                GPT-590M    TT   28.9  19.6  25.7  20.8
+                            PIT  29.3
+                                       19.2  26.1  21.5
+
+                GPT-1.3B    TT   39.5  29.8  36.2  31.1
+                            PIT  39.9
+                                       30.9  36.7  32.3
+
+as a robustness and controllability bias for continued training and lightweight updates on pretrained
+models, rather than as a universally dominant choice for from-scratch models.
+
+C A Formal Description
+
+We summarize the training procedure for Pseudo-Inverse Tying (PIT) in Algorithm 1. The method
+constructs a single shared token memory from either a source-checkpoint embedding for continued
+pretraining or a random orthonormal initialization for from-scratch pretraining. It then learns a
+compact SPD transform that jointly determines the input embedding map and the output projection
+used to produce logits. This implementation directly realizes the tied parameterization introduced in
+our equations, while avoiding explicit materialization of the embedding and unembedding matrices
+and preserving pseudo-inverse synchronization throughout training.
+
+                                 14
+Algorithm 1 Pseudo-Inverse Tying (PIT) with Shared Memory Z and SPD Transform T
+
+Require: Vocabulary size V , hidden size d, training corpus D, mode mode ∈ {teacher, scratch}.
+
+Require: (Optional) Teacher embedding table E0 ∈ RV ×d if mode = teacher.
+Ensure: Trained Transformer parameters Θ, shared memory Z ∈ RV ×d, and SPD transform
+
+     T ∈ Rd×d.
+
+1: Initialize shared memory Z (column-orthonormal).
+2: if mode = teacher then
+3: Compute thin polar decomposition E0 = U H with U ⊤U = Id and H ≻ 0.
+4: Set Z ← U .
+5: else
+6: Sample Z˜ ∼ N (0, 1)V ×d and compute thin QR factorization Z˜ = QR.
+7: Set Z ← Q.
+8: end if
+
+9: Optionally freeze Z for the remainder of training (recommended for controlled ablations).
+
+10: Parameterize the SPD transform T .
+11: Maintain a lower-triangular matrix L ∈ Rd×d with positive diagonal (e.g., diag(L) = exp(ℓ)).
+12: Define T ← LL⊤.
+
+13: if mode = teacher then
+14: (Optional) Initialize L such that T −1 approximately matches the teacher embedding scale
+
+       induced by H.
+
+15: else
+
+16: Initialize L ← Id (thus T = Id).
+17: end if
+
+18: Define the tied embedding/head maps (do not materialize full matrices).
+19: Embed: for token id t, compute et ← ztT −1, where zt is the t-th row of Z.
+20: Project: for hidden state h, compute logits logits(h) ← (hT )Z⊤.
+21: {When Z⊤Z = Id, these maps satisfy the pseudo-inverse consistency implied by the PIT
+
+    equations.}
+
+22: Train with standard language-model objective.
+
+23: for each optimizer step do
+
+24: Sample minibatch B ⊂ D and run the Transformer to obtain hidden states h under parameters
+
+     Θ.
+
+25: Compute logits using PIT projection: logits ← (hT )Z⊤.
+
+26: Compute loss L (e.g., next-token cross-entropy) and update (Θ, L) by backpropagation.
+
+27: if Z is trainable then
+
+28:      Apply a Stiefel retraction to Z to maintain Z⊤Z ≈ Id
+
+29:      {e.g., polar retraction Z ← Z(Z⊤Z + ϵI)−1/2, executed per optimizer step or periodically.}
+
+30: end if
+
+31: end for
+
+32: Return (Θ, Z, T ) with T = LL⊤.
+
+                                     15
+

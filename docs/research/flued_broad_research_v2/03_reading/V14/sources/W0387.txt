@@ -1,0 +1,701 @@
+A Masked Segmental Language Model for Unsupervised Natural
+                          Language Segmentation
+
+   C.M. Downey Fei Xia Gina-Anne Levow Shane Steinert-Threlkeld
+                  Department of Linguistics, University of Washington
+
+               {cmdowney, fxia, levow, shanest}@uw.edu
+
+                      Abstract                          by iteratively joining commonly co-occuring units.
+                                                        However, these segmentations are usually not sen-
+     We introduce a Masked Segmental Language           sical to human readers (Park et al., 2021). Given
+     Model (MSLM) for joint language model-             the current performance of models using BPE-type
+     ing and unsupervised segmentation. While           tokenization, the nonsensical nature of these seg-
+     near-perfect supervised methods have been de-      mentations does not necessarily seem to inhibit the
+     veloped for segmenting human-like linguis-         success of neural models.
+     tic units in resource-rich languages such as
+     Chinese, many of the world’s languages are            Nevertheless, BPE does not necessarily help
+     both morphologically complex, and have no          in situations where knowing a sensical segmen-
+     large dataset of “gold” segmentations for su-      tation of linguistic-like units is important, such as
+     pervised training. Segmental Language Mod-         attempting to model the ways in which children
+     els offer a unique approach by conducting un-      acquire language (Goldwater et al., 2009), segment-
+     supervised segmentation as the byproduct of        ing free-ﬂowing speech (Kamper et al., 2016; Rasa-
+     a neural language modeling objective. How-         nen and Blandon, 2020), creating linguistic tools
+     ever, current SLMs are limited in their scalabil-  for morphologically complex languages (Moeng
+     ity due to their recurrent architecture. We pro-   et al., 2021), or studying the structure of an endan-
+     pose a new type of SLM for use in both unsu-       gered language with few or no current speakers
+     pervised and lightly supervised segmentation       (Dunbar et al., 2020).
+     tasks. The MSLM is built on a span-masking
+     transformer architecture, harnessing a masked         While near-perfect supervised models have been
+     bidirectional modeling context and attention,      developed for resource-rich languages like Chinese,
+     as well as adding the potential for model scal-    most of the world’s languages do not have large
+     ability. In a series of experiments, our model     corpora of training data (Joshi et al., 2020). Es-
+     outperforms the segmentation quality of recur-     pecially for morphologically complex languages,
+     rent SLMs on Chinese, and performs similarly       large datasets containing “gold” segmentations into
+     to the recurrent model on English.                 units like morphemes are very rare.
+
+1 Introduction                                             To help mitigate this problem, we propose a
+                                                        novel variant of the unsupervised Segmental Lan-
+Outside of the orthography of English and lan-          guage Model (Sun and Deng, 2018; Kawakami
+guages with similar writing systems, natural lan-       et al., 2019). Segmental Language Models (SLMs)
+guage is rarely overtly segmented into meaningful       function as neural LMs that can also be used for un-
+units. Languages such as Chinese, are written with      supervised segmentation correlating with units like
+no spaces in between characters, and Chinese Word       words and morphemes (Kawakami et al., 2019).
+Segmentation remains an active ﬁeld of study (e.g.
+Tian et al., 2020). Running speech is also highly          Traditional (recurrent) SLMs provide a good
+ﬂuent with no meaningful pauses existing between        tradeoff between language-modeling performance
+“words” like in orthography.                            and segmentation quality. However, in order to em-
+                                                        brace a fully bidirectional modeling context, atten-
+   Tokenization schemes for large modern lan-           tion, and the scalability afforded by parallelization,
+guage models are now largely passed off to greedy       we present a Masked Segmental Language Model
+information-theoretic algorithms like Byte-Pair         (MSLM), built on a span-masking transformer ar-
+Encoding (Sennrich et al., 2016) and the subse-         chitecture (Vaswani et al., 2017). As far as we are
+quent SentencePiece (Kudo and Richardson, 2018),        aware, we are the ﬁrst to introduce a non-recurrent
+which create subword vocabularies of a desired size
+
+                                                         39
+
+19th SIGMORPHON Workshop on Computational Research in Phonetics, Phonology, and Morphology, pages 39 - 50
+                                July 14, 2022 ©2022 Association for Computational Linguistics
+architecture for segmental modeling.                       cal structure in sequential data. Inﬂuential among
+                                                           these are Connectionist Temporal Classiﬁcation
+   In this paper, we seek to compare our model             (Graves et al., 2006), Sleep-Wake Networks (Wang
+to recurrent baselines across two standard word-           et al., 2017), Segmental RNNs (Kong et al., 2016),
+segmentation datasets in Chinese and English, with         and Hierarchical Multiscale Recurrent Neural Net-
+the hope of expanding to more languages and do-            works (Chung et al., 2017).
+mains (such as speech) in future work. We con-
+strain the scope of our work to comparison with               In addition, SLMs draw heavily from character
+recurrent SLMs both because standard Bayesian              and open-vocabulary language models. For exam-
+models have been compared to SLMs elsewhere                ple, Kawakami et al. (2017) and Mielke and Eisner
+(Kawakami et al., 2019, Section 2), and because            (2019) present open-vocabulary language models
+SLMs have different use cases from Bayesian algo-          in which words are represented either as atomic
+rithms, which tend to be weaker language models            lexical units, or built out of characters. While the
+and lack continuous character representations that         hierarchical nature and dual-generation strategy of
+are invaluable in settings such as transfer learning.      these models did inﬂuence SLMs (Kawakami et al.,
+                                                           2019), both assume that word boundaries are avail-
+   In what follows, we overview baselines in unsu-         able during training, and use them to form word
+pervised segmentation as well as other precursors          embeddings from characters on-line. In contrast,
+to SLMs (Section 2), provide a formal character-           SLMs usually assume no word boundary informa-
+ization of SLMs in general, as well as the archi-          tion is available in training.
+tecture and modeling assumptions that make the
+MSLM distinct (Section 3), present our experimen-          Segmental Language Models The next section
+tal method comparing recurrent and masked SLMs             has a more technical description of SLMs; here we
+(Section 4), and ﬁnally show that the MSLM out-            give a short overview of related work. The term
+performs its recurrent counterpart on Chinese seg-         Segmental Language Model seems to be jointly
+mentation, and performs similarly to the recurrent         due to Sun and Deng (2018) and Kawakami et al.
+model on English (Sections 5-6). Section 7 lays            (2019). Sun and Deng (2018) demonstrate strong
+out directions for future work.                            results for Chinese Word Segmentation using an
+                                                           LSTM-based SLM and greedy decoding, competi-
+2 Related Work                                             tive with and sometimes exceeding state of the art
+                                                           for the time. This study tunes the model for seg-
+Segmentation Techniques and SLM Precursors                 mentation quality on a validation set, which we will
+An early application of machine learning to unsu-          call a “lightly supervised” setting (Section 4.3).
+pervised segmentation is Elman (1990), who shows
+that temporal surprisal peaks in RNNs provide a               Kawakami et al. (2019) use LSTM-based SLMs
+heuristic for inferring word boundaries. Subse-            in a strictly unsupervised setting in which the
+quently, Minimum Description Length (MDL) (Ris-            model is only trained to optimize language-
+sanen, 1989) was widely used. The MDL model                modeling performance on the validation set, and is
+family underlies well-known segmentation tools             not tuned on segmentation quality. Here they report
+such as Morfessor (Creutz and Lagus, 2002) and             that “vanilla” SLMs give sub-par segmentations
+other notable works (de Marcken, 1996; Goldsmith,          unless combined with one or more regularization
+2001).                                                     techniques, including a character n-gram “lexicon”
+                                                           and length regularization.
+   More recently, Bayesian models have proved
+some of the most accurate in their ability to model           Finally, Wang et al. (2021) very recently intro-
+word boundaries. Some of the best examples are             duce a bidirectional SLM based on a Bi-LSTM.
+Hierarchical Dirichlet Processes (Teh et al., 2006),       They show improved results over the unidirectional
+e.g. those applied to natural language by Goldwater        SLM of Sun and Deng (2018), test over more su-
+et al. (2009), as well as Nested Pitman-Yor (Mochi-        pervision settings, and include novel methods for
+hashi et al., 2009; Uchiumi et al., 2015). However,        combining decoding decisions over the forward and
+Kawakami et al. (2019) notes most of these do not          backward directions. This study is most similar to
+adequately account for long-range dependencies in          our own work, though our transformer-based SLMs
+the same capacity as modern neural LMs.                    utilize a bidirectional context in a qualitatively dif-
+                                                           ferent way, and do not require an additional layer
+   Segmental Language Models follow a variety of           to capture the reverse context.
+recurrent models proposed for ﬁnding hierarchi-
+
+                                                       40
+3 Model                                                                                 a forward-pass lattice can be used to recursively
+                                                                                        compute the marginal as in (2) given the base con-
+3.1 Recurrent SLMs                                                                      dition that α0 = 1. The maximum-probability seg-
+                                                                                        mentation can then be read off of the backpointer-
+A schematic of the original Recurrent SLM can be                                        augmented lattice through Viterbi decoding.
+found in Figure 1. Within an SLM, a sequence of
+symbols or time-steps x can further be modeled as                                       p(x) =              p(yi:i+zi )  (1)
+a sequence of segments y, which are themselves
+sequences of the input time-steps, such that the                                                z∈Z(|x|) i
+concatenation of segments π(y) = x.
+                                                                                                                    L
+   SLMs are broken into two levels: a Context En-
+coder and a Segment Decoder. The Segment De-                                            p(x0:i) = αi = p(yi−k:i|x0:i−k)αi−k (2)
+coder estimates the probability of the jth character
+in the segment starting at index i, yji , as:                                                                     k=1
+
+      p(yji |y0i :j, x0:i) = Decoder (hij−1, yji−1)
+
+where the indices for xi:j are [i, j). The Context
+Encoder encodes information about the input se-
+quence up to index i. The hidden encoding hi is
+
+hi = Encoder (hi−1, xi)
+
+   Finally, the Context Encoder “feeds” the Seg-
+ment Decoder: the initial character of a segment
+beginning at i is decoded using (transformations
+of) the encoded context as initial states (gh(x) and
+gstart(x) are single feed-forward layers):
+
+p(y0i |x0:i) = Decoder (hi∅, starti)                                                    Figure 1: Recurrent Segmental Language Model
+        h∅i = gh(hi−1)
+
+    start i = gstart (hi−1)
+
+   For inference, the probability of a segment yi:i+k                                   3.2 New Model: Masked SLM
+(starting at index i and of length k) is modeled as
+                                                                                        We present a Masked Segmental Language Model,
+the log probability of generating yi:i+k with the                                       which leverages a non-directional transformer as
+xSe0:gi.meNntoDteetchoadterthgeivpernotbhaebilleifttycoonf taexsteπg(my0e:ni)t          the Context Encoder. This reﬂects recent ad-
+                                                                                =       vances in bidirectional (Schuster and Paliwal, 1997;
+                                                                                is      Graves and Schmidhuber, 2005; Peters et al., 2018)
+                                                                                        and adirectional language modeling (Devlin et al.,
+not conditioned on other segments / segmentation                                        2019). Such modeling contexts are also psycholog-
+choice, but only on the unsegmented input time-                                         ically plausible: Luce (1986) shows that in acoustic
+                                                                                        perception, most words need some following con-
+series. Thus, the probability of the segment is                                         text to be recognizable.
+
+                            k                                                              A key difference between our model and stan-
+                                                                                        dard Masked LMs like BERT is that the latter pre-
+p(y0i |hi∅, start i) p(yji |hij−1, yji−1)                                               dict single tokens based on the rest, while for SLMs
+                                                                                        we must predict a segment of tokens based on all
+                           j=1                                                          other tokens outside the segment. For instance, to
+                                                                                        predict the three-character segment starting at xt,
+where yki is the end-of-segment symbol.                                                 the modeled distribution is p(xt:t+3|x<t, x≥t+3).
+   The probability of a sentence is thus modeled
+                                                                                           Some recent pre-training techniques for trans-
+as the marginal probability over all possible seg-                                      formers, such as MASS (Song et al., 2019) and
+
+mentations of the input, as in equation (1) below
+(where Z(|x|) is the set of all possible segmenta-
+tions of an input x). However, since there are 2|x|−1
+possible segmentations, directly marginalizing is
+
+intractable. Instead, dynamic programming over
+
+                                                                                    41
+BART (Lewis et al., 2020) mask out spans to be             with our work, which uses a custom attention mask
+predicted. A key difference between our model and          to “autoencode” each position without needing a
+these approaches is that the pre-training data for         special mask token. One key difference is that their
+large transformer models is usually large enough           masking scheme is used to predict single tokens,
+that only about 15% of training tokens are masked,         rather than spans. In addition, their mask runs di-
+while we need to estimate the generation probabil-         rectly along the diagonal of the attention matrix,
+ity for every possible segment of x. Since the usual       rather than being offset. This means that to pre-
+method for masking is to replace the masked to-            serve self-masking in the ﬁrst layer, the Queries are
+ken(s) with a special symbol, only one span can be         the “pure” positional embeddings.
+predicted with each forward pass. However, each
+sequence contains O(|x|) possible segments, so re-            To prevent information leaking “from under the
+placing each one with a mask token and recovering          mask”, our encoder uses a different conﬁguration
+it would require as many forward passes.                   in its ﬁrst layer than in subsequent layers. In the
+                                                           ﬁrst layer, Queries, Keys, and Values are all learned
+   These design considerations motivate our Seg-           from the original input embeddings. In subsequent
+mental Transformer Encoder, and the Segmen-                layers, the Queries come from the hidden encod-
+tal Attention Mask around which it is based. Each          ings output by the previous layer, while Keys and
+forward pass of the encoder generates an encoding          Values are learned directly from the original em-
+for every possible start-position in x, for a segment      beddings. If Queries and either Keys or Values both
+of up to length k. The encoding at timestep t − 1          come from the previous layer, information can leak
+corresponds to every possible segment whose ﬁrst           from positions that are supposed to be masked for
+timestep is at index t. Thus with maximum seg-             a particular query position. Shin et al. (2020) come
+ment length of k and total sequence length n, the          to a similar solution to preserve their auto-encoder
+encoding at each index t − 1 will approximate              masking.
+
+        p(xt:t+1, xt:t+2, ...xt:t+k|x<t, x≥t+k)               The encodings learned by the segmental encoder
+                                                           are then input to an SLM decoder in exactly the
+   This encoder leverages an attention mask that           same way as previous models (Figure 3).
+conditions predictions only on indices outside the
+predicted segment. An example of this mask with
+k = 3 is shown in Figure 2. For max segment
+length k, the mask is given by:
+
+αi,j =  −∞  if 0 < j − i ≤ k
+        0   else
+
+                                                           Figure 3: Masked Segmental Language Model, k = 2.
+
+Figure 2: Segmental Attention Mask with segment-              To tease apart the role of an adirectional model-
+length (k) of 3. Blue squares are equal to 0, orange       ing assumption itself, vs the role of attention, we
+squares are equal to −∞. This mask blocks the posi-        additionally deﬁne a Directional MSLM, which
+tion encoding the segment in the Queries from attend-      uses a directional (“causal”) mask instead of the
+ing to segment-internal positions in the Keys.             span masking type. Using the directional mask, the
+                                                           encoder is still attention-based, but the language
+   This solution is similar to that of Shin et al.         modeling context is strictly “directional”, in that
+(2020), developed independently and concurrently
+
+                                                       42
+positions are only allowed to attend over a mono-          as much from an attention model. See also Chen
+tonic “leftward” context (Figure 4).                       et al. (2018) for hybrid models with transformer
+                                                           encoders and recurrent decoders.
+   Finally, to add positional information to the en-
+coder, we use static sinusoidal encodings (Vaswani         4.2 Evaluation Metrics
+et al., 2017) and additionally employ a linear map-
+ping f to the concatenation of the original and            Part of the motivation for SLMs is to create strong
+positional embeddings to learn the ratio at which          language models that can also be used for segmen-
+to add the two together.                                   tation (Kawakami et al., 2019). Because of this,
+                                                           we report both segmentation quality and language
+  g = 1.0 + ReLU (f ([embedding, position]))               modeling performance.
+
+       embedding ←− g ∗ embedding + position                  For segmentation quality, we get the word-F1
+                                                           score for each corpus using the script from the
+4 Experiments                                              SIGHAN Bakeoff (Emerson, 2005). Following
+                                                           Kawakami et al. (2019), we report this measure
+Our experiments assess SLMs across three dimen-            over the entire corpus. For language modeling per-
+sions: (1) network architecture and language mod-          formance, we report the average Bits Per Character
+eling assumptions, (2) evaluation metrics, speciﬁ-         (bpc) loss over the test set.
+cally segmentation quality and language-modeling
+performance, and (3) supervision setting (if and           4.3 Supervision Setting
+where gold segmentation data is available).
+                                                           Because previous studies have used SLMs both in
+4.1 Architecture and Modeling                              “lightly supervised” settings (Sun and Deng, 2018)
+                                                           and totally unsupervised ones (Kawakami et al.,
+To analyze the importance of the self-attention ar-        2019), and because we expect SLMs to be deployed
+chitecture versus the bidirectional conditioning con-      in either use case, we test both. For all model types,
+text, we test SLMs with three different encoders:          we conduct a hyperparameter sweep and select both
+the standard R(ecurrent)SLM based on an LSTM,              the conﬁguration that maximizes the validation seg-
+the M(asked)SLM introduced in 3.2 with a seg-              mentation quality (light supervision) and the one
+mental or “cloze” mask, and a D(irectional)MSLM,           that minimizes the validation bpc (unsupervised).
+with a “causal” or directional mask. The RSLM
+is thus (+recurrent context, +directional), the DM-        4.4 Datasets
+SLM is (-recurrent context, +directional), and the
+MSLM is (-recurrent context, -directional).                We evaluate our SLMs on two datasets used in
+                                                           Kawakami et al. (2019). For each, we use the same
+                                                           training, validation, and test split. The sets were
+                                                           chosen to represent two relatively different writing
+                                                           systems: Chinese (PKU) and English (PTB). Statis-
+                                                           tics for each are in Table 1. One striking difference
+                                                           between the two writing systems can be seen in the
+                                                           character vocabulary size: phonemic-type writing
+                                                           systems like English have a much smaller vocabu-
+                                                           lary of tokens, with words being built out of longer
+                                                           sequences of characters that are not meaningful on
+                                                           their own.
+
+                                                           Corpus                     PKU PTB
+
+               Figure 4: Directional MSLM                  Tokens/Characters          1.93M              4.60M
+                                                           Words                      1.21M              1.04M
+   For all models, we use an LSTM for the segment          Lines                      20.78k             49.20k
+decoder, as a control and because the decoded se-          Avg. Characters per Word    1.59               4.44
+quences are relatively short and may not beneﬁt            Character Vocabulary Size   4508
+                                                                                                           46
+
+                                                                   Table 1: Statistics for the datasets
+
+                                                       43
+Peking University Corpus (PKU) PKU has                           (+0.23 bpc for lightly supervised and +0.11 bpc
+been used as a Chinese Word Segmentation bench-                  for unsupervised); the RSLM produced the second-
+mark since the International Chinese Word Seg-                   best bpc in the unsupervised setting.
+mentation Bakeoff (Emerson, 2005). One minor
+change we make to this dataset is to tokenize En-                   The RSLM gives the best bpc in the lightly-
+glish, number, and punctuation tokens using the                  supervised setting. However for this setting, the
+module from Sun and Deng (2018), to make our                     strict division of the models that maximize segmen-
+results more comparable to theirs. Unlike them, we               tation quality and those that minimize bpc can be
+do not pre-split sequences on punctuation.                       misleading. In between these two conﬁgurations,
+                                                                 many have both good segmentation quality and low
+Penn Treebank (PTB) For English, we use                          bpc, and if the practitioner has gold validation data,
+the version of the Penn Treebank corpus from                     they will be able to pick a conﬁguration with the
+(Kawakami et al., 2019; Mikolov et al., 2010).                   desired tradeoff.
+
+4.5 Parameters and Trials                                           In addition, there is some evidence that “under-
+                                                                 shooting” the objective in the unsupervised case
+For all models, we tune among six learning rates on              with a slightly lower learning rate may lead to
+a single random seed. After the parameter sweep,                 more stable segmentation quality. The unsuper-
+the conﬁguration that maximizes validation seg-                  vised MSLM in the table was trained at rate 2e-3,
+mentation quality and the one that minimizes vali-               and achieved 5.625 bpc (validation). An MSLM
+dation bpc are run over an additional four random                trained at rate 1e-3 achieved only a slightly worse
+seeds. All models are trained using Adam (Kingma                 bpc (5.631) and resulted in better and more stable
+and Ba, 2015) for 8192 steps.                                    segmentation quality (69.4 ± 2.0 / 70.4).
+
+   All models have one encoder layer and one de-                 5.2 English
+coder layer, as well as an embedding and hidden
+size of 256. The transformer-based encoder has a                 Results for English (PTB) can also be found in
+number of trainable parameters less than or equal                Table 2. By median, results remain comparable be-
+to the number in the LSTM-based encoder.1                        tween the recurrent and transformer-based models,
+                                                                 but the RSLM yields better segmentation perfor-
+   One important parameter for SLMs is the max-                  mance in both settings (+4.0 and +4.7 F1). How-
+imum segment length k. Sun and Deng (2018)                       ever, both types of MSLM are slightly more sus-
+tune this as a hyperparameter, with different val-               ceptible to random seed variation, causing those
+ues for k ﬁtting different CWS standards more or                 means to be skewed slightly lower. The DMSLM
+less well. In practice, this parameter can be chosen             seems more susceptible than the MSLM to outlier
+empirically to be an upper bound on the maximum                  performance based on random seeds, as evidenced
+segment length one expects to ﬁnd, so as to not                  by its large standard deviation. Finally, the RSLM
+rule out long segments. We follow Kawakami et al.                gives considerably better bpc performance in both
+(2019) in choosing k = 5 for Chinese and k = 10                  settings (-0.29 and -0.31 bpc).
+for English. For a more complete characterization
+of our training procedure, see Appendix A.2                      6 Analysis and Discussion
+
+5 Results                                                        6.1 Error Analysis
+
+5.1 Chinese                                                      We conduct an error analysis for our models based
+                                                                 on the overall Precision and Recall scores for each
+For PKU (Table 2), Masked SLMs yield better seg-                 (using the character-wise binary classiﬁcation task,
+mentation quality in both the lightly-supervised                 i.e. word-boundary vs no word-boundary).
+and unsupervised settings, though the advantage
+in the former setting is much larger (+12.4 median                  As can be seen in Table 3, all model types trained
+F1). The Directional MSLM produces similar qual-                 on Chinese have a Precision that approaches 100%,
+ity segmentations to the MSLM, but it has worse                  meaning almost all boundaries that are inserted
+language modeling performance in both settings                   are true boundaries. On ﬁrst glance the main dif-
+                                                                 ference in the unsupervised case seems to be the
+    1592,381 trainable parameters in the former, 592,640 in      RSLM’s relatively higher Recall. However, the
+the latter                                                       higher Precision of both MSLM types seems to
+                                                                 be more important for the overall segmentation
+    2The code used to build SLMs and conduct these experi-
+ments can be found at (url redacted)
+
+                                                             44
+Dataset  Model  Tuned on Gold                                          Unsupervised
+ PKU
+ PTB     RSLM   F1 Mean / Median                                  BPC  F1 Mean / Median   BPC
+         DMSLM
+         MSLM   61.2 ± 3.6 / 60.2  5.67 ± 0.01                         59.4 ± 1.9 / 58.7  5.63 ± 0.01
+                                   6.08 ± 0.31
+         RSLM   72.2 ± 2.0 / 72.7  5.85 ± 0.12                         62.9 ± 2.6 / 63.4  5.67 ± 0.03
+         DMSLM  72.3 ± 0.7 / 72.6                                      62.9 ± 2.8 / 64.1  5.56 ± 0.01
+         MSLM
+                77.4 ± 0.7 / 77.6  2.10 ± 0.04                         75.7 ± 2.6 / 76.2 1.96 ± 0.00
+                70.6 ± 6.4 / 73.3  2.36 ± 0.07                         67.9 ± 10.6 / 73.8 2.27 ± 0.04
+                71.1 ± 5.6 / 73.6  2.39 ± 0.06                         69.3 ± 5.6 / 71.5 2.27 ± 0.01
+
+Table 2: Results on the Peking University Corpus and English Penn Treebank (over 5 random seeds)
+
+performance.3 In the lightly-supervised case, the                     in this difﬁcult language-modeling task. Further,
+MSLM variants learn to trade off a small amount                       though the DMSLM achieves similar segmentation
+of Precision for a large gain in Recall, allowing                     quality, the bidirectional context of the MSLM does
+them to capture more of the true word boundaries                      seem to be the source of the best bpc modeling
+in the data. Given different corpora have different                   performance.
+standards for the coarseness of Chinese segmenta-
+tion, this reinforces the need for studies on a wider                    In English, on the other hand, recurrent SLMs
+selection of datasets.                                                seem to retain a slight edge. By median, segmen-
+                                                                      tation quality remains fairly similar between the
+   Because the English results (also in Table 3)                      three model types, but the RSLM holds a major
+are similar between supervision settings, we only                     language-modeling advantage in our experiments.
+show the unsupervised variants. Here, the RSLM                        Our main hypothesis for the disparity in modeling
+shows a deﬁnitive advantage in Recall, leading to                     performance between Chinese and English comes
+overall better performance. The transformer-based                     down to the nature of the orthography for each. As
+models show equal or higher Precision, but tend to                    noted before, Chinese has a much larger charac-
+under-segment, i.e. produce longer words. Exam-                       ter vocabulary. This is because in Chinese, almost
+ple model segmentations for PTB can be found in                       every character is a morpheme itself (i.e. it has
+Table 4. Some intuitions from our error analysis                      some meaning). English, on the other hand, has a
+can be seen here: the moderate Precision of these                     roughly phonemic writing system, e.g. the letter c
+models yields some false splits like be + fore                        has no inherent meaning outside of a context like
+and quest + ion, but all models also seem to                          cat.
+pick up some valid morphological splits not present
+in the gold standard (e.g. +able in questionable).                       Intuitively, one can see why this might pose a
+Predictably, rare words with uncommon structure                       limitation on transformers. Without additive or
+remain difﬁcult to segment (e.g. asbestos).                           learned positional encodings, they are essentially
+                                                                      adirectional. In English, cat is completely differ-
+6.2 Discussion                                                        ent from act, but this might be difﬁcult to model
+                                                                      for an attention model without robust positional
+For Chinese, the transformer-based SLM exceeds                        information. To try to counteract this, we added
+the recurrent baseline for segmentation quality, by a                 dynamic scaling to our static positional encodings,
+moderate amount for the unsupervised setting, and                     but without deeper networks or more robust po-
+by a large amount when tuned on gold validation                       sitional information, the discrepancy in character-
+segmentations. The MSLM also gives stronger                           based modeling for phonemic systems may remain.
+language modeling. Given the large vocabulary
+size for Chinese, it is intuitive that the powerful                   7 Conclusion
+transformer architecture may make a difference
+                                                                      This study provides strong proof-of-concept for
+    3This table also shows that though character-wise segmen-         the viability of transfomer-based Masked Segmen-
+tation quality (i.e. classifying whether a certain character has      tal Language Models as an alternative to recurrent
+a boundary after it) is a useful heuristic, it does not always        SLMs in their ability to perform joint language
+scale straightforwardly to word-wise F1 like is traditionally         modeling and unsupervised segmentation. MSLMs
+used (e.g. by the SIGHAN script).
+
+                                                                  45
+Dataset       Model           Avg. Word Length           Precision        Recall
+ PKU
+ PTB          Gold                    1.59                    -              -
+              RSLM (unsup.)       1.93 ± 0.02            98.2 ± 0.1     80.8 ± 0.6
+              DMSLM (unsup.)      1.99 ± 0.04            98.6 ± 0.1     78.5 ± 1.8
+              MSLM (unsup.)       2.00 ± 0.05            98.5 ± 0.1     78.1 ± 1.9
+              RSLM (sup.)         1.92 ± 0.02            98.2 ± 0.1     81.3 ± 0.7
+              DMSLM (sup.)        1.83 ± 0.04            97.5 ± 0.5     84.6 ± 1.5
+              MSLM (sup.)         1.83 ± 0.01            97.6 ± 0.1     84.5 ± 0.4
+
+              Gold                    4.44                    -              -
+              RSLM (unsup.)       4.02 ± 0.08            86.1 ± 1.9     95.5 ± 0.1
+              DMSLM (unsup.)      4.27 ± 0.17            85.4 ± 5.4     88.9 ± 4.6
+              MSLM (unsup.)       4.29 ± 0.12            86.2 ± 1.5     89.5 ± 3.5
+
+              Table 3: Error analysis statistics (over 5 random seeds)
+
+       Gold   Examples
+ RSLM Median
+DMSLM Median  we ’re talking about years ago before anyone heard of asbestos having any questionable...
+ MSLM Median  we’re talking about years ago be fore any one heard of as best os having any question able
+              we’re talking about years ago be fore any one heard of as bestos having any quest ion able
+              we’re talking about years ago be fore any one heard of as bestos having any quest ion able
+
+              Table 4: Example model segmentations from the Penn Treebank
+
+provide the advantage of a parallelizable architec-      here, one of the main advantages of transformers
+ture, and have several open avenues for extending        is their ability to scale to deep architectures due to
+their utility. To close, we lay out directions for       their short derivational chains. Thus, extending seg-
+future work.                                             mental models to “deep” settings would be more
+                                                         feasible using MSLMs than RSLMs.
+   The most obvious next step is evaluating
+MSLMs on additional segmentation datasets. As               Lastly, Kawakami et al. (2019) propose regular-
+mentioned, the criteria for “wordhood” in Chi-           ization techniques for SLMs due to low segmen-
+nese are not agreed upon, thus more experiments          tation quality from their “vanilla” models. They
+are warranted using corpora with different stan-         report good ﬁndings using a character n-gram “lex-
+dards. Prime candidates include the Chinese Penn         icon” jointly with expected segment length regu-
+Treebank (Xue et al., 2005), as well as those in-        larization based on Eisner (2002) and Liang and
+cluded in the SIGHAN segmentation bakeoff: Mi-           Klein (2009). Both techniques are implemented
+crosoft Research, City University of Hong Kong,          in our codebase, and we have tested them in pilot
+and Academia Sinicia (Emerson, 2005).                    settings. Oddly, neither has given us any gain in
+                                                         performance over our “vanilla” models. A more ex-
+   The sets used here are also relatively formal         haustive hyperparameter search with these methods
+orthographic datasets. An eventual use of SLMs           may produce a future beneﬁts as well.
+may be in speech segmentation, but a smaller step
+in that direction could be using phonemic tran-             In conclusion, the present study shows strong
+script datasets like the Brent Corpus, also used in      potential for the use of MSLMs. They show par-
+Kawakami et al. (2019). This set consists of phone-      ticular promise for writing systems with a large in-
+mic transcripts of child-directed English speech         ventory of semantic characters (e.g. Chinese), and
+(Brent, 1999). SLMs could also be applied to the         we believe that they could be stable competitors of
+orthographies of more typologically diverse lan-         recurrent models in phonemic-type writing systems
+guages, especially ones with complicated systems         given some mitigation of the relative weakness of
+of morphology (e.g. Swahili, Turkish, Hungarian,         the positional information available in transform-
+Finnish).                                                ers.
+
+   Further, though we only test shallow models
+
+                                                     46
+References                                                    John Goldsmith. 2001. Unsupervised Learning of the
+                                                                 Morphology of a Natural Language. Computational
+Michael R. Brent. 1999. An Efﬁcient, Probabilistically           Linguistics, 27(2):153–198.
+   Sound Algorithm for Segmentation and Word Dis-
+   covery. Machine Learning, 34:71–105.                       Sharon Goldwater, Thomas L. Grifﬁths, and Mark
+                                                                 Johnson. 2009. A Bayesian framework for word seg-
+Mia Xu Chen, Orhan Firat, Ankur Bapna, Melvin                    mentation: Exploring the effects of context. Cogni-
+   Johnson, Wolfgang Macherey, George Foster, Llion              tion, 112(1):21–54.
+   Jones, Mike Schuster, Noam Shazeer, Niki Parmar,
+   Ashish Vaswani, Jakob Uszkoreit, Lukasz Kaiser,            Alex Graves, Fernández Santiago, Faustino Gomez,
+   Zhifeng Chen, Yonghui Wu, and Macduff Hughes.                 and Jürgen Schmidhuber. 2006. Connectionist Tem-
+   2018. The Best of Both Worlds: Combining Recent               poral Classiﬁcation: Labelling Unsegmented Se-
+   Advances in Neural Machine Translation. In Pro-               quence Data with Recurrent Neural Networks. In
+   ceedings of the 56th Annual Meeting of the Associa-           Proceedings of the 23rd International Conference on
+   tion for Computational Linguistics (Volume 1: Long            Machine Learning, Pittsburgh, PA.
+   Papers), pages 76–86, Melbourne, Australia. Asso-
+   ciation for Computational Linguistics.                     Alex Graves and Jürgen Schmidhuber. 2005. Frame-
+                                                                 wise phoneme classiﬁcation with bidirectional
+J. Chung, Sungjin Ahn, and Yoshua Bengio. 2017.                  LSTM and other neural network architectures. In
+   Hierarchical Multiscale Recurrent Neural Networks.            Neural Networks, volume 18, pages 602–610. Perg-
+   In 5th International Conference on Learning Repre-            amon.
+   sentations, ICLR 2017, Conference Track Proceed-
+   ings, Toulon, France.                                      Pratik Joshi, Sebastin Santy, Amar Budhiraja, Kalika
+                                                                 Bali, and Monojit Choudhury. 2020. The State and
+Mathias Creutz and Krista Lagus. 2002. Unsupervised              Fate of Linguistic Diversity and Inclusion in the
+   Discovery of Morphemes. In Proceedings of the                 NLP World. In Proceedings of the 58th Annual
+   ACL-02 Workshop on Morphological and Phonolog-                Meeting of the Association for Computational Lin-
+   ical Learning, pages 21–30. Association for Compu-            guistics, pages 6282–6293, Online. Association for
+   tational Linguistics.                                         Computational Linguistics.
+
+Carl de Marcken. 1996. Linguistic Structure as Com-           Herman Kamper, Aren Jansen, and Sharon Goldwa-
+   position and Perturbation. In 34th Annual Meet-               ter. 2016. Unsupervised word segmentation and
+   ing of the Association for Computational Linguistics,         lexicon discovery using acoustic word embeddings.
+   pages 335–341, Santa Cruz, California, USA. Asso-             IEEE/ACM Transactions on Audio, Speech and Lan-
+   ciation for Computational Linguistics.                        guage Processing, 24(4):669–679.
+
+Jacob Devlin, Ming-Wei Chang, Kenton Lee, and                 Kazuya Kawakami, Chris Dyer, and Phil Blunsom.
+   Kristina Toutanova. 2019. BERT: Pre-training of               2017. Learning to Create and Reuse Words in Open-
+   Deep Bidirectional Transformers for Language Un-              Vocabulary Neural Language Modeling. In Proceed-
+   derstanding. In Proceedings of the 2019 Conference            ings of the 55th Annual Meeting of the Association
+   of the North American Chapter of the Association              for Computational Linguistics (Volume 1: Long Pa-
+   for Computational Linguistics: Human Language                 pers), pages 1492–1502, Vancouver, Canada. Asso-
+   Technologies, Volume 1 (Long and Short Papers),               ciation for Computational Linguistics.
+   pages 4171–4186, Minneapolis, Minnesota. Associ-
+   ation for Computational Linguistics.                       Kazuya Kawakami, Chris Dyer, and Phil Blunsom.
+                                                                 2019. Learning to Discover, Ground and Use Words
+Ewan Dunbar, Julien Karadayi, Mathieu Bernard,                   with Segmental Neural Language Models. In Pro-
+   Xuan-Nga Cao, Robin Algayres, Lucas Ondel,                    ceedings of the 57th Annual Meeting of the Asso-
+   Laurent Besacier, Sakriani Sakti, and Emmanuel                ciation for Computational Linguistics, pages 6429–
+   Dupoux. 2020. The Zero Resource Speech Chal-                  6441, Florence, Italy. Association for Computa-
+   lenge 2020: Discovering discrete subword and word             tional Linguistics.
+   units. In Proceedings of INTERSPEECH 2020.
+                                                              Diederik Kingma and Jimmy Ba. 2015. Adam: A
+Jason Eisner. 2002. Parameter Estimation for Prob-               Method for Stochastic Optimization. In 3rd Inter-
+   abilistic Finite-State Transducers. In Proceedings            national Conference on Learning Representations,
+   of the 40th Annual Meeting of the Association for             ICLR 2015, Conference Track Proceedings, San
+   Computational Linguistics, pages 1–8, Philadelphia,           Diego, CA, USA.
+   Pennsylvania, USA. Association for Computational
+   Linguistics.                                               Lingpeng Kong, Chris Dyer, and Noah A Smith. 2016.
+                                                                 Segmental Recurrent Neural Networks. In 4th Inter-
+Jeffrey L. Elman. 1990. Finding structure in time. Cog-          national Conference on Learning Representations,
+   nitive Science, 14(2):179–211.                                ICLR 2016, Conference Track Proceedings, San
+                                                                 Juan, Puerto Rico.
+Thomas Emerson. 2005. The Second International Chi-
+   nese Word Segmentation Bakeoff. In Proceedings of
+   the Fourth SIGHAN Workshop on Chinese Language
+   Processing.
+
+                                                          47
+Taku Kudo and John Richardson. 2018. SentencePiece:             Association for Computational Linguistics, 9:261–
+   A simple and language independent subword tok-               276. _eprint: https://direct.mit.edu/tacl/article-
+   enizer and detokenizer for Neural Text Processing.           pdf/doi/10.1162/tacl_a_00365/1924158/tacl_a_00365.pdf.
+   In Proceedings of the 2018 Conference on Empirical        Matthew Peters, Mark Neumann, Mohit Iyyer, Matt
+   Methods in Natural Language Processing: System               Gardner, Christopher Clark, Kenton Lee, and Luke
+   Demonstrations, pages 66–71, Brussels, Belgium.              Zettlemoyer. 2018. Deep Contextualized Word Rep-
+   Association for Computational Linguistics.                   resentations. In Proceedings of the 2018 Confer-
+                                                                ence of the North American Chapter of the Associ-
+Mike Lewis, Yinhan Liu, Naman Goyal, Mar-                       ation for Computational Linguistics: Human Lan-
+   jan Ghazvininejad, Abdelrahman Mohamed, Omer                 guage Technologies, Volume 1 (Long Papers), pages
+   Levy, Veselin Stoyanov, and Luke Zettlemoyer.                2227–2237, New Orleans, Louisiana. Association
+   2020. BART: Denoising Sequence-to-Sequence Pre-              for Computational Linguistics.
+   training for Natural Language Generation, Transla-        O. Rasanen and M. A. Cruz Blandon. 2020. Unsuper-
+   tion, and Comprehension. In Proceedings of the               vised Discovery of Recurring Speech Patterns using
+   58th Annual Meeting of the Association for Compu-            Probabilistic Adaptive Metrics. In Proceedings of
+   tational Linguistics, pages 7871–7880, Online. As-           INTERSPEECH 2020.
+   sociation for Computational Linguistics.                  Jorma Rissanen. 1989. Stochastic Complexity in Statis-
+                                                                tical Inquiry, volume 15 of Series in Computer Sci-
+Percy Liang and Dan Klein. 2009. Online EM for                  ence. World Scientiﬁc, Singapore.
+   Unsupervised Models. In Proceedings of Human              Mike Schuster and Kuldip K. Paliwal. 1997. Bidirec-
+   Language Technologies: The 2009 Annual Confer-               tional recurrent neural networks. IEEE Transactions
+   ence of the North American Chapter of the Associa-           on Signal Processing, 45(11):2673–2681.
+   tion for Computational Linguistics, pages 611–619,
+   Boulder, Colorado. Association for Computational
+   Linguistics.
+
+Paul A. Luce. 1986. A computational analysis of              Rico Sennrich, Barry Haddow, and Alexandra Birch.
+   uniqueness points in auditory word recognition. Per-         2016. Neural Machine Translation of Rare Words
+   ception & Psychophysics, 39(3):155–158.                      with Subword Units. In Proceedings of the 54th An-
+                                                                nual Meeting of the Association for Computational
+Sabrina Mielke and Jason Eisner. 2019. Spell                    Linguistics (Volume 1: Long Papers), pages 1715–
+   Once, Summon Anywhere: A Two-Level Open-                     1725, Berlin, Germany. Association for Computa-
+   Vocabulary Language Model. Proceedings of                    tional Linguistics.
+   the AAAI Conference on Artiﬁcial Intelligence,
+   33(01):6843–6850. Number: 01.                             Joongbo Shin, Yoonhyung Lee, Seunghyun Yoon, and
+                                                                Kyomin Jung. 2020. Fast and Accurate Deep Bidi-
+Tomas Mikolov, Kai Chen, G. Corrado, and J. Dean.               rectional Language Representations for Unsuper-
+   2013. Efﬁcient Estimation of Word Representations            vised Learning. In Proceedings of the 58th An-
+   in Vector Space. In 1st International Conference             nual Meeting of the Association for Computational
+   on Learning Representations, ICLR 2013, Workshop             Linguistics, pages 823–835, Online. Association for
+   Track Proceedings, Scottsdale, AR, USA.                      Computational Linguistics.
+
+Tomas Mikolov, Martin Karaﬁát, Lukas Burget, Jan             K. Song, X. Tan, Tao Qin, Jianfeng Lu, and T. Liu.
+   Cernocký, and Sanjeev Khudanpur. 2010. Recurrent             2019. MASS: Masked Sequence to Sequence Pre-
+   neural network based language model. volume 2,               training for Language Generation. In Proceedings
+   pages 1045–1048.                                             of the 36th International Conference on Machine
+                                                                Learning, Long Beach, CA.
+Daichi Mochihashi, Takeshi Yamada, and Naonori
+   Ueda. 2009. Bayesian Unsupervised Word Segmen-            Zhiqing Sun and Zhi-Hong Deng. 2018. Unsupervised
+   tation with Nested Pitman-Yor Language Modeling.             Neural Word Segmentation for Chinese via Segmen-
+   In Proceedings of the Joint Conference of the 47th           tal Language Modeling. In Proceedings of the 2018
+   Annual Meeting of the ACL and the 4th International          Conference on Empirical Methods in Natural Lan-
+   Joint Conference on Natural Language Processing              guage Processing, pages 4915–4920, Brussels, Bel-
+   of the AFNLP, pages 100–108, Suntec, Singapore.              gium. Association for Computational Linguistics.
+   Association for Computational Linguistics.
+                                                             Yee Whye Teh, Michael I. Jordan, Matthew J. Beal,
+Tumi Moeng, Sheldon Reay, Aaron Daniels, and Jan                and David M. Blei. 2006. Hierarchical Dirichlet Pro-
+   Buys. 2021. Canonical and Surface Morphological              cesses. Journal of the American Statistical Associa-
+   Segmentation for Nguni Languages. ArXiv.                     tion, 101(476):1566–1581.
+
+Hyunji Hayley Park, Katherine J. Zhang, Coleman Ha-          Yuanhe Tian, Yan Song, Fei Xia, Tong Zhang, and
+   ley, Kenneth Steimel, Han Liu, and Lane Schwartz.            Yonggang Wang. 2020. Improving Chinese Word
+   2021. Morphology Matters: A Multilingual Lan-                Segmentation with Wordhood Memory Networks.
+   guage Modeling Analysis. Transactions of the                 In Proceedings of the 58th Annual Meeting of the
+                                                                Association for Computational Linguistics, pages
+
+                                                         48
+   8274–8285, Online. Association for Computational
+   Linguistics.
+Kei Uchiumi, Hiroshi Tsukahara, and Daichi Mochi-
+   hashi. 2015. Inducing Word and Part-of-Speech
+   with Pitman-Yor Hidden Semi-Markov Models. In
+   Proceedings of the 53rd Annual Meeting of the
+   Association for Computational Linguistics and the
+   7th International Joint Conference on Natural Lan-
+   guage Processing (Volume 1: Long Papers), pages
+   1774–1782, Beijing, China. Association for Compu-
+   tational Linguistics.
+Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob
+   Uszkoreit, Llion Jones, Aidan N Gomez, Lukasz
+   Kaiser, and Ilia Polosukhin. 2017. Attention is All
+   You Need. In Proceedings of the 31st Conference
+   on Neural Information Processing Systems, Long
+   Beach, CA. Neural Information Processing Systems
+   Foundation.
+Chong Wang, Yining Wang, Po-Sen Huang, Abdel-
+   rahman Mohamed, Dengyong Zhou, and Li Deng.
+   2017. Sequence Modeling via Segmentations. In
+   Proceedings of the 34th International Conference
+   on Machine Learning, volume 70 of Proceedings
+   of Machine Learning Research, pages 3674–3683,
+   International Convention Centre, Sydney, Australia.
+   PMLR.
+L. Wang, Zongyi Li, and Xiaoqing Zheng. 2021. Un-
+   supervised Word Segmentation with Bi-directional
+   Neural Language Model. ArXiv.
+Nianwen Xue, Fei Xia, Fu-Dong Chiou, and Martha
+   Palmer. 2005. The Penn Chinese TreeBank: Phrase
+   Structure Annotation of a Large Corpus. Natural
+   Language Engineering, 11(2):207–238.
+
+                                                             49
+A Training Details                                                   Model      s / step
+
+A.1 Data                                                             RSLM   PKU PTB
+                                                                    DMSLM
+The datasets used here are sourced from                              MSLM   2.942 2.177
+Kawakami et al. (2019), and can be downloaded                               2.987 2.190
+at https://s3.eu-west-2.amazonaws.                                          2.988 2.200
+com/k-kawakami/seg.zip. Our PKU data
+is tokenized slightly differently, and all data used       Table 5: Average runtime per batch in seconds
+in our experiments can be found in our project
+repository (url redacted).                                 objective they optimize: segmentation MCC or
+                                                           language-modeling BPC.
+A.2 Architecture
+                                                           Dataset   Model  by MCC  by BPC
+A dropout rate of 0.1 is applied leading into both          PKU
+the encoder and the decoder. Transformers use 4                      RSLM     6e-4    9e-4
+attention heads and a feedforward size of 509 (cho-         PTB     DMSLM     6e-4    2e-3
+sen to come out less than or equal to the number                     MSLM     6e-4    2e-3
+of parameters in the standard LSTM). This also
+includes a 512-parameter linear mapping to learn                     RSLM     7e-3    3e-3
+the combination proportion of the word and sinu-                    DMSLM     1e-3    8e-4
+soidal positional embeddings. The dropout within                     MSLM     1e-3    6e-4
+transformer layers is 0.15.
+                                                           Table 6: Optimum learning rates
+A.3 Initialization
+
+Character embeddings are initialized using CBOW
+(Mikolov et al., 2013) on the given training set for
+32 epochs, with a window size of 5 for Chinese and
+10 for English. Special tokens like <eoseg> that
+do not appear in the training corpus are randomly
+initialized. These pre-trained embeddings are not
+frozen during training.
+
+A.4 Training
+
+For PKU, the learning rates swept are {6e-4, 7e-4,
+8e-4, 9e-4, 1e-3, 2e-3}, and for PTB we use {6e-
+4, 8e-4, 1e-3, 3e-3, 5e-3, 7e-3}. For Chinese, we
+found a linear warmup for 1024 steps was useful,
+followed by a linear decay. For English, we apply
+simple linear decay from the beginning. Check-
+points are taken every 128 steps. A gradient norm
+clip threshold of 1.0 is used. Mini-batches are sized
+by number of characters rather than number of se-
+quences, with a size of 8192 (though this is not
+always exact since we do not split up sequences).
+The ﬁve random seeds used are {2, 3, 5, 8, 13}.
+
+   Each model is trained on an Nvidia Tesla M10
+GPU with 8GB memory, with the average per-batch
+runtime of each model type listed in Table 5.
+
+A.5 Optimal Hyperparameters
+
+The optimal learning rate for each model type,
+dataset, and supervision setting are listed in the
+Table 6. Parameters are listed by the validation
+
+                                                       50
+

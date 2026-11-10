@@ -1,0 +1,764 @@
+                                       Learning to select computations
+
+                                       Frederick Callaway1,a, Sayan Gul1,a, Paul Kruegera, Thomas L. Grifﬁthsa, & Falk Lieder1,a,b
+                                                                         a University of California, Berkeley, USA
+
+                                                          b Max Planck Institute for Intelligent Systems, Tu¨bingen, Germany
+                                                                             1 These authors contributed equally.
+
+arXiv:1711.06892v3 [cs.AI] 7 Aug 2018                        Abstract                              3.5–2.5, Deep Blue had to evaluate 200 000 000 posi-
+                                                                                                   tions per second, whereas Kasparov was able to per-
+                                             The efﬁcient use of limited computational re-         form at almost the same level by evaluating only 3 posi-
+                                             sources is an essential ingredient of intel-          tions per second (Campbell, Hoane, & Hsu, 2002; IBM
+                                             ligence. Selecting computations optimally             Research, 1997). This ability to make efﬁcient use of
+                                             according to rational metareasoning would             limited computational resources is the essence of intel-
+                                             achieve this, but this is computationally in-         ligence (Russell & Wefald, 1991a). People accomplish
+                                             tractable. Inspired by psychology and neu-            this feat by being very selective about when to think and
+                                             roscience, we propose the ﬁrst concrete and           what to think about, choosing computations adaptively
+                                             domain-general learning algorithm for approx-         and terminating deliberation when its expected beneﬁt
+                                             imating the optimal selection of computations:        falls below its cost (Gershman, Horvitz, & Tenenbaum,
+                                             Bayesian metalevel policy search (BMPS). We           2015; Lieder & Grifﬁths, 2017; Payne, Bettman, & John-
+                                             derive this general, sample-efﬁcient search al-       son, 1988).
+                                             gorithm for a computation-selecting metalevel
+                                             policy based on the insight that the value of         Rational metareasoning was introduced to recreate
+                                             information lies between the myopic value             such intelligent control over computation in machines
+                                             of information and the value of perfect in-           (Horvitz, Cooper, & Heckerman, 1989; Russell & We-
+                                             formation. We evaluate BMPS on three in-              fald, 1991b; Hay, Russell, Tolpin, & Shimony, 2012).
+                                             creasingly difﬁcult metareasoning problems:           In principle, rational metareasoning can be used to al-
+                                             when to terminate computation, how to allo-           ways select those computations that make optimal use
+                                             cate computation between competing options,           of the agent’s ﬁnite computational resources. However,
+                                             and planning. Across all three domains, BMPS          its computational complexity is prohibitive (Hay et al.,
+                                             achieved near-optimal performance and com-            2012). The human mind circumvents this computational
+                                             pared favorably to previously proposed metar-         challenge by learning to select computations through
+                                             easoning heuristics. Finally, we demonstrate          metacognitive reinforcement learning (Krueger, Lieder,
+                                             the practical utility of BMPS in an emergency         & Grifﬁths, 2017; Lieder & Grifﬁths, 2017; Wang et al.,
+                                             management scenario, even accounting for the          2017). Concretely, people appear to learn to predict the
+                                             overhead of metareasoning.                            value of alternative cognitive operations from features
+                                                                                                   of the task, their current belief state, and the cognitive
+                                       1 INTRODUCTION                                              operations themselves. If humans learn to metareason
+                                                                                                   through metacognitive reinforcement learning, then it
+                                       The human brain is the best example of an intelligent       should be possible to build intelligent systems that learn
+                                       system we have so far. One feature that sets it apart from  to metareason as efﬁciently as people.
+                                       current AI is the remarkable computational efﬁciency
+                                       that enables people to effortlessly solve hard problems     In this paper, we introduce Bayesian metalevel policy
+                                       for which artiﬁcial intelligence either under-performs      search (BMPS), the ﬁrst domain-general algorithm for
+                                       humans or requires superhuman computing power and           learning how to metareason, and evaluate it against exist-
+                                       training time. For instance, to defeat Garry Kasparov       ing methods for approximate metareasoning on three in-
+                                                                                                   creasingly more complex toy problems. Finally, we show
+                                                                                                   that our method makes metareasoning efﬁcient enough to
+                                                                                                   offset its cost in a more realistic emergency management
+scenario. In this problem, which we use as a running ex-    A includes computations C that update the belief, as well
+ample, an emergency manager must decide which cities        as a special metalevel action ⊥ that terminates delibera-
+to evacuate in the face of an approaching tornado. She      tion and initiates acting on the current belief. The effects
+bases her decision on a series of computationally inten-    of computations are encoded by Tmeta : B × A × B →
+sive simulations that noisily estimate the impact of the    [0, 1] analogously to a standard transition function. The
+tornado on each city. Because time is short, she is forced  termination action always leads to a unique end state.
+to decide which simulations are the most important to
+run. In the following section, we discuss how to formal-    The metalevel reward function rmeta captures the cost
+ize this problem as a sequential decision process.          of thinking (Shugan, 1980) and the external reward the
+                                                            agent expects to receive from the environment. The com-
+2 BACKGROUND                                                putations C have no external effects and thus always in-
+                                                            cur a negative reward rmeta(b, c) = −cost(c). In the
+2.1 METAREASONING                                           problems studied below, all computations that deliber-
+                                                            ate have the same cost, that is cost(c) = λ for all c ∈ C
+If reasoning seeks an answer to the question “what          whereas cost(⊥) = 0. An external reward is received
+should I do?”, metareasoning seeks to answer the ques-      only when the agent terminates deliberation and makes a
+tion “how should I decide what to do?”. The theory of ra-   decision, which is assumed to be optimal given the cur-
+tional metareasoning (Russell & Wefald, 1991b; Russell      rent belief. The metalevel reward for terminating is thus
+& Subramanian, 1995) frames this problem as selecting       rmeta(b, ⊥) = maxπ Eθ∼b[Uπ(θ)].1
+computations so as to maximize the sum of the rewards
+of resulting decisions minus the costs of the computa-      Early work on rational metareasoning (Russell & We-
+tions involved. Concretely, one can formalize reason-       fald, 1991b) deﬁned the optimal way to select computa-
+ing as a metalevel Markov decision process (metalevel       tions as maximizing the value of computation (VOC):
+MDP) and metareasoning as solving that MDP (Hay et
+al., 2012). While traditional (object-level) MDPs de-       πm∗ eta  =  arg  max   VOC(c,  b),  (1)
+scribe the objects of reasoning—the state of the external
+environment and how it is affected by physical actions—                         c
+a metalevel MDP describes reasoning itself. Formally, a
+metalevel MDP Mmeta = (B, A, Tmeta, rmeta) is an MDP        where VOC(c, b) is the expected improvement in deci-
+where the states B encode the agent’s beliefs, the ac-      sion quality that can be achieved by performing compu-
+tions A are computations, the transition function Tmeta     tation c in belief state b and continuing optimally, mi-
+describes how computations update beliefs, and the re-      nus the cost of the optimal sequence of computations
+ward function rmeta describes the costs and beneﬁts of      (Russell & Wefald, 1991b). When no computation has
+computation. A deﬁnition table for our notation is in-      positive value, the policy terminates computation and ex-
+cluded in the Supplementary Material.                       ecutes the best object-level action, thus VOC(⊥, b) = 0.
+
+A belief state b ∈ B encodes a probability distribution     2.2 APPROXIMATE METAREASONING
+over parameters θ of a model of the domain. For ex-
+ample, in the tornado problem described in the introduc-    Previous work (Russell & Wefald, 1991b; Lin,
+tion, θ could be a vector of k probabilities that each of   Kolobov, Kamar, & Horvitz, 2015) has approx-
+the k cities will incur evacuation-warranting damage; b     imated rational metareasoning by the meta-greedy
+would thus encode k distributions over [0, 1], e.g. k Beta  policy arg maxc VOC1(c, b) where VOC1(c, b) =
+distributions. The parameters θ determine the utility of    EB ∼Tmeta(b,c,·) [rmeta(B , ⊥)] − rmeta(b, ⊥) + rmeta(b, c),
+acting according to a policy π, that is Uπ(θ). For one-     is the myopic value of computation (Russell & Wefald,
+shot decisions, Uπ(θ) is the expected reward of taking      1991b). The meta-greedy policy selects each computa-
+the single action identiﬁed with π. In the tornado prob-    tion assuming that it will be the last computation. This
+lem, for example, π can be represented as a binary vector   policy is optimal when computation provides diminish-
+of length k indicating whether each city should be evac-    ing returns (i.e. the improvement from each additional
+uated, and Uπ(θ) is the cost of making the evacuations      computation is less than that from the previous one), but
+plus the expected cost of failing to evacuate cities that   it deliberates too little when this assumption is violated.
+incur major damage. In sequential decision-problems,        For example, in the tornado problem (where false nega-
+Uπ(θ) = Vπ(θ)(s) is the expected sum of rewards the         tives have high cost), a single simulation may be unable
+agent will obtain by acting according to policy π if the    to ensure that evacuation is unnecessary with sufﬁcient
+environment has the characteristics encoded by θ.           conﬁdence, while two or more could.
+
+                                                                1If the agent’s model is unbiased, this reward has the same
+                                                            expectation but lower variance than the true external reward.
+Hay et al. (2012) approximated rational metareasoning       tions, then the improvement achieved by the optimal se-
+by combining the solutions to smaller metalevel MDPs        quence of computations should lie between the beneﬁt of
+that formalize the problem of deciding how to decide        deciding immediately after the ﬁrst computation and the
+between one object-level action and the expected re-        beneﬁt of obtaining perfect information (Howard, 1966).
+turn of its best alternative. Each of these smaller met-    The former is given by the myopic value of information,2
+alevel MDPs includes only the computations for rea-
+soning about the expected return of the corresponding          VOI1(c, b) = EB ∼Tmeta(b,c,·) [U (B )] − U (b) . (2)
+object-level action. While this blinkered approximation
+is more accurate than the meta-greedy policy, it is also    and the latter is given by the value of perfect information,
+signiﬁcantly less scalable and not directly applicable to
+metareasoning about planning.                                       VPI(b) = Eθ∗∼b [U (B∗ (·; θ∗))] − U (b) , (3)
+
+These are the main approximations to rational metarea-      where U (b) = rmeta(b, ⊥) is shorthand for the expected
+soning. So, to date, there appears to be no accurate and    value of terminating computation and B∗(θ; θ∗) =
+scalable method for solving general metalevel MDPs.         δ(θi − θi∗) is the belief state with perfect knowledge of
+                                                            the true environment parameters θ∗.
+2.3 METACOGNITIVE RL
+                                                            In problems with many parameters, this upper bound can
+It has been proposed that metareasoning can be made         be very loose because the optimal metalevel policy might
+tractable by learning an approximation to the value of      reason only about a small subset of relevant parame-
+computation (Russell & Wefald, 1991b). However, de-         ters. To capture this, we introduce an additional fea-
+spite some preliminary steps in this direction (Harada      ture VPIsub(c, b) that measures how beneﬁcial it would
+& Russell, 1998; Lieder et al., 2014; Lieder, Krueger,      be to have full information about a subset of the parame-
+& Grifﬁths, 2017) and related work on meta-learning         ters that are most relevant to the given computation. We
+(Smith-Miles, 2009; Thornton, Hutter, Hoos, & Leyton-       model relevance with a function f (c, i) that returns 1 if
+Brown, 2013; Wang et al., 2017), learning to approx-        θi is relevant to what c is reasoning about and 0 other-
+imate bounded optimal information processing remains        wise. Using this relevance function, we deﬁne the value
+an unsolved problem in artiﬁcial intelligence.              of gaining perfect information about the relevant subset
+                                                            of parameters as
+Previous research in cognitive science suggests that peo-
+ple circumvent the intractability of metareasoning by       VPIsub(c, b) = Eθ∗∼b [U (Bsub(·; c, b, θ∗))] − U (b), (4)
+learning a metalevel policy from experience (Lieder &
+Grifﬁths, 2017; Cushman & Morris, 2015; Krueger et al.,         2The VOI1 deﬁned here is equal to the myopic VOC deﬁned
+2017). At least in some cases, the underlying mechanism     by Russell and Wefald (1991) plus the cost of the computation.
+appears to be model-free reinforcement learning (RL)
+(Cushman & Morris, 2015; Krueger et al., 2017). This        Expected Increase in Reward                                       VPI
+suggests that model-free reinforcement learning might
+be a promising approach to solving metalevel MDPs.                                       0.25
+To our knowledge, this approach is yet to be explored
+in artiﬁcial intelligence. Here, we present a proof-                                     0.20                                          πm* eta
+of-concept that near-optimal metalevel policies can be
+learned through metacognitive reinforcement learning.                                    0.15
+
+3 BAYESIAN METALEVEL POLICY                                                              0.10                VOI1
+SEARCH
+                                                                                         0.05
+According to rational metareasoning, an optimal met-
+alevel policy is one that maximizes the VOC (Equa-                                       0.00         5  10  15                    20  25       30
+tion 1). Although the VOC is intractable to compute, it                                            0
+can bounded. Bayesian metalevel policy search (BMPS)
+capitalizes on these bounds to dramatically reduce the                                                   Number of Computations
+difﬁculty of learning near-optimal metalevel policies.
+Figure 1 illustrates that if the expected decision quality  Figure 1: Expected performance in metareasoning about
+improves monotonically with the number of computa-          how to choose between three actions increases monoton-
+                                                            ically with the number of computations, asymptoting at
+                                                            the value of perfect information (VPI). Consequently, the
+                                                            value of executing a single computation must lie between
+                                                            the myopic value of information (VOI1) and the VPI.
+with                                                         art approximations—the meta-greedy policy and the
+                                                             blinkered approximation—on three increasingly difﬁcult
+                                     k                       metareasoning problems.
+
+ Bsub(θ; c, b, θ∗) = B∗(θi; θ∗)f(c,i) · b(θi)1−f(c,i),       4.1 WHEN TO STOP DELIBERATING?
+
+                                      i                      How long should an agent deliberate before answering a
+                                                             question? Our evaluation mimics this problem for a bi-
+where k is the number of parameters in the agent’s           nary prediction task (e.g., “Will the price of the stock go
+model of the environment. In the tornado problem, for        up or down?”). Every deliberation incurs a cost and pro-
+example, each simulation is informative about a sin-         vides probabilistic evidence Xt ∼ Bernoulli(θ) in favor
+gle parameter (the probability that the target city will     of one outcome or the other. At any point the agent can
+sustain evacuation-warranting damage); thus, we deﬁne        stop deliberating and predict the outcome supported by
+f (cj, i) = 1(j = i). In the general case, the relevance     previous deliberations. The agent receives a reward of
+function is a design choice that affords an easy oppor-      +1 if its prediction is correct, or incurs a loss of −1 if it
+tunity to imbue BMPS with domain knowledge. In the           is incorrect. The goal is to maximize the expected reward
+simulations reported below, the relevance function asso-     of this one prediction minus the cost of computation.
+ciates each c with the set of parameters that inform the
+value of the actions (or, in the case of planning, options)  4.1.1 Metalevel MDP
+that c reasons about.
+                                                             We formalize the problem of deciding when
+Critically, all three VOI features can be computed ef-
+ﬁciently or can be efﬁciently approximated by Monte-         to stop thinking as a metalevel MDP Mmeta =
+Carlo integration (Hammersley, 2013). BMPS thus ap-          (B, A, Tmeta, rmeta) where each belief state (α, β) ∈ B
+proximates the VOC by a mixture of VOI features and an       deﬁnes a beta distribution over the probability θ of the
+estimate of the cost of future computations
+
+VOˆ C(c, b; w) = w1 · VOI1(c, b) + w2 · VPI(b)  (5)          ﬁrst outcome. The metalevel actions A are {c1, ⊥}
+                                                             where c1 reﬁnes the belief by sampling, and ⊥ termi-
++ w3 · VPIsub(c, b) − w4 · cost(c),
+
+                                                             nates deliberation and predicts the outcome that is most
+
+with the constraints that w1, w2, w3 ∈ [0, 1], w1 + w2 +     likely according to the current belief. The transition
+w3 = 1, and w4 ∈ [1, h] where h is an upper bound
+on how many computations can be performed. Since             probabilities for sampling are deﬁned by the agent’s be-
+the VOC deﬁnes the optimal metalevel policy (Equa-
+tion 1), we can deﬁne an approximately optimal policy,       lief  state,  that  is  Tmeta((α, β), c1, (α + 1, β))  =    α  and
+πmeta(b; w) = arg maxc VOˆ C(c, b; w).                                                                                 α+β
+
+The parameters w of this policy are opti-                    Tmeta((α, β), c1, (α, β+1))  =     β  .  The reward function
+mized by maximizing the expected return                                                       α+β
+E [ t rmeta(bt, πmeta(bt; w))], i.e. direct policy search.
+Because there are only three free parameters with the        rmeta reﬂects the cost of computation, rmeta(b, c1) = −λ,
+summation constraint, we propose using Bayesian
+optimization (BO) (Mockus, 2012) to optimize the             and the probability of making the correct prediction,
+weights in a sample efﬁcient manner.
+                                                             rmeta(b, ⊥) = +1 · pcorrect(α, β) − 1 · (1 − pcorrect(α, β)),
+The novelty of BMPS lies in leveraging machine learn-                                                   β
+ing to approximate the solution to metalevel MDPs and        where pcorrect(α, β)    =  max{    α  ,  α+β  }).      We set the
+in the discovery of features that make this tractable. As                                     α+β
+far as we know, BMPS is the ﬁrst general approach to
+metacognitive RL. In the following sections, we validate     horizon to h = 30, meaning that the agent can perform
+the assumptions of BMPS, evaluate its performance on
+increasingly complex metareasoning problems, compare         at most 29 computations before making a prediction (the
+it to existing methods, and discuss potential applications.
+                                                             30th metalevel action must be ⊥).
+
+                                                             Since there is only one parameter (θ has length one), the
+                                                             VPIsub feature is identical with the VPI feature; thus, we
+                                                             exclude it. For the same reason, the blinkered approxi-
+                                                             mation is equivalent to solving the problem exactly, and
+                                                             we exclude it from the comparison.
+
+4 EVALUATIONS OF BMPS                                        4.1.2 Evaluation procedure
+
+We evaluate how accurately BMPS can approxi-                 We evaluated the potential of BMPS in two steps:
+mate rational metareasoning against two state-of-the-        First, we performed a regression analysis to evaluate
+                                                             whether the proposed features are sufﬁcient to capture
+                                                             the value of computation, computed exactly by back-
+                                                             ward induction (Puterman, 2014). Second, we tested
+                                                             whether a near-optimal metalevel policy can be learned
+                                                             by Bayesian optimization of the weights of the metalevel
+                                                             policy. We ran 500 iterations of optimization, estimating
+Metareasoning Performance  0.5                                                                                       4.2 META-DECISION-MAKING
+
+                                                                                                        Optimal      How should an agent allocate its limited decision-time
+                                                                                                        BMPS         across estimating the expected utilities of multiple al-
+                                                                                                        Meta-greedy  ternatives? To evaluate how well BMPS can solve this
+                           0.4                                                                                       kind of problem, we evaluate it on the Bernoulli met-
+                                                                                                                     alevel probability model introduced by Hay et al. (2012).
+                           0.3                                                                                       This problem is similar to the standard multi-armed ban-
+                                                                                                                     dit problem with one critical difference: Only the re-
+                           0.2                                                                                       ward from the ﬁnal pull counts—the previous ”simu-
+                                                                                                                     lated” pulls provide information, but no reward. Like
+                           0.1                                                                                       the ﬁrst problem, the agent takes a single object-level
+                                                                                                                     action, choosing arm i and receiving reward r(s, ai) ∼
+                           0     10-2            10-1                                                                Bernoulli(θi). Unlike the ﬁrst problem, however, the
+                           10-3            Cost                                                                      agent must track multiple environment parameters and
+                                                                                                                     select among competing computations.
+Figure 2: Results of performance evaluation on the prob-
+lem of metareasoning about when to stop deliberating.
+
+                                                                                                                     4.2.1 Metalevel MDP
+
+the expected return of the policy entailed by the probed                                                             The Bernoulli metalevel probability model is a metalevel
+weight vector by its average return across 2500 episodes.
+The performance of the learned policy was evaluated on                                                               MDP Mmeta = (B, A, Tmeta, rmeta, h) where each be-
+an independent test set of 3000 episodes.
+                                                                                                                     lief state b deﬁnes k Beta distributions over the reward
+4.1.3 Results
+                                                                                                                     probabilities θ1, · · · , θk of the k possible actions. Thus
+First, linear regression analyses conﬁrmed that the three
+features (VOI1(c, b), VPI(c, b), and cost(c)) are sufﬁ-                                                              b can be represented by ((α1, β1), . . . , (αk, βk)) where
+cient to capture between 90.8% and 100.0% of the vari-
+ance in the value of computation for performing a sim-                                                               b(θi) = Beta(θi; αi, βi). For the initial belief state b0,
+ulation (VOC(b, c1)) across different states b, depending
+on the cost of computation.                                                                                          these parameters are αi = βi = 1. The metalevel ac-
+
+Concretely, as the cost of computation increased from                                                                tions A are {c1, . . . , ck, ⊥} where ci simulates action
+0.001 to 0.1 the regression weights shifted from 0.76 ·
+VPI + 0.46 · VOI1 − 4.5 · cost to 0.00 · VPI + 1.00 ·                                                                ai and ⊥ terminates deliberation and executes the ac-
+VOI1 − 1.00 · cost and the explained variance increased
+from 90.8% to 100.0%. The explained variance and the                                                                 tion with the highest expected return. The metalevel
+weights remained the same for costs greater than 0.1.
+Supplementary Figure 1 illustrates this ﬁt for λ = 0.02.                                                             transition function Tmeta encodes that performing com-
+
+Second, we found that the VOI1 and the VPI features                                                                  putation  ci  increments  αi  with  probability    αi    and    in-
+are sufﬁcient to learn a near-optimal metalevel policy.                                                                                                               αi +βi
+As shown in Figure 2, the performance of BMPS was
+at most 5.19% lower than the performance of the opti-                                                                crements βi with probability          . βi  The metalevel re-
+mal metalevel policy across all costs. The difference in
+performance was largest for the lowest cost λ = 0.001                                                                                                    αi +βi
+(t(2999) = 3.75, p = 0.0002) and decreased with in-
+creasing cost so that there was no statistically signiﬁ-                                                             ward function rmeta(b, c) is −λ for c ∈ {c1, · · · , ck} and
+cant performance difference between BMPS and the op-
+timal metalevel policy for costs greater than λ = 0.0025                                                             rmeta(b, ⊥)   =  maxi    . αi  Finally,  the  horizon    h  is  the
+(all p > 0.15). BMPS performed between 6.78% and
+35.8% better than the meta-greedy policy across all costs                                                                                   αi +βi
+where the optimal policy made more than one obser-
+vation (all p < 0.0001) and 20.3% better on average                                                                  maximum number of metalevel actions that can be per-
+(t(44999) = 42.4, p < 10−15).
+                                                                                                                     formed and the last metalevel action must be ⊥.
+
+                                                                                                                     4.2.2 Evaluation procedure
+
+                                                                                                                     We evaluated BMPS on Bernoulli metalevel probabil-
+                                                                                                                     ity problems with k ∈ {2, · · · , 5} object-level actions, a
+                                                                                                                     horizon of h = 25, and computational costs ranging from
+                                                                                                                     10−4 to 10−1. We compared the policy learned by BMPS
+                                                                                                                     with the optimal metalevel policy and three alternative
+                                                                                                                     approximations: the meta-greedy heuristic (Russell &
+                                                                                                                     Wefald, 1991b), the blinkered approximation (Hay et al.,
+                                                                                                                     2012), and the metalevel policy that always deliberates as
+                                                                                                                     much as possible. In addition to these, we also trained a
+                                                                                                                     Deep-Q-Network (DQN) (Mnih et al., 2015) on the met-
+                                                                                                                     alevel MDP to compare the performance of our method
+                                                                                                                     to baselines achieved by off-the-shelf deep RL methods
+                                                                                                                     (Dhariwal et al., 2017).
+
+                                                                                                                     We trained BMPS as described above, but with 10 iter-
+                                                                                                                     ations of 1000 episodes each. To combat the possibil-
+ity of overﬁtting, we evaluated the average returns of the  4.3 METAREASONING ABOUT PLANNING
+ﬁve best weight vectors over 5000 more episodes and se-
+lected the one that performed best. The relevance func-     Having evaluated BMPS on problems of metareasoning
+tion for VPIsub matches each computation with the single    about how to make a one-shot decision, we now evalu-
+parameter it is informative about, i.e., f (cj, i) = 1(j =  ate its performance at deciding how to plan. To do so,
+i). The optimal metalevel policy and the blinkered pol-     we deﬁne the Bernoulli metalevel tree, which general-
+icy were computed using backward induction (Puterman,       izes the Bernoulli metalevel probability model by replac-
+2014). The DQN was trained for 5, 000, 000 steps. Since     ing the one-shot decision between k options by a tree-
+the episodes have a horizon of h = 25, this resulted in     structured sequential decision problem that we will re-
+more than 200, 000 training episodes for the DQN. We        fer to as the object-level MDP. The transitions of the
+evaluated the performance of each policy by its average     object-level MDP are deterministic and known to the
+return across 2000 test episodes for each combination of    agent. The reward associated with each of k = 2h+1 − 1
+computational cost and number of object-level actions.      states in the tree is deterministic, but initially unknown;
+                                                            r(s, a, si) = θi ∈ {−1, 1}. The agent can uncover these
+4.2.3 Results                                               rewards through reasoning at a cost of −λ per reward.
+                                                            When the agent terminates deliberation, it executes a pol-
+We found that the BMPS policy attained 99.1% of op-         icy with maximal expected utilty. Unlike in the previous
+timal performance (0.6535 vs. 0.6596, t(1998) =             domains, this policy entails a sequence of actions rather
+−7.43, p < 0.0001) and signiﬁcantly outperformed            than a single action.
+the meta-greedy heuristic (0.60, t(1998) = 83.9, p <
+10−15), the full-deliberation policy (0.20, t(1998) =       4.3.1 Metalevel MDP
+469.1, p < 10−15), and the DQN (0.58, t(1998) =
+79.2, p < 10−15). The performance of BMPS (0.6535)          The Bernoulli metalevel tree is a metalevel MDP
+and the blinkered approximation (0.6559) differed by        Mmeta = (B, A, Tmeta, rmeta) where each belief state b
+only 0.37%.                                                 encodes one Bernoulli distribution for each transition’s
+                                                            reward. Thus, b can be represented as (p1, · · · , pi) such
+Figure 3a shows the methods’ average performance as         that b(θi = 1) = pi and b(θi = −1) = 1 − pi. The
+a function of the cost of computation. BMPS outper-         initial belief b0 has pi = 0.5 for all i. The metalevel
+formed the meta-greedy heuristic for costs smaller than     actions are deﬁned A = {c1, · · · , ck, ⊥} where ci re-
+0.03 (all p < 10−15), the full-deliberation policy for      veals the reward at state si and ⊥ selects the path with
+costs greater than 0.0003 (all p < 0.005), and the DQN      highest expected sum of rewards according to the cur-
+for all costs (all p < 10−15). For costs below 0.0003, the  rent belief state. The transition function Tmeta encodes
+blinkered policy performed slightly better than BMPS        that performing computation ci sets pi to 1 or 0 with
+(all p < 0.01). For all other costs both methods per-       equal probability (unless pi has already been updated, in
+formed at the same level (all p > 0.1). For costs above     which case ci has no effect). The metalevel reward func-
+0.01, performance of BMPS becomes indistinguishable         tion is deﬁned rmeta(b, c) = −λ for c ∈ {c1, · · · , ck},
+from the optimal policy’s performance (all p > 0.1).        and rmeta(b, ⊥) = maxt∈T i∈t E[θi | pi] where T is
+                                                            the set of possible trajectories t through the environment,
+Figure 3b shows the metareasoning performance of each       and E[θi | pi] = 2pi − 1 is the expected reward attained
+method as a function of the number of options. We found     at state si.
+that the performance of BMPS scaled well with the size
+of the decision problem. For each number of options, the    4.3.3 Evaluation procedure
+relative performance of the different methods was con-
+sistent with the results reported above.                    We evaluated each method’s performance by its aver-
+                                                            age return over 5000 episodes for each combination of
+Finally, as illustrated in Supplementary Figure 2, we       tree-height h ∈ {2, · · · , 6} and computational cost λ ∈
+found that BMPS learned surprisingly quickly, usually       {2−7, · · · , 20}. To facilitate comparisons across plan-
+discovering near-optimal policies in less than 10 itera-    ning problems with different numbers of steps, we mea-
+tions. In particular, BMPS was able to perform signif-      sured the performance of metalevel policies by their ex-
+icantly better than the DQN, despite being trained on       pected return divided by the tree-height.
+fewer than 20% as many episodes. This demonstrates
+the value of the proposed VOI features, which dramat-       We trained the BMPS policy with 100 iterations of 1000
+ically constrain the space of possible metalevel policies   episodes each. To combat the possibility of overﬁt-
+to be considered.                                           ting, we evaluated the average returns of the three best
+                                                            weight vectors over 2000 more episodes and selected
+ 0.8                                                                                                                          1
+0.75
+                            Optimal                                                                                                Full Deliberation
+ 0.7                        Blinkered
+0.65                        BMPS                                                                                                   DQN
+                            Full Deliberation
+ 0.6                        Meta-greedy                                                                                            Meta-greedy
+0.55                        DQN
+Metareasoning Performance                                                                                                     0.8  BMPS
+ 0.5                                                                                               Metareasoning Performance
+0.45                                                                                                                               Blinkered
+
+ 0.4                                                                                                                               Optimal
+    10-4
+                                                                                                                              0.6
+
+                                                                                                                              0.4
+
+                                                                                                                              0.2
+
+          10-3        10-2  10-1                                                                                              0    2                  3       4    5
+
+                Cost                                                                                                                            Number of Options
+
+                (a)                                                                                                                                      (b)
+
+Figure 3: Metareasoning performance of alternative methods on the Bernoulli metalevel probability model (a) as a
+function of the cost of computation and (b) as a function of the number of actions. Metareasoning performance is
+deﬁned as the expected reward for the chosen option minus the computational cost of the decision process. Error bars
+enclose 95% conﬁdence intervals.
+
+the one that performed best. The relevance function          soning performance of 0.392 units of reward per object-
+for VPIsub maps a computation to all the parameters          level action, thereby outperforming the meta-greedy
+that affect the value of any policy that the initial com-    heuristic (0.307, t(399998) = 72.84, p < 10−15),
+putation is informative about, i.e. f (cj, i) = 1(i ∈        the recursively blinkered policy (0.368, t(399998) =
+{j} ∪ descendents(j) ∪ ancestors(j))                         20.77, p < 10−15), and the full-deliberation policy
+                                                             (−1.740, t(399998) = 231.18, p < 10−15).
+For metareasoning about how to plan in trees of height
+2 and 3, we were able to compute the optimal met-            As shown in Figure 4a, BMPS performed near-optimally
+alevel policy using dynamic programming. But for larger      across all computational costs, and its advantage over the
+trees, computing the optimal metalevel policy would          meta-greedy heuristic and the tree-blinkered approxima-
+have taken signiﬁcantly longer than 6 hours and was          tion was largest when the cost of computation was low,
+therefore not undertaken.                                    whereas its beneﬁt over the full-deliberation policy in-
+                                                             creased with the cost of computation.
+The blinkered policy of Hay et al. (2012) is not directly
+applicable to planning because of its assumption of “in-     Figure 4b shows that the performance of BMPS scaled
+dependent actions” which is violated in the Bernoulli        very well with the size of the planning problem, and that
+metalevel tree. Brieﬂy, the assumption is violated be-       its advantage over the meta-greedy heuristic increased
+cause the reward at a given state affects the value of mul-  with the height of the tree.
+tiple policies. Thus, we derived a recursive generaliza-
+tion of the blinkered policy to compare with our method.     5 IS METAREASONING USEFUL?
+See the Supporting Materials for details.
+                                                             The costs of metareasoning often outweigh the result-
+4.3.4 Results                                                ing improvements in object-level reasoning. But here we
+                                                             show that the beneﬁts of BMPS outweigh its costs in a
+We ﬁrst compared BMPS with the optimal policy for            potential application to emergency management.
+h ∈ {2, 3}, ﬁnding that it attained 98.4% of op-
+timal performance (0.367 vs. 0.373, t(159998) =              During severe weather, important decisions—such as
+−2.87, p < 10−15). Metareasoning performance dif-            which cities to evacuate in the face of an approaching
+fered signiﬁcantly across the four methods we evaluated      tornado—must be based on a limited number of compu-
+(F (3, 799840) = 4625010; p < 10−15), and the mag-           tationally intense weather simulations that estimate the
+nitude of this effect depends on the height of the tree      probability that a city will be severely hit (Baumgart,
+(F (12, 799840) = 1110179, p < 10−15) and the cost of        Bass, Philips, & Kloesel, 2008). Based on these simu-
+computation (F (21, 799840) = 1266582, p < 10−15).           lations, an emergency manager makes evacuation deci-
+                                                             sions so as to minimize the risk of false positive errors
+Across all heights and costs, BMPS achieved a metarea-
+0.8                                                                                                                         0.6
+0.7
+0.6               Optimal                                                                                                        Meta-greedy
+0.5               BMPS
+0.4               Blinkered                                                                                                      Blinkered
+0.3               Full Deliberation
+0.2               Meta-greedy                                                                                               0.5  BMPS
+0.1Metareasoning Performance
+                                                                                                 Metareasoning Performance       Optimal
+  0
+      10-2                                                                                                                  0.4
+
+                                                                                                                            0.3
+
+                                                                                                                            0.2
+
+                                                                                                                            0.1
+
+            10-1  100                                                                                                       0    2            3    4       5        6
+
+            Cost                                                                                                                                   Height
+
+            (a)                                                                                                                                    (b)
+
+Figure 4: Metareasoning performance of alternative methods on the Bernoulli tree (a) as a function of computational
+cost (with tree-height 3) and (b) as a function of the number of actions (marginalizing over computational costs
+between 10−4 and 10−1). Metareasoning performance is normalized by tree height to facilitate comparison. In (b),
+the optimal policy is only shown for heights at which it can be computed in under six hours and the full observation
+policy is not shown because its performance is negative for all heights. Error bars enclose 95% conﬁdence intervals.
+
+(evacuating cities that are safe) and false negative errors  sions about whether to evacuate each city. Evacuation
+(failing to evacuate a city the tornado hits). We assume     has a cost, λevac = −1, but failing to evacuate a heavily-
+that the manager has access to a single supercomputer,       hit city has a much larger cost, λfn = −20. Thus, the
+but pays no cost for running each simulation. Thus, the      metalevel reward function is
+manager has a ﬁxed budget of simulations and her goal
+is to maximize the expected utility of the ﬁnal decision.                                                                   rmeta(b, ⊥) =          max        αi    · λfn, λevac  . (6)
+                                                                                                                                                           αi + βi
+5.1 METHODS                                                                                                                                 1≤i≤k
+
+We model the above scenario as follows: There is a ﬁ-        In contrast to the previous simulations, we now explicitly
+nite amount of time T until evacuation decisions about
+k cities have to be made. For each city i, the emer-         consider the cost of metareasoning. The decision time T
+gency manager can run a ﬁne grained, stochastic simu-
+lation (ci) of how it will be impacted by the approaching    has to be allocated between reasoning about the cities
+tornado. Each simulation yields a binary outcome, in-
+dicating whether the simulated impact would warrant an       and metareasoning about which city to reason about so
+evacuation or not. The belief state b and transition func-
+tion Tmeta of the corresponding metalevel MDP are the        that T = nsim · (tMR + tsim), where nsim is the number
+same as in the Bernoulli metalevel probability model:
+Each belief state deﬁnes k Beta distributions that track     of simulations run, tMR is the amount of time it takes to
+the probability that the tornado will cause evacuation-
+warranting damage in each city. The parameters αi and        choose one simulation to run (i.e. by metareasoning),
+βi correspond to the number of simulations predicting
+that the tornado {would — would not} be strong enough        and tsim is the amount of time it takes to run one simula-
+to warrant an evacuation of city i. Prior to the ﬁrst sim-
+ulation, the parameters for each city i are initialized as   tion. Thus, for given values of tMR and tsim the number of
+αi = 0.1 and βi = 0.9 to capture the prior knowledge
+that evacuations are rarely necessary. The primary for-      simulations that can be performed is nsim =                                                                     T    ,
+mal difference from the Bernoulli metalevel probability                                                                                                                tMR +tsim
+model lies in how the ﬁnal belief state is translated into
+a decision and reward. Rather than choosing a single         where x rounds x down to the closest integer. Note that
+option, the agent must make k independent binary deci-
+                                                             metalevel policy is computed ofﬂine, and thus training
+
+                                                             time does not factor into the above equation. The simula-
+
+                                                             tions reported below use a single BMPS policy optimized
+
+                                                             for k = 20 and nsim = 50 to mimic the reuse of pre-
+
+                                                             computed weights in practical applications; the weights
+
+                                                             are relatively insensitive to these parameters.
+
+                                                             To assess if BMPS could be useful in practice, we com-
+                                                             pare the utility of evacuation decisions made by its met-
+                                                             alevel policy to those made by a baseline metalevel pol-
+                                                             icy that uniformly distributes simulations across the k
+                                                             cities. Since the BMPS policy has tMR > 0 while the
+                                                             baseline policy has tMR ≈ 0, BMPS will typically run
+fewer simulations and must make up for this by choos- 6 DISCUSSION
+
+ing more valuable ones.
+
+5.2 RESULTS                                                                   We have introduced a new approach to solving the foun-
+                                                                              dational problem of rational metareasoning: metacogni-
+We evaluated the BMPS policy and the uniform compu-                           tive reinforcement learning. This approach applies algo-
+tation policy on the tornado problem with T = 24 hours,                       rithms from RL to metalevel MDPs to learn a policy for
+k ∈ {10, 30} cities, and a range of plausible values for                      selecting computations. Our results show that BMPS can
+the duration of each weather simulation (tsim ∈ [2−2, 24]                     outperform the state of the art for approximate metarea-
+hours). For each policy and parameter setting we esti-                        soning. While we illustrated this approach using a policy
+mate utility as the mean return over 5000 rollouts.                           search algorithm based on Bayesian optimization, there
+                                                                              are many other RL algorithms that could be used instead,
+Empirically, we found that tMR ≈ 1 ms for k = 10 and                          including policy gradient algorithms, actor-critic meth-
+tMR ≈ 3 ms for k = 30. Thus, even with a conservative                         ods, and temporal difference learning with function ap-
+estimate of tMR = 0.001 hours, metareasoning would                            proximation.
+cost at most one simulation. Consequently, in our simu-
+lations, diverting some of the computational resources to                     Since BMPS approximates the value of computation as a
+metareasoning was advantageous regardless of how long                         mixture of the myopic VOI and two other VOI features,
+exactly a tornado simulation might take and the number                        it can be seen as a generalization of the meta-greedy ap-
+of cities being considered. As Figure 5 shows, the beneﬁt                     proximation (Lin et al., 2015; Russell & Wefald, 1991a).
+of metareasoning was larger for the more complex prob-                        It is the combination of these features with RL that makes
+lem with more cities and peaked for an intermediate cost                      BMPS tractable and powerful. BMPS works well across
+of object-level reasoning.                                                    a wider range of problems than previous approximations
+                                                                              because it reduces arbitrarily complex metalevel MDPs
+While this is a hypothetical scenario, it suggests that                       to low-dimensional optimization problems. We predict
+BMPS could be useful for practical applications. Specif-                      that metacognitive RL will enable signiﬁcant advances
+ically, we suggest that the method will be most valu-                         in artiﬁcial intelligence and its applications. In the long
+able when a metareasoning problem must be faced mul-                          view, metacognitive RL may become a foundation for
+tiple times (so that the cost of training BMPS ofﬂine can                     self-improving AI systems that learn how to solve in-
+be amortized) and object-level computations are expen-                        creasingly complex problems with increasing efﬁciency.
+sive (so that the resulting savings in object-level reason-
+ing outweigh the online cost of computing the features                        One weakness of our approach is that the time required
+used for metareasoning). In follow-up simulations, we                         to compute the value of perfect information by exact in-
+explored conditions in which the cost of metareasoning                        tegration increases exponentially with the number of pa-
+causes a substantial reduction in the number of simula-                       rameters in the agent’s model of the environment. Thus,
+tions that can be run. We found that metareasoning con-                       an important direction for future work is developing
+tinues to be useful as long as object-level computation                       efﬁcient approximations or alternatives to this feature,
+is substantially more expensive than metareasoning (see                       and/or discovering new features via deep RL (Mnih et
+Supplementary Material).                                                      al., 2015). A second limitation is our assumption that the
+                                                                              meta-reasoner has an exact model of its own computa-
+                           10 Cities      −17.5       30 Cities               tional architecture in the form of a metalevel MDP. This
+         −4                               −20.0                               motivates the incorporation of model-learning mecha-
+                                          −22.5                      BMPS     nisms into a metacognitive RL algorithm.
+                                          −25.0                      Uniform
+                                          −27.5                               We have shown that the beneﬁts of metareasoning with
+Utility  −6                               −30.0                               our method already more than outweigh its computa-
+                                                                              tional costs in scenarios where the object-level computa-
+         −8                                                                   tions are very expensive. It might therefore beneﬁt prac-
+                                                                              tical applications that involve complex large-scale simu-
+         −10                                                                  lations, active learning problems, hyperparameter search,
+                                                                              and the optimization of functions that are very expensive
+              2−1  21                 23         2−1  21            23        to evaluate. Finally, BMPS could also be applied to de-
+                                                                              rive rational process models of human cognition.
+                   tsim (hours)                       tsim (hours)
+
+Figure 5: Beneﬁt of metareasoning in the tornado evacu-
+ation scenario depending on the duration of each simula-
+tion (tsim) and the number of cities considered.
+References                                                  Lieder, F., Plunkett, D., Hamrick, J. B., Russell, S. J.,
+                                                                   Hay, N., & Grifﬁths, T. (2014). Algorithm se-
+Baumgart, L. A., Bass, E. J., Philips, B., & Kloesel, K.           lection by rational metareasoning as a model of
+       (2008). Emergency management decision making                human strategy selection. In Advances in Neu-
+       during severe weather. Weather and Forecasting,             ral Information Processing Systems 27 (pp. 2870–
+       23(6), 1268–1279.                                           2878).
+
+Campbell, M., Hoane, A. J., & Hsu, F.-H. (2002). Deep       Lin, C. H., Kolobov, A., Kamar, E., & Horvitz, E. (2015).
+       blue. Artiﬁcial intelligence, 134(1-2), 57–83.              Metareasoning for planning under uncertainty. In
+                                                                   Proceedings of the 24th International Conference
+Cushman, F., & Morris, A. (2015). Habitual control                 on Artiﬁcial Intelligence (pp. 1601–1609).
+       of goal selection in humans. Proceedings of the
+       National Academy of Sciences, 112(45), 13817–        Mnih, V., Kavukcuoglu, K., Silver, D., Rusu, A. A.,
+       13822.                                                      Veness, J., Bellemare, M. G., . . . others (2015).
+                                                                   Human-level control through deep reinforcement
+Dhariwal, P., Hesse, C., Klimov, O., Nichol, A., Plappert,         learning. Nature, 518(7540), 529–533.
+       M., Radford, A., . . . Wu, Y. (2017). Open AI
+       Baselines. https://github.com/openai/                Mockus, J. (2012). Bayesian approach to global
+       baselines.                                                  optimization: theory and applications (Vol. 37).
+                                                                   Springer Science & Business Media.
+Gershman, S. J., Horvitz, E. J., & Tenenbaum, J. B.
+       (2015). Computational rationality: A converg-        Payne, J. W., Bettman, J. R., & Johnson, E. J. (1988).
+       ing paradigm for intelligence in brains, minds, and         Adaptive strategy selection in decision making.
+       machines. Science, 349(6245), 273–278.                      Journal of Experimental Psychology: Learning,
+                                                                   Memory, and Cognition, 14(3), 534.
+Hammersley, J. (2013). Monte Carlo methods. Springer
+       Science & Business Media.                            Puterman, M. L. (2014). Markov decision processes:
+                                                                   discrete stochastic dynamic programming. John
+Harada, D., & Russell, S. J. (1998). Meta-level reinforce-         Wiley & Sons.
+       ment learning. In NIPS 1998 Workshop on Ab-
+       straction and Hierarchy in Reinforcement Learn-      Russell, S. J., & Subramanian, D. (1995). Provably
+       ing.                                                        bounded-optimal agents. Journal of Artiﬁcial In-
+                                                                   telligence Research, 2, 575–609.
+Hay, N., Russell, S. J., Tolpin, D., & Shimony, S. (2012).
+       Selecting computations: Theory and applications.     Russell, S. J., & Wefald, E. (1991a). Do the right thing:
+       In Proceedings of the 28th Conference of Uncer-             studies in limited rationality. Cambridge, MA:
+       tainty in Artiﬁcial Intelligence.                           MIT press.
+
+Horvitz, E. J., Cooper, G. F., & Heckerman, D. E. (1989).   Russell, S. J., & Wefald, E. (1991b). Principles of metar-
+       Reﬂection and action under scarce resources: The-           easoning. Artiﬁcial Intelligence, 49(1-3), 361–
+       oretical principles and empirical study. In Pro-            395.
+       ceedings of the Eleventh International Joint Con-
+       ference on Artiﬁcial Intelligence (pp. 1121–1127).   Shugan, S. M. (1980). The cost of thinking. Journal of
+       San Mateo, CA: Morgan Kaufmann.                             consumer Research, 7(2), 99–111.
+
+Howard, R. A. (1966). Information value theory. IEEE        Smith-Miles, K. A. (2009, January). Cross-disciplinary
+       Transactions on systems science and cybernetics,            perspectives on meta-learning for algorithm selec-
+       2(1), 22–26.                                                tion. ACM Comput. Surv., 41(1), 6:1–6:25.
+
+IBM Research. (1997). Kasparov vs Deep Blue:                Thornton, C., Hutter, F., Hoos, H. H., & Leyton-Brown,
+       A contrast in styles. http://researchweb                    K. (2013). Auto-WEKA: Combined selection
+       .watson.ibm.com/deepblue.                                   and hyperparameter optimization of classiﬁcation
+                                                                   algorithms. In Proceedings of the 19th ACM
+Krueger, P. M., Lieder, F., & Grifﬁths, T. L. (2017). En-          SIGKDD International Conference on Knowledge
+       hancing metacognitive reinforcement learning us-            Discovery and Data Mining (pp. 847–855).
+       ing reward structures and feedback. In Proceed-
+       ings of the 39th Annual Conference of the Cogni-     Wang, J. X., Kurth-Nelson, Z., Tirumala, D., Soyer, H.,
+       tive Science Society.                                       Leibo, J. Z., Munos, R., . . . Botvinick, M. (2017,
+                                                                   January 23). Learning to reinforcement learn. In
+Lieder, F., & Grifﬁths, T. (2017). Strategy selection              Proceedings of the 39th Annual Conference of the
+       as rational metareasoning. Psychological Review,            Cognitive Science Society.
+       124(6), 762–794.
+
+Lieder, F., Krueger, P. M., & Grifﬁths, T. L. (2017). An
+       automatic method for discovering rational heuris-
+       tics for risky choice. In Proceedings of the 39th
+       Annual Meeting of the Cognitive Science Society.
+SUPPLEMENTARY MATERIAL                                         reduction is greatest when object-level computations are
+                                                               fast and the total amount of available time T is high.
+THE RECURSIVELY BLINKERED POLICY                               Nevertheless, as shown in Figure 7, BMPS still often out-
+                                                               performs allocating computation time uniformly. This
+The blinkered policy of Hay et al. (2012) was deﬁned           is often true even when BMPS can perform only half as
+for problems where each computation informs the value          many simulations (e.g. T = 0.03; k = 30; tsim = 2−10).
+of only one action. This assumption of “independent            As expected, when the time to run a simulation is much
+actions” is crucial to the efﬁciency of the blinkered ap-      less than the time to metareason about which simulation
+proximation because it allows the problem to be decom-         to run, metareasoning does not pay off anymore. Overall,
+posed into independent (and easily solved) subproblems         we see that the beneﬁt of metareasoning increases with
+for each action. However, the assumption does not hold         the costliness of object-level reasoning and the number
+for the Bernoulli metalevel tree because the reward at a       of computations that must be considered, but decreases
+given state affects the value of multiple policies. This       with increased total computation time.
+is because in the context of sequential decision mak-
+ing, “actions” become policies, and the reward at one                                        T = 0.01                              T = 0.03
+state affects the values of all policies visiting that state.           100
+Thus, a single computation affects the value of many                                                                                                 BMPS
+policies. An intuitive generalization would be to approx-               80                                                                           Uniform
+imate the value of a computation c by assuming that fu-                                                                                              tMR
+ture computations will be limited to those that are in-
+formative about any of the policies the initial compu-         nsim     60
+tation is relevant to, a set we call Ec,. However, for
+large trees, this only modestly reduces the size of the ini-            40
+tial problem. This suggests a recursive generalization:
+Rather than applying the blinkered approximation once                   20
+and solving the resulting subproblem exactly, we recur-
+sively apply the approximation to the resulting subprob-                0          −11     −10     −9    −8   2−7          −11     −10        −9    −8        2−7
+lems. Finally, to ensure that the subproblems decrease
+in size monotonically, we remove from Ec the compu-                             2       2       2      2                2       2          2      2
+tations about rewards on the path from the agent’s cur-
+rent state to the state inspected by computation c and                                  tsim (hours)                            tsim (hours)
+call the resulting set Ec. Thus, we deﬁne the recursively
+blinkered policy as πRB(b) = arg maxc QRB(b, c) with           Figure 6: The number of simulations that can be run with
+QRB(bt, ⊥) = rmeta(bt, ⊥) and QmRBeta(b, c) =                  versus without metareasoning as a function of the total
+                                                               time T and the cost of each simulation tsim.
+
+                                                                            −6          T = 0.01 k = 10                       T = 0.03 k = 10
+                                                                            −7                                     −4
+                                                                            −8
+                                                                            −9                                     −5
+                                                                          −10
+                                                                                                                   −6
+                                                                        −29.2
+                                                               Utility  −29.4                                      −7
+                                                                        −29.6
+                                                                        −29.8                                      −8
+                                                                        −30.0
+                                                                                                                   −9
+
+rmeta(b, c) + EB ∼Tmeta(b,c,·)  max QRB(B , c )                                                                    −10
+
+                                c ∈E
+                                c                                                       T = 0.01 k = 30                         T = 0.03 k = 30
+                                                                                                                   −18
+
+                                                                                                                                                        BMPS
+
+DETAILS ON SIMULATIONS REPORTED IN                                                                                 −20                            Uniform
+SECTION 5
+                                                                                                                                                        tMR
+We found the computational cost of metareasoning for                                                               −22
+the tornado problem to be several orders of magnitude
+lower than realistic costs of object-level computations        Utility                                             −24
+(i.e. weather simulations). Thus, the simulations leave
+open the question of whether BMPS can also be usefully                                                             −26
+applied when metareasoning costs are non-negligible. To
+answer this question, we ran additional simulations for                                                            −28
+the tornado problem with unrealistically low values of T
+and tsim.                                                                                                          −30
+
+The simulations summarized in Figure 6 investigated hy-                                 2  −10         2  −8                       2  −10         2  −8
+pothetical scenarios where the metareasoning cost in-
+curred by the BMPS policy considerably reduces the                                      tsim (hours)                               tsim (hours)
+amount of object-level computation it can perform. This
+                                                               Figure 7: Utility of BMPS vs. allocating computation
+                                                               uniformly as a function of the total time T , the cost of
+                                                               each simulation tsim, and the number of possible compu-
+                                                               tations (i.e. the number of cities) k.
+Mmeta            meta-level Markov Decision Process
+B
+A                Set of possible belief states
+C                Set of meta-level actions C, ∪{⊥}
+⊥
+                 set of possible computations
+rmeta(b, c)
+λ                meta-level action that terminates deliberation and initiates an object-
+Tmeta(b, c, b )  level action
+θ                reward function of the meta-level MDP, rmeta(b, c) = −cost(c) = −λ
+π                for c ∈ C and rmeta(b, ⊥) = maxπ Eθ∼b[Uπ(θ)]
+Uπ (θ)           cost of a single computation
+                 probability that performing computation c in belief state b leads to be-
+U (b)            lief state b
+πmeta
+πmeta            parameters of the agent’s model of the environment
+VOC(c, b)
+                 object-level policy for selecting physical actions
+VOI1(c, b)       expected return of acting according to the object-level policy π if θ is
+                 the correct model of the environment
+VPI(b)           expected value of terminating computation with the belief b, rmeta(b, ⊥)
+                 meta-level policy for selecting computational actions
+VPIsub(c, b)
+                 optimal meta-level policy, see Equation 1
+
+                 Value of Computation, the expected improvement in decision quality
+                 that can be achieved by performing computation c in belief state b and
+                 continuing optimally, minus the cost of the optimal sequence of com-
+                 putations
+
+                 myopic Value of Information, expected improvement in decision qual-
+                 ity from taking a single computation c before terminating computation,
+                 see Equation 2
+
+                 Value of Perfect Information, the expected improvement in decision
+                 quality from attaining a maximally informed belief state beginning in
+                 belief state b, see Equation 3
+
+                 value of attaining perfect information about the subset of components
+                 of θ that are most relevant to computation c, see Equation 4
+
+                            Table 1: Mathematical notation
+

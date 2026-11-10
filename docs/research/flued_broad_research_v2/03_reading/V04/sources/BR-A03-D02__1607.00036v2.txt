@@ -1,0 +1,1278 @@
+arXiv:1607.00036v2 [cs.LG] 17 Mar 2017                                                                                                          1
+
+                                        Dynamic Neural Turing Machine with
+                                        Continuous and Discrete Addressing Schemes
+
+                                        Caglar Gulcehre1, Sarath Chandar1, Kyunghyun Cho2, Yoshua Bengio1
+
+                                        1University of Montreal, name.lastname@umontreal.ca
+                                        2New York University, name.lastname@nyu.edu
+
+                                            Keywords: neural networks, memory, neural Turing machines, natural language
+                                        processing
+
+                                                                                      Abstract
+                                        We extend neural Turing machine (NTM) model into a dynamic neural Turing ma-
+                                        chine (D-NTM) by introducing a trainable memory addressing scheme. This address-
+                                        ing scheme maintains for each memory cell two separate vectors, content and address
+                                        vectors. This allows the D-NTM to learn a wide variety of location-based addressing
+                                        strategies including both linear and nonlinear ones. We implement the D-NTM with
+                                        both continuous, differentiable and discrete, non-differentiable read/write mechanisms.
+                                        We investigate the mechanisms and effects of learning to read and write into a memory
+                                        through experiments on Facebook bAbI tasks using both a feedforward and GRU-
+                                        controller. The D-NTM is evaluated on a set of Facebook bAbI tasks and shown to
+                                        outperform NTM and LSTM baselines. We have done extensive analysis of our model
+                                        and different variations of NTM on bAbI task. We also provide further experimental
+                                        results on sequential pMNIST, Stanford Natural Language Inference, associative recall
+                                        and copy tasks.
+
+                                        1 Introduction
+
+                                        Designing of general-purpose learning algorithms is one of the long-standing goals of
+                                        artiﬁcial intelligence. Despite the success of deep learning in this area (see, e.g., (Good-
+                                        fellow et al., 2016)) there are still a set of complex tasks that are not well addressed by
+                                        conventional neural network based models. Those tasks often require a neural network
+                                        to be equipped with an explicit, external memory in which a larger, potentially un-
+                                        bounded, set of facts need to be stored. They include, but are not limited to, episodic
+                                        question-answering (Weston et al., 2015b; Hermann et al., 2015; Hill et al., 2015), com-
+                                        pact algorithms (Zaremba et al., 2015), dialogue (Serban et al., 2016; Vinyals and Le,
+                                        2015) and video caption generation (Yao et al., 2015).
+    Recently two promising approaches that are based on neural networks for this type
+of tasks have been proposed. Memory networks (Weston et al., 2015b) explicitly store
+all the facts, or information, available for each episode in an external memory (as con-
+tinuous vectors) and use the attention-based mechanism to index them when returning
+an output. On the other hand, neural Turing machines (NTM, (Graves et al., 2014))
+read each fact in an episode and decides whether to read, write the fact or do both to the
+external, differentiable memory.
+
+    A crucial difference between these two models is that the memory network does
+not have a mechanism to modify the content of the external memory, while the NTM
+does. In practice, this leads to easier learning in the memory network, which in turn
+resulted in that it being used more in realistic tasks (Bordes et al., 2015; Dodge et al.,
+2015). On the contrary, the NTM has mainly been tested on a series of small-scale,
+carefully-crafted tasks such as copy and associative recall. However, NTM is more
+expressive, precisely because it can store and modify the internal state of the network
+as it processes an episode and we were able to use it without any modiﬁcations on the
+model for different tasks.
+
+    The original NTM supports two modes of addressing (which can be used simulta-
+neously.) They are content-based and location-based addressing. We notice that the
+location-based strategy is based on linear addressing. The distance between each pair
+of consecutive memory cells is ﬁxed to a constant. We address this limitation, in this
+paper, by introducing a learnable address vector for each memory cell of the NTM with
+least recently used memory addressing mechanism, and we call this variant a dynamic
+neural Turing machine (D-NTM).
+
+    We evaluate the proposed D-NTM on the full set of Facebook bAbI task (We-
+ston et al., 2015b) using either continuous, differentiable attention or discrete, non-
+differentiable attention (Zaremba and Sutskever, 2015) as an addressing strategy. Our
+experiments reveal that it is possible to use the discrete, non-differentiable attention
+mechanism, and in fact, the D-NTM with the discrete attention and GRU controller
+outperforms the one with the continuous attention. We also provide results on sequen-
+tial pMNIST, Stanford Natural Language Inference (SNLI) task and algorithmic tasks
+proposed by (Graves et al., 2014) in order to investigate the ability of our model when
+dealing with long-term dependencies.
+
+    We summarize our contributions in this paper as below,
+
+    • We propose a variation of neural Turing machine called a dynamic neural Turing
+       machine (D-NTM) which employs a learnable and location-based addressing.
+
+    • We demonstrate the application of neural Turing machines on more natural and
+       less toyish tasks, episodic question-answering, natural language entailment, digit
+       classiﬁcation from the pixes besides the toy tasks. We provide a detailed analysis
+       of our model on the bAbI task.
+
+    • We propose to use the discrete attention mechanism and empirically show that, it
+       can outperform the continuous attention based addressing for episodic QA task.
+
+    • We propose a curriculum strategy for our model with the feedforward controller
+       and discrete attention that improves our results signiﬁcantly.
+
+                                                   2
+    In this paper, we avoid doing architecture engineering for each task we work on and
+focus on pure model’s overall performance on each without task-speciﬁc modiﬁcations
+on the model. In that respect, we mainly compare our model against similar models
+such as NTM and LSTM without task-speciﬁc modiﬁcations. This helps us to better
+understand the model’s failures.
+
+    The remainder of this article is organized as follows. In Section 2, we describe the
+architecture of Dynamic Neural Turing Machine (D-NTM). In Section 3, we describe
+the proposed addressing mechanism for D-NTM. Section 4 explains the training pro-
+cedure. In Section 5, we brieﬂy discuss some related models. In Section 6, we report
+results on episodic question answering task. In Section 7, 8, and 9 we discuss the re-
+sults in sequential MNIST, SNLI, and algorithmic toy tasks respectively. Section 10
+concludes the article.
+
+2 Dynamic Neural Turing Machine
+
+The proposed dynamic neural Turing machine (D-NTM) extends the neural Turing ma-
+chine (NTM, (Graves et al., 2014)) which has a modular design. The D-NTM consists
+of two main modules: a controller, and a memory. The controller, which is often imple-
+mented as a recurrent neural network, issues a command to the memory so as to read,
+write to and erase a subset of memory cells.
+
+2.1 Memory
+
+D-NTM consists of an external memory Mt, where each memory cell i in Mt[i] is
+partitioned into two parts: a trainable address vector At[i] ∈ R1×da and a content vector
+Ct[i] ∈ R1×dc.
+
+                                       Mt[i] = [At[i]; Ct[i]] .
+
+Memory Mt consists of N such memory cells and hence represented by a rectangular
+matrix Mt ∈ RN×(dc+da):
+
+                                          Mt = [At; Ct] .
+The ﬁrst part At ∈ RN×da is a learnable address matrix, and the second Ct ∈ RN×dc
+a content matrix. The address part At is considered a model parameter that is updated
+during training. During inference, the address part is not overwritten by the controller
+and remains constant. On the other hand, the content part Ct is both read and written
+by the controller both during training and inference. At the beginning of each episode,
+the content part of the memory is refreshed to be an all-zero matrix, C0 = 0. This
+introduction of the learnable address portion for each memory cell allows the model to
+learn sophisticated location-based addressing strategies.
+
+2.2 Controller
+
+At each timestep t, the controller (1) receives an input value xt, (2) addresses and reads
+the memory and creates the content vector rt, (3) erases/writes a portion of the memory,
+(4) updates its own hidden state ht, and (5) outputs a value yt (if needed.) In this
+
+                                                   3
+paper, we use both a gated recurrent unit (GRU, (Cho et al., 2014)) and a feedforward-
+controller to implement the controller such that for a GRU controller
+
+                     ht = GRU(xt, ht−1, rt)        (1)
+
+and for a feedforward-controller
+
+                                  ht = σ(xt, rt).  (2)
+
+2.3 Model Operation
+
+At each timestep t, the controller receives an input value xt. Then it generates the read
+
+weights wtr ∈ RN×1. By using the read weights wtr, the content vector read from the
+memory rt ∈ R(da+dc)×1 is computed as
+
+                                  rt = (Mt) wtr,   (3)
+
+The hidden state of the controller (ht) is conditioned on the memory content vector rt
+and based on this current hidden state of the controller. The model predicts the output
+
+label yt for the input.
+    The controller also updates the memory by erasing the old content and writing a
+
+new content into the memory. The controller computes three vectors: erase vector
+et ∈ Rdc×1, write weights wtw ∈ RN×1, and candidate memory content vector c¯t ∈
+Rdc×1. These vectors are used to modify the memory. Erase vector is computed by a
+simple MLP which is conditioned on the hidden state of the controller ht. The candidate
+memory content vector c¯t is computed based on the current hidden state of the controller
+ht ∈ Rdh×1 and the input of the controller which is scaled by a scalar gate αt. The αt is
+a function of the hidden state and the input of the controller.
+
+αt = f (ht, xt),                                   (4)
+
+c¯t = ReLU(Wmht + αtWxxt).                         (5)
+
+where Wm and Wx are trainable matrices and ReLU is the rectiﬁed linear activation
+
+function (Nair and Hinton, 2010). Given the erase, write and candidate memory content
+vectors (et, wtw, and c¯t respectively), the memory matrix is updated by,
+
+Ct[j] = (1 − etwtw[j]) Ct−1[j] + wtw[j]c¯t.        (6)
+
+where the index j in Ct[j] denotes the j-th row of the content matrix Ct of the memory
+matrix Mt.
+
+No Operation (NOP) As found in (Joulin and Mikolov, 2015), an additional NOP
+operation can be useful for the controller not to access the memory only once in a
+while. We model this situation by designating one memory cell as a NOP cell to which
+the controller should access when it does not need to read or write into the memory.
+Because reading from or writing into this memory cell is completely ignored.
+
+    We illustrate and elaborate more on the read and write operations of the D-NTM in
+Figure 1.
+
+    The computation of the read wtr and write vector wtw are the most crucial parts of
+the model since the controller decide where to read from and write into the memory by
+using those. We elaborate this in the next section.
+
+                                  4
+          Story          Controller                          Memory
+
+                      .                  .                   Address 1        Content
+                    .                  .                     Address 2
+                      .                  .                   Address 3        Content
+                                                             Address 4
+Fact t-1                                       Writer        Address 5        Content
+Fact t                                         Reader        Address 6
+Question                                       Content       Address 7        Content
+
+                                                                              Content
+
+                                                                              Content
+
+                                                                              Content
+                                                                        .
+                                                                        .
+                                                                        .
+
+                         Answer
+
+Figure 1: A graphical illustration of the proposed dynamic neural Turing machine with
+the recurrent-controller. The controller receives the fact as a continuous vector encoded
+by a recurrent neural network, computes the read and write weights for addressing the
+memory. If the D-NTM automatically detects that a query has been received, it returns
+an answer and terminates.
+
+3 Addressing Mechanism
+
+Each of the address vectors (both read and write) is computed in similar ways. First,
+the controller computes a key vector:
+
+                                         kt = Wk ht + bk,
+Both for the read and the write operations, kt ∈ R(da+dc)×1. Wk ∈ R(da+dc)×N and
+bk ∈ R(da+dc)×1 are the learnable weight matrix and bias respectively of kt. Also, the
+sharpening factor βt ∈ R ≥ 1 is computed as follows:
+
+                         βt = softplus(uβ ht + bβ) + 1.                                (7)
+
+where uβ and bβ are the parameters of the sharpening factor βt and softplus is deﬁned
+as follows:
+
+                         softplus(x) = log(exp(x) + 1)                                 (8)
+
+Given the key kt and sharpening factor βt, the logits for the address weights are then
+computed by,
+
+                         zt[i] = βtS (kt, Mt[i])                                       (9)
+
+where the similarity function is basically the cosine distance where it is deﬁned as
+
+S (x, y) ∈ R and 1 ≥ S (x, y) ≥ −1,
+
+                         S (x, y) =            x·y        .
+
+                                            ||x||||y|| +
+
+ is a small positive value to avoid division by zero. We have used = 1e − 7 in all our
+experiments. The address weight generation which we have described in this section is
+same with the content based addressing mechanism proposed in (Graves et al., 2014).
+
+                                            5
+3.1 Dynamic Least Recently Used Addressing
+
+We introduce a memory addressing operation that can learn to put more emphasis on
+the least recently used (LRU) memory locations. As observed in (Santoro et al., 2016;
+Rae et al., 2016), we ﬁnd it easier to learn the write operations with the use of LRU
+addressing.
+
+    To learn a LRU based addressing, ﬁrst we compute the exponentially moving av-
+erages of the logits (zt) as vt, where it can be computed as vt = 0.1vt−1 + 0.9zt.
+We rescale the accumulated vt with γt, such that the controller adjusts the inﬂuence of
+how much previously written memory locations should effect the attention weights of
+a particular time-step. Next, we subtract vt from zt in order to reduce the weights of
+previously read or written memory locations. γt is a shallow MLP with a scalar output
+and it is conditioned on the hidden state of the controller. γt is parametrized with the
+parameters uγ and bγ,
+
+γt = sigmoid(uγ ht + bγ),                   (10)
+
+wt = softmax(zt − γtvt−1).                  (11)
+
+    This addressing method increases the weights of the least recently used rows of the
+memory. The magnitude of the inﬂuence of the least-recently used memory locations is
+being learned and adjusted with γt. Our LRU addressing is dynamic due to the model’s
+ability to switch between pure content-based addressing and LRU. During the training,
+we do not backpropagate through vt. Due to the dynamic nature of this addressing
+mechanism, it can be used for both read and write operations. If needed, the model will
+automatically learn to disable LRU while reading from the memory.
+
+    The address vector deﬁned in Equation (11) is a continuous vector. This makes
+the addressing operation differentiable and we refer to such a D-NTM as continuous
+D-NTM.
+
+3.2 Discrete Addressing
+
+By deﬁnition in Eq. (11), every element in the address vector wt is positive and sums
+up to one. In other words, we can treat this vector as the probabilities of a categorical
+distribution C(wt) with dim(wt) choices:
+
+                                            p[j] = wt[j],
+
+where wt[j] is the j-th element of wt. We can readily sample from this categorical
+distribution and form an one-hot vector w˜ t such that
+
+                                         w˜ t[k] = I(k = j),
+
+where j ∼ C(w), and I is an indicator function. If we use w˜ t instead of wt, then we
+will read and write from only one memory cell at a time. This makes the addressing
+operation non-differentiable and we refer to such a D-NTM as discrete D-NTM. In
+discrete D-NTM we sample the one-hot vector during training. Once training is over,
+we switch to a deterministic strategy. We simply choose an element of wt with the
+largest value to be the index of the target memory cell, such that
+
+                                  w˜ t[k] = I(k = argmax(wt)).
+
+                                                   6
+3.3 Multi-step Addressing
+
+At each time-step, controller may require more than one-step for accessing to the mem-
+ory. The original NTM addresses this by implementing multiple sets of read, erase and
+write heads. In this paper, we explore an option of allowing each head to operate more
+than once at each timestep, similar to the multi-hop mechanism from the end-to-end
+memory network (Sukhbaatar et al., 2015).
+
+4 Training D-NTM
+
+Once the proposed D-NTM is executed, it returns the output distribution p(y(n)|x1(n), . . . , xT(n); θ)
+for the nth example that is parameterized with θ. We deﬁne our cost function as the neg-
+ative log-likelihood:
+
+                                   1  N
+                      C(θ) = −
+                                           log p(y(n)|x(1n), . . . , xT(n); θ),  (12)
+                                  N
+                                      n=1
+
+where θ is a set of all the parameters of the model.
+    Continuous D-NTM, just like the original NTM, is fully end-to-end differentiable
+
+and hence we can compute the gradient of this cost function by using backpropagation
+and learn the parameters of the model with a gradient-based optimization algorithm,
+such as stochastic gradient descent, to train it end-to-end. However, in discrete D-
+NTM, we use sampling-based strategy for all the heads during training. This clearly
+makes the use of backpropagation infeasible to compute the gradient, as the sampling
+procedure is not differentiable.
+
+4.1 Training discrete D-NTM
+
+To train discrete D-NTM, we use REINFORCE (Williams, 1992) together with the three
+
+variance reduction techniques–global baseline, input-dependent baseline and variance
+
+normalization– suggested in (Mnih and Gregor, 2014).
+
+Let us deﬁne R(x) = log p(y|x1, . . . , xT ; θ) as a reward. We ﬁrst center and re-
+
+scale the reward by,
+
+                                      R˜(x) = R√(x) − b ,
+                                                   σ2 +
+
+where b and σ is running average and standard deviation of R. We can further center it
+for each input x separately, i.e.,
+
+                      R¯(x) = R˜(x) − b(x),
+
+where b(x) is computed by a baseline network which takes as input x and predicts its
+
+estimated reward. The baseline network is trained to minimize the Huber loss (Huber,
+1964) between the true reward R˜(x) and the predicted reward b(x). This is also called
+
+as input based baseline (IBB) which is introduced in (Mnih and Gregor, 2014).
+
+                                           7
+We use the Huber loss to learn the baseline b(x) which is deﬁned by,
+
+                                            z2                for |z| ≤ δ,
+                             Hδ(z) = δ(2|z| − δ), otherwise,
+
+due to its robustness where z would be R¯(x) in this case. As a further measure to reduce
+the variance, we regularize the negative entropy of all those category distributions to
+facilitate a better exploration during training (Xu et al., 2015).
+
+    Then, the cost function for each training example is approximated as in Equation
+(13). In this equation, we write the terms related to compute the REINFORCE gradients
+that includes terms for the entropy regularization on the action space, the likelihood-
+ratio term to compute the REINFORCE gradients both for the read and the write heads.
+
+                Cn(θ) = − log p(y|x1:T , w˜ 1r:J , w˜ 1w:J )
+
+                                   J
+
+                             − R¯(xn)(log p(w˜ jr|x1:T ) + log p(w˜ jw|x1:T )
+
+                                  j=1
+
+                                  J
+
+                             − λH (H(wjr|x1:T ) + H(wjw|x1:T )).                                   (13)
+
+                                  j=1
+
+    where J is the number of addressing steps, λH is the entropy regularization coefﬁ-
+cient, and H denotes the entropy.
+
+4.2 Curriculum Learning for the Discrete Attention
+
+Training discrete attention with feedforward controller and REINFORCE is challeng-
+
+ing. We propose to use a curriculum strategy for training with the discrete attention in
+
+order to tackle this problem. For each minibatch, the controller stochastically decides
+
+to choose either to use the discrete or continuous weights based on the random variable
+
+πn with probability pn where n stands for the number of k minibatch updates such that
+
+we only update pn every k minibatch updates. πn is a Bernoulli random variable which
+
+is sampled with probability of pn, πn ∼ Bernoulli(pn). The model will either use the
+
+discrete or the continuous-attention based on the πn. We start the training procedure
+
+with  p0  =  1  and  during  the  training  pn  is  annealed  to  0  by  setting  pn  =  √p0    .
+                                                                                           1+n
+
+We can rewrite the weights wt as in Equation (14), where it is expressed as the
+
+combination of continuous attention weights w¯ t and discrete attention weights w˜ t with
+
+πt being a binary variable that chooses to use one of them,
+
+                                  wt = πnw¯ t + (1 − πn)w˜ t.                                      (14)
+
+    By using this curriculum learning strategy, at the beginning of the training, the
+
+model learns to use the memory mainly with the continuous attention. As we anneal
+the pt, the model will rely more on the discrete attention.
+
+                                                    8
+4.3 Regularizing D-NTM
+
+If the controller of D-NTM is a recurrent neural network, we ﬁnd it to be important to
+regularize the training of the D-NTM so as to avoid suboptimal solutions in which the
+D-NTM ignores the memory and works as a simple recurrent neural network.
+
+Read-Write Consistency Regularizer One such suboptimal solution we have ob-
+served in our preliminary experiments with the proposed D-NTM is that the D-NTM
+uses the address part A of the memory matrix simply as an additional weight matrix,
+rather than as a means to accessing the content part C. We found that this pathologi-
+cal case can be effectively avoided by encouraging the read head to point to a memory
+cell which has also been pointed by the write head. This can be implemented as the
+following regularization term:
+
+                                   T          1  t
+                                      ||1 − (
+Rrw(wr, ww) = λ                                       wtw) wtr ||22    (15)
+                                              t
+t =1                                             t=1
+
+In the equations above, wtw is the write and wtr is the read weights.
+
+Next Input Prediction as Regularization Temporal structure is a strong signal that
+should be exploited by the controller based on a recurrent neural network. We exploit
+this structure by letting the controller predict the input in the future. We maximize the
+predictability of the next input by the controller during training. This is equivalent to
+minimizing the following regularizer:
+
+                                                             T
+
+                    Rpred(W) = − log p(xt+1|xt, wtr, wtw, et, Mt; θ)
+
+                                                           t=0
+
+where xt is the current input and xt+1 is the input at the next timestep. We ﬁnd this
+regularizer to be effective in our preliminary experiments and use it for bAbI tasks.
+
+5 Related Work
+
+A recurrent neural network (RNN), which is used as a controller in the proposed D-
+NTM, has an implicit memory in the form of recurring hidden states. Even with this
+implicit memory, a vanilla RNN is however known to have difﬁculties in storing in-
+formation for long time-spans (Bengio et al., 1994; Hochreiter, 1991). Long short-term
+memory (LSTM, (Hochreiter and Schmidhuber, 1997)) and gated recurrent units (GRU,
+(Cho et al., 2014)) have been found to address this issue. However all these models
+based solely on RNNs have been found to be limited when they are used to solve, e.g.,
+algorithmic tasks and episodic question-answering.
+
+    In addition to the ﬁnite random access memory of the neural Turing machine, based
+on which the D-NTM is designed, other data structures have been proposed as external
+memory for neural networks. In (Sun et al., 1997; Grefenstette et al., 2015; Joulin and
+Mikolov, 2015), a continuous, differentiable stack was proposed. In (Zaremba et al.,
+
+                                                   9
+2015; Zaremba and Sutskever, 2015), grid and tape storage are used. These approaches
+differ from the NTM in that their memory is unbounded and can grow indeﬁnitely. On
+the other hand, they are often not randomly accessible. Zhang et al. (2015) proposed a
+variation of NTM that has a structured memory and they have shown experiments on
+copy and associative recall tasks with this model.
+
+    In parallel to our work (Yang, 2016) and (Graves et al., 2016) proposed new memory
+access mechanisms to improve NTM type of models. (Graves et al., 2016) reported
+superior results on a diverse set of algorithmic learning tasks.
+
+    Memory networks (Weston et al., 2015b) form another family of neural networks
+with external memory. In this class of neural networks, information is stored explicitly
+as it is (in the form of its continuous representation) in the memory, without being erased
+or modiﬁed during an episode. Memory networks and their variants have been applied
+to various tasks successfully (Sukhbaatar et al., 2015; Bordes et al., 2015; Dodge et al.,
+2015; Xiong et al., 2016; Chandar et al., 2016). Miller et al. (2016) have also indepen-
+dently proposed the idea of having separate key and value vectors for memory networks.
+A similar addressing mechanism is also explored in (Reed and de Freitas, 2016) in the
+context of learning program traces.
+
+    Another related family of models is the attention-based neural networks. Neural
+networks with continuous or discrete attention over an input have shown promising
+results on a variety of challenging tasks, including machine translation (Bahdanau et al.,
+2015; Luong et al., 2015), speech recognition (Chorowski et al., 2015), machine reading
+comprehension (Hermann et al., 2015) and image caption generation (Xu et al., 2015).
+
+    The latter two, the memory network and attention-based networks, are however
+clearly distinguishable from the D-NTM by the fact that they do not modify the content
+of the memory.
+
+6 Experiments on Episodic Question-Answering
+
+In this section, we evaluate the proposed D-NTM on the synthetic episodic question-
+answering task called Facebook bAbI (Weston et al., 2015a). We use the version of the
+dataset that contains 10k training examples per sub-task provided by Facebook.1 For
+each episode, the D-NTM reads a sequence of factual sentences followed by a question,
+all of which are given as natural language sentences. The D-NTM is expected to store
+and retrieve relevant information in the memory in order to answer the question based
+on the presented facts.
+
+6.1 Model and Training Details
+
+We use the same hyperparameters for all the tasks for a given model. We use a recurrent
+neural network with GRU units to encode a variable-length fact into a ﬁxed-size vec-
+tor representation. This allows the D-NTM to exploit the word ordering in each fact,
+unlike when facts are encoded as bag-of-words vectors. We experiment with both a
+recurrent and feedforward neural network as the controller that generates the read and
+
+  1 https://research.facebook.com/researchers/1543934539189348
+
+                                                   10
+write weights. The controller has 180 units. We train our feedforward controller using
+noisy-tanh activation function (Gulcehre et al., 2016) since we were experiencing train-
+ing difﬁculties with sigmoid and tanh activation functions. We use both single-step and
+three-steps addressing with our GRU controller. The memory contains 120 memory
+cells. Each memory cell consists of a 16-dimensional address part and 28-dimensional
+content part.
+
+    We set aside a random 10% of the training examples as a validation set for each
+sub-task and use it for early-stopping and hyperparameter search. We train one D-NTM
+for each sub-task, using Adam (Kingma and Ba, 2014) with its learning rate set to 0.003
+and 0.007 respectively for GRU and feedforward controller. The size of each minibatch
+is 160, and each minibatch is constructed uniform-randomly from the training set.
+
+6.2 Goals
+
+The goal of this experiment is three-fold. First, we present for the ﬁrst time the per-
+formance of a memory-based network that can both read and write dynamically on the
+Facebook bAbI tasks2. We aim to understand whether a model that has to learn to
+write an incoming fact to the memory, rather than storing it as it is, is able to work
+well, and to do so, we compare both the original NTM and proposed D-NTM against
+an LSTM-RNN.
+
+    Second, we investigate the effect of having to learn how to write. The fact that the
+NTM needs to learn to write likely has adverse effect on the overall performance, when
+compared to, for instance, end-to-end memory networks (MemN2N, (Sukhbaatar et al.,
+2015)) and dynamic memory network (DMN+, (Xiong et al., 2016)) both of which
+simply store the incoming facts as they are. We quantify this effect in this experiment.
+Lastly, we show the effect of the proposed learnable addressing scheme.
+
+    We further explore the effect of using a feedforward controller instead of the GRU
+controller. In addition to the explicit memory, the GRU controller can use its own
+internal hidden state as the memory. On the other hand, the feedforward controller
+must solely rely on the explicit memory, as it is the only memory available.
+
+6.3 Results and Analysis
+
+In Table 1, we ﬁrst observe that the NTMs are indeed capable of solving this type of
+episodic question-answering better than the vanilla LSTM-RNN. Although the avail-
+ability of explicit memory in the NTM has already suggested this result, we note that
+this is the ﬁrst time neural Turing machines have been used in this speciﬁc task.
+
+    All the variants of NTM with the GRU controller outperform the vanilla LSTM-
+RNN. However, not all of them perform equally well. First, it is clear that the proposed
+dynamic NTM (D-NTM) using the GRU controller outperforms the original NTM with
+the GRU controller (NTM, CBA only NTM vs. continuous D-NTM, Discrete D-NTM).
+As discussed earlier, the learnable addressing scheme of the D-NTM allows the con-
+troller to access the memory slots by location in a potentially nonlinear way. We expect
+
+  2Similar experiments were done in the recently published (Graves et al., 2016), but D-NTM results
+
+for bAbI tasks were already available in arxiv by that time.
+
+                                                   11
+Task      LSTM   MemN2N   DMN+   1-step  1-step   1-step   1-step   3-steps  3-steps  3-steps  3-steps
+1          0.00     0.00   0.00  LBA∗    CBA       Soft   Discrete  LBA∗      CBA       Soft   Discrete
+2         81.90     0.30   0.30  NTM     NTM     D-NTM    D-NTM     NTM      NTM               D-NTM
+3         83.10     2.10   1.10  16.30   16.88     5.41              0.00     0.00    D-NTM
+4          0.20     0.00   0.00  57.08   55.70    58.54     6.66    61.67    59.38      0.00     0.00
+5          1.20     0.80   0.50  74.16   55.00    74.58    56.04    83.54    65.21     46.66    62.29
+6         51.80     0.10   0.00   0.00    0.00     0.00    72.08     0.00     0.00     47.08    41.45
+7         24.90     2.00   2.40   1.46   20.41     1.66     0.00     0.83     1.46      0.00     0.00
+8         34.10     0.90   0.00  23.33   21.04    40.20     1.04    48.13    54.80      1.25     1.45
+9         20.20     0.30   0.00  21.67   21.67    19.16    44.79     7.92    37.70     20.62    11.04
+10        30.10     0.00   0.00  25.76   21.05    12.58    19.58    25.38     8.82      7.29     5.62
+11        10.30     0.10   0.00  24.79   24.17    36.66    18.46    37.80     0.00     11.02     0.74
+12        23.40     0.00   0.00  41.46   33.13    52.29    34.37    56.25    23.75     39.37    32.50
+13         6.10     0.00   0.00  18.96   31.88    31.45    50.83     3.96     0.28     20.00    20.83
+14        81.00     0.10   0.20  25.83   30.00     7.70     4.16    28.75    23.75     30.62    16.87
+15        78.70     0.00   0.00   6.67    5.63     5.62     6.66     5.83    83.13      5.41     4.58
+16        51.90    51.80  45.30  58.54   59.17    60.00     2.29    61.88    57.71      7.91     5.00
+17        50.10    18.60   4.20  36.46   42.30    36.87    63.75    35.62    21.88     58.12    60.20
+18         6.80     5.30   2.10  71.15   71.15    49.16    39.27    46.15    50.00     36.04    40.26
+19        90.30     2.30   0.00  43.75   43.75    17.91    51.35    43.75    56.25     46.04    45.41
+20         2.10     0.00   0.00   3.96   47.50     3.95    16.04    47.50    47.50     21.25     9.16
+Avg.Err.  36.41     4.24   2.81  75.89   71.51    73.74     3.54    61.56    63.65      6.87     1.66
+                                  1.25    0.00     2.70    64.63     0.40     0.00     75.88    76.66
+                                 31.42   33.60    29.51     3.12    32.85    32.76      3.33     0.00
+                                                           27.93                       24.24    21.79
+
+Table 1: Test error rates (%) on the 20 bAbI QA tasks for models using 10k training
+examples with the GRU and feedforward controller. FF stands for the experiments that
+are conducted with feedforward controller. Let us, note that LBA∗ refers to NTM that
+uses both LBA and CBA. In this table, we compare multi-step vs single-step address-
+ing, original NTM with location based+content based addressing vs only content based
+addressing, and discrete vs continuous addressing on bAbI.
+
+it to help with tasks that have non-trivial access patterns, and as anticipated, we see a
+large gain with the D-NTM over the original NTM in the tasks of, for instance, 12 -
+Conjunction and 17 - Positional Reasoning.
+
+    Among the recurrent variants of the proposed D-NTM, we notice signiﬁcant im-
+provements by using discrete addressing over using continuous addressing. We con-
+jecture that this is due to certain types of tasks that require precise/sharp retrieval of
+a stored fact, in which case continuous addressing is in disadvantage over discrete ad-
+dressing. This is evident from the observation that the D-NTM with discrete addressing
+signiﬁcantly outperforms that with continuous addressing in the tasks of 8 - Lists/Sets
+and 11 - Basic Coreference. Furthermore, this is in line with an earlier observation in
+(Xu et al., 2015), where discrete addressing was found to generalize better in the task
+of image caption generation.
+
+    In Table 2, we also observe that the D-NTM with the feedforward controller and
+discrete attention performs worse than LSTM and D-NTM with continuous-attention.
+However, when the proposed curriculum strategy from Sec. 3.2 is used, the average test
+error drops from 68.30 to 37.79.
+
+    We empirically found training of the feedforward controller more difﬁcult than that
+of the recurrent controller. We train our feedforward controller based models four times
+longer (in terms of the number of updates) than the recurrent controller based ones
+in order to ensure that they are converged for most of the tasks. On the other hand,
+the models trained with the GRU controller overﬁt on bAbI tasks very quickly. For
+example, on tasks 3 and 16 the feedforward controller based model underﬁts (i.e., high
+training loss) at the end of the training, whereas with the same number of units the
+model with the GRU controller can overﬁt on those tasks after 3,000 updates only.
+
+    We notice a signiﬁcant performance gap, when our results are compared to the vari-
+ants of the memory network (Weston et al., 2015b) (MemN2N and DMN+). We at-
+
+                                                 12
+tribute this gap to the difﬁculty in learning to manipulate and store a complex input.
+    Graves et al. (2016) also has also reported results with differentiable neural com-
+
+puter (DNC) and NTM on bAbI dataset. However their experimental setup is different
+from the setup we use in this paper. This makes the comparisons between more difﬁ-
+cult. The main differences broadly are, as the input representations to the controller,
+they used the embedding representation of each word whereas we have used the rep-
+resentation obtained with GRU for each fact. Secondly, they report only joint training
+results. However, we have only trained our models on the individual tasks separately.
+However, despite the differences in terms of architecture in DNC paper (see Table 1),
+the mean results of their NTM results is very close to ours 28.5% with std of +/- 2.9
+which we obtain 31.4% error.
+
+  Task       FF      FF         FF
+    1       Soft  Discrete  Discrete∗
+    2     D-NTM   D-NTM      D-NTM
+    3       4.38
+    4       27.5   81.67      14.79
+    5      71.25   76.67      76.67
+    6       0.00   79.38      70.83
+    7       1.67   78.65      44.06
+    8       1.46   83.13      17.71
+    9       6.04   48.76      48.13
+   10       1.70   54.79      23.54
+   11       0.63   69.75      35.62
+   12      19.80   39.17      14.38
+   13       0.00   56.25      56.25
+   14       6.25   78.96      39.58
+   15        7.5    82.5      32.08
+   16       17.5    75.0      18.54
+   17        0.0   78.75      24.79
+   18      49.65   71.42      39.73
+   19       1.25   71.46      71.15
+   20       0.24   43.75      43.75
+           39.47   48.13       2.92
+Avg.Err.     0.0   71.46      71.56
+           12.81   76.56       9.79
+                   68.30      37.79
+
+Table 2: Test error rates (%) on the 20 bAbI QA tasks for models using 10k training
+examples with feedforward controller.
+
+6.4 Visualization of Discrete Attention
+
+We visualize the attention of D-NTM with GRU controller with discrete attention in
+Figure 2. From this example, we can see that D-NTM has learned to ﬁnd the correct
+supporting fact even without any supervision for the particular story in the visualization.
+
+6.5 Learning Curves for the Recurrent Controller
+
+In Figure 3, we compare the learning curves of the continuous and discrete attention
+D-NTM model with recurrent controller on Task 1. Surprisingly, the discrete attention
+D-NTM converges faster than the continuous-attention model. The main difﬁculty of
+learning continuous-attention is due to the fact that learning to write with continuous-
+attention can be challenging.
+
+                  13
+Figure 2: An example view of the discrete attention over the memory slots for both
+read (left) and write heads(right). x-axis the denotes the memory locations that are
+being accessed and y-axis corresponds to the content in the particular memory location.
+In this ﬁgure, we visualize the discrete-attention model with 3 reading steps and on task
+20. It is easy to see that the NTM with discrete-attention accesses to the relevant part
+of the memory. We only visualize the last-step of the three steps for writing. Because
+with discrete attention usually the model just reads the empty slots of the memory.
+
+3.0              Train nll hard attention model
+
+                 Train nll soft attention model
+
+2.5
+
+2.0
+
+1.5
+
+1.0
+
+0.5
+
+0.0  0  50  100  150  200  250  300
+
+Figure 3: A visualization for the learning curves of continuous and discrete D-NTM
+models trained on Task 1 using 3 steps. In most tasks, we observe that the discrete
+attention model with GRU controller does converge faster than the continuous-attention
+model.
+
+                 14
+6.6 Training with Continuous Attention and Testing with Discrete
+      Attention
+
+In Table 3, we provide results to investigate the effects of using discrete attention model
+
+at the test-time for a model trained with feedforward controller and continuous attention.
+Discrete∗ D-NTM model bootstraps the discrete attention with the continuous attention,
+using the curriculum method that we have introduced in Section 4.2. Discrete† D-NTM
+
+model is the continuous-attention model which uses discrete-attention at the test time.
+We observe that the Discrete† D-NTM model which is trained with continuous-attention
+
+outperforms Discrete D-NTM model.
+
+     continuous Discrete Discrete∗ Discrete†
+
+Task D-NTM D-NTM D-NTM D-NTM
+
+1    4.38   81.67 14.79   72.28
+
+2    27.5   76.67 76.67   81.67
+
+3    71.25  79.38 70.83   78.95
+
+4    0.00   78.65 44.06   79.69
+
+5    1.67   83.13 17.71   68.54
+
+6    1.46   48.76 48.13   31.67
+
+7    6.04   54.79 23.54   49.17
+
+8    1.70   69.75 35.62   79.32
+
+9    0.63   39.17 14.38   37.71
+
+10   19.80  56.25 56.25   25.63
+
+11   0.00   78.96 39.58   82.08
+
+12   6.25   82.5   32.08  74.38
+
+13   7.5    75.0   18.54  47.08
+
+14   17.5   78.75 24.79   77.08
+
+15   0.0    71.42 39.73   73.96
+
+16   49.65  71.46 71.15   53.02
+
+17   1.25   43.75 43.75   30.42
+
+18   0.24   48.13  2.92   11.46
+
+19   39.47  71.46 71.56   76.05
+
+20   0.0    76.56  9.79   13.96
+
+Avg  12.81  68.30 37.79   57.21
+
+Table 3: Test error rates (%) on the 20 bAbI QA tasks for models using 10k training
+examples with the feedforward controller. Discrete∗ D-NTM model bootstraps the dis-
+
+crete attention with the continuous attention, using the curriculum method that we have
+introduced in Section 3.2. Discrete† D-NTM model is the continuous-attention model
+
+which uses discrete-attention at the test time.
+
+6.7 D-NTM with BoW Fact Representation
+
+In Table 4, we provide results for D-NTM using BoW with positional encoding (PE)
+Sukhbaatar et al. (2015) as the representation of the input facts. The facts representa-
+tions are provided as an input to the GRU controller. In agreement to our results with the
+GRU fact representation, with the BoW fact representation we observe improvements
+with multi-step of addressing over single-step and discrete addressing over continuous
+addressing.
+
+            15
+     Soft   Discrete      Soft   Discrete
+
+Task D-NTM(1-step) D-NTM(1-step) D-NTM(3-steps) D-NTM(3-steps)
+
+1    0.00   0.00          0.00   0.00
+
+2    61.04  59.37         56.87  55.62
+
+3    55.62  57.5          62.5   57.5
+
+4    27.29  24.89         26.45  27.08
+
+5    13.55  12.08         15.83  14.78
+
+6    13.54  14.37         21.87  13.33
+
+7    8.54   6.25          8.75   14.58
+
+8    1.69   1.36          3.01   3.02
+
+9    17.7   16.66         37.70  17.08
+
+10   26.04  27.08         26.87  23.95
+
+11   20.41  3.95          2.5    2.29
+
+12   0.41   0.83          0.20   4.16
+
+13   3.12   1.04          4.79   5.83
+
+14   62.08  58.33         61.25  60.62
+
+15   31.66  26.25         0.62   0.05
+
+16   54.47  48.54         48.95  48.95
+
+17   43.75  31.87         43.75  30.62
+
+18   33.75  39.37         36.66  36.04
+
+19   64.63  69.21         67.23  65.46
+
+20   1.25   0.00          1.45   0.00
+
+Avg  27.02  24.98         26.36  24.05
+
+Table 4: Test error rates (%) on the 20 bAbI QA tasks for models using 10k training
+examples with the GRU controller and representations of facts are obtained with BoW
+using positional encoding.
+
+7 Experiments on Sequential pMNIST
+
+In sequential MNIST task, the pixels of the MNIST digits are provided to the model in
+scan line order, left to right and top to bottom (Le et al., 2015). At the end of sequence
+of pixels, the model predicts the label of the digit in the sequence of pixels. We ex-
+periment D-NTM on the variation of sequential MNIST where the order of the pixels
+is randomly shufﬂed, we call this task as permuted MNIST (pMNIST). An important
+contribution of this task to our paper, in particular, is to measure the model’s ability to
+perform well when dealing with long-term dependencies. We report our results in Ta-
+ble 5, we observe improvements over other models that we compare against. In Table
+5, ”discrete addressing with MAB” refers to D-NTM model using REINFORCE with
+baseline computed from moving averages of the reward. Discrete addressing with IB
+refers to D-NTM using REINFORCE with input-based baseline.
+
+    In Figure 4, we show the learning curves of input-based-baseline (ibb) and regular
+REINFORCE with moving averages baseline (mab) on the pMNIST task. We observe
+that input-based-baseline in general is much easier to optimize and converges faster as
+well. But it can quickly overﬁt to the task as well. Let us note that, recurrent batch
+normalization with LSTM (Cooijmans et al., 2017) with 95.6% accuracy and it per-
+forms much better than other algorithms. However, it is possible to use recurrent batch
+normalization in our model and potentially improve our results on this task as well.
+
+    In all our experiments on sequential MNIST task, we try to keep the capacity of our
+model to be close to our baselines. We use 100 GRU units in the controller and each
+
+                      16
+                                              Test Acc
+
+D-NTM discrete MAB                            89.6
+
+D-NTM discrete IB                             92.3
+
+Soft D-NTM                                    93.4
+
+NTM                                           90.9
+
+I-RNN (Le et al., 2015)                       82.0
+
+Zoneout (Krueger et al., 2016)                93.1
+
+LSTM (Krueger et al., 2016)                   89.8
+
+Unitary-RNN (Arjovsky et al., 2016)           91.4
+
+Recurrent Dropout (Krueger et al., 2016)      92.5
+
+Recurrent Batch Normalization (Cooijmans et al., 2017) 95.6
+
+            Table 5: Sequential pMNIST.
+
+2.5
+
+                         validation learning curve of ibb
+
+2.0                      validation learning curve of mab
+
+                         training learning curve of ibb
+
+                  training learning curve of mab
+
+1.5
+
+1.0
+
+0.5
+
+0.0  0      20           40          60   80                 100
+
+Figure 4: We compare the learning curves of our D-NTM model using discrete attention
+on pMNIST task with input-based baseline and regular REINFORCE baseline. The x-
+axis is the loss and y-axis is the number of epochs.
+
+                                17
+content vector of size 8 and with address vectors of size 8. We use a learning rate of
+1e − 3 and trained the model with Adam optimizer. We did not use the read and write
+consistency regularization in any of our models.
+
+8 Stanford Natural Language Inference (SNLI) Task
+
+SNLI task (Bowman et al., 2015) is designed to test the abilities of different ma-
+chine learning algorithms for inferring the entailment between two different statements.
+Those two statements, can either entail, contradict or be neutral to each other. In this pa-
+per, we feed the premise followed by the end of premise (EOP) token and the hypothesis
+in the same sequence as an input to the model. Similarly Rockta¨schel et al. (2015) have
+trained their model by providing the premise and the hypothesis in a similar way. This
+ensures that the performance of our model does not rely only on a particular prepro-
+cessing or architectural engineering. But rather we mainly rely on the model’s ability
+to represent the sequence and the dependencies in the input sequence efﬁciently. The
+model proposed by Rockta¨schel et al. (2015), applies attention over its previous hidden
+states over premise when it reads the hypothesis.
+
+    In Table 6, we report results for different models with or without recurrent dropout
+(Semeniuta et al., 2016) and layer normalization (Ba et al., 2016).
+
+    The number of input vocabulary we use in our paper is 41200, we use GLOVE (Pen-
+nington et al., 2014) embeddings to initialize the input embeddings. We use GRU-
+controller with 300 units and the size of the embeddings are also 300. We optimize our
+models with Adam. We have done a hyperparameter search to ﬁnd the optimal learning
+rate via random search and sampling the learning rate from log-space between 1e − 2
+and 1e − 4 for each model. We use layer-normalization in our controller (Ba et al.,
+2016).
+
+    We have observed signiﬁcant improvements by using layer normalization and dropout
+on this task. Mainly because that the overﬁtting is a severe problem on SNLI. D-NTM
+achieves better performance compared to both LSTM and NTMs.
+
+                                                   Test Acc
+
+Word by Word Attention(Rockta¨schel et al., 2015)  83.5
+
+Word by Word Attention two-way(Rockta¨schel et al., 2015) 83.2
+
+LSTM + LayerNorm + Dropout                         81.7
+
+NTM + LayerNorm + Dropout                          81.8
+
+DNTM + LayerNorm + Dropout                         82.3
+
+LSTM (Bowman et al., 2015)                         77.6
+
+D-NTM                                              80.9
+
+NTM                                                80.2
+
+Table 6: Stanford Natural Language Inference Task
+
+                            18
+9 NTM Toy Tasks
+
+We explore the possibility of using D-NTM to solve algorithmic tasks such as copy and
+associative recall tasks. We train our model on the same lengths of sequences that is
+experimented in (Graves et al., 2014). We report our results in Table 7. We ﬁnd out that
+D-NTM using continuous-attention can successfully learn the ”Copy” and ”Associative
+Recall” tasks.
+
+    In Table 7, we train our model on sequences of the same length as the experiments
+in (Graves et al., 2014) and test the model on the sequences of the maximum length
+seen during the training. We consider a model to be successful on copy or associative
+recall if its validation cost (binary cross-entropy) is lower than 0.02 over the sequences
+of maximum length seen during the training. We set the threshold to 0.02 to determine
+whether a model is successful on a task. Because empirically we observe that the mod-
+els have higher validation costs perform badly in terms of generalization over the longer
+sequences. ”D-NTM discrete” model in this table is trained with REINFORCE using
+moving averages to estimate the baseline.
+
+            Copy Tasks Associative Recall
+
+Soft D-NTM  Success     Success
+                        Failure
+D-NTM discrete Success  Success
+
+NTM         Success
+
+     Table 7: NTM Toy Tasks.
+
+    On both copy and associative recall tasks, we try to keep the capacity of our model
+to be close to our baselines. We use 100 GRU units in the controller and each content
+vector of has a size of 8 and using address vector of size 8. We use a learning rate
+of 1e − 3 and trained the model with Adam optimizer. We did not use the read and
+write consistency regularization in any of our models. For the model with the discrete
+attention we use REINFORCE with baseline computed using moving averages.
+
+10 Conclusion and Future Work
+
+In this paper we extend neural Turing machines (NTM) by introducing a learnable ad-
+dressing scheme which allows the NTM to be capable of performing highly nonlinear
+location-based addressing. This extension, to which we refer by dynamic NTM (D-
+NTM), is extensively tested with various conﬁgurations, including different addressing
+mechanisms (continuous vs. discrete) and different number of addressing steps, on the
+Facebook bAbI tasks. This is the ﬁrst time an NTM-type model was tested on this
+task, and we observe that the NTM, especially the proposed D-NTM, performs better
+than vanilla LSTM-RNN. Furthermore, the experiments revealed that the discrete, dis-
+crete addressing works better than the continuous addressing with the GRU controller,
+and our analysis reveals that this is the case when the task requires precise retrieval of
+memory content.
+
+    Our experiments show that the NTM-based models can be weaker than other vari-
+ants of memory networks which do not learn but have an explicit mechanism of storing
+
+                                                   19
+incoming facts as they are. We conjecture that this is due to the difﬁculty in learning
+how to write, manipulate and delete the content of memory. Despite this difﬁculty, we
+ﬁnd the NTM-based approach, such as the proposed D-NTM, to be a better, future-proof
+approach, because it can scale to a much longer horizon (where it becomes impossible
+to explicitly store all the experiences.)
+
+    On pMNIST task, we show that our model can outperform other similar type of
+approaches proposed to deal with the long-term dependencies. On copy and associa-
+tive recall tasks, we show that our model can solve the algorithmic problems that are
+proposed to solve with NTM type of models.
+
+    Finally we have shown some results on the SNLI task where our model performed
+better than NTM and the LSTM on this task. However our results do not involve any
+task speciﬁc modiﬁcations and the results can be improved further by structuring the
+architecture of our model according to the SNLI task.
+
+    The success of both the learnable address and the discrete addressing scheme sug-
+gests two future research directions. First, we should try both of these schemes in a
+wider array of memory-based models, as they are not speciﬁc to the neural Turing ma-
+chines. Second, the proposed D-NTM needs to be evaluated on a diverse set of applica-
+tions, such as text summarization (Rush et al., 2015), visual question-answering (Antol
+et al., 2015) and machine translation, in order to make a more concrete conclusion.
+
+References
+
+Stanislaw Antol, Aishwarya Agrawal, Jiasen Lu, Margaret Mitchell, Dhruv Batra,
+  C. Lawrence Zitnick, and Devi Parikh. VQA: visual question answering. In 2015
+  IEEE International Conference on Computer Vision, ICCV 2015, Santiago, Chile,
+  December 7-13, 2015, pages 2425–2433, 2015.
+
+Martin Arjovsky, Amar Shah, and Yoshua Bengio. Unitary evolution recurrent neural
+  networks. ICML 2016, 2016.
+
+Jimmy Lei Ba, Jamie Ryan Kiros, and Geoffrey E Hinton. Layer normalization. arXiv
+  preprint arXiv:1607.06450, 2016.
+
+Dzmitry Bahdanau, Kyunghyun Cho, and Yoshua Bengio. Neural machine translation
+  by jointly learning to align and translate. In Proceedings Of The International Con-
+  ference on Representation Learning (ICLR 2015), 2015.
+
+Yoshua Bengio, Patrice Simard, and Paolo Frasconi. Learning long-term dependencies
+  with gradient descent is difﬁcult. Neural Networks, IEEE Transactions on, 5(2):
+  157–166, 1994.
+
+Antoine Bordes, Nicolas Usunier, Sumit Chopra, and Jason Weston. Large-scale simple
+  question answering with memory networks. arXiv preprint arXiv:1506.02075, 2015.
+
+Samuel R Bowman, Gabor Angeli, Christopher Potts, and Christopher D Manning.
+  A large annotated corpus for learning natural language inference. arXiv preprint
+  arXiv:1508.05326, 2015.
+
+                                                   20
+Sarath Chandar, Sungjin Ahn, Hugo Larochelle, Pascal Vincent, Gerald Tesauro, and
+  Yoshua Bengio. Hierarchical memory networks. arXiv preprint arXiv:1605.07427,
+  2016.
+
+Kyunghyun Cho, Bart van Merrienboer, Caglar Gulcehre, Fethi Bougares, Holger
+  Schwenk, and Yoshua Bengio. Learning phrase representations using rnn encoder-
+  decoder for statistical machine translation. In EMNLP, 2014.
+
+Jan Chorowski, Dzmitry Bahdanau, Dmitriy Serdyuk, Kyunghyun Cho, and Yoshua
+  Bengio. Attention-based models for speech recognition. arXiv preprint
+  arXiv:1506.07503, 2015.
+
+Tim Cooijmans, Nicolas Ballas, Ce´sar Laurent, and Aaron Courville. Recurrent batch
+  normalization. ICLR 2017, Toullone France, 2017.
+
+Jesse Dodge, Andreea Gane, Xiang Zhang, Antoine Bordes, Sumit Chopra, Alexan-
+  der Miller, Arthur Szlam, and Jason Weston. Evaluating prerequisite qualities for
+  learning end-to-end dialog systems. CoRR, abs/1511.06931, 2015.
+
+Ian Goodfellow, Yoshua Bengio, and Aaron Courville. Deep learning. Book in prepa-
+  ration for MIT Press, 2016. URL http://www.deeplearningbook.org.
+
+Alex Graves, Greg Wayne, and Ivo Danihelka. Neural turing machines. arXiv preprint
+  arXiv:1410.5401, 2014.
+
+Alex Graves, Greg Wayne, Malcolm Reynolds, Tim Harley, Ivo Danihelka, Agnieszka
+  Grabska-Barwin´ska, Sergio Go´mez Colmenarejo, Edward Grefenstette, Tiago Ra-
+  malho, John Agapiou, et al. Hybrid computing using a neural network with dynamic
+  external memory. Nature, 538(7626):471–476, 2016.
+
+Edward Grefenstette, Karl Moritz Hermann, Mustafa Suleyman, and Phil Blunsom.
+  Learning to transduce with unbounded memory. In Advances in Neural Information
+  Processing Systems, pages 1819–1827, 2015.
+
+Caglar Gulcehre, Marcin Moczulski, Misha Denil, and Yoshua Bengio. Noisy activation
+  functions. ICML 2016, New York, 2016.
+
+Karl Moritz Hermann, Toma´sˇ Kocˇisky`, Edward Grefenstette, Lasse Espeholt, Will Kay,
+  Mustafa Suleyman, and Phil Blunsom. Teaching machines to read and comprehend.
+  arXiv preprint arXiv:1506.03340, 2015.
+
+Felix Hill, Antoine Bordes, Sumit Chopra, and Jason Weston. The goldilocks princi-
+  ple: Reading children’s books with explicit memory representations. arXiv preprint
+  arXiv:1511.02301, 2015.
+
+Sepp Hochreiter. Untersuchungen zu dynamischen neuronalen netzen. Diploma, Tech-
+  nische Universita¨t Mu¨nchen, page 91, 1991.
+
+Sepp Hochreiter and Ju¨rgen Schmidhuber. Long short-term memory. Neural Computa-
+  tion, 9(8):1735–1780, 1997.
+
+                                                   21
+Peter J. Huber. Robust estimation of a location parameter. Ann. Math. Statist., 35(1):
+  73–101, 03 1964.
+
+Armand Joulin and Tomas Mikolov. Inferring algorithmic patterns with stack-
+  augmented recurrent nets. In Advances in Neural Information Processing Systems,
+  pages 190–198, 2015.
+
+Diederik P. Kingma and Jimmy Ba. Adam: A method for stochastic optimization.
+  CoRR, abs/1412.6980, 2014.
+
+David Krueger, Tegan Maharaj, Ja´nos Krama´r, Mohammad Pezeshki, Nicolas Bal-
+  las, Nan Rosemary Ke, Anirudh Goyal, Yoshua Bengio, Hugo Larochelle, Aaron
+  Courville, et al. Zoneout: Regularizing rnns by randomly preserving hidden activa-
+  tions. arXiv preprint arXiv:1606.01305, 2016.
+
+Quoc V Le, Navdeep Jaitly, and Geoffrey E Hinton. A simple way to initialize recurrent
+  networks of rectiﬁed linear units. arXiv preprint arXiv:1504.00941, 2015.
+
+Minh-Thang Luong, Hieu Pham, and Christopher D Manning. Effective approaches to
+  attention-based neural machine translation. In Proceedings Of The Conference on
+  Empirical Methods for Natural Language Processing (EMNLP 2015), 2015.
+
+Alexander Miller, Adam Fisch, Jesse Dodge, Amir-Hossein Karimi, Antoine Bordes,
+  and Jason Weston. Key-value memory networks for directly reading documents.
+  CoRR, abs/1606.03126, 2016. URL http://arxiv.org/abs/1606.03126.
+
+Andriy Mnih and Karol Gregor. Neural variational inference and learning in belief
+  networks. International Conference on Machine Learning, ICML, 2014.
+
+Vinod Nair and Geoffrey E Hinton. Rectiﬁed linear units improve restricted boltzmann
+  machines. In Proceedings of the 27th international conference on machine learning
+  (ICML-10), pages 807–814, 2010.
+
+Jeffrey Pennington, Richard Socher, and Christopher D Manning. Glove: Global vec-
+  tors for word representation. In EMNLP, volume 14, pages 1532–1543, 2014.
+
+Jack W Rae, Jonathan J Hunt, Tim Harley, Ivo Danihelka, Andrew Senior, Greg Wayne,
+  Alex Graves, and Timothy P Lillicrap. Scaling memory-augmented neural networks
+  with sparse reads and writes. In Advances in NIPS. 2016.
+
+Scott Reed and Nando de Freitas. Neural programmer-interpreters. ICLR 2016, 2016.
+
+Tim Rockta¨schel, Edward Grefenstette, Karl Moritz Hermann, Toma´sˇ Kocˇisky`, and
+  Phil Blunsom. Reasoning about entailment with neural attention. arXiv preprint
+  arXiv:1509.06664, 2015.
+
+Alexander M. Rush, Sumit Chopra, and Jason Weston. A neural attention model for
+  abstractive sentence summarization. In Proceedings of the 2015 Conference on Em-
+  pirical Methods in Natural Language Processing, EMNLP 2015, Lisbon, Portugal,
+  September 17-21, 2015, pages 379–389, 2015.
+
+                                                   22
+Adam Santoro, Sergey Bartunov, Matthew Botvinick, Daan Wierstra, and Timothy Lil-
+  licrap. One-shot learning with memory-augmented neural networks. ICML 2016,
+  2016.
+
+Stanislau Semeniuta, Aliaksei Severyn, and Erhardt Barth. Recurrent dropout without
+  memory loss. arXiv preprint arXiv:1603.05118, 2016.
+
+Iulian V Serban, Alessandro Sordoni, Yoshua Bengio, Aaron Courville, and Joelle
+  Pineau. Building end-to-end dialogue systems using generative hierarchical neural
+  network models. In Proceedings of the 30th AAAI Conference on Artiﬁcial Intelli-
+  gence (AAAI-16), 2016.
+
+Sainbayar Sukhbaatar, Arthur Szlam, Jason Weston, and Rob Fergus. End-to-end mem-
+  ory networks. arXiv preprint arXiv:1503.08895, 2015.
+
+Guo-Zheng Sun, C. Lee Giles, and Hsing-Hen Chen. The neural network pushdown au-
+  tomaton: Architecture, dynamics and training. In Adaptive Processing of Sequences
+  and Data Structures, International Summer School on Neural Networks, pages 296–
+  345, 1997.
+
+Oriol Vinyals and Quoc Le. A neural conversational model. arXiv preprint
+  arXiv:1506.05869, 2015.
+
+Jason Weston, Antoine Bordes, Sumit Chopra, and Tomas Mikolov. Towards ai-
+  complete question answering: a set of prerequisite toy tasks. arXiv preprint
+  arXiv:1502.05698, 2015a.
+
+Jason Weston, Sumit Chopra, and Antoine Bordes. Memory networks. In Proceedings
+  Of The International Conference on Representation Learning (ICLR 2015), 2015b.
+  In Press.
+
+Ronald J. Williams. Simple statistical gradient-following algorithms for connectionist
+  reinforcement learning. Machine Learning, 8:229–256, 1992.
+
+Caiming Xiong, Stephen Merity, and Richard Socher. Dynamic memory networks for
+  visual and textual question answering. CoRR, abs/1603.01417, 2016.
+
+Kelvin Xu, Jimmy Ba, Ryan Kiros, Aaron Courville, Ruslan Salakhutdinov, Richard
+  Zemel, and Yoshua Bengio. Show, attend and tell: Neural image caption generation
+  with visual attention. In Proceedings Of The International Conference on Represen-
+  tation Learning (ICLR 2015), 2015.
+
+Greg Yang. Lie access neural turing machine. arXiv preprint arXiv:1602.08671, 2016.
+
+Li Yao, Atousa Torabi, Kyunghyun Cho, Nicolas Ballas, Christopher Pal, Hugo
+  Larochelle, and Aaron Courville. Describing videos by exploiting temporal struc-
+  ture. In Computer Vision (ICCV), 2015 IEEE International Conference on. IEEE,
+  2015.
+
+                                                   23
+Wojciech Zaremba and Ilya Sutskever. Reinforcement learning neural turing machines.
+  CoRR, abs/1505.00521, 2015.
+
+Wojciech Zaremba, Tomas Mikolov, Armand Joulin, and Rob Fergus. Learning simple
+  algorithms from examples. arXiv preprint arXiv:1511.07275, 2015.
+
+Wei Zhang, Yang Yu, and Bowen Zhou. Structured memory for neural turing machines.
+  arXiv preprint arXiv:1510.03931, 2015.
+
+                                                   24
+

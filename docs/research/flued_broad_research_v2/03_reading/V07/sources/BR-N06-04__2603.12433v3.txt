@@ -1,0 +1,922 @@
+                                       Revisiting Model Stitching in the Foundation Model Era
+
+                                                Zheda Mai1,3* Ke Zhang3 Fu-En Wang3 Zixiao Ken Wang3
+                                       Albert Y. C. Chen3 Lu Xia3 Min Sun3 Wei-Lun Chao2 Cheng-Hao Kuo3
+
+                                             1The Ohio State University 2Boston University 3Amazon
+
+                                       https://zheda-mai.github.io/Model-Stitch                                          mai.145@osu.edu
+
+arXiv:2603.12433v3 [cs.CV] 2 Jun 2026                          Abstract                                 Layer 1  Layer 1   Layer 1   Layer 1   Layer 1
+
+                                          Model stitching, connecting early layers of one model             ...       ...       ...       ...       ...
+                                       (source) to later layers of another (target) via a light stitch
+                                       layer, has served as a probe of representational compati-        Layer n  Layer n   Layer n   Layer n   Layer n
+                                       bility. Prior work finds that models trained on the same
+                                       dataset remain stitchable (negligible accuracy drop) despite      Stitch             Stitch              Stitch
+                                       different initializations or objectives. We revisit stitching     Layer              Layer               Layer
+                                       for Vision Foundation Models (VFMs) that vary in objec-
+                                       tives, data, and modality (e.g., CLIP, DINOv2, SigLIP2)          Feature L2 Loss    Layer n+1 Layer n+1 Layer n+1
+                                       and ask: Are heterogeneous VFMs stitchable? We intro-
+                                       duce a systematic protocol spanning stitch positions, stitch     Layer    Model     Layer N Layer N     Layer N
+                                       layer families, training losses, and downstream tasks. Three     Layer    Model       Feature L2 Loss
+                                       findings emerge. (1) Stitch layer training matters: con-                                                Task FT
+                                       ventional approaches that match the intermediate features                                                 Loss
+                                       at the stitch position or optimize the task loss end-to-end
+                                       struggle to retain accuracy, especially at shallow stitch po-    (a) Layer Feature (b) Final Feature (c) Task Loss
+                                       sitions. (2) With a simple feature-matching loss at the target
+                                       model’s penultimate layer, heterogeneous VFMs become re-         Matching           Matching            Training
+                                       liably stitchable across vision tasks. (3) For deep stitch po-
+                                       sitions, the stitched model can significantly surpass either     Figure 1. Model stitching training strategies: (a) Layer feature
+                                       constituent model with a small inference overhead (for the       matching trains the stitch layer to match features between the
+                                       stitch layer). Building on these findings, we further propose    source and target models at the stitch position. (b) Final feature
+                                       the VFM Stitch Tree (VST), which shares early layers across      matching trains the stitch layer so that the stitched model matches
+                                       VFMs while retaining their later layers, yielding a control-     the target model’s final features. (c) Task loss training optimizes
+                                       lable accuracy-latency trade-off for multimodal LLMs that        the stitch layer with downstream task objective. Across all strate-
+                                       often leverage multiple VFMs. Taken together, our study          gies, the stitch layer is the only trainable component; the source
+                                       elevates stitching from a diagnostic probe to a practical        and target models are kept frozen.
+                                       recipe for integrating complementary VFM strengths and
+                                       pinpointing where their representations align or diverge.        generalization and transferability: users can often fine-tune
+                                                                                                        with little (or no) task-specific data and reach accuracy that
+                                       1. Introduction                                                  was out of reach only a few years ago [33, 35].
+
+                                       The last decade has seen a shift from crafting bespoke              A natural question follows. Although VFMs achieve dif-
+                                       model architectures to pre-training vision foundation mod-       ferent scores on downstream, capability-probing tasks [12,
+                                       els (VFMs)—typically Transformers—on massive, hetero-            45], are they fundamentally different “end-to-end,” or are
+                                       geneous data with diverse objectives [4, 39, 49]. VFMs now       their internal representations similar or compatible up to
+                                       serve as default backbones for many tasks thanks to strong       simple transformations? The answer matters for strategy:
+                                                                                                        should we keep training new models (costly), or invest in
+                                           *Work done during internship at Amazon.                      managing and integrating existing ones?
+
+                                                                                                           We study this through model stitching: connecting the
+                                                                                                        early layers of a source model to the later layers of a target
+model via a light stitch layer [3, 9] (Figure 1). Two models      From probe to system: VFM Stitch Tree (VST). Modern
+are stitchable if, with all original weights frozen and only      multimodal systems (e.g. Multimodal LLMs and Vision-
+the stitch layer trained, the stitched model matches the tar-     Language Models) increasingly deploy multiple VFMs to
+get model’s accuracy (i.e., negligible drop). Existing results    capture complementary visual cues but incurs linear com-
+showed that small models (e.g., ResNet-18 [15]) trained on        pute/memory overhead. Leveraging stitchability, we pro-
+the same dataset (e.g., CIFAR-10 [28]) are stitchable de-         pose the VFM Stitch Tree (VST): share early layers across
+spite different initializations or objectives. We extend this     VFMs and retain specialized deep layers, enabling a con-
+question to VFMs, large Transformers trained with different       trollable accuracy-latency trade-off. Taking a LLaVA
+datasets (e.g., LAION [21], WebLI [49], LVD-142M [37]),           model [31] with two VFMs as an example, VST with 22
+objectives (contrastive vs. reconstruction), and modalities       shared layers and 1 specialized layer (4.3% extra resources)
+(vision-language vs. pure vision)—including CLIP [39],            achieves 45% gain of the full two-VFM (requires 100% ex-
+DINOv2 [37], DINOv3 [40] and SigLIP 2 [49].                       tra resources). With 14 shared + 9 specialized layers (40%
+                                                                  extra), VST achieves 84% of the gain. Thus, VST offers a
+Our contribution. We develop a systematic protocol cover-         compute-aware knob for integrating complementary VFMs
+ing the stitch positions, stitch layer designs, training losses,  in multimodal systems.
+and multiple downstream tasks, and conduct a comprehen-           Summary. Our paper has the following key contributions.
+sive analysis. Key insights are as follows.                       • We revisit model stitching for VFMs and show that with
+
+Naive stitching fails. We revisit two common strategies to          appropriate training, they are reliably stitchable. Across
+learn the stitch layer [3, 42]: 1) Layer Feature Matching—          vision tasks, stitched models consistently improve upon
+train the stitch layer to match features between the source         baseline performance, suggesting complementary knowl-
+and target models at the stitch position; and 2) Task-Loss          edge transfer between VFMs.
+Training—optimize only the downstream objective (e.g.,            • Based on the findings, we propose VFM Stitch Tree, of-
+cross-entropy). In the VFM setting, both struggle, some-            fering a controllable performance–efficiency trade-off for
+times even much worse than either constituent model, and            multimodal LLMs that employ multiple VFMs.
+failures are more pronounced at shallow stitch positions.         • To our knowledge, this is the first systematic study of
+                                                                    model stitching for VFMs, aiming to advance this tech-
+Tailored training matters. A closer look at the failures            nique from a pure diagnostic probe toward a practical
+suggests that how to train the stitch layer matters. On the         recipe and open a path for future work to integrate com-
+one hand, low feature matching error at the stitch position         plementary VFM strengths.
+does not imply aligned final representations, particularly for
+shallow stitches. On the other hand, Task-Loss Training           2. Related Work
+faces an intrinsic optimization challenge at shallow stitch
+positions. As all target model’s layers after the stitch po-      2.1. Model Stitching and Representational Analysis
+sitions are frozen, gradients originating from the prediction
+head with weak supervision (e.g., via the final pooled to-        Foundations of Model Stitching. Model stitching was
+ken) must traverse these frozen layers to adjust only the         introduced by [29] as a tool for analyzing representations
+stitch layer, making the loss landscape poorly conditioned,       through the lens of equivariance and equivalence. The key
+especially when the stitch layer is randomly initialized. We      idea is to connect intermediate layers from two models us-
+therefore propose a simple two-stage recipe: (i) pre-train        ing a trainable stitch layer and measure whether the stitched
+the stitch layer to match the target model’s final output fea-    model remains functional. Subsequent work [3] showed
+tures (Final Feature Matching), and then (ii) fine-tune with      that models trained under similar settings are often stitch-
+the downstream task loss. The pre-training largely reduces        able with negligible performance degradation, suggesting a
+output-feature discrepancy, and the subsequent fine-tuning        certain degree of representational compatibility. A critical
+turns the good initialization into a strong stitched model        refinement in this field is the distinction between representa-
+accuracy—often matching or surpassing linear probes of ei-        tional similarity (e.g., CKA [26]) and functional similarity
+ther VFM across stitch positions.                                 (task performance compatibility) [9]. More recently, [42]
+                                                                  questioned whether stitching success should be interpreted
+Stitching integrates complementary strengths. To ensure           as evidence of semantic alignment, arguing instead that it
+gains are not merely from the adding stitch layer capacity,       may largely reflect representational clustering. [25] pro-
+we insert the same trainable module into the source-only          vided a broader survey of representation comparison meth-
+and target-only models. The stitched model consistently           ods, highlighting the difficulty of drawing robust conclu-
+outperforms these self-stitched controls across stitch posi-      sions about neural representations.
+tions (Figure 5), indicating that stitching VFMs is not only      Model Stitching Training. Recent work has explored dif-
+feasible but also has the potential to fuse complementarity       ferent objectives for learning the stitch layer. [8] com-
+between VFMs. We verify this across datasets and tasks—
+classification and semantic segmentation.
+pared layer feature matching, which trains the stitch layer to                                                         Stitch Position
+match source and target features at the stitch position, with
+task loss matching, which optimizes the stitch layer directly   Figure 2. Feature distance of Layer Feature Matching (LFM) and
+for downstream performance. They found that task loss           Final Feature Matching (FFM) on SigLIP→DINOv2. We measure
+matching can produce out-of-distribution intermediate rep-      the ℓ2 distance between the stitched model’s features and those of
+resentations that improve task-specific accuracy, whereas       the target model when stitching at different positions. indicates
+layer feature matching is often more reliable for represen-     the layer feature distance and indicates the final feature dis-
+tation analysis. Recently, Functional Latent Alignment [1]      tance. While LFM minimizes the layer feature distance, it leaves
+was proposed to encourage alignment not only at the stitch      a relatively large final feature distance. In contrast, FFM achieves
+position but also across subsequent layers.                     substantially smaller final-feature distance.
+Application of Model Stitching. Beyond representation
+analysis, model stitching has also been used for efficient      input x to the intermediate features An ∈ Rd×k at layer n:
+model design and deployment. For example, [38] and its          Rn(x) = f n ◦ · · · ◦ f 1(x) = An, where d and k denote the
+concurrent work [48] use stitching to construct flexible        token dimension and number of token. Similarly, we define
+model families that support resource-adaptive inference by      the function T N that map the An to the output feature AN :
+recombining components from different networks.                 T N (An) = f N ◦ · · · ◦ f n(An) = AN .
+
+   Despite this progress, existing work largely focuses on         Given a source and target VFM with parameters θ and
+relatively small models trained from scratch or ImageNet-       ϕ respectively, we can stitch them at layer n by matching
+scale pretraining. In contrast, we explore model stitching      the source features Aθn to the target feature Aϕn through a
+between independently trained large VFMs with substan-          trainable stitching layer S : Rdθ×k → Rdϕ×k. Thus, the
+tial heterogeneity in pretraining data (e.g., LAION [21],       stitched VFM can be represented by:
+LVD-142M [37]), learning objectives (contrastive versus re-
+construction), and modality (vision-language versus pure                            F (x) = TϕN ◦ S ◦ Rθn(x)
+vision). Furthermore, we shift the paradigm from pas-
+sive analysis to active knowledge fusion, demonstrating that       We want to emphasize that all the parameters in TϕN and
+stitching can bridge complementary specializations to sur-      Rθn are frozen; only the stitch layer S is trainable. Follow-
+pass the performance of individual constituent models.          ing [3, 9], for a given task, the source and target models are
+                                                                stitchable if the stitched model F has limited performance
+2.2. Vision Foundation Models                                   degradation compared to the target model fϕ.
+
+A wide range of architectures, learning strategies and data     3.2. How to Train the Stitch Layer?
+have been explored to develop vision foundation models
+(VFMs). Self-supervised models such as DINOv2 [37]              To answer whether heterogeneous VFMs are stitchable, we
+learn strong visual representations without explicit labels,    first explore the fundamental question: Are existing stitch-
+while vision-language models such as CLIP [39] and              ing approaches still effective for VFMs? Two training
+SigLIP [46, 49] use contrastive objectives to align images      strategies are most common (see Figure 1): (1) Layer Fea-
+and text. Efforts to scale both model size and data [10, 43]    ture Matching [9] and (2) Task Loss Training [3]. In the fol-
+have further pushed the boundaries of zero-shot generaliza-     lowing sections, we aim to conduct controlled experiments
+tion and robust representation learning. As a result of these   to evaluate their compatibility with VFMs.
+differences in architecture, supervision, and training data,    Experiment Setup. We start with two commonly used
+different VFMs often exhibit distinct strengths and weak-       VFMs: DINOv2-L [37] trained with only vision data (LVD-
+nesses across visual abilities, such as fine-grained recog-     142M) in a self-supervised manner, and SigLIP2-L [46]
+nition, depth estimation, and semantic grounding [34, 45].      trained on vision-language data (WebLI) [6] with both
+This diversity motivates us to ask whether fundamentally        vision self-supervised loss and language supervised loss.
+different VFMs can be stitched together, and if so, how their
+complementary specializations can be leveraged efficiently.
+Detailed descriptions of the VFMs considered in this work
+are provided in Appendix A.
+
+3. Model Stitching for VFMs
+
+3.1. Problem Formulation
+
+Let f = f N ◦· · ·◦f 1 be a VFM with N Transformer layers.
+For an image x, we define Rn as the function to map the
+Stitch Position       Stitch Position
+
+Figure 3. Final Feature Matching consistently shows better ac-    Figure 4. Our two-stage training approach (Final Feature Match-
+curacy than Layer Feature Matching. In the DINOv2→SigLIP2         ing + Task Loss Training) allows stitched models to consistently
+case, the stitched model can even exceed the performance of both  outperform linear-probing of both constituent models.
+constituent models.
+
+Both VFMs have 24 layers. In the following control stud-          final features at layer N between the stitch model F and
+ies, we use a two-layer perceptron with ReLU (MLP) as             target model fϕ:
+the stitch layer, as it’s a common feature projector for self-
+supervised learning [5] and multimodal LLMs (e.g. LLaVA-                       1  M
+1.5 [32]). We focus first on image classification with            LF F M = M
+fMoW [7], a challenging and commonly used fine-tuning                                  ∥TϕN (S(Rθn(xi))) − TϕN (Rϕn(xi))∥22
+dataset for VFM evaluation [11]. More setup details are
+provided in Appendix. Detailed investigation of stitch layer                      i=1
+families, datasets, VFM, and evaluation tasks will be dis-
+cussed in the latter sections.                                       As shown in Figure 2, compared with LFM, FFM sig-
+                                                                  nificantly reduces the final feature distances ( ) at shal-
+3.2.1. Layer Feature Matching (LFM)                               low stitch positions—precisely where difference accumu-
+                                                                  lation is most pronounced. More interestingly, although
+The intuition behind LFM is that the target features should       FFM directly matches the final features, it still retains sim-
+be easily matched from the source features if they are simi-      ilarly low layer feature distances ( ) as LFM, suggesting
+lar enough. Given unlabeled training images D = {xi}M i=1,        that the supervision at the final layer can induce implicit
+LFM trains S by minimizing the feature discrepancy at             local alignment at the stitch positions. The better final fea-
+layer n:                                                          ture alignment translates into better linear probing accuracy
+                                                                  (Figure 3): stitch models trained with FFM consistently out-
+             1   M                                                perform their LFM counterparts across stitch positions. No-
+LLF M = M                                                         tably, in the DINOv2→SigLIP2 case, the stitched model
+                      ∥S(Rθn(xi)) − Rϕn(xi)∥22                    can exceed the performance of both constituent models un-
+                                                                  der linear probing. Crucially, this improvement is achieved
+                 i=1                                              without using any labels; the stitch layer is trained only to
+                                                                  match the final representations in FFM.
+Note that LFM training is label-free, and if we pre-extract
+the source and target features, the training can be done with-    3.2.2. Task Loss Training (TLT)
+out VFM inference.
+Observations. To assess how well the target features can          Task Loss Training (TLT) trains the stitching layer directly
+be transformed from source features across stitch posi-
+tions n ∈ [2, 6, 10, 14, 18, 22], we measure on the valida-       with downstream task loss using the labeled training data
+tion set the mean ℓ2 layer feature distance ∥S(Rθn(x)) −          D = {(xi, yi)}M i=1, where ℓ is the task-specific loss (e.g.,
+Rϕn(x)∥2 ( in Figure 2). As expected, because LFM op-             cross-entropy for classification):
+timizes this directly, these distances are very small (order
+of 10−3). However, small layer feature discrepancies do                                1M   ℓ(F (xi), yi)
+not guarantee similarity at the final features. On the con-       Ltask = M                                (1)
+trary, we observe substantially larger final feature distances
+∥TϕN (S(Rθn(x))) − RϕN (x)∥2 ( in Figure 2), especially                                i=1
+for shallow stitches. Intuitively, a small mismatch could
+accumulate and possibly be amplified by the frozen target         Observations. Existing studies show that generally TLT
+layers, resulting in a pronounced final feature difference.       outperforms LFM across stitch positions, as it directly op-
+Remedy. Motivated by the observations above and inspired          timizes the task objective. We also observe this pattern at
+by feature distillation, we propose Final Feature Matching        deep stitch positions. However, in contrast to existing obser-
+(FFM), which trains the stitch layer to directly match the        vations, we find that TLT fails sharply for shallow stitches.
+                                                                  Taking DINOv2→SigLIP2 stitching at layer 2 as an ex-
+                                                                  ample, TLT attains only 25.1%, markedly below the lin-
+                                                                  ear probing for DINOv2 (46.7%), SigLIP2 (53.5%), LFM
+                                                                  (49.4%) and FFM (51.4%).
+Pre-train  DINOv2 → SigLIP2
+
+Stitch Position 2 6 10 14 18 22
+
+ No        25.1 39.4 52.6 62.3 68.6 68.6
+LFM        33.1 57.8 59.3 67.3 68.4 70.3
+FFM        51.7 59.8 61.1 68.0 72.0 71.8
+
+Pre-train  SigLIP2 → DINOv2
+
+Stitch Position 2 6 10 14 18 22
+
+ No        38.7 50.7 58.3 64.4 70.4 70.1                                                                          Stitch Position
+LFM        35.8 51.8 59.2 69.4 70.2 72.1
+FFM        53.8 53.8 61.9 69.6 70.4 72.2                             Figure 5. Stitched Model vs Self-Stitch. Both DINOv2→SigLIP
+                                                                     and SigLIP→DINOv2 (solid lines) consistently outperform their
+Table 1. Initializing the stitch layer with FFM substantially im-    respective self-stitch baselines (dashed lines), demonstrating gen-
+proves over naive TLT, especially at shallow stitch positions where  uine knowledge fusion gains.
+naive TLT severely underperforms. FFM also provides consis-
+tent gains at deeper stitch positions. Compared with LFM initial-    els(Figure 4). One might be tempted to conclude that VFMs
+ization, FFM offers a clear advantage at shallow stitch positions,   are broadly stitchable, given that stitched models typically
+while their performance becomes similar at deeper stitch positions   have around 0-10% accuracy drop compared to the target
+(Numbers are accuracy on fMoW).                                      model in prior works [3]. However, in earlier studies, the
+                                                                     source, target, and stitch layer were all trained/evaluated on
+Remedy. When stitching shallowly, all post-stitch target             the same dataset (e.g., CIFAR-10). In contrast, VFMs are
+layers are frozen; thus, gradients from the prediction head          pretrained on massive, diverse data and evaluated via fine-
+must backpropagate through a long, fixed transformation to           tuning on downstream data. Under this regime, improve-
+update only the stitch layer. This may attenuate update di-          ments could arise simply from task adaptation in the stitch
+rections and cause optimization challenges, especially un-           layer. We therefore design baselines that disentangle stitch
+der random initialization and weak supervision (via pooled-          layer capacity.
+token). To place the stitch layer in a better loss landscape,
+we adopt a simple two-stage procedure:                               4.1. Self-Stitch Baseline
+
+   (i) Initialize the stitch layer by pre-training with FFM          To rigorously test whether gains only stem from added ca-
+  (ii) Fine-tune the stitch layer with TLT                           pacity, we introduce a Self-Stitch baseline: inserting the
+As summarized in Table 1, FFM initialization not only res-           identical stitch layer into the source-only and target-only
+cues na¨ıve TLT at shallow stitches where TLT alone under-           models at the same stitch positions. For example, for
+performs, but also yields consistent gains at deeper stitch          SigLIP2→DINOv2 stitched at layer 22, the baselines are
+positions. In our experiments, it also significantly surpasses       SigLIP2→SigLIP2 and DINOv2→DINOv2 with an identi-
+the linear-probing performance of both constituent models,           cal stitch module at layer 22. Self-stitch controls share the
+as shown in Figure 4. We also observe that shallow lay-              same trainable module, stitch positions, training loss, and
+ers consistently underperform. We hypothesize that early             downstream data. Matching self-stitch performance there-
+layers may encode pretraining-specific features (e.g., low-          fore indicates genuine VFM stitchability.
+level visual features for DINOv2, text-aligned features for
+SigLIP2) while deep layers may develop more transfer-                4.2. Stitching integrates complementary strengths
+able, task-relevant representations, leading to easier stitch-
+ing than shallow layers.                                             Figure 5 compares the cross-VFM stitched model against
+   Our approach also resonates with a recent work [8]                their self-stitched baselines. Surprisingly, the stitched
+which argues that TLT can create out-of-distribution repre-          model consistently outperforms the self-stitched controls
+sentations that optimize for task performance at the cost of         across stitch positions, indicating that improvements are
+representational fidelity. Our FFM initialization mitigates          not explained solely by stitch layer capacity or downstream
+this risk by first preserving representational fidelity, then        fine-tuning. Instead, the results suggest that stitching het-
+applying task-level adaptation for functionality.                    erogeneous VFMs is not only feasible but also has the po-
+                                                                     tential to fuse complementarity between them. To better un-
+4. Where do Improvements Come From?                                  derstand how knowledge fusion affects prediction behavior,
+                                                                     we provide prediction analysis for the stitched model and
+Why do our results differ from prior works? With our                 self-stitch baseline in Appendix B.
+two-stage training, the stitched model can substantially ex-
+ceed linear probing for both the source and target mod-
+Figure 6. Evaluation of DINOv2, DINOv3, SigLIP2 and CLIP.            cept for using CLIP as the source model. In this case,
+The stitched models generally outperform both corresponding          CLIP is a weaker VFM in our setting (as evidenced by
+self-stitch baselines across stitched layers, except for using CLIP  lower linear-probing and self-stitch performance), so the
+as the source model (discussion in Sec. 5.2).                        stitched model can improve over CLIP itself but still fails
+                                                                     to match the stronger target model. Viewing the source
+5. Generality of Model Stitching                                     as an encoder, this suggests that a weak encoder may dis-
+                                                                     card task-critical information that the stronger target net-
+To stay focused on exploring how to train the stitch layer in        work cannot recover. Conversely, when CLIP serves as the
+previous sections, we adopt a fixed experiment setup. We             target, the stitched model achieves strong performance, in-
+assess the consistency of our findings across datasets, tasks,       dicating that as long as a strong source model preserves
+stitch-layer architectures, and VFMs.                                rich intermediate representations, even a relatively weak
+                                                                     target can still transform these features into high-quality
+5.1. Validation Across Datasets & Tasks                              final predictions. These results are reminiscent of obser-
+                                                                     vations in encoder–decoder architectures for detection and
+In addition to fMoW [7] (satellite images), we evaluate on           segmentation, where upgrading only the encoder/backbone
+two widely used fine-grained classification datasets: iNat-          (e.g., from ResNet-50 to ResNet-101) reliably improves
+Subset [47] (animal species) and FGVC-Aircraft [36]. Be-             performance, while substituting a strong backbone with a
+yond classification, we evaluate semantic segmentation on            weaker one consistently degrades accuracy even under an
+ADE20K [50, 51] with a linear decoder [23]. To simplify              unchanged decoder [16, 22, 30].
+feature matching and avoid confounding factors, no data
+augmentation is used during training.                                  Stitch Position 2 6 10 14 18 22
+
+   As shown in Table 2, stitched models consistently sur-                         Linear 26.1 54.3 59.5 66.5 69.1 69.6
+pass the corresponding self-stitch baselines across datasets           D→S MLP 51.7 55.8 59.3 68.0 72.0 71.8
+in classification (+0.7% to +5.5%), indicating that the ob-
+served knowledge fusion gain is not a dataset-specific arti-                      LoRA 49.1 49.4 57.4 61.7 67.7 67.3
+fact but a generalizable observation. In ADE20K, we like-
+wise observe steady improvements over self-stitching (+0.5                        Linear 50.3 56.4 60.0 65.7 69.6 71.9
+to +0.7 mIoU), demonstrating that complementary knowl-                 S→D MLP 53.8 53.8 61.9 69.6 70.4 72.2
+edge fusion extends to dense prediction. We hypothesize
+that DINOv2 contributes robust perceptual structure while                         LoRA 48.3 56.2 62.4 65.3 66.2 65.0
+SigLIP2 provides stronger semantic alignment; their combi-
+nation, mediated by the stitch layer, yields modest yet reli-        Table 3. Stitch layer comparison: MLP consistently outperforms
+able improvements. More dataset details, experiment setup            Linear and the LoRA option across stitching directions (D→S,
+and results are provided in the Appendix.                            S→D) where D and S denote DINOv2 and SigLIP2, respectively.
+
+5.2. Validation Across More VFMs                                     5.3. Across Stitch Layer Families
+
+Beyond the DINOv2 and SigLIP2 pairs, we further include              Beyond the default MLP, we explore two different stitch
+the widely used CLIP and the recently released DINOv3                layers: (1) a linear layer and (2) source model’s n layer with
+to verify the generality of our findings. As shown in Fig-           LoRA [17], mapping (n−1)-layer features of the source to
+ure 6, the stitched models generally outperform both cor-            the n-layer features of the target. Concretely, (2) can be rep-
+responding self-stitch baselines across stitched layers, ex-         resented as FLoRA(x) = TϕN ◦ f(nθ,LoRA) ◦ Rθn−1(x) where
+                                                                     only LoRA parameters within fθn,LoRA [18, 35] are trainable.
+                                                                     From a capacity perspective, the linear layer processes to-
+                                                                     kens independently and is the least expressive; the MLP
+                                                                     adds nonlinearity while still operating per token; the LoRA
+                                                                     option allows inter-token interactions and is the most ex-
+                                                                     pressive. As reported in Table 3, the MLP generally attains
+                                                                     the strongest performance on the benchmarks considered,
+                                                                     with linear trailing—as expected given its lower capacity.
+                                                                     Somewhat counterintuitively, the LoRA-based option often
+                                                                     underperforms the MLP despite its higher expressiveness.
+                                                                     A plausible interpretation is that stitching may benefit from
+                                                                     controlled mismatch that enables complementary informa-
+                                                                     tion to be fused. If the stitch layer perfectly reproduces
+                                                                     the target’s intermediate features, S(Rθn(x)) = Rϕn(x), the
+                                                                     stitched model would be expected to match the target’s self-
+Stitch Position        fMoW           Classification                                 Aircraft                    Segmentation
+                                        iNaturalist                                                                ADE20K
+DINOv2→DINOv2        6 / 14 / 22                                                    6 / 14 / 22                      14 / 22
+SigLIP2→SigLIP2                          6 / 14 / 22
+                 41.5 / 59.7 / 69.9                                             37.8 / 79.3 / 91.2                 35.4 / 50.9
+DINOv2→SigLIP2   50.5 / 62.0 / 68.9  56.9 / 81.5 / 91.2                         67.9 / 88.1 / 89.3                 44.5 / 50.5
+SigLIP2→DINOv2                       71.2 / 88.5 / 87.3
+                 59.8 / 68.0 / 71.8  75.9 / 89.1 / 92.8                         77.8 / 87.6 / 92.4                 44.9 / 51.2
+                 53.8 / 69.6 / 72.2  86.3 / 88.9 / 91.9                         80.7 / 89.0 / 91.0                 49.0 / 51.4
+
+Table 2. Comprehensive results across all datasets and tasks. Classification results in accuracy (%), segmentation in mIoU (%). All results
+use the two-stage approach (Final Feature Matching + Task Loss Training).
+
+stitch, leaving little room for cross-model complementarity.              Key Findings
+
+5.4. Does Stitching Require Task-Specific Data?                           • Heterogeneous VFMs trained with different data,
+                                                                             objectives, and modalities remain stitchable
+Our previous results show that FFM is an effective stitch-                   across diverse vision tasks and datasets.
+ing objective. However, these findings rely on task-specific
+training data (e.g. use fMoW training images to learn the                 • Stitched VFMs consistently outperform self-
+stitch layer for evaluation on fMoW). We therefore ask                       stitch baselines, indicating that the gains arise not
+whether stitching must be task-specific, or whether it can                   merely from the added capacity of the stitch layer,
+instead be learned from general task-agnostic data. To study                 but also from the complementary strengths of dif-
+this, we train stitch layers using the task-agnostic LLaVA-                  ferent VFMs.
+1.5 data (1.1M images) [32], and evaluate the resulting
+stitched models on downstream tasks via linear probing,               6. From Insights To Applications
+without further TLT.
+
+fMoW             iNaturalist                                          Layer N Layer N       Layer N    Layer N    Layer N    Layer N    Layer N    Layer N
+
+T-Spec. T-Agn. T-Spec. T-Agn.                                         ...       ...             ...         ...        ...        ...        ...        ...
+
+                                                                      Layer n+1 Layer n+1  Layer n+1  Layer n+1  Layer n+1  Layer n+1  Layer n+1  Layer n+1
+
+D→S 54.7 53.8 77.3 77.45                                                                                         Stitch Layer Stitch Layer Stitch Layer Stitch Layer
+S→D 50.8 50.0 75.5 77.7
+
+Table 4. Comparison between task-specific (T-Spec.) and task-         Layer n   Layer n    Layer n    Layer n               Layer n
+agnostic (T-Agn.) stitching. Results are reported for layer 22 (ear-
+lier analysis identifies as a strong stitch position).                     ...       ...       ...         ...                  ...
+
+                                                                      Layer 1   Layer 1    Layer 1    Layer 1               Layer 1
+
+   As shown in Table 4, task-agnostic FFM achieves com-                         (a) Naive Multi-VFMs                        (b) VFM Stitch Tree
+parable, and in some cases better, accuracy compared to
+task-specific training. On fMoW, task-agnostic training               Figure 7. VFM Stitch Tree (VST) serves as a simple and efficient
+matches task-specific performance, while on iNat, it sur-             alternative to naively running all VFMs end-to-end.
+prisingly yields a performance gain. We hypothesize that
+iNat aligns more closely with the visual distribution of              6.1. The Efficiency Challenge For Multi-VFMs
+LLaVA-1.5 than fMoW, allowing the significantly larger
+scale of the LLaVA-1.5 data to facilitate more robust feature         Modern multimodal systems increasingly deploy multiple
+matching. These results suggest that stitch layers can be             VFMs to capture complementary visual information. For
+pre-trained in a task-agnostic manner and reused across di-           example, MoF-LLaVA [45] combines CLIP and DINOv2
+verse downstream applications, obviating the need for per-            to preserve instruction following while improving visual
+task retraining. More broadly, this indicates that stitching          grounding; OpenVLA [24] leverages SigLIP and DINOv2
+captures a fundamental alignment between the representa-              to fuse low-level spatial structure with higher-level seman-
+tion spaces of two VFMs rather than a narrow task-specific            tics; Cambrian-1 [44] shows that assembling four VFMs
+mapping. This opens the possibility for Hybrid VFMs:                  with distinct strengths can lift MLLM performance across
+stitching can be used for synthesizing a better VFM by fus-           diverse benchmarks. However, there is no free lunch: with
+ing the complementary strengths of distinct VFMs in a task-           k VFMs, one must load all of them into GPU memory (k×)
+agnostic way. Such hybrid models can then serve as more               and process each input k times, yielding roughly k× la-
+versatile backbones for a wide array of downstream tasks.             tency. Question: Can we design an architecture that re-
+                                                                      tains the benefits of multiple VFMs without incurring linear
+             LLM                                                      LLM
+
+Layer N      Layer N    What is the color          Layer N     Layer N     What is the color
+                         of the shirt the                                   of the shirt the
+    ...          ...    man is wearing?                 ...        ...     man is wearing?
+
+Layer n      Layer n                              Layer n+1   Layer n+1
+
+                                                             Stitch Layer
+
+Layer n - 1  Layer n-1                                       Layer n       Layer  DINOv2
+                                                                           Layer  CLIP
+     ...          ...                                            ...
+
+  Layer 1     Layer 1                                        Layer 1
+
+             (a) Naive Multi-VFMs                            (b) VFM Stitch Tree              Figure 9. VST recovers 45% and 84% of the gain achieved by the
+                                                                                              naive multi-VFM baseline (100% extra resources), with only 4.3%
+Figure 8. VFM Stitch Tree (VST) can be easily applied in various                              and 39% extra resources. Details are in Appendix.
+multimodal systems. This is an example of VST in a MoF-LLaVA
+with CLIP and DINOv2.                                                                         performance, 100% extra backbone cost) or none (no
+                                                                                              gain). VST introduces a compute-aware knob that inter-
+compute and memory costs?                                                                     polates between these extremes, enabling controllable per-
+                                                                                              formance–efficiency trade-offs under real deployment con-
+6.2. VFM Stitch Tree (VST)                                                                    straints. We view this as an initial step toward resource-
+                                                                                              conscious multi-VFM design; broader evaluations are pro-
+Motivated by the stitchability of VFMs, we propose the                                        vided in the Appendix.
+VFM Stitch Tree (VST): shares common shallow layers
+across VFMs while retains model-specific deep layers, con-                                       We want to highlight that our findings on VFM stitch-
+nected via stitch layers (Figure 7). VST serves as a simple                                   ability open a fertile space of research questions about
+and efficient alternative to naively running all VFMs end-                                    knowledge fusion and also indicate potential for practical
+to-end. Consider Cambrian-1 with four VFMs. A VST                                             utility. VST is just one instantiation of how these insights
+stitched at layer 14 reduces GPU memory and computation                                       can be applied. The central takeaway is that heterogeneous
+relative to running all four full VFMs (Tab. 5).                                              VFMs can be stitched and fused to exploit complementary
+                                                                                              knowledge, which has potential applications across differ-
+Method Param (M) GFLOPs Lat. (ms) Mem (MB)                                                    ent domains and use cases.
+
+Naive                   1581.4             878.8             96.2          6075               7. Conclusion
+                                                                           4502
+VST-6                   1219.0             701.7             71.4          3065               We revisit model stitching under the foundation model
+                                                                           1527               regime and find that, contrary to the common assumption
+VST-14                  815.9              419.5             43.9                             that heterogeneity hinders compatibility, VFMs trained with
+                                                                                              different data, objectives, and modalities can in fact be
+VST-22                  412.9              217.4             20.6                             stitched effectively. Our study shows that the key lies in
+                                                                                              how the stitch layer is trained: while conventional layer
+Table 5. Efficiency metrics for different stitching configurations.                           feature matching and naive end-to-end task optimization
+Latency is measured on a single NVIDIA A100 GPU with a batch                                  often fail, especially for shallow stitches, a simple two-
+size of 1. VST significantly reduces computational overhead com-                              stage strategy based on final feature matching followed by
+pared to the Naive Multi-VFM baseline.                                                        task fine-tuning yields strong and consistent results. Impor-
+                                                                                              tantly, stitched models not only remain functional but of-
+   We instantiate VST within a MoF-LLaVA (CLIP + DI-                                          ten surpass corresponding self-stitch baselines, suggesting
+NOv2) with a Qwen-3B LLM [20]. The model is trained                                           that stitching can actively fuse complementary knowledge
+following the standard LLaVA-1.5 [32] training recipe and                                     across VFMs rather than merely preserve target behavior.
+datasets. We evaluate VST stitched at layer 14 and 22,                                        We further demonstrate that these findings generalize across
+as demonstrated in Figure 8. Relative to a single-VFM                                         tasks, datasets, stitch-layer designs, and model families, and
+LLaVA baseline, the na¨ıve two-VFM MoF-LLaVA doubles                                          that stitch layers can even be pretrained in a task-agnostic
+the VFM cost (100% extra). In contrast, our VST vari-                                         manner. Finally, we show how these insights enable VFM
+ants require only 39% (VST-14) and 4.3% (VST-22) addi-                                        Stitch Tree, a practical architecture that reduces the cost of
+tional resources. In this early exploration, we evaluate the                                  multi-VFM systems while preserving much of their benefit.
+MLLM on VQAv2 [14] and MME-Perception and MME-                                                Taken together, our work advances model stitching from a
+Cognition [13]. As shown in Figure 9, VST-22, with just                                       representational probe to a practical paradigm for integrat-
+one additional specialized layer (4.3% overhead), recovers                                    ing and scaling heterogeneous foundation models.
+45% of the two-VFM performance gain; when more budget
+is available, VST-14 reaches 84% of that gain at 39% over-
+head. We provide experiment setup, detailed results and
+resource calculation in the Appendix.
+Accuracy–efficiency knob. Without VST, users face a
+binary choice: deploy an entire additional VFM (higher
+References                                                                  ninth Annual Conference on Neural Information Processing
+                                                                            Systems Datasets and Benchmarks Track, 2025. 8
+ [1] Ioannis Athanasiadis, Anmar Karmush, and Michael Fels-
+      berg. Functional similarity by functional latent alignment.     [14] Yash Goyal, Tejas Khot, Douglas Summers-Stay, Dhruv Ba-
+      In Greeks in AI Symposium 2025, 2025. 3                               tra, and Devi Parikh. Making the v in vqa matter: Elevating
+                                                                            the role of image understanding in visual question answer-
+ [2] Jinze Bai, Shuai Bai, Yunfei Chu, Zeyu Cui, Kai Dang,                  ing. In Proceedings of the IEEE conference on computer
+      Xiaodong Deng, Yang Fan, Wenbin Ge, Yu Han, Fei                       vision and pattern recognition, pages 6904–6913, 2017. 8, 2
+      Huang, et al. Qwen technical report. In arXiv preprint
+      arXiv:2309.16609, 2023. 2                                       [15] Kaiming He, Xiangyu Zhang, Shaoqing Ren, and Jian Sun.
+                                                                            Deep residual learning for image recognition. In Proceed-
+ [3] Yamini Bansal, Preetum Nakkiran, and Boaz Barak. Revisit-              ings of the IEEE Conference on Computer Vision and Pattern
+      ing model stitching to compare neural representations. In Ad-         Recognition (CVPR), pages 770–778, 2016. 2
+      vances in Neural Information Processing Systems (NeurIPS),
+      2021. 2, 3, 5                                                   [16] Xinyu Hou, Peng Chen, and Haishuo Gu. Lm-deeplabv3+:
+                                                                            A lightweight image segmentation algorithm based on multi-
+ [4] Mathilde Caron, Hugo Touvron, Ishan Misra, Herve´ Je´gou,              scale feature interaction. Applied Sciences, 14(4):1558,
+      Julien Mairal, Piotr Bojanowski, and Armand Joulin. Emerg-            2024. 6
+      ing properties in self-supervised vision transformers. In
+      Proceedings of the IEEE/CVF International Conference on         [17] Edward J Hu, Yelong Shen, Phillip Wallis, Zeyuan Allen-
+      Computer Vision (ICCV), pages 9650–9660, 2021. 1                      Zhu, Yuanzhi Li, Shean Wang, Lu Wang, and Weizhu Chen.
+                                                                            Lora: Low-rank adaptation of large language models. arxiv
+ [5] Ting Chen, Simon Kornblith, Mohammad Norouzi, and Ge-                  2021. arXiv preprint arXiv:2106.09685, 10, 2021. 6
+      offrey Hinton. A simple framework for contrastive learning
+      of visual representations. In International conference on ma-   [18] Edward J Hu, Yelong Shen, Phillip Wallis, Zeyuan Allen-
+      chine learning, pages 1597–1607. PmLR, 2020. 4                        Zhu, Yuanzhi Li, Shean Wang, Liang Wang, Weizhu Chen,
+                                                                            et al. Lora: Low-rank adaptation of large language models.
+ [6] Xi Chen, Xiao Wang, Soravit Changpinyo, Anthony J Pier-                Iclr, 1(2):3, 2022. 6
+      giovanni, Piotr Padlewski, Daniel Salz, Sebastian Goodman,
+      Adam Grycner, Basil Mustafa, Lucas Beyer, et al. Pali:          [19] Drew A Hudson and Christopher D Manning. Gqa: A new
+      A jointly-scaled multilingual language-image model. arXiv             dataset for real-world visual reasoning and compositional
+      preprint arXiv:2209.06794, 2022. 3                                    question answering. In Proceedings of the IEEE/CVF con-
+                                                                            ference on computer vision and pattern recognition, pages
+ [7] Gordon Christie, Neil Fendley, James Wilson, and Ryan                  6700–6709, 2019. 2
+      Mukherjee. Functional map of the world. Proceedings of the
+      IEEE Conference on Computer Vision and Pattern Recogni-         [20] Binyuan Hui, Jian Yang, Zeyu Cui, Jiaxi Yang, Dayiheng
+      tion (CVPR), 2018. 4, 6, 1                                            Liu, Lei Zhang, Tianyu Liu, Jiajun Zhang, Bowen Yu, Kem-
+                                                                            ing Lu, et al. Qwen2. 5-coder technical report. arXiv preprint
+ [8] Katherine M Collins, Umang Bhatt, and Adrian Weller. How               arXiv:2409.12186, 2024. 8
+      not to stitch representations to measure similarity: Task loss
+      matching versus direct matching. In Proceedings of the AAAI     [21] Gabriel Ilharco, Mitchell Wortsman, Ross Wightman, Cade
+      Conference on Artificial Intelligence, 2025. 2, 5                     Gordon, Nicholas Carlini, Rohan Taori, Achal Dave,
+                                                                            Vaishaal Shankar, Hongseok Namkoong, John Miller, et al.
+ [9] Adria´n Csisza´rik, Pe´ter Ko˝ro¨si-Szabo´, A´ kos K. Matszan-         Openclip. https://github.com/mlfoundations/
+      gosz, Gergely Papp, and Da´niel Varga. Similarity and match-          open_clip, 2021. 2, 3
+      ing of neural network representations. In Advances in Neu-
+      ral Information Processing Systems (NeurIPS), pages 5656–       [22] Christoph Kamann and Carsten Rother. Benchmarking the
+      5668, 2021. 2, 3                                                      robustness of semantic segmentation models. In Proceed-
+                                                                            ings of the IEEE/CVF Conference on Computer Vision and
+[10] Alex Fang, Albin Madappally Jose, Amit Jain, Ludwig                    Pattern Recognition (CVPR), 2020. 6
+      Schmidt, Alexander Toshev, and Vaishaal Shankar. Data fil-
+      tering networks. arXiv preprint arXiv:2309.17425, 2023. 3       [23] Tommie Kerssies, Daan De Geus, and Gijs Dubbelman. How
+                                                                            to benchmark vision foundation models for semantic seg-
+[11] Enrico Fini, Mustafa Shukor, Xiujun Li, Philipp Dufter,                mentation? In Proceedings of the IEEE/CVF Conference
+      Michal Klein, David Haldimann, Sai Aitharaju, Victor                  on Computer Vision and Pattern Recognition, pages 1162–
+      G Turrisi da Costa, Louis Be´thune, Zhe Gan, et al. Multi-            1171, 2024. 6, 2
+      modal autoregressive pre-training of large vision encoders.
+      In Proceedings of the Computer Vision and Pattern Recogni-      [24] Moo Jin Kim, Karl Pertsch, Siddharth Karamcheti, Ted Xiao,
+      tion Conference, pages 9641–9654, 2025. 4                             Ashwin Balakrishna, Suraj Nair, Rafael Rafailov, Ethan
+                                                                            Foster, Grace Lam, Pannag Sanketi, et al. Openvla: An
+[12] Chaoyou Fu, Peixian Chen, Yunhang Shen, Yulei Qin,                     open-source vision-language-action model. arXiv preprint
+      Mengdan Zhang, Xu Lin, Jinrui Yang, Xiawu Zheng, Ke                   arXiv:2406.09246, 2024. 7
+      Li, Xing Sun, et al. Mme: A comprehensive evaluation
+      benchmark for multimodal large language models. In arXiv        [25] Max Klabunde, Tobias Schubert, and Sebastian Lapuschkin.
+      preprint arXiv:2306.13394, 2023. 1, 2                                 Similarity of neural network models revisited: Measuring
+                                                                            functional similarity. In International Conference on Ma-
+[13] Chaoyou Fu, Peixian Chen, Yunhang Shen, Yulei Qin,                     chine Learning (ICML), 2024. 2
+      Mengdan Zhang, Xu Lin, Jinrui Yang, Xiawu Zheng, Ke Li,
+      Xing Sun, et al. Mme: A comprehensive evaluation bench-         [26] Simon Kornblith, Mohammad Norouzi, Honglak Lee, and
+      mark for multimodal large language models. In The Thirty-             Geoffrey Hinton. Similarity of neural network represen-
+      tations revisited. In International conference on machine               ing transferable visual models from natural language super-
+      learning, pages 3519–3529. PMlR, 2019. 2                                vision. In Proceedings of the 38th International Conference
+                                                                              on Machine Learning (ICML), 2021. 1, 2, 3
+[27] Ranjay Krishna, Yuke Zhu, Oliver Groth, Justin Johnson,            [40] Oriane Sime´oni, Huy V. Vo, Maximilian Seitzer, Federico
+      Kenji Hata, Joshua Kravitz, Stephanie Chen, Yannis Kalan-               Baldassarre, Maxime Oquab, Cijo Jose, Vasil Khalidov,
+      tidis, Li-Jia Li, David A Shamma, et al. Visual genome:                 Marc Szafraniec, Seungeun Yi, Michae¨l Ramamonjisoa,
+      Connecting language and vision using crowdsourced dense                 Francisco Massa, Daniel Haziza, Luca Wehrstedt, Jianyuan
+      image annotations. International journal of computer vision,            Wang, Timothe´e Darcet, The´o Moutakanni, Leonel Sentana,
+      123(1):32–73, 2017. 2                                                   Claire Roberts, John Brandt, Camille Couprie, Julien Mairal,
+                                                                              Herve´ Je´gou, Patrick Labatut, and Piotr Bojanowski. Di-
+[28] Alex Krizhevsky, Geoffrey Hinton, et al. Learning multiple               nov3. arXiv preprint arXiv:2508.10104, 2025. 2, 1
+      layers of features from tiny images. 2009. 2                      [41] Amanpreet Singh, Vivek Natarajan, Meet Shah, Yu Jiang,
+                                                                              Xinlei Chen, Dhruv Batra, Devi Parikh, and Marcus
+[29] Karel Lenc and Andrea Vedaldi. Understanding image repre-                Rohrbach. Towards vqa models that can read. In Proceedings
+      sentations by measuring their equivariance and equivalence.             of the IEEE/CVF conference on computer vision and pattern
+      In Proceedings of the IEEE Conference on Computer Vision                recognition, pages 8317–8326, 2019. 2
+      and Pattern Recognition (CVPR), 2015. 2                           [42] Damian Smith, Harvey Mannering, and Antonia Marcu.
+                                                                              Functional alignment can mislead: Examining model stitch-
+[30] Tsung-Yi Lin, Piotr Dolla´r, Ross Girshick, Kaiming He,                  ing. In Proceedings of the 42nd International Conference on
+      Bharath Hariharan, and Serge Belongie. Feature pyramid                  Machine Learning (ICML), 2025. 2
+      networks for object detection. In Proceedings of the IEEE         [43] Quan Sun, Yuxin Fang, Ledell Wu, Xinlong Wang, and Yue
+      Conference on Computer Vision and Pattern Recognition                   Cao. Eva-clip: Improved training techniques for clip at scale.
+      (CVPR), pages 936–944, 2017. 6                                          arXiv preprint arXiv:2303.15389, 2023. 3
+                                                                        [44] Peter Tong, Ellis Brown, Penghao Wu, Sanghyun Woo,
+[31] Haotian Liu, Chunyuan Li, Qingyang Wu, and Yong Jae Lee.                 Adithya Jairam Vedagiri IYER, Sai Charitha Akula,
+      Visual instruction tuning. In Advances in Neural Information            Shusheng Yang, Jihan Yang, Manoj Middepogu, Ziteng
+      Processing Systems (NeurIPS), 2023. 2                                   Wang, et al. Cambrian-1: A fully open, vision-centric explo-
+                                                                              ration of multimodal llms. Advances in Neural Information
+[32] Haotian Liu, Chunyuan Li, Yong Jae Li, and Yong Jae Lee.                 Processing Systems, 37:87310–87356, 2024. 7, 4
+      Improved baselines with visual instruction tuning. arXiv          [45] Shengbang Tong, Zhuang Liu, Yuexiang Zhai, Yi Ma, Yann
+      preprint arXiv:2310.03744, 2024. 4, 7, 8, 2                             LeCun, and Saining Xie. Eyes wide shut? exploring the
+                                                                              visual shortcomings of multimodal llms. arXiv preprint
+[33] Zheda Mai, Arpita Chowdhury, Ping Zhang, Cheng-Hao Tu,                   arXiv:2401.06209, 2024. 1, 3, 7, 2
+      Hong-You Chen, Vardaan Pahuja, Tanya Berger-Wolf, Song            [46] Michael Tschannen, Alexey Gritsenko, Xiao Wang, Muham-
+      Gao, Charles Stewart, Yu Su, et al. Fine-tuning is fine, if cal-        mad Ferjad Naeem, Ibrahim Alabdulmohsin, Nikhil
+      ibrated. Advances in neural information processing systems,             Parthasarathy, Talfan Evans, Lucas Beyer, Ye Xia, Basil
+      37:136084–136119, 2024. 1                                               Mustafa, et al. Siglip 2: Multilingual vision-language en-
+                                                                              coders with improved semantic understanding, localization,
+[34] Zheda Mai, Arpita Chowdhury, Zihe Wang, Sooyoung Jeon,                   and dense features. arXiv preprint arXiv:2502.14786, 2025.
+      Lemeng Wang, Jiacheng Hou, and Wei-Lun Chao. Ava-                       3, 1, 4
+      bench: Atomic visual ability benchmark for vision founda-         [47] Grant Van Horn, Oisin Mac Aodha, Yang Song, Yin Cui,
+      tion models. arXiv preprint arXiv:2506.09082, 2025. 3                   Chen Sun, Alex Shepard, Hartwig Adam, Pietro Perona, and
+                                                                              Serge Belongie. The inaturalist species classification and
+[35] Zheda Mai, Ping Zhang, Cheng-Hao Tu, Hong-You Chen,                      detection dataset. In Proceedings of the IEEE Conference
+      Quang-Huy Nguyen, Li Zhang, and Wei-Lun Chao. Lessons                   on Computer Vision and Pattern Recognition (CVPR), pages
+      and insights from a unifying study of parameter-efficient               8769–8778, 2018. 6, 1
+      fine-tuning (peft) in visual recognition. In Proceedings of the   [48] Xingyi Yang, Daquan Zhou, Songhua Liu, Jingwen Ye, and
+      Computer Vision and Pattern Recognition Conference, pages               Xinchao Wang. Deep model reassembly. Advances in neural
+      14845–14857, 2025. 1, 6                                                 information processing systems, 35:25739–25753, 2022. 3
+                                                                        [49] Xiaohua Zhai, Basil Mustafa, Alexander Kolesnikov, and
+[36] Subhransu Maji, Esa Rahtu, Juho Kannala, Matthew                         Lucas Beyer. Sigmoid loss for language-image pre-training.
+      Blaschko, and Andrea Vedaldi. Fine-grained visual classi-               arXiv preprint arXiv:2303.15343, 2023. 1, 2, 3
+      fication of aircraft. http://www.robots.ox.ac.uk/                 [50] Bolei Zhou, Hang Zhao, Xavier Puig, Sanja Fidler, Adela
+      ˜vgg/data/fgvc-aircraft/, 2013. arXiv preprint                          Barriuso, and Antonio Torralba. Scene parsing through
+      arXiv:1306.5151. 6, 1                                                   ade20k dataset. In Proceedings of the IEEE Conference on
+                                                                              Computer Vision and Pattern Vision (CVPR), 2017. 6, 1
+[37] Maxime Oquab, Timothe´e Darcet, The´o Moutakanni, Huy V            [51] Bolei Zhou, Hang Zhao, Xavier Puig, Tete Xiao, Sanja Fi-
+      Vo, Marc Szafraniec, Vasil Khalidov, Pierre Fernandez,                  dler, Adela Barriuso, and Antonio Torralba. Semantic under-
+      Daniel Haziza, Francisco Massa, Alaaeldin El-Nouby, et al.
+      Dinov2: Learning robust visual features without supervision.
+      arXiv preprint arXiv:2304.07193, 2023. 2, 3, 1
+
+[38] Zizheng Pan, Bohan Zhuang, Haoyu He, Jing Liu, and Jian-
+      fei Cai. Stitchable neural networks. In Proceedings of
+      the IEEE/CVF Conference on Computer Vision and Pattern
+      Recognition (CVPR), pages 16041–16050, 2023. 3
+
+[39] Alec Radford, Jong Wook Kim, Chris Hallacy, Aditya
+      Ramesh, Gabriel Goh, Sandhini Agarwal, Girish Sastry,
+      Amanda Askell, Pamela Mishkin, Jack Clark, et al. Learn-
+      standing of scenes through the ade20k dataset. In Interna-
+      tional Journal of Computer Vision, 2019. 6, 1
+
+[52] Baichuan Zhou, Ying Hu, Xi Weng, Junlong Jia, Jie Luo,
+      Xien Liu, Ji Wu, and Lei Huang. Tinyllava: A frame-
+      work of small-scale large multimodal models. arXiv preprint
+      arXiv:2402.14289, 2024. 2
+Revisiting Model Stitching in the Foundation Model Era
+                       Supplementary Material
+
+We provide details omitted in the paper.                        can focus on model stitching itself rather than confounding
+                                                                effects from label imbalance, which would complicate the
+• Sec. A: Experiment and dataset details                        interpretation of stitching behavior.
+• Sec. B: Detailed results
+                                                                iNaturalist-Subset [47] The iNaturalist 2021 dataset
+A. Experiment and Dataset Details                               family has become a standard testbed for assessing VFM
+                                                                performance on fine-grained, real-world biodiversity recog-
+A.1. Vision Foundation Models (VFMs)                            nition. It is a large-scale and heavily imbalanced species
+                                                                classification benchmark that reflects naturally occurring
+We use the following VFMs in our experiments.                   long-tailed distributions. To obtain a controlled yet chal-
+• DINOv2-L [37]: A ViT-L/14 encoder trained with self-          lenging setting for analyzing stitching, we sample 106
+                                                                species from three visually similar Lepidoptera families
+  supervised DINOv2 on a curated collection of ∼142M            (Sphingidae, Pieridae, Pyralidae) and rebalance the data
+  internet images, using a teacher–student distillation ob-     with 200 training and 50 test images per class (21,200 train /
+  jective that encourages consistency across multi-crop im-     5,300 test). This balanced construction removes imbalance
+  age views without labels. In our experiments, we feed         as an additional variable, enabling a cleaner analysis of how
+  336 × 336 inputs with patch size 14.                          stitching choices impact performance.
+• CLIP-L [39]: A ViT-L/14 vision encoder from CLIP,
+  trained jointly with a text encoder on ∼400M image–text       FGVC-Aircraft [36] FGVC-Aircraft is widely adopted
+  pairs from the web using a contrastive objective that pulls   as a canonical fine-grained classification benchmark for
+  matched image–caption pairs together and pushes mis-          VFMs. The version we use contains 102 aircraft models
+  matched pairs apart in a shared embedding space. We           and approximately 10k images, with each model appearing
+  use the vision tower with 336 × 336 inputs and patch size     in around 100 images. We follow the standard split with
+  14.                                                           6.6k training and 3.3k test images, which requires distin-
+• SigLIP2-L [46]: A ViT-L/16 multilingual vi-                   guishing subtle variations in shape, livery, and viewpoint.
+  sion–language encoder trained on a diverse mixture
+  of web image–text data with a sigmoid-based image–text        A.2.2. Training Details
+  matching loss, augmented with captioning-style pretrain-
+  ing, self-distillation, masked prediction, and online data    For all fine-grained classification experiments, we adopt lin-
+  curation to improve dense features and localization. We       ear probing: a single linear classifier is trained on pooled
+  use 384 × 384 inputs and patch size 16.                       image features while all VFM parameters remain frozen.
+• DINOv3-L [40]: A ViT-L/16 self-supervised encoder
+  from the DINOv3 family, trained at large scale on a multi-       For layer feature matching, we first extract intermedi-
+  domain image collection with a distillation-style objec-      ate features from both source and target VFMs and train
+  tive and Gram anchoring to stabilize dense feature maps,      the stitch MLP purely on these features; no additional VFM
+  yielding strong frozen representations for both global and    forward passes are required during this phase. For final fea-
+  dense tasks. In our experiments, we use 384 × 384 inputs      ture matching, we extract features from the target model and
+  and patch size 16.                                            train only the stitch layer.
+
+A.2. Fine-Grained Classification                                   To isolate the effect of stitching, we do not apply any
+                                                                data augmentation. We use the AdamW optimizer in all
+A.2.1. Dataset Details                                          experiments, train for up to 100 epochs with early stop-
+                                                                ping (patience of 5 epochs), and tune the learning rate in
+fMoW [7] The Functional Map of the World (fMoW)                 {0.001, 0.005, 0.01}. For layer feature matching, we use a
+dataset is a commonly used and challenging dataset for          batch size of 256; all other configurations use a batch size of
+VFM evaluation. It is a collection of high-quality remote-      128. Training is performed with automatic mixed precision
+sensing satellite images collected worldwide, annotated         using bfloat16.
+with 62 land-use and functional categories (e.g., airfield,
+port, hospital). We use the fMoW-RGB variant, which pro-        A.2.3. Semantic Segmentation
+vides pan-sharpened RGB crops and associated metadata.
+Since the original dataset is highly imbalanced, we con-        A.2.4. Dataset Details
+struct a class-balanced subset with 230 training and 26 test
+images per class (14,260 train / 1,612 test) so that our study  ADE20K [50, 51] ADE20K is a scene-centric seman-
+                                                                tic segmentation dataset with pixel-level annotations for
+150 object and stuff categories across diverse indoor and         Layer 1  Layer 1   Layer 1   Layer 1   Layer 1   Layer 1
+outdoor environments. We adopt the canonical split with
+20,210 training images and 3,000 held-out test images. The            ...       ...       ...       ...       ...       ...
+dense annotations cover scenes, objects, and parts, mak-
+ing ADE20K a challenging benchmark for evaluating dense           Layer n  Layer n   Layer n   Layer n   Layer n   Layer n
+prediction performance.
+                                                                   Stitch             Stitch              Stitch    Stitch
+A.2.5. Training Details                                            Layer              Layer               Layer     Layer
+
+For semantic segmentation, we train a linear layer to predict     Feature L2 Loss    Layer n+1 Layer n+1 Layer n+1 Layer n+1
+per-pixel class logits for each patch token. The linear layer
+produces a low-resolution logit map (e.g., 24 × 24 for a                             Layer N Layer N     Layer N   Layer N
+model with patch size 14 and 336 × 336 input), which is
+then bilinearly upsampled to the original image resolution        Layer    Model     Feature L2 Loss     Task FT   Task FT
+to obtain the final segmentation map.                             Layer    Model                           Loss      Loss
+
+   For layer feature matching and final feature matching,         (a) Layer Feature  (b) Final Feature (c) Task Loss (d) Self
+we reuse the optimization and hyperparameter settings de-              Matching
+scribed for classification (optimizer, learning rates, batch                         Matching            Training Stitch
+sizes, early stopping, and mixed precision). All remaining
+experimental details for segmentation follow [23].                Figure 10. Model stitching training strategies: (a) Layer feature
+                                                                  matching trains the stitch layer to match features between the
+A.3. VFM Stitch Tree for Multimodal LLM                           source and target models at the stitch position. (b) Final feature
+                                                                  matching trains the stitch layer so that the stitched model matches
+A.3.1. Dataset Details                                            the target model’s final features. (c) Task loss training optimizes
+                                                                  the stitch layer with the downstream task objective. (d) Self-Stitch
+We use the LLaVA-1.5 training data prepared by                    inserts the stitch layer into the source-only and target-only models
+TinyLLaVA.1 LLaVA-1.5-Pretrain (PT) consists of 558k              at the same stitch position. Across all strategies, the stitch layer
+image–caption pairs [32], while LLaVA-1.5-SFT com-                is the only trainable component; the source and target models are
+prises 665k visual instruction-tuning conversations that          kept frozen.
+combine academic-style VQA [14, 19, 27, 41] samples
+with instruction-tuning data from LLaVA-Instruct [31]. In         B.2. Layer and Final Feature Matching
+our preliminary study, we evaluate on VQA-v2 [14] and
+MME [12].                                                         We present a detailed comparison between Layer and Final
+                                                                  Feature Matching in Tab. 6. We observe that Final Feature
+A.3.2. Training Details                                           Matching consistently outperforms Layer Feature Match-
+                                                                  ing across all configurations. Notably, in the DINOv2 →
+We jointly use LLaVA-1.5-Pretrain and LLaVA-1.5-SFT to            SigLIP2 setting, the stitched model surpasses the perfor-
+train the stitch layer for one epoch with a learning rate of      mance of both constituent models. Our results further in-
+0.001 and batch size 64. All remaining hyperparameters            dicate that stitching a lower-performing source model to a
+follow the TinyLLaVA recipe [52]. We adopt Qwen2.5-               higher-performing target is more effective than the reverse;
+3B [2] as the LLM and employ an interleaved mixture-of-           DINOv2 → SigLIP2 consistently achieves higher accuracy
+features (MoF) [45] strategy when combining visual tokens         than SigLIP2 → DINOv2, regardless of the matching strat-
+from CLIP and DINOv2.                                             egy employed.
+
+B. Detailed and Additional Results                                B.3. Stitching Between Different VFMs
+
+B.1. Self-Stitch                                                  To verify the generality of our findings, we extend our anal-
+                                                                  ysis beyond DINOv2 and SigLIP2 to include the widely
+To rigorously test whether gains only stem from added ca-         adopted CLIP and the recently released DINOv3. Detailed
+pacity, we introduce a Self-Stitch baseline: inserting the        comparisons between Stitched models, Self-Stitch base-
+identical stitch layer into the source-only and target-only       lines, and Linear Probing are provided in Tabs. 7 to 11.
+models at the same stitch positions. Fig. 10 illustrates the      Consistent with our previous results, stitched models gen-
+difference between model stitching and the self-stitching         erally outperform their corresponding self-stitch baselines
+baseline.                                                         across most layers. The primary exception arises when
+                                                                  CLIP is utilized as the source model; we discuss the po-
+    1We use the data preparation pipeline from TinyLLaVA: https:  tential causes for this phenomenon in the main paper.
+/ / tinyllava - factory . readthedocs . io / en / latest /
+Prepare%20Datasets.html
+                   DINOv2               SigLIP2                                              SigLIP2          CLIP
+
+Linear Probing        46.7                  53.5                       Linear Probing        53.5             46.4
+
+Layer              2 6 10 14 18 22                                     Layer              6        14     18        22
+
+                Layer Feature Matching                                 SigLIP2 → SigLIP2  50.5 62.0       69.4 68.9
+                                                                       CLIP → CLIP        48.5 63.1       59.6 60.7
+
+DINOv2 → SigLIP2 49.4 48.2 51.0 48.5 45.3 48.2                         CLIP → SigLIP2     48.3 68.9       65.4 62.9
+SigLIP2 → DINOv2 29.9 32.4 26.9 42.4 43.7 47.2                         SigLIP2 → CLIP     59.8 70.7       73.2 71.9
+
+                Final Feature Matching                                 Table 9. Stitched Model vs Self-Stitch vs Linear Probing: SigLIP2
+                                                                       and CLIP.
+DINOv2 → SigLIP2 51.4 53.1 56.1 51.0 55.7 54.7
+SigLIP2 → DINOv2 46.4 47.1 43.3 47.3 48.8 50.8
+
+                                                                                             DINOv3       SigLIP2
+
+Table 6. Comparison of Layer and Final Feature Matching.               Linear Probing        50.0             53.5
+We report linear probing accuracy for different stitching strategies.
+Orange indicates performance surpassing the SigLIP2 baseline,          Layer              6           14  18        22
+while Blue indicates performance surpassing the DINOv2 base-
+line.                                                                  DINOv3 → DINOv3    44.7 63.9       66.9 69.0
+                                                                       SigLIP2 → SigLIP2  50.5 62.0       69.4 68.9
+
+                      DINOv2                CLIP                       SigLIP2 → DINOv3   58.6 67.0       69.4 69.3
+                                                                       DINOv3 → SigLIP2   45.0 69.4       70.5 72.4
+
+Linear Probing        46.7                  46.4                       Table 10. Stitched Model vs Self-Stitch vs Linear Probing: DI-
+                                                                       NOv3 and SigLIP2.
+Layer              6        14          18        22
+
+DINOv2 → DINOv2    41.5 59.7            68.2 69.9                                            DINOv2       DINOv3
+CLIP → CLIP        48.5 63.1            59.6 60.7
+
+CLIP → DINOv2      53.1 65.8            63.3 64.0                      Linear Probing        46.7             50.0
+DINOv2 → CLIP      54.1 68.1            72.0 71.9
+                                                                       Layer
+                                                                                          6           14  18        22
+                                                                       DINOv2 → DINOv2
+Table 7. Stitched Model vs Self-Stitch vs Linear Probing: DINOv2       DINOv3 → DINOv3    41.5 59.7       68.2 69.9
+and CLIP.                                                                                 44.7 63.9       66.9 69.0
+                                                                       DINOv3 → DINOv2
+                      DINOv2            SigLIP2                        DINOv2 → DINOv3    43.8 67.2       67.9 72.0
+                                                                                          57.8 65.0       69.2 70.3
+
+Linear Probing        46.7                  53.5                       Table 11. Stitched Model vs Self-Stitch vs Linear Probing: DI-
+                                                                       NOv2 and DINOv3.
+Layer              6        14          18        22
+
+DINOv2 → DINOv2    41.5 59.7            68.2 69.9
+SigLIP2 → SigLIP2  50.5 62.0            69.4 68.9
+
+SigLIP2 → DINOv2   53.8 69.6            70.4 72.2                         the correct prediction.
+DINOv2 → SigLIP2   55.8 68.0            72.0 71.8                      2. Rescue (Col. 3). Both self-stitched models are wrong
+
+Table 8. Stitched Model vs Self-Stitch vs Linear Probing: DINOv2          but the stitched model is correct.
+and SigLIP2.                                                           3. Interference (Cols. 4–6). At least one self-stitched
+
+B.4. Prediction Analysis                                                  model is correct but the stitched model becomes wrong.
+
+To better understand how knowledge fusion affects                         Across both datasets and stitch directions, the total count
+prediction behavior, we compare each stitched model                    of preserve and rescue scenarios clearly exceeds that of
+(DINOv2→SigLIP2 and SigLIP2→DINOv2) against                            interference scenarios, indicating that the stitched models
+the two self-stitched baselines (DINOv2→DINOv2 and                     benefit more from fusing complementary signals than they
+SigLIP2→SigLIP2) on fMoW and iNaturalist. We discard                   suffer from conflicts between the two backbones.
+trivial cases where all three models are correct or all three
+are wrong, and partition the remaining examples into the                  We further ask whose behavior the stitched model
+scenarios in Tab. 12:                                                  tends to follow when the two self-stitched models dis-
+                                                                       agree. On fMoW, where the two self-stitched accura-
+1. Preserve (Cols. 1–2). At least one self-stitched model is           cies are similar, the stitched models are more likely to
+   correct and the stitched model is also correct, preserving          match the source model: for SigLIP2→DINOv2, the num-
+                                                                       ber of cases where the stitched prediction agrees with
+                                                                       SigLIP2→SigLIP2 substantially exceeds the cases where
+                                                                       it agrees with DINOv2→DINOv2, and an analogous trend
+                             fMoW
+
+                   Scenario  Acc.                                                     Scenario       Acc.
+
+DINOv2→DINOv2 W R W R R W 69.9                                 DINOv2→DINOv2 W R W R R W 69.9
+SigLIP2→SigLIP2 R W W R W R 68.9                               SigLIP2→SigLIP2 R W W R W R 68.9
+SigLIP2→DINOv2 R R R W W W 72.2                                DINOv2→SigLIP2 R R R W W W 71.8
+
+Count  116 78 47 40 86 33                                      Count           77 116 54 52 48 72
+
+                             iNaturalist
+
+                   Scenario  Acc.                                                     Scenario       Acc.
+
+DINOv2→DINOv2 W    R W R R W 91.2                              DINOv2→DINOv2 W        R W R R W 91.2
+SigLIP2→SigLIP2 R  W W R W R 87.3                              SigLIP2→SigLIP2 R      W W R W R 87.3
+SigLIP2→DINOv2 R   R R W W W 91.9                              DINOv2→SigLIP2 R       R R W W W 92.8
+
+Count  138 292 75 68 116 53                                    Count           127 331 80 49 77 64
+
+Table 12. Analysis of Predictions: R and W denote Right and Wrong predictions for each model, with counts in the last row and
+accuracies in the last column for fMoW and iNaturalist. Stitched models fall into complementarity scenarios (stitched is correct while at
+least one self-stitched baseline is wrong) far more often than interference ones (stitched is wrong while at least one self-stitched baseline
+is correct). When the two self-stitched models disagree, the stitched model tends to follow the source model on fMoW but follows the
+stronger model DINOv2 on iNaturalist.
+
+holds for DINOv2→SigLIP2. In contrast, on iNatural-            Number of VFMs   Full  VST-6  VST-14  VST-22
+ist, where DINOv2→DINOv2 is the stronger self-stitched
+model, both stitch directions tend to align with the stronger            2     100%    74%    39%      4%
+model’s predictions regardless of whether it is used as                  3     200%   148%    78%      9%
+source or target.                                                        4     300%   222%    117%    13%
+                                                                         5     400%   296%    156%    17%
+   Overall, these analyses support our interpretation that
+stitching primarily acts as a knowledge-fusion mechanism:      Table 13. Comparison of Additional Computation Cost. We
+it preserves or rescues correct predictions from at least one  report the additional increase in computation compared to a single
+backbone much more often than it disrupts them, and when       VFM. “Full” denotes running all VFMs independently. “VST-n”
+there is a strong/weak asymmetry, the stitched model grav-     denotes a shared backbone up to the stitch position n, where lay-
+itates toward the stronger expert’s decisions.                 ers 1 through n are shared and subsequent layers are executed in-
+                                                               dependently. For example, VST-14 shares the first 14 layers and
+B.5. VFM Stitch Tree (VST) for Multimodal LLM                  maintains specialized branches from layer 15 onwards.
+       (MLLM)
+                                                               B.6. VST as an Accuracy-Efficiency Knob
+B.5.1. Computation Comparison
+                                                               We introduce the concept of “Normalized Gain” to quantify
+Table 13 compares the computational cost of running all        the effectiveness of VST relative to running all VFMs inde-
+VFMs independently (Full) versus our VST method at var-        pendently. Table 14 provides the step-by-step derivation of
+ious stitch positions. We illustrate the efficiency gains us-  these values for both VST-22 and VST-14.
+ing Cambrian-1 with 4 VFMs [44]. Assuming a standard
+24-layer ViT-L architecture [46], and noting that MLLMs           We define the Normalized Gain as the ratio between the
+typically extract features from the second last layer (layer   performance improvement achieved by VST (∆VST) and the
+23) [32], we base our calculations on a 23-layer depth.        maximum improvement achieved by running all VFMs in-
+While the “Full” setting incurs a 300% computational over-     dependently (∆max):
+head compared to a single VFM, VST-14 significantly re-
+duces this burden. By sharing the first 14 layers and main-     Normalized Gain (%) = ∆VST = PerfVST − PerfCLIP (2)
+taining specialized branches only from layer 15 onwards,                                       ∆max PerfFull − PerfCLIP
+VST-14 requires processing only 3 × (23 − 14) = 27 ad-
+ditional layers. This results in an overhead of just 27/23 ≈      As illustrated in Tab. 14:
+117%, demonstrating a substantial efficiency improvement       • The Orange Row represents the Denominator (∆max):
+over the independent baseline.
+                                                                 the total performance gap between the single-model base-
+                                                                 line and the computationally expensive naive full running
+Model Configuration                    VQAv2                                MME           Efficiency Metrics
+                          Yes/No Number                               Percep. Cogn.  Avg Gain % Add. Cost
+                                                               Other
+1. Define the Upper Bound (Denominator)
+                                                               69.00
+(A) CLIP Baseline         91.75          58.74                 70.30  1418.5  277.1       -     0%
+                                         61.64                  1.30  1460.3  311.8       -    100%
+(B) Full (CLIP + DINOv2)  92.72          2.90                          41.8   34.7   (Denom.)
+                                                               69.15                              -
+(C) Max Gain (∆max = B − A) 0.97                                0.15
+                                                               11.5%
+2. VST-22: The Lightweight Knob (High Efficiency)
+                                                               69.88
+(D) VST-22 (Ours)         92.12 59.21                           0.88  1451.6  305.7      -     4.3%
+                                                               67.7%   33.1    28.6  (Num.)      -
+(E) VST Gain (∆VST = D − A) 0.37          0.47                        79.1%   82.5%  45.5%
+Normalized Gain (% = E/C) 38.1%          16.2%                                                 4.3%
+
+3. VST-14: The Balanced Knob (High Performance)
+
+(F) VST-14 (Ours)         92.54 60.69                                 1474.4  301.8      -     39.0%
+                                                                        55.9   24.7  (Num.)       -
+(G) VST Gain (∆VST = F − A) 0.79          1.95                        133.7%  71.1%  84.2%
+Normalized Gain (% = G/C) 81.4%          67.2%                                                 39.0%
+
+Table 14. Detailed Calculation of Normalized Gain. Comparison of the “Lightweight” VST-22 and the “Balanced” VST-14. The
+ Orange Row represents the gain (∆max) achieved by the computationally expensive Naive ensemble (100% Cost). The Pink Rows
+represent the actual gain (∆VST) achieved by our method. The Normalized Gain is calculated as ∆VST/∆max. Note that VST-22 achieves
+nearly half the total gain (45.5%) with negligible cost (4.3%).
+
+  (100% additional cost).
+• The Pink Rows represent the Numerator (∆VST): the
+
+  actual gain realized by our VST method.
+   The results highlight the versatility of VST as a compute-
+aware knob. VST-22 serves as an ultra-lightweight option,
+recovering 45.5% of the total possible gain while incurring
+a negligible 4.3% increase in backbone cost. Conversely,
+VST-14 acts as a balanced high-performance option, recov-
+ering 84.2% of the total gain for only 39% of the additional
+cost. This granular control allows practitioners to maximize
+model utility within specific computational budgets.
+   Consequently, we view VST as a vital accuracy–
+efficiency knob for architecture design. Without VST, prac-
+titioners face a rigid binary choice: either deploy an en-
+tire additional VFM (yielding higher performance but in-
+curring 100% extra backbone cost) or deploy none (yield-
+ing no gain). VST transforms this discrete step function
+into a continuous spectrum. By serving as a compute-aware
+knob, our method effectively interpolates between these ex-
+tremes, enabling controllable performance–efficiency trade-
+offs that can be dynamically tuned to meet strict real-world
+deployment constraints.
+
